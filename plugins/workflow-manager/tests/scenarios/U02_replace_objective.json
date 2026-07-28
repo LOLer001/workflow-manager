@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "U02",
+  "title": "A replacement starts a new objective generation",
+  "initial": {"agent_cap": 0, "parent_active": true},
+  "events": [
+    {"type": "objective", "mode": "start", "id": "obj-old", "goal": "fix parser", "constraints": ["legacy constraint"], "expect": {"generation": 1}},
+    {"type": "objective", "mode": "replace", "id": "obj-new", "goal": "write release notes", "constraints": ["short format"], "expect": {"objective_id": "obj-new", "generation": 2}}
+  ],
+  "expect": {
+    "objective.id": "obj-new",
+    "objective.generation": 2,
+    "objective.goal": "write release notes",
+    "objective.constraints": ["short format"],
+    "archived_objectives": ["obj-old"]
+  }
+}

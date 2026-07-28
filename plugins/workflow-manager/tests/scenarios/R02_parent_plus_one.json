@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "R02",
+  "title": "The parent lane may add one subagent, not become the subagent",
+  "initial": {"agent_cap": 1, "parent_active": true},
+  "production": {
+    "prompt": "模拟复杂问题处理来测试workflow-manager，然后全面测试并优化",
+    "route": {
+      "label": "complex",
+      "recommended_agent_cap": 1,
+      "agent_mode": "parent_plus_one",
+      "delegation_gate": "audit",
+      "readiness_signal": "none",
+      "dependency_signal": "none",
+      "meta_delegation": false
+    }
+  },
+  "events": [
+    {"type": "objective", "mode": "start", "id": "obj-r02", "goal": "audit and improve"},
+    {"type": "spawn", "agent": "audit-1", "scope": "independent-history-audit", "expect": {"allowed": true}},
+    {"type": "spawn", "agent": "audit-2", "scope": "independent-code-audit", "expect": {"allowed": false, "reason": "agent_cap"}}
+  ],
+  "expect": {
+    "max_active_subagents": 1,
+    "max_total_lanes": 2,
+    "spawn_allowed": 1,
+    "spawn_denied": 1,
+    "denials.agent_cap": 1
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "A02",
+  "title": "An active scope survives compaction and is not spawned twice",
+  "initial": {"agent_cap": 2, "parent_active": true},
+  "events": [
+    {"type": "objective", "mode": "start", "id": "obj-a02", "goal": "audit two independent areas"},
+    {"type": "spawn", "agent": "audit-1", "scope": "source-audit", "expect": {"allowed": true}},
+    {"type": "compact", "expect": {"allowed": true, "compactions": 1}},
+    {"type": "resume", "expect": {"allowed": true, "active_agents": 1}},
+    {"type": "spawn", "agent": "audit-2", "scope": "source-audit", "expect": {"allowed": false, "reason": "duplicate_scope"}}
+  ],
+  "expect": {
+    "compactions": 1,
+    "resumes": 1,
+    "active_agent_ids": ["audit-1"],
+    "max_active_subagents": 1,
+    "spawn_allowed": 1,
+    "spawn_denied": 1,
+    "denials.duplicate_scope": 1
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "R06",
+  "title": "Shared-device requests close delegation before a subagent starts",
+  "initial": {"agent_cap": 0, "parent_active": true},
+  "production": {
+    "prompt": "Please parallelize the release flow: build, package, install, reboot, then validate on the only connected device.",
+    "route": {
+      "label": "complex",
+      "lane_signal": "sequential",
+      "recommended_agent_cap": 0,
+      "agent_mode": "sequential_local",
+      "workflow_shape": "sequential_pipeline",
+      "delegation_gate": "closed",
+      "readiness_signal": "none",
+      "dependency_signal": "ordered_shared",
+      "meta_delegation": false
+    }
+  },
+  "events": [
+    {"type": "objective", "mode": "start", "id": "obj-r06", "goal": "deliver through one shared device"},
+    {"type": "spawn", "agent": "device-lane", "scope": "install-reboot-validate", "expect": {"allowed": false, "reason": "agent_cap"}}
+  ],
+  "expect": {
+    "max_active_subagents": 0,
+    "max_total_lanes": 1,
+    "spawn_allowed": 0,
+    "spawn_denied": 1,
+    "denials.agent_cap": 1
+  }
+}

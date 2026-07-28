@@ -1,0 +1,6 @@
+interface:
+  display_name: "Workflow Manager"
+  short_description: "Manage complex work with bounded context and agents"
+  default_prompt: "Use $workflow-manager to follow the smallest relevant Contract, Evidence, Change, Verify, and Report stages; re-audit newly independent read-only lanes, describe child purposes concisely in Chinese, serialize shared resources, and resume from native summaries without redoing verified work."
+policy:
+  allow_implicit_invocation: true

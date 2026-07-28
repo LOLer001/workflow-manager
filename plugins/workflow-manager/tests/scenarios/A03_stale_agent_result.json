@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "A03",
+  "title": "A late result from an old objective is stale",
+  "initial": {"agent_cap": 1, "parent_active": true},
+  "events": [
+    {"type": "objective", "mode": "start", "id": "objective-old", "goal": "audit old implementation"},
+    {"type": "spawn", "agent": "audit-old", "scope": "old-source", "expect": {"allowed": true}},
+    {"type": "objective", "mode": "replace", "id": "objective-new", "goal": "implement new parser", "expect": {"objective_id": "objective-new", "generation": 2}},
+    {"type": "agent_result", "agent": "audit-old", "expect": {"allowed": true, "disposition": "stale", "committed": false}}
+  ],
+  "expect": {
+    "objective.id": "objective-new",
+    "objective.generation": 2,
+    "archived_objectives": ["objective-old"],
+    "stale_results": 1,
+    "accepted_results": 0,
+    "result_commits": 0,
+    "active_agent_ids": []
+  }
+}

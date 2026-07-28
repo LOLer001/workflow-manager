@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "F01",
+  "title": "An equivalent retry is blocked until a material correction exists",
+  "initial": {"agent_cap": 0, "parent_active": true},
+  "events": [
+    {"type": "attempt", "operation": "compile", "expect": {"allowed": true, "attempt": 1}},
+    {"type": "failure", "operation": "compile", "expect": {"allowed": true, "failures": 1}},
+    {"type": "correction", "operation": "compile", "material": false, "detail": "same command with different wording", "expect": {"allowed": false, "reason": "non_material_correction"}},
+    {"type": "retry", "operation": "compile", "expect": {"allowed": false, "reason": "material_correction_required"}}
+  ],
+  "expect": {
+    "retry.compile.attempts": 1,
+    "retry.compile.failures": 1,
+    "retry.compile.retries": 0,
+    "retry.compile.material_corrections": 0,
+    "denials.non_material_correction": 1,
+    "denials.material_correction_required": 1
+  }
+}

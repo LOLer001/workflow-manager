@@ -1,0 +1,121 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10,
+            "statusMessage": "Restoring Workflow Manager task state"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10,
+            "statusMessage": "Saving Workflow Manager checkpoint"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
+            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

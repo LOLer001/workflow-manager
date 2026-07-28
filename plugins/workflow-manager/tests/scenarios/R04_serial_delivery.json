@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "R04",
+  "title": "Model-level build, deploy, and device ordering policy",
+  "initial": {"agent_cap": 0, "parent_active": true, "serial_order": ["build", "deploy", "device"]},
+  "coverage": {"trace": "model_level_operation_order", "production": "route_fields_and_spawn_gate_only"},
+  "production": {
+    "prompt": "先编译同一构建产物，完成后再部署到唯一设备，然后实机验证",
+    "route": {
+      "label": "complex",
+      "lane_signal": "sequential",
+      "recommended_agent_cap": 0,
+      "workflow_shape": "sequential_pipeline",
+      "execution_order": ["contract", "evidence", "build", "deliver", "verify", "report"],
+      "delegation_gate": "closed",
+      "readiness_signal": "none",
+      "dependency_signal": "ordered_shared",
+      "meta_delegation": false
+    }
+  },
+  "events": [
+    {"type": "objective", "mode": "start", "id": "obj-r04", "goal": "deliver one verified build"},
+    {"type": "operation_start", "operation": "deploy-early", "stage": "deploy", "expect": {"allowed": false, "reason": "dependency_order", "expected_stage": "build"}},
+    {"type": "operation_start", "operation": "build-1", "stage": "build", "expect": {"allowed": true}},
+    {"type": "operation_start", "operation": "deploy-overlap", "stage": "deploy", "expect": {"allowed": false, "reason": "serial_pipeline_busy"}},
+    {"type": "operation_end", "operation": "build-1", "expect": {"allowed": true, "stage": "build"}},
+    {"type": "operation_start", "operation": "deploy-1", "stage": "deploy", "expect": {"allowed": true}},
+    {"type": "operation_end", "operation": "deploy-1", "expect": {"allowed": true, "stage": "deploy"}},
+    {"type": "operation_start", "operation": "device-1", "stage": "device", "expect": {"allowed": true}},
+    {"type": "operation_end", "operation": "device-1", "expect": {"allowed": true, "stage": "device"}}
+  ],
+  "expect": {
+    "completed_order": ["build", "deploy", "device"],
+    "operation_started": 3,
+    "operation_denied": 2,
+    "max_parallel_operations": 1,
+    "max_total_lanes": 1,
+    "denials.dependency_order": 1,
+    "denials.serial_pipeline_busy": 1
+  }
+}

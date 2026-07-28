@@ -1,0 +1,26 @@
+{
+  "name": "workflow-manager",
+  "version": "1.0.12",
+  "description": "Context-efficient workflow management with adaptive routing, output guardrails, compaction recovery, and bounded subagent orchestration.",
+  "author": {
+    "name": "Cong"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workflow Manager",
+    "shortDescription": "Manage complex work with bounded context and agents.",
+    "longDescription": "Guides multi-step work through Contract, Evidence, Change, Verify, and Report; re-audits newly independent lanes before delegation; preserves routes across progress updates and compaction; closes delegation for shared-resource chains; and guards oversized or noisy tool output.",
+    "developerName": "Cong",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Use $workflow-manager to complete this task through the smallest relevant Contract, Evidence, Change, Verify, and Report stages.",
+      "Preserve progress across compaction, avoid repeating verified work, bound command output, and report only material phase changes or long waits.",
+      "Delegate only independent ready-now work: re-audit when a new non-overlapping read-only lane emerges, count the parent as one lane, and keep shared build/device chains serialized."
+    ],
+    "brandColor": "#0F766E",
+    "screenshots": []
+  }
+}

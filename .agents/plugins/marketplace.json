@@ -1,0 +1,20 @@
+{
+  "name": "workflow-manager",
+  "interface": {
+    "displayName": "Workflow Manager"
+  },
+  "plugins": [
+    {
+      "name": "workflow-manager",
+      "source": {
+        "source": "local",
+        "path": "./plugins/workflow-manager"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
