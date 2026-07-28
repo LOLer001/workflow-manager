@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "Context-efficient workflow management with adaptive routing, output guardrails, compaction recovery, and bounded subagent orchestration.",
   "author": {
     "name": "Cong"

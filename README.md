@@ -55,7 +55,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.12 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.13 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -63,7 +63,7 @@ codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.12 --json
 ```bash
 codex plugin remove workflow-manager@workflow-manager --json
 codex plugin marketplace remove workflow-manager --json
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.12 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.13 --json
 codex plugin add workflow-manager@workflow-manager --json
 ```
 

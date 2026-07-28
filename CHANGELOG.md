@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.0.13
+
+- 修复英文 Windows 系统区域设置下 Unicode 插件路径测试驱动的编码兼容性。
+- 保留 `py -3 -m unittest -v tests.test_windows_hook` 九项原生 Windows 端到端验证。
+
 ## 1.0.12
 
 - 插件与技能统一命名为 Workflow Manager。

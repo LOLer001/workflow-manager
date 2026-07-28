@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.12"
+WRITER_VERSION = "1.0.13"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {

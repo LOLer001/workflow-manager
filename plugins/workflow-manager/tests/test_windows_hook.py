@@ -43,9 +43,9 @@ class WindowsHookTests(unittest.TestCase):
     def resolved_command(self, env: dict[str, str]) -> str:
         return EXPECTED_WINDOWS_COMMAND.replace("${PLUGIN_ROOT}", env["PLUGIN_ROOT"])
 
-    def prepare_driver(self, env: dict[str, str]) -> None:
-        command = self.resolved_command(env)
-        self.driver.write_text(f"@echo off\n{command}\n", encoding="mbcs")
+    def prepare_driver(self) -> None:
+        command = EXPECTED_WINDOWS_COMMAND.replace("${PLUGIN_ROOT}", "%PLUGIN_ROOT%")
+        self.driver.write_text(f"@echo off\n{command}\n", encoding="ascii")
 
     def environment(
         self,
@@ -69,7 +69,7 @@ class WindowsHookTests(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         resolved_env = env or self.environment()
-        self.prepare_driver(resolved_env)
+        self.prepare_driver()
         return subprocess.run(
             self.command(),
             input=json.dumps(payload, ensure_ascii=True),
@@ -178,6 +178,11 @@ class WindowsHookTests(unittest.TestCase):
             },
             env=env,
         )
+        driver_bytes = self.driver.read_bytes()
+        self.assertTrue(driver_bytes.isascii())
+        driver_text = driver_bytes.decode("ascii")
+        self.assertIn("%PLUGIN_ROOT%", driver_text)
+        self.assertNotIn(str(fake_root), driver_text)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("hookSpecificOutput", json.loads(result.stdout))
         self.assertEqual(len(list((self.data / "sessions").glob("*.json"))), 1)
@@ -238,7 +243,7 @@ class WindowsHookTests(unittest.TestCase):
     def test_concurrent_windows_commands_preserve_operations(self) -> None:
         env = self.environment(data=self.root / "concurrent-data")
         env["TOKEN_FRUGAL_DEBUG"] = "1"
-        self.prepare_driver(env)
+        self.prepare_driver()
         processes: list[subprocess.Popen[str]] = []
         for index in range(12):
             payload = {
