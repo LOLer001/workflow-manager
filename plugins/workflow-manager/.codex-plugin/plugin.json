@@ -1,23 +1,23 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.13",
-  "description": "Context-efficient workflow management with adaptive routing, output guardrails, compaction recovery, and bounded subagent orchestration.",
+  "version": "1.0.14",
+  "description": "Quality-first, context-efficient workflow management with adaptive routing, lossless output guidance, compaction recovery, and bounded subagent orchestration.",
   "author": {
     "name": "Cong"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Workflow Manager",
-    "shortDescription": "Manage complex work with bounded context and agents.",
-    "longDescription": "Guides multi-step work through Contract, Evidence, Change, Verify, and Report; re-audits newly independent lanes before delegation; preserves routes across progress updates and compaction; closes delegation for shared-resource chains; and guards oversized or noisy tool output.",
+    "shortDescription": "Protect reasoning quality while managing context and agents.",
+    "longDescription": "Guides multi-step work without omitting required reasoning, evidence, correction, or verification; preserves oversized tool results for model reasoning; resumes acceptance state across compaction; and delegates only independent ready-now lanes.",
     "developerName": "Cong",
     "category": "Productivity",
     "capabilities": [
       "Interactive"
     ],
     "defaultPrompt": [
-      "Use $workflow-manager to complete this task through the smallest relevant Contract, Evidence, Change, Verify, and Report stages.",
-      "Preserve progress across compaction, avoid repeating verified work, bound command output, and report only material phase changes or long waits.",
+      "Use $workflow-manager to complete this task through the smallest relevant stages without omitting required reasoning, evidence, correction, or verification.",
+      "Correctness and acceptance evidence outrank context savings; preserve oversized results, checkpoint before compaction, and remove only redundant work or presentation.",
       "Delegate only independent ready-now work: re-audit when a new non-overlapping read-only lane emerges, count the parent as one lane, and keep shared build/device chains serialized."
     ],
     "brandColor": "#0F766E",

@@ -286,7 +286,7 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(len({item["fingerprint"] for item in state["operations"]}), 12)
         self.assertEqual(state["event_counts"]["PostToolUse"], 12)
 
-    def test_windows_guard_denies_unc_git_and_compacts_large_output(self) -> None:
+    def test_windows_guard_denies_unc_git_and_preserves_large_output(self) -> None:
         denied = self.run_command_windows(
             {
                 "hook_event_name": "PreToolUse",
@@ -312,8 +312,19 @@ class WindowsHookTests(unittest.TestCase):
             }
         )
         self.assertEqual(compacted.returncode, 0, compacted.stderr)
-        compacted_output = json.loads(compacted.stdout)
-        self.assertEqual(compacted_output["decision"], "block")
+        preserved_output = json.loads(compacted.stdout)
+        self.assertTrue(preserved_output["continue"])
+        self.assertNotIn("decision", preserved_output)
+        context = preserved_output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("preserved the original", context)
+        self.assertIn("Correctness and evidence completeness take priority", context)
+        state_files = list((self.data / "sessions").glob("*.json"))
+        states = [json.loads(path.read_text(encoding="utf-8")) for path in state_files]
+        operations = [item for state in states for item in state.get("operations", [])]
+        self.assertEqual(len(operations), 1)
+        self.assertTrue(operations[0]["oversized"])
+        self.assertFalse(operations[0]["compacted"])
+        self.assertNotIn("failure line", json.dumps(states))
 
 
 if __name__ == "__main__":

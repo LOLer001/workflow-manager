@@ -1,61 +1,69 @@
 ---
 name: workflow-manager
-description: Manage context-efficient Codex workflows with bounded exploration, live context-pressure hints, compaction-safe continuity, duplicate-work avoidance, and selective subagent delegation. Use for long or multi-step tasks, parallelizable investigation, repeated tool work, context pressure or compaction, or explicit requests to conserve tokens and preserve progress.
+description: Manage quality-first, context-efficient Codex workflows with bounded exploration, compaction-safe continuity, duplicate avoidance, and selective subagents. Use for long/multi-step work, independent lanes, repeated tools, context pressure/compaction, or token-saving requests without reducing required reasoning, evidence, or verification.
 ---
 
 # Workflow Manager
 
-Keep the main thread to requirements, decisions, verified facts, and final outputs. Spend tokens only on evidence that changes the next action.
+Keep the main thread to requirements, decisions, verified facts, and outputs. Remove redundancy, never evidence needed for correctness, safety, reproducibility, or acceptance.
+
+## Quality invariant
+
+- Correctness and required reasoning, evidence, safety, reproducibility, and acceptance outrank context savings.
+- “Smallest relevant” means remove redundancy, never a necessary stage, source, diagnostic, corrected retry, or risk-appropriate check.
+- Pressure may change order, representation, or checkpoint timing, never the depth needed to solve the task. If an excerpt is insufficient, fetch exact evidence or compact safely and continue.
+- Shorter output, fewer tools/agents, or fewer tokens is not success without the requested outcome and complete acceptance evidence.
 
 ## Route and run
 
-1. Route first: **Direct** is an answer/small edit; **Focused** is one causal chain; **Complex** has noisy or separable work and needs a lane audit.
-2. Prompt size, “comprehensive/parallel” wording, and many stages measure effort, not independence. Build > package > deploy > device is usually one chain.
+1. Route first: **Direct** is an answer/small edit; **Focused** is one causal chain; **Complex** needs a lane audit.
+2. Prompt size, “parallel” wording, and many stages show effort, not independence. Build > package > deploy > device is usually one chain.
 3. Progress updates inherit the active objective/route; a clearly new objective may replace or downgrade it.
-4. For Focused/Complex work use only relevant stages: `Contract(outcome+acceptance+scope) > Evidence(cause/assumption) > Change(small coherent edit) > Verify(decisive check) > Report(outcome+paths+checks+risk)`.
+4. For Focused/Complex work use only relevant stages, while satisfying the quality invariant: `Contract(outcome+acceptance+scope) > Evidence(cause) > Change(coherent edit) > Verify(risk-appropriate checks) > Report(outcome+paths+checks+risk)`.
 5. Use a 3-5 step plan only for more than two material stages, risky acceptance, or shared/external state.
-6. Reuse the native summary, plan, and unchanged success before rerunning. Search exact paths/patterns and read short excerpts.
-7. With tools, send one kickoff; update `phase | done | next | blocker` only on material change or ~60s wait, never per read/edit/poll.
+6. Reuse native summaries, plans, and unchanged success. Search exact paths/patterns; start short, then expand until evidence is sufficient.
+7. With tools, send one kickoff; update `phase | done | next | blocker` only on material change or ~60s wait, never per tool.
 
 ## Context gates
 
-- Below 55% work normally; at 55-70% trim output; at 70% stop broad exploration, checkpoint, then use narrow work or allow native compaction.
-- After compaction, resume from the native summary and re-arm the 55%/70% gates for the next context cycle; never reconstruct completed work from scratch.
-- Reclassify on new phases, repeated failures, long builds, or large output. Pressure alone never justifies delegation; make compaction safe instead of suppressing it.
+- Below 55% work normally; at 55-70% trim presentation; at 70% stop unfocused exploration, checkpoint, then continue required evidence narrowly or after native compaction.
+- After compaction, resume from the native summary, re-arm both gates, and never reconstruct completed work.
+- Reclassify on new phases, repeated failures, long builds, or large output. Pressure never justifies delegation; make compaction safe.
 
 ## Delegation
 
 Delegate only when at least two bounded, summary-friendly lanes are independent, ready now, and worth the coordination.
 
-- Before spawning, note `deliverable | inputs | ready now | file/write owner | shared resource` for each candidate. If an initially sequential objective later exposes a safe lane, state explicitly that the child lane and parent lane are independent, non-overlapping, read-only, and ready now so the hook can re-audit it.
-- Parent owns integration/shared state. Use `subagents=min(ready_lanes-1, route_cap)`: Direct/Focused 0; Complex defaults to parent+1; expand only when a phase transition exposes another high-cost lane.
-- The hook denies closed-gate, cap-exceeded, and confirmable duplicate-scope `Agent/spawn_agent` requests before start; an audit gate still requires judgment. `SubagentStart` records continuity and injects the child contract, but cannot block a start.
-- Dependencies, one artifact, overlapping edits, one build account, or one device override parallel wording. Keep build > deploy > reboot > device acceptance under one owner.
+- Before spawning, note `deliverable | inputs | ready now | write owner | shared resource`. A newly safe lane must be explicitly independent, non-overlapping, read-only, and ready now for re-audit.
+- Parent owns integration/shared state. Use `subagents=min(ready_lanes-1, route_cap)`: Direct/Focused 0; Complex normally parent+1; expand only for a new high-cost lane.
+- The hook denies closed-gate, over-cap, and confirmed duplicate-scope spawn requests. Audit still needs judgment; `SubagentStart` records continuity but cannot block.
+- Dependencies, one artifact, overlapping edits, one build account, or one device force serialization. One owner keeps build > deploy > reboot > device acceptance.
 - Routine show/submit/mount/rename/one-step automation stays local unless an expensive evidence lane is ready.
-- Prefer agents for read-heavy research, source/log triage, or independent verification. Describe each child to the user with a concise Chinese purpose summary. When the host requires an ASCII `task_name`, use a short schema-safe internal ID and put the Chinese purpose at the start of the child prompt and progress update. Prompts state scope/exclusions, paths, result shape, and no-redo/no-raw-log.
-- Reuse a live agent for one bounded follow-up. An older-objective result is validation-only and cannot restart old mutations.
+- Prefer agents for read-heavy research, log/source triage, or independent verification. Give each child a concise Chinese purpose summary. If the host needs an ASCII `task_name`, use a schema-safe ID and put the Chinese purpose in its prompt/update. State scope, exclusions, paths, result shape, and no-redo/no-raw-log.
+- Reuse a live agent for one bounded follow-up. Old-objective results are validation-only.
 
 ## Continuity
 
-- Reuse terminal success only when input, cwd, files, device/external state, freshness, and native evidence are unchanged; never reuse unknown/running/failed/cancelled/timed-out work.
-- Native summary owns semantics; hook fingerprints/counters are hints. Resume the recorded stage, keep active agents, and repair each missing checkpoint field with one narrow check—not a full skill/protocol/source reload.
-- Added constraints extend the objective and preserve valid evidence; explicit replacement stops old-objective tools and makes late results validation-only.
+- Reuse success only when inputs, cwd, files, device/external state, freshness, and native evidence are unchanged; never reuse nonterminal or failed work.
+- Native summaries own semantics; hook fingerprints/counters are hints. Resume the recorded stage/agents and repair each missing field with one narrow check, not a full reload.
+- Added constraints preserve valid evidence; objective replacement stops old tools and makes late results validation-only.
 
 ## Output and command guards
 
-- Bound output with exact paths/patterns/ranges, quiet modes, limits, or log redirection. Budget Git status, build/package, logs, recording, and 1-3 representative frames.
+- Bound output with exact paths/patterns/ranges, limits, or full-log redirection. Budget Git status, builds, logs, recordings, and 1-3 frames.
 - Before first mutation/automation, preflight only unverified path/entrypoint, input/encoding, and acceptance source.
-- The hook may deny mounted Git, broad status, unbudgeted build/log/recording. Correct once; do not try an equivalent unbounded route.
-- Keep the first error; diagnose once; retry only after material correction or one bounded alternate. Same-cause second failure or ~25 actions in one stage forces `checkpoint > reclassify`.
-- Run one build/deploy/device acceptance loop per unchanged revision. If PostToolUse compacts output, use its excerpt or one narrower query—never rerun the full command.
+- The hook may deny mounted Git, broad status, or unbudgeted build/log/recording. Correct once; do not try an equivalent unbounded route.
+- Keep the first error; diagnose once; retry after material correction or one bounded alternate. A repeated same-cause failure or ~25 stage actions requires `checkpoint > reclassify`, never abandonment of needed diagnosis/acceptance.
+- Run one acceptance loop per unchanged revision unless reliability, flakiness, sampling, or explicit criteria require repetition. PostToolUse preserves oversized results and only advises future bounds.
 - Ignore unrelated files, generated output, old logs, and history unless blocking.
 
 ## Mounted-source safety
 
-Never run Git from CIFS, Samba, UNC, DrvFS, or WSL-mounted source, including path-limited Git commands. Use `android-remote-git`, the authoritative remote Linux tree, or an explicitly safe non-mounted terminal. Mounted paths are for targeted reads/searches/edits only.
+Never run Git from CIFS, Samba, UNC, DrvFS, or other WSL-mounted source. Use `android-remote-git`, the authoritative remote Linux tree, or a safe non-mounted terminal; mounts are only for targeted reads/searches/edits.
 
 ## Truthfulness and boundaries
 
-- Hook availability, a route, or zero agents does not prove effectiveness; judge bounded output, duplication, safe commands, checkpoints, and delegation fit.
-- Agents often reduce main-thread noise but increase total tokens; telemetry/ranges are estimates. PreToolUse is a guardrail, not a security boundary.
+- Hook availability, a route, or zero agents does not prove effectiveness; judge outputs, duplication, commands, checkpoints, and delegation fit.
+- Agents may reduce main-thread noise but raise total tokens; telemetry is estimated. PreToolUse is a guardrail, not a security boundary.
+- Workflow quality is the release gate. Savings may remove redundancy, never reasoning, evidence, correction, or verification.
 - User instructions, safety, project-local skills, and required workflow gates take precedence.

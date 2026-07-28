@@ -38,6 +38,7 @@ RELEASE_BLOCKERS = {
     "U02",
     "F01",
     "F02",
+    "Q01",
 }
 PRODUCTION_ROUTE_FIELDS = {
     "delegation_gate",

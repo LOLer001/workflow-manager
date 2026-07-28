@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.13"
+WRITER_VERSION = "1.0.14"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -512,6 +512,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "visual_items": max(safe_int(item.get("visual_items")), 0),
         "truncated": bool(item.get("truncated")),
         "budgeted": bool(item.get("budgeted")),
+        "oversized": bool(item.get("oversized")),
         "compacted": bool(item.get("compacted")),
     }
 
@@ -580,6 +581,28 @@ def _safe_active_agent_scope(item: Any) -> dict[str, Any] | None:
     return result or None
 
 
+def _safe_continuity(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    change = str(item.get("change_fingerprint") or "")
+    if change and not re.fullmatch(r"[0-9a-f]{8,64}", change):
+        change = ""
+    return {
+        "current_stage": safe_label(item.get("current_stage"), 32)
+        if item.get("current_stage")
+        else "unknown",
+        "acceptance_pending": bool(item.get("acceptance_pending")),
+        "next_required_stage": safe_label(item.get("next_required_stage"), 32)
+        if item.get("next_required_stage")
+        else "unknown",
+        "last_outcome_status": safe_label(item.get("last_outcome_status"), 32)
+        if item.get("last_outcome_status")
+        else "unknown",
+        "evidence_available": bool(item.get("evidence_available")),
+        "change_fingerprint": change[:64] if change else None,
+    }
+
+
 def _safe_compaction(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -606,6 +629,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             if (scope := _safe_active_agent_scope(raw)) is not None
         ][:8],
         "recent_successes": successes[-8:],
+        "continuity": _safe_continuity(item.get("continuity")),
     }
 
 
@@ -1505,6 +1529,11 @@ _NESTED_POWERSHELL_RE = re.compile(
 )
 
 
+_NESTED_EVAL_RE = re.compile(
+    r"(?i)(?:^|[;&|]\s*|\$\(|\(\s*)(?:(?:builtin|command)\s+)?eval[ \t]+?"
+)
+
+
 def _outer_shell_segment(command: str, start: int) -> str:
     masked = shell_syntax_view(command)
     boundary = re.search(r"(?:&&|\|\||[;|])", masked[start:])
@@ -1520,11 +1549,22 @@ def _first_shell_argument(value: str) -> str:
     return parts[0] if parts else ""
 
 
+def _joined_shell_arguments(value: str) -> str:
+    try:
+        return " ".join(shlex.split(value, posix=True))
+    except (TypeError, ValueError):
+        return ""
+
+
 def _nested_shell_payloads(command: str) -> list[str]:
     payloads: list[str] = []
     masked = shell_syntax_view(command)
     for match in _NESTED_POSIX_SHELL_RE.finditer(masked):
         payload = _first_shell_argument(_outer_shell_segment(command, match.end()))
+        if payload:
+            payloads.append(payload)
+    for match in _NESTED_EVAL_RE.finditer(masked):
+        payload = _joined_shell_arguments(_outer_shell_segment(command, match.end()))
         if payload:
             payloads.append(payload)
     for pattern in (_NESTED_CMD_RE, _NESTED_POWERSHELL_RE):
@@ -1562,14 +1602,22 @@ GIT_INVOCATION_RE = re.compile(
     r"(?i)(?:^|[;&|]\s*|\$\(|\(\s*)(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
     r"git(?:\.exe)?\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+)\s+)*([a-z][a-z0-9-]*)"
 )
-BUILD_COMMAND_RE = re.compile(
-    r"(?i)(?:^|[;&|]\s*)(?:\./)?(?:gradlew(?:\.bat)?|gradle|mvnw?|ninja|make|bazel|buck2?|cargo)\b|"
-    r"(?:^|[;&|]\s*)(?:m|mm|mmm)\s+(?:-|[A-Za-z0-9_./])"
+_COMMAND_BOUNDARY_RE = (
+    r"(?:^|[;&|]\s*|\$\(|[({}]\s*|\)\s*|[\r\n]\s*|"
+    r"\b(?:if|then|elif|else|while|until|do|coproc)\s+)"
 )
-_COMMAND_BOUNDARY_RE = r"(?:^|[;&|]\s*|\$\(|\(\s*)"
 _COMMAND_PREFIX_RE = (
-    r"(?:(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)|"
-    r"(?:sudo(?:\s+-\S+)*\s+)|(?:timeout(?:\s+-\S+)*\s+\S+\s+))*"
+    r"(?:!\s+)?(?:"
+    r"(?:env(?:\s+(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S+))*\s+)|"
+    r"(?:sudo(?:(?:\s+-[ug]\s+\S+)|(?:\s+--(?:user|group)(?:=|\s+)\S+)|(?:\s+-\S+))*\s+)|"
+    r"(?:timeout(?:\s+-\S+)*\s+\S+\s+)|(?:command(?:\s+-\S+)*\s+)|"
+    r"(?:time(?:\s+-\S+)*\s+)|(?:nohup(?:\s+--)?\s+)|"
+    r"(?:nice(?:\s+(?:-\S+|\d+))*\s+))*"
+)
+BUILD_COMMAND_RE = re.compile(
+    rf"(?i){_COMMAND_BOUNDARY_RE}{_COMMAND_PREFIX_RE}(?:"
+    rf"(?:\./)?(?:gradlew(?:\.bat)?|gradle|mvnw?|ninja|make|bazel|buck2?|cargo)\b|"
+    rf"(?:m|mm|mmm)\s+(?:-|[A-Za-z0-9_./]))"
 )
 _DEVICE_COMMAND = "a" "db"
 _LOG_COMMAND = "log" "cat"
@@ -1675,16 +1723,30 @@ def command_category(payload: dict[str, Any], command: str | None = None) -> str
     if "openaideveloperdocs" in tool or "search" in tool or "fetch" in tool:
         return "research"
     return "other"
+
+
+def build_exit_status_preserved(command: str) -> bool:
+    masked = shell_syntax_view(command)
+    build = BUILD_COMMAND_RE.search(masked)
+    if not build:
+        return True
+    prefix = masked[build.start():build.end()]
+    if re.search(r"(?:^|\s)!\s", prefix):
+        return False
+    tail = re.sub(r";\s*}\s*$", "", masked[build.end():])
+    status_changing_control = re.compile(
+        r"\|\||&&|(?<!\|)\|(?!\|)|;(?=\s*\S)|[\r\n](?=\s*\S)|(?<![>&])&(?![>&])"
+    )
+    return status_changing_control.search(tail) is None
+
+
 def command_output_budget(payload: dict[str, Any], command: str, risk_kind: str) -> bool:
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        budget = safe_int(tool_input.get("max_output_tokens"))
-        if 0 < budget <= 6000:
-            return True
     redirects_to_file = bool(re.search(r"(?<!\d)(?:>>?|&>)\s*(?!&)[^\s;&|]+", command))
     bounded_pipe = bool(re.search(r"(?i)\|\s*(?:head|tail)\b(?:\s+-n)?\s+\d+", command))
     if risk_kind == "build_output":
-        return redirects_to_file or bounded_pipe or bool(re.search(r"(?i)(?:^|\s)(?:-q|--quiet)(?:\s|$)", command))
+        # A UI/output cap, quiet flag, or head/tail pipe can hide the real build result.
+        # Preserve the complete log and the command exit code before narrowing diagnostics.
+        return redirects_to_file and build_exit_status_preserved(command)
     if risk_kind == "streaming_log":
         return redirects_to_file or bounded_pipe or bool(
             re.search(r"(?i)(?:^|\s)(?:-t\s*\d+|--lines(?:=|\s+)\d+|--max-count(?:=|\s+)\d+)(?:\s|$)", command)
@@ -1692,6 +1754,11 @@ def command_output_budget(payload: dict[str, Any], command: str, risk_kind: str)
     if risk_kind == "screenrecord":
         match = re.search(r"(?i)--time-limit(?:=|\s+)(\d+)", command)
         return bool(match and 0 < int(match.group(1)) <= 180)
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        budget = safe_int(tool_input.get("max_output_tokens"))
+        if 0 < budget <= 6000:
+            return True
     return True
 
 
@@ -1729,8 +1796,9 @@ def command_guard(payload: dict[str, Any]) -> tuple[str, str] | None:
         if BUILD_COMMAND_RE.search(detection_command) and not command_output_budget(payload, candidate, "build_output"):
             return (
                 "build_output",
-                "Workflow Manager guard blocked an unbudgeted build/package command. Redirect full output to a log or use "
-                "a quiet mode, preserve the exit code, then inspect only the first direct error and short tail.",
+                "Workflow Manager guard blocked a build/package command without a recoverable full log. Redirect complete "
+                "output to a file with no trailing shell work so the real exit code remains observable; quiet flags, output caps, and head/tail pipes "
+                "are not substitutes. Run follow-up commands separately, then inspect the exact diagnostics needed.",
             )
     return None
 def command_risk_kind(payload: dict[str, Any], command: str) -> str | None:
@@ -1862,27 +1930,22 @@ def emit_pretool_deny(reason: str) -> None:
     )
 
 
-def emit_posttool_compaction(status_value: str, meta: dict[str, Any], excerpt: str) -> None:
+def emit_posttool_advisory(status_value: str, meta: dict[str, Any]) -> None:
     summary = (
-        "Workflow Manager guard replaced an oversized tool result before normal model processing: "
-        f"status={status_value}, chars={safe_int(meta.get('output_chars'))}, "
-        f"lines={safe_int(meta.get('output_lines'))}, visuals={safe_int(meta.get('visual_items'))}, "
-        f"truncated={bool(meta.get('truncated'))}."
-    )
-    if excerpt:
-        summary += " Bounded diagnostic excerpt:\n" + excerpt
-    summary += (
-        "\nDo not rerun the full command. If output was redirected, query that log narrowly; otherwise rerun only "
-        "a narrower budgeted query or inspect the exact artifact."
+        "Workflow Manager noticed an oversized tool result and preserved the original for normal model reasoning: "
+        f'status={status_value}, chars={safe_int(meta.get("output_chars"))}, '
+        f'lines={safe_int(meta.get("output_lines"))}, visuals={safe_int(meta.get("visual_items"))}, '
+        f'truncated={bool(meta.get("truncated"))}. '
+        "Correctness and evidence completeness take priority over context savings. Use the current result; "
+        "bound only future reads or queries, and obtain more exact evidence whenever the current result is insufficient."
     )
     print(
         json.dumps(
             {
-                "decision": "block",
-                "reason": summary,
+                "continue": True,
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
-                    "additionalContext": "The original oversized result was replaced with a bounded diagnostic summary.",
+                    "additionalContext": summary,
                 },
             },
             ensure_ascii=False,
@@ -1996,6 +2059,55 @@ def current_execution_stage(state: dict[str, Any]) -> str:
     return str(order[0]) if order else "unknown"
 
 
+def quality_continuity(state: dict[str, Any]) -> dict[str, Any]:
+    operations = [item for item in state.get("operations", []) if isinstance(item, dict)]
+    if not operations:
+        compactions = [item for item in state.get("compactions", []) if isinstance(item, dict)]
+        if compactions:
+            prior = _safe_continuity(compactions[-1].get("continuity"))
+            if prior:
+                return prior
+    order = [str(item) for item in as_list(state.get("last_route", {}).get("execution_order")) if item]
+    current_stage = current_execution_stage(state)
+    last_status = str(operations[-1].get("status") or "unknown") if operations else "unknown"
+    last_change_index = -1
+    last_verification_success = -1
+    evidence_available = False
+    change_fingerprint: str | None = None
+    for index, operation in enumerate(operations):
+        category = str(operation.get("category") or "")
+        status_value = str(operation.get("status") or "")
+        if category in {"implementation", "build_package", "delivery_device"}:
+            last_change_index = index
+            fingerprint = str(operation.get("fingerprint") or "")
+            if re.fullmatch(r"[0-9a-f]{8,64}", fingerprint):
+                change_fingerprint = fingerprint[:64]
+        if status_value in SUCCESS_STATUSES and category in {"analysis", "research", "evidence", "verification"}:
+            evidence_available = True
+        if status_value in SUCCESS_STATUSES and category in {"evidence", "verification"}:
+            last_verification_success = index
+    acceptance_pending = "verify" in order and (
+        last_verification_success < last_change_index or last_verification_success < 0
+    )
+    if not operations:
+        next_required_stage = order[0] if order else "unknown"
+    elif last_status not in SUCCESS_STATUSES:
+        next_required_stage = current_stage
+    elif current_stage in order:
+        current_index = order.index(current_stage)
+        next_required_stage = order[current_index + 1] if current_index + 1 < len(order) else "complete"
+    else:
+        next_required_stage = "verify" if acceptance_pending else "report"
+    return {
+        "current_stage": current_stage,
+        "acceptance_pending": acceptance_pending,
+        "next_required_stage": next_required_stage,
+        "last_outcome_status": last_status,
+        "evidence_available": evidence_available,
+        "change_fingerprint": change_fingerprint,
+    }
+
+
 def session_start(payload: dict[str, Any]) -> None:
     cleanup_old_sessions()
     telemetry = latest_token_telemetry(payload)
@@ -2007,10 +2119,11 @@ def session_start(payload: dict[str, Any]) -> None:
     state, _ = mutate_state(payload, update)
     source = str(payload.get("source") or "startup")
     base = (
-        "Workflow Manager loaded: availability only, not proof of effectiveness. Multi-step protocol: "
-        "Contract > Evidence > Change > Verify > Report; skip irrelevant stages. Direct work stays local. "
-        "Delegate only independent lanes ready now (the parent is one lane). Bound output, reuse success only when "
-        f"state is unchanged, and checkpoint instead of resisting compaction. Pressure: {pressure_text(telemetry)}."
+        "Workflow Manager loaded: availability only, not proof of effectiveness. Correctness and required "
+        "reasoning/evidence/correction/acceptance outrank context savings. Protocol: "
+        "Contract > Evidence > Change > Verify > Report; skip only irrelevant stages. Direct stays local; "
+        "delegate only independent ready lanes. Remove redundant output; reuse only unchanged success/evidence; "
+        f"checkpoint before compaction. Pressure: {pressure_text(telemetry)}."
     )
     if source in {"compact", "resume"}:
         successful = [op for op in state.get("operations", []) if op.get("status") in SUCCESS_STATUSES][-6:]
@@ -2028,6 +2141,8 @@ def session_start(payload: dict[str, Any]) -> None:
             "active_agent_scopes": active_agent_scope_summary(state),
             "guard_blocks": sum(1 for item in state.get("guards", []) if item.get("action") == "deny"),
             "outputs_compacted": sum(1 for item in state.get("operations", []) if item.get("compacted")),
+            "oversized_outputs_preserved": sum(1 for item in state.get("operations", []) if item.get("oversized")),
+            "continuity": quality_continuity(state),
             "runtime_escalations": sum(
                 1 for item in state.get("guards", []) if item.get("kind") == "runtime_escalation"
             ),
@@ -2148,24 +2263,24 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
     cap = min(max(safe_int(classification.get("recommended_agent_cap")), 0), 3)
     mode = str(classification.get("agent_mode") or "local")
     if cap:
-        agents = f"Agents: {mode}; subagent_cap={cap}; parent is one lane; independent ready work only."
+        agents = f"Agents: {mode}; subagent_cap={cap}; parent is one lane; independent ready only."
     elif label in {"complex", "extensive"}:
-        agents = f"Agents: 0 ({mode}); serialize shared stages; re-audit independent reads."
+        agents = f"Agents: 0 ({mode}); serialize shared work; re-audit independent reads."
     else:
         agents = "Agents: 0; do not delegate for pressure alone."
     pressure = telemetry.get("pressure")
     pressure_summary = f"{pressure:.1%}" if isinstance(pressure, (int, float)) else "unknown"
     gate = (
-        " gate=checkpoint+stop-broad."
+        " gate=checkpoint+stop-broad; required reasoning/evidence continue."
         if isinstance(pressure, (int, float)) and pressure >= PRESSURE_CHECKPOINT_THRESHOLD
         else ""
     )
     return (
         f"Route: {label}/{shape} | pressure={pressure_summary} | budget={classification.get('future_token_range')}. "
-        f"Order: {order}. {agents}{gate} Control: plan 3-5 only for >2 stages/risky acceptance. "
+        f"Order: {order}. {agents}{gate} Control: bounded. "
         "Update: phase|done|next|blocker at kickoff/material change/~60s wait only; never per tool. "
-        "Preflight path/input/acceptance; diagnose once, then retry after material correction only. "
-        "Contract=outcome+acceptance. Verify minimally; reuse only if state unchanged."
+        "Preflight path/input/acceptance; diagnose once; retry after material correction only. "
+        "Acceptance in contract; verify to risk; never trim it; reuse only unchanged state/evidence."
     )
 
 
@@ -2510,11 +2625,11 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             "only after a material correction or one bounded alternate route."
         )
     if notify_stage:
-        notices.append("Stage action budget reached (~25): checkpoint and reclassify before more broad/equivalent work.")
+        notices.append("Stage action budget reached (~25): checkpoint and reclassify before more broad/equivalent work, then continue any reasoning or verification still required.")
     if "pressure_55" in pressure_notices:
-        notices.append("Context pressure crossed 55%: trim the next read/output; this does not raise the subagent cap.")
+        notices.append("Context pressure crossed 55%: trim redundant presentation only; preserve all reasoning and evidence needed for correctness. This does not raise the subagent cap.")
     if "pressure_70" in pressure_notices:
-        notices.append("Context pressure crossed 70%: checkpoint before broad work; this does not raise the subagent cap.")
+        notices.append("Context pressure crossed 70%: checkpoint before unfocused work, then continue required reasoning, evidence, and verification narrowly or after native compaction. This does not raise the subagent cap.")
     if notify_escalation and escalation:
         phases = ",".join(escalation.get("phase_hints") or [])
         order = " > ".join(escalation.get("execution_order") or [])
@@ -2532,10 +2647,11 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     command = extract_command(payload)
     category = command_category(payload, command)
     risk_kind = command_risk_kind(payload, command)
-    response_meta, excerpt = analyze_tool_response(response)
+    response_meta, _ = analyze_tool_response(response)
     previous = snapshot_state(payload)
     telemetry = latest_token_telemetry(payload) or safe_telemetry(previous.get("telemetry"))
-    compacted = output_needs_compaction(response_meta, telemetry)
+    oversized = output_needs_compaction(response_meta, telemetry)
+    compacted = False
     budgeted = command_output_budget(payload, command, risk_kind) if command and risk_kind else False
 
     def update(state: dict[str, Any]) -> None:
@@ -2550,6 +2666,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "risk_kind": risk_kind,
                 **response_meta,
                 "budgeted": budgeted,
+                "oversized": oversized,
                 "compacted": compacted,
             }
         )
@@ -2557,8 +2674,8 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             state["telemetry"] = telemetry
 
     mutate_state(payload, update)
-    if compacted:
-        emit_posttool_compaction(status_value, response_meta, excerpt)
+    if oversized:
+        emit_posttool_advisory(status_value, response_meta)
 def compact_event(payload: dict[str, Any], phase: str) -> None:
     telemetry = latest_token_telemetry(payload)
 
@@ -2578,6 +2695,7 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "telemetry": telemetry,
                 "objective_meta": state.get("objective", {}),
                 "current_stage": current_execution_stage(state),
+                "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
                     op.get("fingerprint")

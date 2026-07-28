@@ -46,6 +46,14 @@ class SkillIdentityTests(unittest.TestCase):
         prompts = json.dumps(self.manifest["interface"]["defaultPrompt"], ensure_ascii=False)
         self.assertIn(f"${EXPECTED_ID}", prompts)
 
+    def test_quality_first_context_savings_contract_is_consistent(self) -> None:
+        self.assertIn("Correctness and required reasoning", self.skill_text)
+        self.assertIn("never the depth needed to solve the task", self.skill_text)
+        self.assertIn("Quality-first, context-efficient", self.manifest["description"])
+        prompts = " ".join(self.manifest["interface"]["defaultPrompt"])
+        self.assertIn("Correctness and acceptance evidence outrank context savings", prompts)
+        self.assertIn("preserving all reasoning, evidence, correction, and verification", self.agent_text)
+
     def test_legacy_skill_identity_is_absent_from_plugin(self) -> None:
         legacy_ids = ("token-frugal-" + "orchestrator", "token-frugal-" + "workflow")
         readable_suffixes = {".json", ".md", ".ps1", ".py", ".sh", ".yaml", ".yml"}

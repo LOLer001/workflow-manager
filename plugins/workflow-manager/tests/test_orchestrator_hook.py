@@ -848,10 +848,12 @@ class OrchestratorHookTests(unittest.TestCase):
         git_phrase = "git " + "status"
         log_phrase = "adb " + "logcat"
         record_phrase = "screen" + "record"
+        build_phrase = "./gradlew assembleDebug > /tmp/build.log 2>&1 || true"
         commands = (
             f'rg -n "; {git_phrase}" docs',
             f'rg -n "{log_phrase}" docs',
             f'rg -n "adb shell {record_phrase}" docs',
+            f'rg -n "{build_phrase}" docs',
             f"python3 -c 'print(\"{log_phrase}; {record_phrase}\")'",
             f"echo {log_phrase}",
         )
@@ -903,6 +905,8 @@ class OrchestratorHookTests(unittest.TestCase):
     def test_pretool_requires_budgets_for_build_logs_and_screenrecord(self) -> None:
         cases = (
             ("./gradlew assembleDebug", "build_output"),
+            ("./gradlew assembleDebug --quiet", "build_output"),
+            ("./gradlew assembleDebug | tail -n 20", "build_output"),
             ("adb logcat", "streaming_log"),
             ("adb shell screenrecord /sdcard/run.mp4", "screenrecord"),
         )
@@ -924,8 +928,74 @@ class OrchestratorHookTests(unittest.TestCase):
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertTrue(any(item["kind"] == marker for item in state["guards"]))
 
+        capped_build = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "capped-build-without-log",
+                "hook_run_id": "capped-build-without-log",
+                "cwd": "/srv/repo",
+                "tool_name": "Bash",
+                "tool_input": {"command": "./gradlew assembleDebug", "max_output_tokens": 2000},
+            }
+        )
+        capped_output = json.loads(capped_build.stdout)
+        self.assertEqual(capped_output["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("recoverable full log", capped_output["hookSpecificOutput"]["permissionDecisionReason"])
+
+        masked_status_commands = (
+            "./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "./gradlew assembleDebug > /tmp/build.log 2>&1; true",
+            "./gradlew assembleDebug > /tmp/build.log 2>&1 && echo done",
+            "./gradlew assembleDebug > /tmp/build.log 2>&1 | true",
+            "./gradlew assembleDebug > /tmp/build.log 2>&1 &",
+            "bash -lc \"./gradlew assembleDebug > /tmp/build.log 2>&1 || true\"",
+            "eval \"./gradlew assembleDebug > /tmp/build.log 2>&1 || true\"",
+            "eval \"printf ready; \" \"./gradlew assembleDebug > /tmp/build.log 2>&1 || true\"",
+            "env FOO=1 ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "sudo ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "timeout 60 ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "(./gradlew assembleDebug > /tmp/build.log 2>&1 || true)",
+            "if ./gradlew assembleDebug > /tmp/build.log 2>&1; then true; else true; fi",
+            "while ./gradlew assembleDebug > /tmp/build.log 2>&1; do break; done",
+            "{ ./gradlew assembleDebug > /tmp/build.log 2>&1 || true; }",
+            "! ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "case x in x) ./gradlew assembleDebug > /tmp/build.log 2>&1 || true;; esac",
+            "time ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "command ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "env -i ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "nohup ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "nice -n 10 ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+            "sudo -u root ./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
+        )
+        for index, command in enumerate(masked_status_commands):
+            with self.subTest(masked_status=command):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": f"masked-build-status-{index}",
+                        "hook_run_id": f"masked-build-status-{index}",
+                        "cwd": "/srv/repo",
+                        "tool_name": "Bash",
+                        "tool_input": {"command": command},
+                    }
+                )
+                denied = json.loads(result.stdout)["hookSpecificOutput"]
+                self.assertEqual(denied["permissionDecision"], "deny")
+                self.assertIn("real exit code", denied["permissionDecisionReason"])
+
         bounded_commands = (
             "./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "cd /srv/repo && ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "env FOO=1 ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "timeout 60 ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "(./gradlew assembleDebug > /tmp/build.log 2>&1)",
+            "{ ./gradlew assembleDebug > /tmp/build.log 2>&1; }",
+            "time ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "command ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "env -i ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "nohup ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "nice -n 10 ./gradlew assembleDebug > /tmp/build.log 2>&1",
+            "sudo -u root ./gradlew assembleDebug > /tmp/build.log 2>&1",
             "adb logcat -d -t 200",
             "adb shell screenrecord --time-limit 120 /sdcard/run.mp4",
         )
@@ -943,7 +1013,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 )
                 self.assertEqual(result.stdout, "")
 
-    def test_posttool_compacts_large_output_and_persists_metadata_only(self) -> None:
+    def test_posttool_preserves_large_output_and_persists_metadata_only(self) -> None:
         secret = "large-output-secret"
         response = {"exit_code": 1, "output": (("normal line\n" * 320) + f"fatal password={secret}\n")}
         result = self.run_hook(
@@ -958,15 +1028,19 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         output = json.loads(result.stdout)
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("oversized tool result", output["reason"])
+        self.assertTrue(output["continue"])
+        self.assertNotIn("decision", output)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("preserved the original", context)
+        self.assertIn("Correctness and evidence completeness take priority", context)
         self.assertNotIn(secret, result.stdout)
         self.assertLess(len(result.stdout), 4000)
         state_text = self.state_files()[0].read_text(encoding="utf-8")
         self.assertNotIn(secret, state_text)
         state = json.loads(state_text)
         operation = state["operations"][-1]
-        self.assertTrue(operation["compacted"])
+        self.assertTrue(operation["oversized"])
+        self.assertFalse(operation["compacted"])
         self.assertGreater(operation["output_lines"], HOOK.DEFAULT_OUTPUT_LINE_LIMIT)
         self.assertEqual(operation["risk_kind"], "build_output")
 
@@ -988,7 +1062,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn("Traceback (most recent call last):", diagnostic_excerpt)
         self.assertIn("ValueError: boom", diagnostic_excerpt)
 
-    def test_compaction_guidance_does_not_assume_a_saved_log(self) -> None:
+    def test_oversized_unsaved_output_preserves_original_and_requests_exact_followup(self) -> None:
         result = self.run_hook(
             {
                 "hook_event_name": "PostToolUse",
@@ -999,16 +1073,22 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_response": {"exit_code": 0, "output": "line\n" * 320},
             }
         )
-        reason = json.loads(result.stdout)["reason"]
-        self.assertIn("If output was redirected", reason)
-        self.assertIn("narrower budgeted query", reason)
+        output = json.loads(result.stdout)
+        self.assertTrue(output["continue"])
+        self.assertNotIn("decision", output)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("preserved the original", context)
+        self.assertIn("Use the current result", context)
+        self.assertIn("obtain more exact evidence", context)
 
-    def test_posttool_compacts_excess_visual_items(self) -> None:
+    def test_posttool_preserves_excess_visual_items_under_pressure(self) -> None:
+        transcript = self.token_transcript(70_000, 100_000)
         result = self.run_hook(
             {
                 "hook_event_name": "PostToolUse",
                 "session_id": "visual-budget",
                 "hook_run_id": "visual-budget",
+                "transcript_path": str(transcript),
                 "tool_name": "view_image",
                 "tool_input": {"path": "/tmp/frame.png"},
                 "tool_response": {
@@ -1018,10 +1098,79 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         output = json.loads(result.stdout)
-        self.assertEqual(output["decision"], "block")
+        self.assertTrue(output["continue"])
+        self.assertNotIn("decision", output)
         operation = self.load_only_state()["operations"][-1]
         self.assertEqual(operation["visual_items"], 4)
-        self.assertTrue(operation["compacted"])
+        self.assertTrue(operation["oversized"])
+        self.assertFalse(operation["compacted"])
+
+    def test_compaction_resume_preserves_pending_acceptance_without_raw_content(self) -> None:
+        session = "quality-continuity"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "quality-prompt",
+                "prompt": "全面排查并修复多个模块，完成构建和回归验证",
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "quality-change",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "sensitive-change-detail"},
+                "tool_response": {"exit_code": 0, "output": "done"},
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "PreCompact",
+                "session_id": session,
+                "hook_run_id": "quality-precompact",
+                "trigger": "auto",
+            }
+        )
+        state = self.load_only_state()
+        continuity = state["compactions"][-1]["continuity"]
+        self.assertTrue(continuity["acceptance_pending"])
+        self.assertIsNotNone(continuity["change_fingerprint"])
+        self.assertNotIn("sensitive-change-detail", json.dumps(continuity))
+        resumed = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "hook_run_id": "quality-resume",
+                "source": "resume",
+            }
+        )
+        context = json.loads(resumed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("\"acceptance_pending\":true", context)
+        self.assertIn("\"continuity\"", context)
+
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "quality-verify",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python -m unittest tests.test_quality"},
+                "tool_response": {"exit_code": 0, "output": "OK"},
+            }
+        )
+        completed = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "hook_run_id": "quality-resume-complete",
+                "source": "resume",
+            }
+        )
+        completed_context = json.loads(completed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("\"acceptance_pending\":false", completed_context)
+        self.assertIn("\"next_required_stage\":\"report\"", completed_context)
 
     def test_runtime_complexity_escalates_once_from_observed_phases(self) -> None:
         session = "runtime-escalation"
