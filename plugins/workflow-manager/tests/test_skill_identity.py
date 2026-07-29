@@ -54,6 +54,15 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn("Correctness and acceptance evidence outrank context savings", prompts)
         self.assertIn("preserving all reasoning, evidence, correction, and verification", self.agent_text)
 
+    def test_delegation_policy_is_efficiency_biased_not_read_only_quota(self) -> None:
+        prompts = " ".join(self.manifest["interface"]["defaultPrompt"])
+        self.assertIn("expected wall-clock time", prompts)
+        self.assertIn("positive-utility", self.skill_text)
+        self.assertIn("Read-only investigation is only one option", self.skill_text)
+        self.assertIn("Complex up to 2 subagents; Extensive up to 3", self.skill_text)
+        self.assertIn("caps as ceilings, never quotas", self.skill_text)
+        self.assertIn("read, write, test, research, or review", self.agent_text)
+
     def test_legacy_skill_identity_is_absent_from_plugin(self) -> None:
         legacy_ids = ("token-frugal-" + "orchestrator", "token-frugal-" + "workflow")
         readable_suffixes = {".json", ".md", ".ps1", ".py", ".sh", ".yaml", ".yml"}

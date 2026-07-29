@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.14"
+WRITER_VERSION = "1.0.15"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -277,6 +277,7 @@ def safe_route(value: Any) -> dict[str, Any]:
         if value.get("dependency_signal") in {"none", "ordered", "shared_resource", "ordered_shared"}
         else "none",
         "meta_delegation": bool(value.get("meta_delegation")),
+        "delegation_opt_out": bool(value.get("delegation_opt_out")),
         "lane_signal": value.get("lane_signal")
         if value.get("lane_signal") in {"none", "possible", "explicit", "sequential"}
         else "none",
@@ -472,6 +473,7 @@ def _safe_prompt(item: Any) -> dict[str, Any] | None:
         if item.get("dependency_signal") in {"none", "ordered", "shared_resource", "ordered_shared"}
         else "none",
         "meta_delegation": bool(item.get("meta_delegation")),
+        "delegation_opt_out": bool(item.get("delegation_opt_out")),
         "lane_signal": item.get("lane_signal")
         if item.get("lane_signal") in {"none", "possible", "explicit", "sequential"}
         else "none",
@@ -1087,11 +1089,7 @@ def explicit_spawn_signal(prompt: str, meta_delegation: bool = False) -> bool:
     lower = prompt.lower()
     if meta_delegation:
         return False
-    if re.search(
-        r"\b(?:do not|don't|never|without)\s+(?:use|spawn|launch|create|delegate to)\s+"
-        r"(?:any\s+)?(?:subagents?|agents?|workers?)\b",
-        lower,
-    ) or re.search(r"(?:不要|无需|禁止|不许).{0,12}(?:子智能体|子代理|委派)", prompt):
+    if delegation_opt_out_signal(prompt):
         return False
     return bool(
         re.search(
@@ -1100,6 +1098,18 @@ def explicit_spawn_signal(prompt: str, meta_delegation: bool = False) -> bool:
             lower,
         )
         or re.search(r"(?:派出|启动|创建|使用|安排|委派给).{0,16}(?:子智能体|子代理|代理)", prompt)
+    )
+
+
+def delegation_opt_out_signal(prompt: str) -> bool:
+    lower = prompt.lower()
+    return bool(
+        re.search(
+        r"\b(?:do not|don't|never|without)\s+(?:use|spawn|launch|create|delegate to)\s+"
+        r"(?:any\s+)?(?:subagents?|agents?|workers?)\b",
+        lower,
+        )
+        or re.search(r"(?:不要|无需|禁止|不许).{0,12}(?:子智能体|子代理|委派)", prompt)
     )
 
 
@@ -1207,11 +1217,14 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
     if dependency not in {"none", "ordered", "shared_resource", "ordered_shared"}:
         dependency = "none"
     meta_delegation = bool(result.get("meta_delegation"))
+    delegation_opt_out = bool(result.get("delegation_opt_out"))
     gate = str(result.get("delegation_gate") or "")
     phases = list(dict.fromkeys(str(item) for item in as_list(result.get("phase_hints")) if item))[:8]
     result["phase_hints"] = phases
 
-    if dependency != "none" or lane_signal == "sequential":
+    if delegation_opt_out:
+        gate = "closed"
+    elif dependency != "none" or lane_signal == "sequential":
         lane_signal = "sequential"
         gate = "closed"
     elif label in {"direct", "focused"}:
@@ -1225,9 +1238,9 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
     if gate == "closed" or label in {"direct", "focused"}:
         cap = 0
     elif label == "complex":
-        cap = min(cap, 1)
+        cap = 2
     elif label == "extensive":
-        cap = min(cap, 2 if gate == "open" and readiness == "ready_three_plus" else 1)
+        cap = 3
     else:
         cap = 0
 
@@ -1236,6 +1249,7 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
     result["readiness_signal"] = readiness
     result["dependency_signal"] = dependency
     result["meta_delegation"] = meta_delegation
+    result["delegation_opt_out"] = delegation_opt_out
     result["recommended_agent_cap"] = cap
     if dependency != "none" and not result.get("dependency_hint"):
         result["dependency_hint"] = (
@@ -1332,6 +1346,7 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
         score = max(score, 2)
 
     meta_delegation = meta_delegation_signal(normalized)
+    delegation_opt_out = delegation_opt_out_signal(normalized)
     spawn_request = explicit_spawn_signal(normalized, meta_delegation)
     raw_parallel = any(
         term in lower
@@ -1363,6 +1378,8 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
     sequential = dependency_signal != "none"
     if label in {"direct", "focused"}:
         lane_signal, agents, gate = "none", 0, "closed"
+    elif delegation_opt_out:
+        lane_signal, agents, gate = "none", 0, "closed"
     elif sequential:
         lane_signal, agents, gate = "sequential", 0, "closed"
     elif (
@@ -1371,10 +1388,10 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
         and ready_lane_count >= 2
     ):
         lane_signal, gate = "explicit", "open"
-        agents = 2 if label == "extensive" and readiness_signal == "ready_three_plus" else 1
+        agents = 3 if label == "extensive" else 2
     else:
         lane_signal = "possible" if parallel_signal or len(phase_set) >= 2 or breadth_hits else "none"
-        agents, gate = 1, "audit"
+        agents, gate = (3 if label == "extensive" else 2), "audit"
 
     dependency_hint = None
     if dependency_signal in {"shared_resource", "ordered_shared"}:
@@ -1391,6 +1408,7 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
         "readiness_signal": readiness_signal,
         "dependency_signal": dependency_signal,
         "meta_delegation": meta_delegation,
+        "delegation_opt_out": delegation_opt_out,
         "lane_signal": lane_signal,
         "phase_hints": phases,
         "dependency_hint": dependency_hint,
@@ -1469,23 +1487,57 @@ def subagent_request_text(payload: dict[str, Any]) -> str:
 def request_supports_delegation_reaudit(payload: dict[str, Any], route: dict[str, Any]) -> bool:
     if route.get("label") not in {"complex", "extensive"}:
         return False
-    # Never reopen a route that names a shared artifact, account, server, workspace, or device.
-    if route.get("dependency_signal") != "ordered":
+    if route.get("delegation_opt_out"):
         return False
     request = subagent_request_text(payload)
     if not request:
         return False
-    list_items = len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", request))
-    readiness, ready_lane_count = ready_lane_evidence(request, list_items)
+    lower = request.lower()
+    ready_now = bool(
+        re.search(r"\b(?:ready[- ]now|start (?:right )?now|start immediately|can start now)\b", lower)
+        or re.search(r"(?:现在|立即|当前).{0,10}(?:可|可以|能|已经).{0,6}(?:开始|启动|开展|就绪)", request)
+        or re.search(r"(?:可|可以|能)(?:立即|现在).{0,6}(?:开始|启动|开展)", request)
+    )
+    independent = bool(
+        re.search(r"\b(?:independent|disjoint|non-overlapping|no dependencies|separate (?:files|modules|paths))\b", lower)
+        or any(term in request for term in ("互不依赖", "无依赖", "独立工作线", "不重叠", "不同文件", "独立于父"))
+    )
     read_only = bool(
-        re.search(r"\b(?:read[- ]only|no writes?|without modifying|do not modify)\b", request.lower())
+        re.search(r"\b(?:read[- ]only|no writes?|without modifying|do not modify)\b", lower)
         or any(term in request for term in ("只读", "不修改", "不要修改", "不写入"))
     )
-    return (
-        read_only
-        and readiness in {"ready_two", "ready_three_plus"}
-        and ready_lane_count >= 2
+    exclusive_write_owner = bool(
+        re.search(
+            r"\b(?:exclusive write owner|only (?:modify|edit|write)|owns? (?:the )?(?:files?|paths?|module))\b",
+            lower,
+        )
+        or any(term in request for term in ("独占修改", "独占写入", "只修改", "仅修改", "负责修改", "写入所有权"))
     )
+    dependency = str(route.get("dependency_signal") or "none")
+    excludes_shared_resource = bool(
+        re.search(
+            r"\b(?:do not|does not|will not|without|won't)\b.{0,36}"
+            r"\b(?:device|build server|build account|shared artifact|shared workspace)\b",
+            lower,
+        )
+        or re.search(
+            r"(?:不操作|不使用|不接触|不占用|无需).{0,16}"
+            r"(?:设备|构建服务器|构建账号|共享产物|共享工作区)",
+            request,
+        )
+    )
+    conflicting_shared_action = bool(
+        re.search(
+            r"\b(?:build(?! (?:server|account))|compile|deploy|install|reboot|flash|run adb|"
+            r"validate on (?:the )?device)\b",
+            lower,
+        )
+        or re.search(r"(?:编译|构建(?!服务器|账号)|部署|安装|重启|刷机|设备验证|实机验证)", request)
+    )
+    if dependency in {"shared_resource", "ordered_shared"}:
+        if not excludes_shared_resource or conflicting_shared_action:
+            return False
+    return ready_now and independent and (read_only or exclusive_write_owner)
 
 
 def shell_syntax_view(command: str) -> str:
@@ -2119,10 +2171,10 @@ def session_start(payload: dict[str, Any]) -> None:
     state, _ = mutate_state(payload, update)
     source = str(payload.get("source") or "startup")
     base = (
-        "Workflow Manager loaded: availability only, not proof of effectiveness. Correctness and required "
-        "reasoning/evidence/correction/acceptance outrank context savings. Protocol: "
-        "Contract > Evidence > Change > Verify > Report; skip only irrelevant stages. Direct stays local; "
-        "delegate only independent ready lanes. Remove redundant output; reuse only unchanged success/evidence; "
+        "Workflow Manager: availability only, not proof of effectiveness. Acceptance outranks "
+        "context savings. Protocol: Contract > Evidence > Change > Verify > Report; skip irrelevant stages. "
+        "Direct stays local. For Complex/Extensive work audit wall-clock gain; use owned read/write/test/research/"
+        "review lanes and bias low-risk close calls parallel. Reuse unchanged evidence; "
         f"checkpoint before compaction. Pressure: {pressure_text(telemetry)}."
     )
     if source in {"compact", "resume"}:
@@ -2250,6 +2302,9 @@ def merge_followup_route(previous: dict[str, Any], current: dict[str, Any]) -> d
         safe_int(prior.get("recommended_agent_cap")), safe_int(current.get("recommended_agent_cap"))
     )
     result["parallel_signal"] = bool(prior.get("parallel_signal") or current.get("parallel_signal"))
+    result["delegation_opt_out"] = bool(
+        prior.get("delegation_opt_out") or current.get("delegation_opt_out")
+    )
     result["dependency_hint"] = current.get("dependency_hint") or prior.get("dependency_hint")
     result["route_source"] = "continued"
     result.pop("at", None)
@@ -2263,9 +2318,9 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
     cap = min(max(safe_int(classification.get("recommended_agent_cap")), 0), 3)
     mode = str(classification.get("agent_mode") or "local")
     if cap:
-        agents = f"Agents: {mode}; subagent_cap={cap}; parent is one lane; independent ready only."
+        agents = f"Agents: {mode}; subagent_cap={cap} ceiling; efficiency audit; positive-net owned lanes."
     elif label in {"complex", "extensive"}:
-        agents = f"Agents: 0 ({mode}); serialize shared work; re-audit independent reads."
+        agents = f"Agents: 0 ({mode}); serialize conflicts; re-audit side lanes."
     else:
         agents = "Agents: 0; do not delegate for pressure alone."
     pressure = telemetry.get("pressure")
@@ -2375,7 +2430,7 @@ def runtime_route_escalation(state: dict[str, Any], current_category: str) -> di
         "label": "complex",
         "score": max(safe_int(state.get("last_route", {}).get("score")), 2),
         "future_token_range": "15k-50k",
-        "recommended_agent_cap": 0 if sequential else 1,
+        "recommended_agent_cap": 0 if sequential else 2,
         "parallel_signal": False,
         "lane_signal": "sequential" if sequential else "possible",
         "phase_hints": sorted(categories)[:8],
@@ -2467,15 +2522,17 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     if reaudited:
         emit_context(
             "PreToolUse",
-            "Delegation re-audit accepted one read-only lane: its prompt proves that the child and parent lanes are "
-            "independent, non-overlapping, and ready now. Keep the canonical task_name schema-safe; describe the "
+            "Delegation re-audit accepted one positive-utility side lane: its prompt proves that the child is "
+            "independent, ready now, and either read-only or the exclusive write owner. Shared build/device work "
+            "remains with the parent. Keep the canonical task_name schema-safe; describe the "
             "child's purpose concisely in Chinese in user-facing updates.",
         )
     elif route_known and gate == "audit":
         emit_context(
             "PreToolUse",
-            "Delegation gate is audit: this spawn is within the hard cap, but proceed only if the lane is "
-            "independent, ready now, and non-overlapping. Keep the canonical task_name schema-safe and use a concise "
+            "Delegation gate is audit: this spawn is within the ceiling; proceed when expected wall-clock benefit "
+            "exceeds coordination/collision cost. The lane may read, write, test, research, or review when it is "
+            "ready and has non-overlapping ownership. Keep the canonical task_name schema-safe and use a concise "
             "Chinese purpose summary in user-facing updates.",
         )
     return True
@@ -2636,8 +2693,8 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         cap = safe_int(escalation.get("recommended_agent_cap"))
         notices.append(
             f"Runtime re-route: complex | observed={phases} | order={order} | agent_cap={cap}. "
-            "Parent is one lane; delegate only independent read-only work ready now. Keep build/deploy/device stages "
-            "serialized. Update: phase | done | next | blocker."
+            "Audit for positive-net independent read/write/test/research/review lanes and continue useful parent "
+            "work. Serialize only conflicting build/deploy/device stages. Update: phase | done | next | blocker."
         )
     emit_context("PreToolUse", " ".join(notices))
 def post_tool_use(payload: dict[str, Any]) -> None:
@@ -2814,7 +2871,10 @@ def subagent_start(payload: dict[str, Any]) -> None:
     if gate == "closed" and changed:
         warnings.append("Delegation gate is closed by dependency/shared-resource policy; keep the dependent work serialized.")
     elif gate == "audit" and changed:
-        warnings.append("Delegation gate is audit: the cap is only a ceiling; prove independent ready-now work before spawning.")
+        warnings.append(
+            "Delegation gate is audit: the cap is only a ceiling; use it for ready lanes with positive net "
+            "wall-clock benefit and clear non-overlapping ownership."
+        )
     warning_text = (" " + " ".join(warnings)) if warnings else ""
     emit_context(
         "SubagentStart",

@@ -202,7 +202,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn(independent["label"], {"complex", "extensive"})
         self.assertEqual(independent["lane_signal"], "possible")
         self.assertEqual(independent["delegation_gate"], "audit")
-        self.assertEqual(independent["recommended_agent_cap"], 1)
+        self.assertIn(independent["recommended_agent_cap"], {2, 3})
         self.assertEqual(independent["workflow_shape"], "lane_audit")
 
         ready = HOOK.classify_prompt(
@@ -210,12 +210,19 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(ready["readiness_signal"], "ready_two")
         self.assertEqual(ready["delegation_gate"], "open")
-        self.assertEqual(ready["recommended_agent_cap"], 1)
-        self.assertEqual(ready["agent_mode"], "parent_plus_one")
+        self.assertEqual(ready["recommended_agent_cap"], 2)
+        self.assertEqual(ready["agent_mode"], "bounded_multi")
 
         meta = HOOK.classify_prompt("解释怎样判断是否使用子智能体，重点避免为了并行而并行")
         self.assertTrue(meta["meta_delegation"])
         self.assertNotEqual(meta["delegation_gate"], "open")
+
+        opted_out = HOOK.classify_prompt(
+            "全面排查并修复多个模块，然后完成测试，但不要使用任何子智能体"
+        )
+        self.assertTrue(opted_out["delegation_opt_out"])
+        self.assertEqual(opted_out["delegation_gate"], "closed")
+        self.assertEqual(opted_out["recommended_agent_cap"], 0)
 
         dependent = HOOK.classify_prompt("请并行处理：先编译成功，再安装到唯一设备，然后基于结果验证")
         self.assertEqual(dependent["lane_signal"], "sequential")
@@ -265,11 +272,11 @@ class OrchestratorHookTests(unittest.TestCase):
         route = HOOK.classify_prompt(
             "模拟复杂问题处理来测试workflow-manager，然后全面测试并优化"
         )
-        self.assertEqual(route["agent_mode"], "parent_plus_one")
-        self.assertEqual(route["recommended_agent_cap"], 1)
+        self.assertEqual(route["agent_mode"], "bounded_multi")
+        self.assertEqual(route["recommended_agent_cap"], 2)
         context = HOOK.routing_context(route, {})
-        self.assertIn("subagent_cap=1", context)
-        self.assertIn("parent is one lane", context)
+        self.assertIn("subagent_cap=2 ceiling", context)
+        self.assertIn("efficiency audit", context)
         self.assertNotIn("max=1; parent counts", context)
 
     def test_pressure_boundaries_use_unrounded_ratio(self) -> None:
@@ -661,6 +668,31 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(active[0]["scope_fingerprint"], requests[0]["scope_fingerprint"])
         self.assertEqual(active[0]["request_fingerprint"], requests[0]["request_fingerprint"])
 
+        second = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": audit_session,
+                "turn_id": "audit-turn",
+                "hook_run_id": "second-spawn",
+                "tool_name": "Agent",
+                "tool_input": {"description": "second lane", "prompt": "Inspect another source lane"},
+            },
+            data=audit_data,
+        )
+        second_output = json.loads(second.stdout)["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", second_output)
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": audit_session,
+                "turn_id": "audit-turn",
+                "hook_run_id": "second-start",
+                "agent_id": "agent-2",
+                "agent_type": "default",
+            },
+            data=audit_data,
+        )
+
         over_cap = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -668,21 +700,21 @@ class OrchestratorHookTests(unittest.TestCase):
                 "turn_id": "audit-turn",
                 "hook_run_id": "over-cap-spawn",
                 "tool_name": "Agent",
-                "tool_input": {"description": "second lane", "prompt": "Inspect another source lane"},
+                "tool_input": {"description": "third lane", "prompt": "Inspect a third source lane"},
             },
             data=audit_data,
         )
         over_cap_output = json.loads(over_cap.stdout)["hookSpecificOutput"]
         self.assertEqual(over_cap_output["permissionDecision"], "deny")
-        self.assertIn("active=1, cap=1", over_cap_output["permissionDecisionReason"])
+        self.assertIn("active=2, cap=2", over_cap_output["permissionDecisionReason"])
         final_state = self.load_only_state(audit_data)
-        self.assertEqual(HOOK.active_agent_count(final_state), 1)
+        self.assertEqual(HOOK.active_agent_count(final_state), 2)
         self.assertEqual(
             sum(item["event"] == "request" for item in final_state["subagents"]),
-            1,
+            2,
         )
 
-    def test_pretool_reaudits_newly_independent_read_only_lane(self) -> None:
+    def test_pretool_reaudits_newly_independent_owned_lane(self) -> None:
         data = Path(self.temporary.name) / "reaudit-data"
         session = "agent-runtime-reaudit"
         self.run_hook(
@@ -709,8 +741,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": "evidence_01_threads",
                     "message": (
-                        "用途：分析会话表现。两条工作线互不依赖且现在都可以开始："
-                        "子智能体只读分析会话，不修改文件；父线程独立修改源码，不共享文件或设备。"
+                        "用途：补充策略测试。本任务独立于父线程且现在可以开始；"
+                        "子智能体只修改 tests/test_policy.py，独占修改该文件。"
                     ),
                 },
             },
@@ -753,17 +785,36 @@ class OrchestratorHookTests(unittest.TestCase):
             },
             data=shared_data,
         )
+        safe_side_lane = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": shared_session,
+                "hook_run_id": "shared-safe-spawn",
+                "tool_name": "Agent",
+                "tool_input": {
+                    "task_name": "source_01_review",
+                    "message": (
+                        "用途：审查源码。本任务独立于父线程且现在可以开始；只读检查源码，"
+                        "不操作设备，不使用构建服务器。"
+                    ),
+                },
+            },
+            data=shared_data,
+        )
+        safe_output = json.loads(safe_side_lane.stdout)["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", safe_output)
+        self.assertIn("re-audit accepted", safe_output["additionalContext"])
+
         still_blocked = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
                 "session_id": shared_session,
-                "hook_run_id": "shared-spawn",
+                "hook_run_id": "shared-device-spawn",
                 "tool_name": "Agent",
                 "tool_input": {
                     "task_name": "verify_01_device",
                     "message": (
-                        "两条工作线互不依赖且现在都可以开始；本任务只读检查设备，不修改文件，"
-                        "父线程继续构建。"
+                        "本任务独立于父线程且现在可以开始；只读检查设备，不修改文件。"
                     ),
                 },
             },
@@ -1213,7 +1264,7 @@ class OrchestratorHookTests(unittest.TestCase):
         state = self.load_only_state()
         self.assertEqual(state["last_route"]["label"], "complex")
         self.assertEqual(state["last_route"]["route_source"], "runtime")
-        self.assertEqual(state["last_route"]["recommended_agent_cap"], 1)
+        self.assertEqual(state["last_route"]["recommended_agent_cap"], 2)
 
         second = self.run_hook(
             {

@@ -1,6 +1,6 @@
 interface:
   display_name: "Workflow Manager"
   short_description: "Protect reasoning quality while managing context and agents"
-  default_prompt: "Use $workflow-manager to reduce only redundant context while preserving all reasoning, evidence, correction, and verification required for a correct result; delegate only independent ready-now lanes and resume safely after compaction."
+  default_prompt: "Use $workflow-manager to reduce only redundant context while preserving all reasoning, evidence, correction, and verification required for a correct result; optimize expected wall-clock time by proactively delegating positive-utility independent read, write, test, research, or review lanes with clear ownership, serialize only conflicting shared-resource stages, and resume safely after compaction."
 policy:
   allow_implicit_invocation: true

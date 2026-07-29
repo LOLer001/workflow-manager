@@ -1,7 +1,7 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.14",
-  "description": "Quality-first, context-efficient workflow management with adaptive routing, lossless output guidance, compaction recovery, and bounded subagent orchestration.",
+  "version": "1.0.15",
+  "description": "Quality-first, context-efficient, efficiency-biased workflow management with adaptive routing, lossless output guidance, compaction recovery, and dynamic subagent orchestration.",
   "author": {
     "name": "Cong"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Workflow Manager",
     "shortDescription": "Protect reasoning quality while managing context and agents.",
-    "longDescription": "Guides multi-step work without omitting required reasoning, evidence, correction, or verification; preserves oversized tool results for model reasoning; resumes acceptance state across compaction; and delegates only independent ready-now lanes.",
+    "longDescription": "Guides multi-step work without omitting required reasoning, evidence, correction, or verification; preserves oversized tool results for model reasoning; resumes acceptance state across compaction; and dynamically delegates positive-utility independent lanes.",
     "developerName": "Cong",
     "category": "Productivity",
     "capabilities": [
@@ -18,7 +18,7 @@
     "defaultPrompt": [
       "Use $workflow-manager to complete this task through the smallest relevant stages without omitting required reasoning, evidence, correction, or verification.",
       "Correctness and acceptance evidence outrank context savings; preserve oversized results, checkpoint before compaction, and remove only redundant work or presentation.",
-      "Delegate only independent ready-now work: re-audit when a new non-overlapping read-only lane emerges, count the parent as one lane, and keep shared build/device chains serialized."
+      "For Complex/Extensive work, optimize expected wall-clock time: proactively delegate positive-utility read, write, test, research, or review lanes with clear ownership; treat caps as ceilings and serialize only conflicting shared build/device operations."
     ],
     "brandColor": "#0F766E",
     "screenshots": []

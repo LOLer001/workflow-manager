@@ -6,8 +6,9 @@
 
 - 正确性与必要推理、证据、纠错和验收验证始终高于 token 或上下文节省。
 - 按任务复杂度选择直接处理、聚焦处理或复杂工作流。
-- 只把独立、可立即开始、范围不重叠的工作交给子智能体。
-- 共享代码、构建服务器、设备或交付物时保持串行。
+- 复杂任务主动评估关键路径，只要预期节省时间高于协调成本，就优先并行调度独立的读、写、测试、研究或复核工作。
+- Complex 最多 2 个、Extensive 最多 3 个子智能体；上限只是容量，不是固定数量，也不要求必须派一个只读子智能体。
+- 通过明确文件/模块所有权避免写冲突；共享构建服务器、设备或交付物只串行化实际冲突的阶段。
 - 在上下文压力升高时只收窄冗余展示并提前保存检查点；必要调查继续进行。
 - 压缩后复用原生摘要、计划和已验证结果，不从头重复。
 
@@ -42,7 +43,7 @@ Use $workflow-manager to complete this task.
 - Use `$workflow-manager` by default in every conversation and task.
 ```
 
-Workflow Manager 不会为了“看起来并行”而创建子智能体。构建、部署、重启和同一设备验证通常仍由一个执行者串行完成。
+Workflow Manager 以总完成时间为调度目标，不会为了“看起来并行”而机械创建子智能体。构建、部署、重启和同一设备验证通常仍由一个执行者串行完成，但不会阻塞与这些共享资源无关的源码、测试、研究或复核工作。
 
 ## 升级与回退
 
@@ -56,7 +57,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.14 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.15 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：

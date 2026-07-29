@@ -591,10 +591,9 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                 for field in PRODUCTION_ROUTE_FIELDS:
                     self.assertEqual(normalized[field], route[field], f"safe_route dropped {field}")
                 if route["label"] == "complex":
-                    self.assertLessEqual(route["recommended_agent_cap"], 1)
-                if route["label"] == "extensive" and route["recommended_agent_cap"] == 2:
-                    self.assertEqual(route["delegation_gate"], "open")
-                    self.assertEqual(route["readiness_signal"], "ready_three_plus")
+                    self.assertLessEqual(route["recommended_agent_cap"], 2)
+                if route["label"] == "extensive":
+                    self.assertLessEqual(route["recommended_agent_cap"], 3)
         self.assertGreaterEqual(len(checked), 3)
         self.assertIn("R06", checked, "shared-resource policy must be cross-checked against production routing")
 
@@ -661,7 +660,7 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
         parent_route = HOOK.classify_prompt(scenarios["R02"]["production"]["prompt"])
         parent_state = parent_eval.hook_state(parent_route)
         active_subagents = HOOK.active_agent_count(parent_state)
-        self.assertEqual(parent_route["agent_mode"], "parent_plus_one")
+        self.assertEqual(parent_route["agent_mode"], "bounded_multi")
         self.assertEqual(active_subagents, parent_route["recommended_agent_cap"])
         self.assertEqual(active_subagents + 1, parent_snapshot["max_total_lanes"])
 
@@ -774,7 +773,7 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
 
                 after_denial = self._load_hook_state(session)
                 self.assertEqual(HOOK.active_agent_count(after_denial), 1)
-                self.assertEqual(after_denial["last_route"]["recommended_agent_cap"], 1)
+                self.assertEqual(after_denial["last_route"]["recommended_agent_cap"], 2)
                 self.assertEqual(
                     sum(item["event"] == "start" for item in after_denial["subagents"]),
                     1,
