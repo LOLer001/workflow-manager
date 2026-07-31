@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.18"
+WRITER_VERSION = "1.0.19"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -866,8 +866,12 @@ def mutate_state(
         return new_state(payload), False
 
 
-def cleanup_old_plugin_versions(plugin_root: Path | None = None) -> int:
-    """Best-effort removal of strictly older sibling cache versions."""
+def cleanup_old_plugin_versions(
+    plugin_root: Path | None = None, *, skill_paths_verified: bool = False
+) -> int:
+    """Remove older caches only after every retained task Skill path is verified."""
+    if not skill_paths_verified:
+        return 0
     configured_root = plugin_root or os.environ.get("PLUGIN_ROOT")
     root = Path(configured_root) if configured_root else Path(__file__).resolve().parents[1]
     semver_pattern = r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"

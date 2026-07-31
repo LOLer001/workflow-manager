@@ -180,7 +180,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertTrue(all(len(prompt) <= 128 for prompt in prompts), prompts)
         self.assertLess(ORCHESTRATOR_SKILL.stat().st_size, 6000)
 
-    def test_new_version_removes_only_strictly_older_sibling_caches(self) -> None:
+    def test_new_version_requires_verified_skill_paths_before_cache_removal(self) -> None:
         cache = (
             Path(self.temporary.name)
             / "cache"
@@ -209,7 +209,13 @@ class OrchestratorHookTests(unittest.TestCase):
         except OSError:
             pass
 
-        self.assertEqual(HOOK.cleanup_old_plugin_versions(current), 2)
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(current), 0)
+        self.assertTrue(all(old.is_dir() for old in old_versions))
+
+        self.assertEqual(
+            HOOK.cleanup_old_plugin_versions(current, skill_paths_verified=True),
+            2,
+        )
         self.assertTrue(current.is_dir())
         self.assertTrue(non_version.is_dir())
         self.assertTrue(noncanonical.is_dir())
@@ -232,16 +238,28 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         blocked_old = blocked_cache / "1.0.17"
         blocked_old.mkdir()
-        (blocked_cache / "1.0.19").mkdir()
-        self.assertEqual(HOOK.cleanup_old_plugin_versions(blocked_current), 0)
+        (blocked_cache / "1.0.20").mkdir()
+        self.assertEqual(
+            HOOK.cleanup_old_plugin_versions(
+                blocked_current,
+                skill_paths_verified=True,
+            ),
+            0,
+        )
         self.assertTrue(blocked_old.is_dir())
-        shutil.rmtree(blocked_cache / "1.0.19")
+        shutil.rmtree(blocked_cache / "1.0.20")
 
         (blocked_manifest / "plugin.json").write_text(
             json.dumps({"name": "other", "version": HOOK.WRITER_VERSION}),
             encoding="utf-8",
         )
-        self.assertEqual(HOOK.cleanup_old_plugin_versions(blocked_current), 0)
+        self.assertEqual(
+            HOOK.cleanup_old_plugin_versions(
+                blocked_current,
+                skill_paths_verified=True,
+            ),
+            0,
+        )
         self.assertTrue(blocked_old.is_dir())
 
     def test_cache_cleanup_rejects_wrong_layout_and_manifest_symlinks(self) -> None:
@@ -255,7 +273,13 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         wrong_old = wrong_cache / "1.0.17"
         wrong_old.mkdir()
-        self.assertEqual(HOOK.cleanup_old_plugin_versions(wrong_current), 0)
+        self.assertEqual(
+            HOOK.cleanup_old_plugin_versions(
+                wrong_current,
+                skill_paths_verified=True,
+            ),
+            0,
+        )
         self.assertTrue(wrong_old.is_dir())
 
         cache = (
@@ -279,7 +303,13 @@ class OrchestratorHookTests(unittest.TestCase):
             linked_manifest.symlink_to(external_manifest)
         except OSError:
             return
-        self.assertEqual(HOOK.cleanup_old_plugin_versions(current), 0)
+        self.assertEqual(
+            HOOK.cleanup_old_plugin_versions(
+                current,
+                skill_paths_verified=True,
+            ),
+            0,
+        )
         self.assertTrue(old.is_dir())
 
         linked_cache = (
@@ -295,7 +325,13 @@ class OrchestratorHookTests(unittest.TestCase):
         linked_current.symlink_to(root_target, target_is_directory=True)
         linked_old = linked_cache / "1.0.17"
         linked_old.mkdir()
-        self.assertEqual(HOOK.cleanup_old_plugin_versions(linked_current), 0)
+        self.assertEqual(
+            HOOK.cleanup_old_plugin_versions(
+                linked_current,
+                skill_paths_verified=True,
+            ),
+            0,
+        )
         self.assertTrue(linked_old.is_dir())
 
     def test_wrapper_cleanup_uses_plugin_root_and_session_start_fails_open(self) -> None:
@@ -344,7 +380,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("hookSpecificOutput", json.loads(result.stdout))
-        self.assertFalse(old.exists())
+        self.assertTrue(old.is_dir())
         self.assertTrue(current.is_dir())
 
         output = io.StringIO()

@@ -27,7 +27,7 @@ codex plugin add workflow-manager@workflow-manager --json
 codex plugin list --json
 ```
 
-首次安装后请新建一次 Codex 会话以注册技能和钩子。自 1.0.17 起，后续升级会让已注册的钩子在旧版本缓存被清理后自动定位最新版本，并迁移保留的会话状态；常规钩子升级不再要求重启 Codex。只有新增或重命名技能、工具等宿主目录结构时，才需要新会话加载宿主目录。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
+首次安装或升级后请重启 Codex 并新建一次会话，以重新加载插件和 Skills 目录。自 1.0.19 起，Workflow Manager 不会仅因新版 hook 已接管就删除旧版本缓存：必须先由宿主支持的迁移接口验证全部保留任务的 Skill 路径，或让后续 Skills 注入改用不含语义版本号的稳定路径并完成新旧任务验收。插件不会直接改写 Codex 的 rollout JSONL、SQLite、索引或活动任务文件。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
 
 ## 使用
 
@@ -59,7 +59,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.18 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.19 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：

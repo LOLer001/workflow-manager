@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "description": "Quality-first, context-efficient, efficiency-biased workflow management with adaptive routing, lossless output guidance, compaction recovery, and dynamic subagent orchestration.",
   "author": {
     "name": "Cong"

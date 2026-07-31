@@ -79,6 +79,13 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn("concise Chinese purpose summary", self.skill_text)
         self.assertIn("ASCII `task_name`", self.skill_text)
 
+    def test_plugin_upgrade_preserves_skill_path_continuity(self) -> None:
+        self.assertIn("supported host API", self.skill_text)
+        self.assertIn("stable unversioned path", self.skill_text)
+        self.assertIn("never edit rollout JSONL or live databases/indexes/tasks", self.skill_text)
+        self.assertIn("Keep old caches until either route covers all tasks", self.skill_text)
+        self.assertIn("new/resumed tasks", self.skill_text)
+
     def test_global_mirror_sync_surface_is_removed(self) -> None:
         self.assertFalse((PLUGIN_ROOT / "scripts" / "sync_global_skill.py").exists())
         self.assertFalse((PLUGIN_ROOT / "tests" / "test_skill_sync.py").exists())

@@ -48,7 +48,12 @@ Optimize critical-path time, not agent count. For Complex/Extensive work, seek p
 - Reuse success only when inputs, cwd, files, device/external state, freshness, and native evidence are unchanged; never reuse failed/nonterminal work.
 - Native summaries own semantics; hook fingerprints/counters are hints. Resume recorded work; repair gaps with one narrow check.
 - Added constraints preserve valid evidence; objective replacement makes late results validation-only.
-- When a newer version is active, `SessionStart` removes only older sibling semantic-version caches; preserve current/higher/non-version/symlinks and fail open.
+
+## Upgrade continuity
+
+- Migrate paths through a supported host API; never edit rollout JSONL or live databases/indexes/tasks.
+- Else use a stable unversioned path, refresh discovery, and verify new/resumed tasks load `SKILL.md`.
+- Keep old caches until either route covers all tasks. New writer/state/hook fallback is insufficient; fail open and report gaps.
 
 ## Output and command guards
 
