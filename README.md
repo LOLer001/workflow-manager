@@ -27,7 +27,7 @@ codex plugin add workflow-manager@workflow-manager --json
 codex plugin list --json
 ```
 
-安装后请新建 Codex 会话，插件中的技能和钩子不会热加载到旧会话。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
+首次安装后请新建一次 Codex 会话以注册技能和钩子。自 1.0.17 起，后续升级会让已注册的钩子在旧版本缓存被清理后自动定位最新版本，并迁移保留的会话状态；常规钩子升级不再要求重启 Codex。只有新增或重命名技能、工具等宿主目录结构时，才需要新会话加载宿主目录。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
 
 ## 使用
 
@@ -54,10 +54,12 @@ codex plugin marketplace upgrade workflow-manager --json
 codex plugin add workflow-manager@workflow-manager --json
 ```
 
+1.0.17 及后续版本的已注册钩子会自动跨版本续接，无需为常规升级重启 Codex 或放弃当前任务。
+
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.15 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.17 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -108,7 +110,7 @@ Set-Location plugins/workflow-manager
 py -3 -m unittest -v tests.test_windows_hook
 ```
 
-提交前应同时通过仓库校验、完整 Python 测试和 Windows 9 项原生测试。GitHub Actions 会自动执行这些检查。
+提交前应同时通过仓库校验、完整 Python 测试和 Windows 10 项原生测试。GitHub Actions 会自动执行这些检查。
 
 ## 贡献与发布
 

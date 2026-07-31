@@ -32,6 +32,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run nine native Windows tests
+      - name: Run native Windows tests
         working-directory: plugins/workflow-manager
         run: py -3 -m unittest -v tests.test_windows_hook

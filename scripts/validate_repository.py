@@ -35,6 +35,9 @@ def main() -> int:
     }
     assert manifest.get("name") == PLUGIN_NAME
     assert manifest.get("interface", {}).get("displayName") == "Workflow Manager"
+    prompts = manifest.get("interface", {}).get("defaultPrompt")
+    assert isinstance(prompts, list) and 1 <= len(prompts) <= 3
+    assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
     assert (PLUGIN / "skills" / PLUGIN_NAME / "SKILL.md").is_file()
 
     generated = [

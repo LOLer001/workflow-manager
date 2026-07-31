@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.16"
+WRITER_VERSION = "1.0.17"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -255,6 +255,25 @@ def safe_persistence(value: Any) -> dict[str, Any]:
     }
 
 
+def safe_migration(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    from_writer = safe_label(value.get("from_writer"), 64) if value.get("from_writer") else "unknown"
+    to_writer = safe_label(value.get("to_writer"), 64) if value.get("to_writer") else "unknown"
+    result = {
+        "from_writer": from_writer,
+        "to_writer": to_writer,
+    }
+    if value.get("at"):
+        result["at"] = str(value.get("at"))[:40]
+    return result
+
+
+def safe_fingerprint(value: Any) -> str:
+    fingerprint = str(value or "")
+    return fingerprint[:64] if re.fullmatch(r"[0-9a-f]{8,64}", fingerprint) else ""
+
+
 def safe_route(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -435,6 +454,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "telemetry": {},
         "event_counts": {},
         "persistence": {},
+        "migration": {},
         "prompts": [],
         "operations": [],
         "subagents": [],
@@ -640,9 +660,16 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value, dict):
         return base
     base["created_at"] = value.get("created_at") or base["created_at"]
+    for key in ("session_fingerprint", "cwd_fingerprint"):
+        fingerprint = safe_fingerprint(value.get(key))
+        if fingerprint:
+            base[key] = fingerprint
+    if value.get("model"):
+        base["model"] = safe_label(value.get("model"), 80)
     base["telemetry"] = safe_telemetry(value.get("telemetry"))
     base["event_counts"] = safe_event_counts(value.get("event_counts"))
     base["persistence"] = safe_persistence(value.get("persistence"))
+    base["migration"] = safe_migration(value.get("migration"))
     base["last_route"] = safe_route(value.get("last_route"))
 
     base["objective"] = safe_metadata(value.get("objective"))
@@ -878,6 +905,88 @@ def cleanup_old_sessions() -> None:
             except OSError:
                 pass
     except OSError:
+        return
+
+
+def refresh_related_states() -> None:
+    """Migrate every retained valid state once per writer version."""
+    if not persistence_enabled():
+        return
+    root = data_root()
+    sessions = root / "sessions"
+    marker = root / "migrations" / f"{safe_label(WRITER_VERSION, 64)}.json"
+    try:
+        if marker.is_file():
+            return
+        with state_lock(marker):
+            if marker.is_file():
+                return
+            cleanup_old_sessions()
+            ensure_private_dir(sessions)
+            max_files = env_int(
+                "TOKEN_FRUGAL_MAX_SESSIONS",
+                DEFAULT_MAX_SESSION_FILES,
+                10,
+                5000,
+            )
+            candidates: list[tuple[float, Path]] = []
+            for path in sessions.glob("*.json"):
+                try:
+                    info = path.lstat()
+                    if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_STATE_BYTES:
+                        candidates.append((info.st_mtime, path))
+                except OSError:
+                    continue
+
+            migrated = 0
+            invalid = 0
+            locked = 0
+            for _, path in sorted(candidates, reverse=True)[:max_files]:
+                try:
+                    with state_lock(path, timeout=0.0):
+                        info = path.lstat()
+                        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
+                            invalid += 1
+                            continue
+                        with path.open("r", encoding="utf-8") as stream:
+                            raw = stream.read(MAX_STATE_BYTES + 1)
+                        if len(raw.encode("utf-8")) > MAX_STATE_BYTES:
+                            invalid += 1
+                            continue
+                        value = json.loads(raw)
+                        if not isinstance(value, dict):
+                            invalid += 1
+                            continue
+                        from_writer = (
+                            safe_label(value.get("writer_version"), 64)
+                            if value.get("writer_version")
+                            else "unknown"
+                        )
+                        state = normalize_state(value, {"session_id": path.stem})
+                        state["migration"] = {
+                            "from_writer": from_writer,
+                            "to_writer": WRITER_VERSION,
+                            "at": utc_now(),
+                        }
+                        atomic_write(path, state)
+                        migrated += 1
+                except TimeoutError:
+                    locked += 1
+                except (OSError, ValueError, json.JSONDecodeError):
+                    invalid += 1
+
+            if locked:
+                return
+            atomic_write(
+                marker,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "writer_version": WRITER_VERSION,
+                    "migrated": migrated,
+                    "invalid": invalid,
+                },
+            )
+    except (OSError, TimeoutError):
         return
 
 
@@ -2964,6 +3073,7 @@ def main() -> int:
         if not isinstance(payload, dict):
             return 0
         event = str(payload.get("hook_event_name") or "")
+        refresh_related_states()
         handler = HANDLERS.get(event)
         if handler:
             handler(payload)

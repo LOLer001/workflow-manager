@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "Quality-first, context-efficient, efficiency-biased workflow management with adaptive routing, lossless output guidance, compaction recovery, and dynamic subagent orchestration.",
   "author": {
     "name": "Cong"
@@ -16,9 +16,9 @@
       "Interactive"
     ],
     "defaultPrompt": [
-      "Use $workflow-manager to complete this task through the smallest relevant stages without omitting required reasoning, evidence, correction, or verification.",
-      "Correctness and acceptance evidence outrank context savings; preserve oversized results, checkpoint before compaction, and remove only redundant work or presentation.",
-      "For Complex/Extensive work, optimize expected wall-clock time: proactively delegate positive-utility read, write, test, research, or review lanes with clear ownership; treat caps as ceilings and serialize only conflicting shared build/device operations."
+      "Use $workflow-manager: keep only relevant stages while preserving required reasoning, evidence, correction, and verification.",
+      "Correctness and acceptance evidence outrank context savings; checkpoint before compaction and remove only redundancy.",
+      "For complex work, optimize expected wall-clock time; delegate positive-utility owned lanes and serialize only real conflicts."
     ],
     "brandColor": "#0F766E",
     "screenshots": []

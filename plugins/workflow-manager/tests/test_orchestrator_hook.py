@@ -96,7 +96,7 @@ class OrchestratorHookTests(unittest.TestCase):
             },
         )
 
-    def test_declared_hook_commands_fail_open_when_wrapper_is_missing(self) -> None:
+    def test_declared_hook_commands_recover_removed_version_and_fail_open_without_candidate(self) -> None:
         hooks = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]
         declared = [
             hook
@@ -109,9 +109,11 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(len(posix_commands), 9)
         self.assertEqual(len(set(posix_commands)), 1)
         self.assertEqual(len(set(windows_commands)), 1)
-        self.assertIn("test ! -f", posix_commands[0])
-        self.assertIn("cmd.exe /d /c if exist", windows_commands[0])
-        self.assertIn("${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1", windows_commands[0])
+        self.assertIn('parent="$(dirname "$root")"', posix_commands[0])
+        self.assertIn('"$parent"/*/scripts/run_orchestrator_hook.sh', posix_commands[0])
+        self.assertIn("powershell.exe", windows_commands[0])
+        self.assertIn("[IO.Directory]::EnumerateDirectories", windows_commands[0])
+        self.assertIn("$env:PLUGIN_ROOT=$selectedRoot", windows_commands[0])
 
         missing_root = Path(self.temporary.name) / "removed-plugin-cache"
         env = os.environ.copy()
@@ -128,11 +130,44 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
+        cache_parent = Path(self.temporary.name) / "version-cache"
+        latest_root = cache_parent / HOOK.WRITER_VERSION
+        scripts = latest_root / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / WRAPPER.name).write_bytes(WRAPPER.read_bytes())
+        (scripts / SCRIPT.name).write_bytes(SCRIPT.read_bytes())
+        removed_root = cache_parent / "1.0.16"
+        recovered_data = Path(self.temporary.name) / "recovered-data"
+        env["PLUGIN_ROOT"] = str(removed_root)
+        env["PLUGIN_DATA"] = str(recovered_data)
+        result = subprocess.run(
+            ["sh", "-c", posix_commands[0]],
+            input=json.dumps(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "removed-version",
+                    "source": "startup",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+        state_files = list((recovered_data / "sessions").glob("*.json"))
+        self.assertEqual(len(state_files), 1)
+        state = json.loads(state_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(state["writer_version"], HOOK.WRITER_VERSION)
+
     def test_manifest_uses_plain_semver_and_supported_default_prompt_limit(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(manifest["version"], HOOK.WRITER_VERSION)
-        self.assertLessEqual(len(manifest["interface"].get("defaultPrompt", [])), 3)
+        prompts = manifest["interface"].get("defaultPrompt", [])
+        self.assertLessEqual(len(prompts), 3)
+        self.assertTrue(all(len(prompt) <= 128 for prompt in prompts), prompts)
         self.assertLess(ORCHESTRATOR_SKILL.stat().st_size, 6500)
 
     def test_redaction_matrix(self) -> None:
@@ -1566,6 +1601,67 @@ class OrchestratorHookTests(unittest.TestCase):
         state = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(state["schema_version"], HOOK.SCHEMA_VERSION)
         self.assertIsInstance(state["prompts"], list)
+
+    def test_writer_upgrade_refreshes_every_retained_valid_state_once(self) -> None:
+        sessions = self.data / "sessions"
+        sessions.mkdir(parents=True)
+        original_fingerprints: dict[str, str] = {}
+        old_paths: list[Path] = []
+        for session in ("old-session-a", "old-session-b"):
+            state = HOOK.new_state(
+                {
+                    "session_id": session,
+                    "cwd": f"/workspace/{session}",
+                    "model": "gpt-test",
+                }
+            )
+            state["schema_version"] = 1
+            state["writer_version"] = "1.0.15"
+            state["objective"] = HOOK.text_metadata(f"objective-{session}")
+            path = sessions / f"{HOOK.safe_id(session)}.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            original_fingerprints[session] = state["session_fingerprint"]
+            old_paths.append(path)
+        corrupt = sessions / "corrupt.json"
+        corrupt.write_text("{broken", encoding="utf-8")
+
+        result = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "current-session",
+                "hook_run_id": "upgrade",
+                "last_assistant_message": "done",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        migrated_updated_at: dict[Path, str] = {}
+        for session, path in zip(("old-session-a", "old-session-b"), old_paths):
+            state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(state["schema_version"], HOOK.SCHEMA_VERSION)
+            self.assertEqual(state["writer_version"], HOOK.WRITER_VERSION)
+            self.assertEqual(state["session_fingerprint"], original_fingerprints[session])
+            self.assertEqual(state["model"], "gpt-test")
+            self.assertEqual(state["migration"]["from_writer"], "1.0.15")
+            self.assertEqual(state["migration"]["to_writer"], HOOK.WRITER_VERSION)
+            migrated_updated_at[path] = state["updated_at"]
+        self.assertEqual(corrupt.read_text(encoding="utf-8"), "{broken")
+
+        marker = self.data / "migrations" / f"{HOOK.WRITER_VERSION}.json"
+        marker_state = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(marker_state["migrated"], 2)
+        self.assertEqual(marker_state["invalid"], 1)
+
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "current-session",
+                "hook_run_id": "after-upgrade",
+                "last_assistant_message": "done again",
+            }
+        )
+        for path in old_paths:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(state["updated_at"], migrated_updated_at[path])
 
     def test_control_followup_preserves_substantive_objective(self) -> None:
         session = "followup"

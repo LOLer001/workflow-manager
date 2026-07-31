@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10,
             "statusMessage": "Restoring Workflow Manager task state"
           }
@@ -19,8 +19,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]
@@ -32,8 +32,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]
@@ -45,8 +45,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]
@@ -58,8 +58,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10,
             "statusMessage": "Saving Workflow Manager checkpoint"
           }
@@ -72,8 +72,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]
@@ -85,8 +85,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]
@@ -98,8 +98,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]
@@ -110,8 +110,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "test ! -f \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\" || sh \"$PLUGIN_ROOT/scripts/run_orchestrator_hook.sh\"",
-            "commandWindows": "cmd.exe /d /c if exist \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1\"",
+            "command": "root=\"$PLUGIN_ROOT\"; runner=\"$root/scripts/run_orchestrator_hook.sh\"; if [ ! -f \"$runner\" ]; then runner=\"\"; parent=\"$(dirname \"$root\")\"; for candidate in \"$parent\"/*/scripts/run_orchestrator_hook.sh; do [ -f \"$candidate\" ] || continue; if [ -z \"$runner\" ] || [ \"$candidate\" -nt \"$runner\" ]; then runner=\"$candidate\"; fi; done; fi; if [ -n \"$runner\" ]; then PLUGIN_ROOT=\"$(dirname \"$(dirname \"$runner\")\")\"; export PLUGIN_ROOT; sh \"$runner\"; fi",
+            "commandWindows": "cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root 'scripts\\run_orchestrator_hook.ps1'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory 'scripts\\run_orchestrator_hook.ps1'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }\"",
             "timeout": 10
           }
         ]

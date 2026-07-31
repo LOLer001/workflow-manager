@@ -18,11 +18,7 @@ assert SPEC and SPEC.loader
 HOOK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HOOK)
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
-EXPECTED_WINDOWS_COMMAND = (
-    'cmd.exe /d /c if exist "${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1" '
-    'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass '
-    '-File "${PLUGIN_ROOT}\\scripts\\run_orchestrator_hook.ps1"'
-)
+EXPECTED_WINDOWS_COMMAND = 'cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root \'scripts\\run_orchestrator_hook.ps1\'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory \'scripts\\run_orchestrator_hook.ps1\'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }"'
 
 
 @unittest.skipUnless(os.name == "nt", "native Windows test")
@@ -100,6 +96,31 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
+
+    def test_removed_version_discovers_latest_installed_wrapper(self) -> None:
+        cache_parent = self.root / "version cache"
+        latest_root = cache_parent / HOOK.WRITER_VERSION
+        scripts = latest_root / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(PLUGIN_ROOT / "scripts" / "orchestrator_hook.py", scripts)
+        shutil.copy2(PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.ps1", scripts)
+        removed_root = cache_parent / "1.0.16"
+        recovered_data = self.root / "recovered data"
+        result = self.run_command_windows(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "removed-version",
+                "hook_run_id": "removed-version",
+                "source": "startup",
+            },
+            env=self.environment(plugin_root=removed_root, data=recovered_data),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+        states = list((recovered_data / "sessions").glob("*.json"))
+        self.assertEqual(len(states), 1)
+        state = json.loads(states[0].read_text(encoding="utf-8"))
+        self.assertEqual(state["writer_version"], HOOK.WRITER_VERSION)
 
         wrapper_only_root = self.root / "wrapper without source"
         scripts = wrapper_only_root / "scripts"
