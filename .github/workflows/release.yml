@@ -1,0 +1,69 @@
+name: Publish GitHub Releases
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, or all to backfill every missing release"
+        required: true
+        default: "all"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Publish missing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUESTED_TAG" == "all" ]]; then
+            mapfile -t tags < <(git tag --list 'v*.*.*' --sort=version:refname)
+          else
+            tags=("$REQUESTED_TAG")
+          fi
+
+          for tag in "${tags[@]}"; do
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "Unsupported release tag: $tag" >&2
+              exit 1
+            }
+            git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Release $tag already exists; skipping"
+              continue
+            fi
+
+            version="${tag#v}"
+            manifest_version="$(git show "$tag:plugins/workflow-manager/.codex-plugin/plugin.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+            [[ "$manifest_version" == "$version" ]] || {
+              echo "Tag $tag does not match plugin version $manifest_version" >&2
+              exit 1
+            }
+            changelog="$(mktemp)"
+            notes="$(mktemp)"
+            git show "$tag:CHANGELOG.md" >"$changelog"
+            if ! python3 scripts/extract_release_notes.py --version "$version" --changelog "$changelog" >"$notes"; then
+              echo "Tag $tag predates its CHANGELOG entry; using the current changelog"
+              python3 scripts/extract_release_notes.py --version "$version" --changelog CHANGELOG.md >"$notes"
+            fi
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "Workflow Manager $version" \
+              --notes-file "$notes"
+          done

@@ -45,6 +45,13 @@ def main() -> int:
     assert stable_asset.is_file()
     assert not (PLUGIN / "skills").exists()
     assert (PLUGIN / "scripts" / "install_stable_skill.py").is_file()
+    release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'tags:' in release_workflow and 'workflow_dispatch:' in release_workflow
+    assert 'gh release create "$tag"' in release_workflow
+    assert '--verify-tag' in release_workflow
+    assert (ROOT / "scripts" / "extract_release_notes.py").is_file()
     declared = [
         hook
         for matchers in hooks.values()
