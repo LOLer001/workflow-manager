@@ -50,8 +50,10 @@ def main() -> int:
     windows_commands = {hook["commandWindows"] for hook in declared}
     assert len(declared) == 9 and len(windows_commands) == 1
     windows_command = windows_commands.pop()
+    assert len(windows_command) < 8191
     assert " -EncodedCommand " in windows_command
-    assert windows_command.endswith(" 2>NUL")
+    assert "if defined TOKEN_FRUGAL_DEBUG" in windows_command
+    assert windows_command.endswith(' 2>NUL)"')
     encoded = windows_command.split(" -EncodedCommand ", 1)[1].split(" ", 1)[0]
     resolver = base64.b64decode(encoded).decode("utf-16le")
     expected_resolver = (

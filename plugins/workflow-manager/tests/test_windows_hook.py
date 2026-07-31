@@ -21,11 +21,17 @@ SPEC.loader.exec_module(HOOK)
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
 WINDOWS_RESOLVER = PLUGIN_ROOT / "scripts" / "resolve_orchestrator_hook.ps1"
 RESOLVER_TEXT = WINDOWS_RESOLVER.read_text(encoding="utf-8").replace("\r\n", "\n")
-EXPECTED_WINDOWS_COMMAND = (
+POWERSHELL_COMMAND = (
     "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
     "-EncodedCommand "
     + base64.b64encode(RESOLVER_TEXT.encode("utf-16le")).decode("ascii")
-    + " 2>NUL"
+)
+EXPECTED_WINDOWS_COMMAND = (
+    'cmd.exe /d /c "if defined TOKEN_FRUGAL_DEBUG ('
+    + POWERSHELL_COMMAND
+    + ") else ("
+    + POWERSHELL_COMMAND
+    + ' 2>NUL)"'
 )
 
 
