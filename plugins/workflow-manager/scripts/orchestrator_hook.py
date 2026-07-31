@@ -21,7 +21,10 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.19"
+WRITER_VERSION = "1.0.20"
+STABLE_SKILL_NAME = "workflow-manager"
+STABLE_SKILL_SCHEMA = 1
+STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -437,6 +440,207 @@ def state_lock(path: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[No
             except Exception:
                 pass
         handle.close()
+
+
+def _real_directory(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+
+def _stable_skill_source(plugin_root: Path | None = None) -> Path:
+    configured = plugin_root or os.environ.get("PLUGIN_ROOT")
+    root = Path(configured) if configured else Path(__file__).resolve().parents[1]
+    return root / "assets" / "stable-skill" / STABLE_SKILL_NAME
+
+
+def _codex_home(configured: Path | None = None) -> Path:
+    if configured is not None:
+        return configured
+    env_home = os.environ.get("CODEX_HOME")
+    if env_home:
+        return Path(env_home)
+    return Path.home() / ".codex"
+
+
+def _stable_source_files(source: Path) -> tuple[dict[str, bytes], str] | None:
+    if not _real_directory(source):
+        return None
+    files: dict[str, bytes] = {}
+    digest = hashlib.sha256()
+    try:
+        for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                return None
+            if stat.S_ISDIR(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                return None
+            relative = path.relative_to(source).as_posix()
+            payload = path.read_bytes()
+            files[relative] = payload
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(payload)
+            digest.update(b"\0")
+    except OSError:
+        return None
+    if "SKILL.md" not in files:
+        return None
+    return files, digest.hexdigest()
+
+
+def _managed_skill_marker(path: Path) -> dict[str, Any] | None:
+    marker = path / STABLE_SKILL_MARKER
+    try:
+        info = marker.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_size > 64 * 1024
+        ):
+            return None
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(value, dict) or value.get("managed_by") != STABLE_SKILL_NAME:
+        return None
+    return value
+
+
+def _ensure_real_parents(root: Path, relative: Path) -> Path:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+        else:
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise OSError(f"unsafe managed Skill directory: {current}")
+    return current
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise OSError(f"unsafe managed Skill file: {path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def sync_stable_skill(
+    plugin_root: Path | None = None,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
+    """Synchronize the bundled Skill into a stable, user-scoped, unversioned path."""
+    source = _stable_skill_source(plugin_root)
+    source_data = _stable_source_files(source)
+    home = _codex_home(codex_home)
+    skills_root = home / "skills"
+    target = skills_root / STABLE_SKILL_NAME
+    result: dict[str, Any] = {"path": str(target)}
+    if source_data is None:
+        return {**result, "status": "missing_or_unsafe_source"}
+    files, digest = source_data
+    marker_payload = {
+        "schema": STABLE_SKILL_SCHEMA,
+        "managed_by": STABLE_SKILL_NAME,
+        "writer_version": WRITER_VERSION,
+        "source_digest": digest,
+        "files": sorted(files),
+    }
+    try:
+        try:
+            skills_root_info = skills_root.lstat()
+        except FileNotFoundError:
+            skills_root.mkdir(parents=True, mode=0o700)
+        else:
+            if (
+                not stat.S_ISDIR(skills_root_info.st_mode)
+                or stat.S_ISLNK(skills_root_info.st_mode)
+            ):
+                return {**result, "status": "unsafe_skills_root"}
+        with state_lock(skills_root / f".{STABLE_SKILL_NAME}-sync", timeout=2.0):
+            try:
+                target_info = target.lstat()
+            except FileNotFoundError:
+                target_info = None
+            if target_info is not None:
+                if (
+                    not stat.S_ISDIR(target_info.st_mode)
+                    or stat.S_ISLNK(target_info.st_mode)
+                ):
+                    return {**result, "status": "unsafe_target"}
+                current_marker = _managed_skill_marker(target)
+                if current_marker is None:
+                    return {**result, "status": "unmanaged_target"}
+                if (
+                    current_marker.get("source_digest") == digest
+                    and current_marker.get("writer_version") == WRITER_VERSION
+                ):
+                    return {**result, "status": "current", "digest": digest}
+                for relative, payload in files.items():
+                    relative_path = Path(relative)
+                    parent = _ensure_real_parents(target, relative_path.parent)
+                    _atomic_write_bytes(parent / relative_path.name, payload)
+                _atomic_write_bytes(
+                    target / STABLE_SKILL_MARKER,
+                    (json.dumps(marker_payload, ensure_ascii=False, sort_keys=True) + "\n").encode(
+                        "utf-8"
+                    ),
+                )
+                return {**result, "status": "updated", "digest": digest}
+
+            staging = Path(
+                tempfile.mkdtemp(prefix=f".{STABLE_SKILL_NAME}.", dir=str(skills_root))
+            )
+            try:
+                for relative, payload in files.items():
+                    relative_path = Path(relative)
+                    parent = _ensure_real_parents(staging, relative_path.parent)
+                    _atomic_write_bytes(parent / relative_path.name, payload)
+                _atomic_write_bytes(
+                    staging / STABLE_SKILL_MARKER,
+                    (json.dumps(marker_payload, ensure_ascii=False, sort_keys=True) + "\n").encode(
+                        "utf-8"
+                    ),
+                )
+                os.replace(staging, target)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+            return {**result, "status": "installed", "digest": digest}
+    except TimeoutError:
+        return {**result, "status": "lock_timeout"}
+    except OSError as error:
+        return {
+            **result,
+            "status": "write_error",
+            "error": safe_label(type(error).__name__, 48),
+        }
 
 
 def new_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2349,6 +2553,7 @@ def quality_continuity(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def session_start(payload: dict[str, Any]) -> None:
+    stable_skill = sync_stable_skill()
     try:
         cleanup_old_plugin_versions()
     except Exception:
@@ -2369,6 +2574,11 @@ def session_start(payload: dict[str, Any]) -> None:
         "review lanes and bias low-risk close calls parallel. Reuse unchanged evidence; "
         f"checkpoint before compaction. Pressure: {pressure_text(telemetry)}."
     )
+    if stable_skill.get("status") not in {"installed", "updated", "current"}:
+        base += (
+            " Stable Workflow Manager Skill activation is not verified "
+            f"(sync={safe_label(stable_skill.get('status'), 48)}); do not claim the unversioned path is active."
+        )
     if source in {"compact", "resume"}:
         successful = [op for op in state.get("operations", []) if op.get("status") in SUCCESS_STATUSES][-6:]
         agent_counts = agent_activity_counts(state)

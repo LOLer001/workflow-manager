@@ -22,7 +22,10 @@ WRAPPER = PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.sh"
 WINDOWS_RESOLVER = PLUGIN_ROOT / "scripts" / "resolve_orchestrator_hook.ps1"
 MANIFEST = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
-ORCHESTRATOR_SKILL = PLUGIN_ROOT / "skills" / "workflow-manager" / "SKILL.md"
+ORCHESTRATOR_SKILL = (
+    PLUGIN_ROOT / "assets" / "stable-skill" / "workflow-manager" / "SKILL.md"
+)
+STABLE_INSTALLER = PLUGIN_ROOT / "scripts" / "install_stable_skill.py"
 
 SPEC = importlib.util.spec_from_file_location("orchestrator_hook", SCRIPT)
 assert SPEC and SPEC.loader
@@ -35,6 +38,7 @@ class OrchestratorHookTests(unittest.TestCase):
         native_tmp = "/tmp" if Path("/tmp").is_dir() else None
         self.temporary = tempfile.TemporaryDirectory(prefix="token-frugal-test-", dir=native_tmp)
         self.data = Path(self.temporary.name) / "data"
+        self.codex_home = Path(self.temporary.name) / ".codex"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -50,6 +54,7 @@ class OrchestratorHookTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PLUGIN_DATA"] = str(data or self.data)
+        env["CODEX_HOME"] = str(self.codex_home)
         if extra_env:
             env.update(extra_env)
         command = [sys.executable, str(SCRIPT)]
@@ -180,6 +185,90 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertTrue(all(len(prompt) <= 128 for prompt in prompts), prompts)
         self.assertLess(ORCHESTRATOR_SKILL.stat().st_size, 6000)
 
+    def test_stable_skill_sync_installs_updates_and_is_idempotent(self) -> None:
+        first = HOOK.sync_stable_skill(PLUGIN_ROOT, self.codex_home)
+        self.assertEqual(first["status"], "installed", first)
+        target = self.codex_home / "skills" / "workflow-manager"
+        self.assertEqual(Path(first["path"]), target)
+        self.assertEqual(target.parts[-2:], ("skills", "workflow-manager"))
+        self.assertNotRegex(str(target), r"workflow-manager[/\\]\d+\.\d+\.\d+")
+        self.assertEqual(
+            (target / "SKILL.md").read_bytes(),
+            ORCHESTRATOR_SKILL.read_bytes(),
+        )
+        marker = json.loads(
+            (target / HOOK.STABLE_SKILL_MARKER).read_text(encoding="utf-8")
+        )
+        self.assertEqual(marker["managed_by"], "workflow-manager")
+        self.assertEqual(marker["writer_version"], HOOK.WRITER_VERSION)
+
+        second = HOOK.sync_stable_skill(PLUGIN_ROOT, self.codex_home)
+        self.assertEqual(second["status"], "current", second)
+        self.assertEqual(second["digest"], first["digest"])
+
+        alternate_root = Path(self.temporary.name) / "alternate-plugin"
+        alternate_skill = (
+            alternate_root / "assets" / "stable-skill" / "workflow-manager"
+        )
+        shutil.copytree(ORCHESTRATOR_SKILL.parent, alternate_skill)
+        updated_text = ORCHESTRATOR_SKILL.read_text(encoding="utf-8") + "\n"
+        (alternate_skill / "SKILL.md").write_text(updated_text, encoding="utf-8")
+        updated = HOOK.sync_stable_skill(alternate_root, self.codex_home)
+        self.assertEqual(updated["status"], "updated", updated)
+        self.assertEqual(
+            (target / "SKILL.md").read_text(encoding="utf-8"),
+            updated_text,
+        )
+
+    def test_stable_skill_sync_refuses_unmanaged_or_unsafe_targets(self) -> None:
+        target = self.codex_home / "skills" / "workflow-manager"
+        target.mkdir(parents=True)
+        custom = target / "SKILL.md"
+        custom.write_text("user-owned\n", encoding="utf-8")
+        result = HOOK.sync_stable_skill(PLUGIN_ROOT, self.codex_home)
+        self.assertEqual(result["status"], "unmanaged_target", result)
+        self.assertEqual(custom.read_text(encoding="utf-8"), "user-owned\n")
+
+        shutil.rmtree(target)
+        external = Path(self.temporary.name) / "external-skill"
+        external.mkdir()
+        try:
+            target.symlink_to(external, target_is_directory=True)
+        except OSError:
+            return
+        result = HOOK.sync_stable_skill(PLUGIN_ROOT, self.codex_home)
+        self.assertEqual(result["status"], "unsafe_target", result)
+        self.assertFalse((external / "SKILL.md").exists())
+
+        target.unlink()
+        missing = Path(self.temporary.name) / "missing-skill-target"
+        target.symlink_to(missing, target_is_directory=True)
+        result = HOOK.sync_stable_skill(PLUGIN_ROOT, self.codex_home)
+        self.assertEqual(result["status"], "unsafe_target", result)
+        self.assertTrue(target.is_symlink())
+
+    def test_stable_skill_installer_cli_provisions_requested_codex_home(self) -> None:
+        requested_home = Path(self.temporary.name) / "installer-home"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(STABLE_INSTALLER),
+                "--codex-home",
+                str(requested_home),
+                "--plugin-root",
+                str(PLUGIN_ROOT),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "installed")
+        self.assertTrue(
+            (requested_home / "skills" / "workflow-manager" / "SKILL.md").is_file()
+        )
+
     def test_new_version_requires_verified_skill_paths_before_cache_removal(self) -> None:
         cache = (
             Path(self.temporary.name)
@@ -238,7 +327,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         blocked_old = blocked_cache / "1.0.17"
         blocked_old.mkdir()
-        (blocked_cache / "1.0.20").mkdir()
+        (blocked_cache / "1.0.21").mkdir()
         self.assertEqual(
             HOOK.cleanup_old_plugin_versions(
                 blocked_current,
@@ -247,7 +336,7 @@ class OrchestratorHookTests(unittest.TestCase):
             0,
         )
         self.assertTrue(blocked_old.is_dir())
-        shutil.rmtree(blocked_cache / "1.0.20")
+        shutil.rmtree(blocked_cache / "1.0.21")
 
         (blocked_manifest / "plugin.json").write_text(
             json.dumps({"name": "other", "version": HOOK.WRITER_VERSION}),
@@ -360,6 +449,7 @@ class OrchestratorHookTests(unittest.TestCase):
             {
                 "PLUGIN_ROOT": str(current),
                 "PLUGIN_DATA": str(data),
+                "CODEX_HOME": str(Path(self.temporary.name) / "wrapper-codex-home"),
                 "XDG_RUNTIME_DIR": str(Path(self.temporary.name) / "runtime"),
             }
         )
@@ -391,7 +481,13 @@ class OrchestratorHookTests(unittest.TestCase):
             "source": "startup",
         }
         with (
-            patch.dict(os.environ, {"PLUGIN_DATA": str(fail_open_data)}),
+            patch.dict(
+                os.environ,
+                {
+                    "PLUGIN_DATA": str(fail_open_data),
+                    "CODEX_HOME": str(Path(self.temporary.name) / "fail-open-codex-home"),
+                },
+            ),
             patch.object(
                 HOOK,
                 "cleanup_old_plugin_versions",

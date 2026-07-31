@@ -67,6 +67,7 @@ class WindowsHookTests(unittest.TestCase):
         env = os.environ.copy()
         env["PLUGIN_ROOT"] = str(plugin_root)
         env["PLUGIN_DATA"] = str(data or self.data)
+        env["CODEX_HOME"] = str(self.root / ".codex")
         env["PYTHONUTF8"] = "1"
         if path is not None:
             env["PATH"] = path
@@ -187,6 +188,18 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(len(state["processed_hook_runs"]), 8)
         self.assertEqual(sum(state["event_counts"].values()), 8)
         self.assertEqual(list((self.data / "sessions").glob("*.tmp")), [])
+        stable_skill = self.root / ".codex" / "skills" / "workflow-manager" / "SKILL.md"
+        self.assertTrue(stable_skill.is_file())
+        self.assertEqual(
+            stable_skill.read_bytes(),
+            (
+                PLUGIN_ROOT
+                / "assets"
+                / "stable-skill"
+                / "workflow-manager"
+                / "SKILL.md"
+            ).read_bytes(),
+        )
 
     def test_python_fallback_handles_spaces_and_unicode(self) -> None:
         fake_root = self.root / "插件 root with spaces"

@@ -8,7 +8,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
-SKILLS_ROOT = PLUGIN_ROOT / "skills"
+SKILLS_ROOT = PLUGIN_ROOT / "assets" / "stable-skill"
 EXPECTED_ID = "workflow-manager"
 EXPECTED_DISPLAY = "Workflow Manager"
 
@@ -31,7 +31,7 @@ class SkillIdentityTests(unittest.TestCase):
 
     def test_plugin_and_skill_share_one_internal_identity(self) -> None:
         self.assertEqual(self.manifest["name"], EXPECTED_ID)
-        self.assertEqual(self.manifest["skills"], "./skills/")
+        self.assertNotIn("skills", self.manifest)
         self.assertEqual(self.skill_dir.name, EXPECTED_ID)
         self.assertEqual(frontmatter_name(self.skill_text), EXPECTED_ID)
 
@@ -81,14 +81,18 @@ class SkillIdentityTests(unittest.TestCase):
 
     def test_plugin_upgrade_preserves_skill_path_continuity(self) -> None:
         self.assertIn("supported host API", self.skill_text)
-        self.assertIn("stable unversioned path", self.skill_text)
+        self.assertIn("$CODEX_HOME/skills/workflow-manager", self.skill_text)
         self.assertIn("never edit rollout JSONL or live databases/indexes/tasks", self.skill_text)
         self.assertIn("Keep old caches until either route covers all tasks", self.skill_text)
         self.assertIn("new/resumed tasks", self.skill_text)
 
-    def test_global_mirror_sync_surface_is_removed(self) -> None:
-        self.assertFalse((PLUGIN_ROOT / "scripts" / "sync_global_skill.py").exists())
-        self.assertFalse((PLUGIN_ROOT / "tests" / "test_skill_sync.py").exists())
+    def test_only_unversioned_user_skill_is_discoverable(self) -> None:
+        self.assertFalse((PLUGIN_ROOT / "skills").exists())
+        self.assertTrue((PLUGIN_ROOT / "scripts" / "install_stable_skill.py").is_file())
+        self.assertIn(
+            "sync_stable_skill",
+            (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(encoding="utf-8"),
+        )
 
 
 if __name__ == "__main__":

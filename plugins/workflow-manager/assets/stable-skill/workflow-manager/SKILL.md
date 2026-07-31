@@ -52,7 +52,7 @@ Optimize critical-path time, not agent count. For Complex/Extensive work, seek p
 ## Upgrade continuity
 
 - Migrate paths through a supported host API; never edit rollout JSONL or live databases/indexes/tasks.
-- Else use a stable unversioned path, refresh discovery, and verify new/resumed tasks load `SKILL.md`.
+- Else install `$CODEX_HOME/skills/workflow-manager`; verify new/resumed tasks load its `SKILL.md`.
 - Keep old caches until either route covers all tasks. New writer/state/hook fallback is insufficient; fail open and report gaps.
 
 ## Output and command guards

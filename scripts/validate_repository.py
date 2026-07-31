@@ -37,10 +37,14 @@ def main() -> int:
     }
     assert manifest.get("name") == PLUGIN_NAME
     assert manifest.get("interface", {}).get("displayName") == "Workflow Manager"
+    assert "skills" not in manifest
     prompts = manifest.get("interface", {}).get("defaultPrompt")
     assert isinstance(prompts, list) and 1 <= len(prompts) <= 3
     assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
-    assert (PLUGIN / "skills" / PLUGIN_NAME / "SKILL.md").is_file()
+    stable_asset = PLUGIN / "assets" / "stable-skill" / PLUGIN_NAME / "SKILL.md"
+    assert stable_asset.is_file()
+    assert not (PLUGIN / "skills").exists()
+    assert (PLUGIN / "scripts" / "install_stable_skill.py").is_file()
     declared = [
         hook
         for matchers in hooks.values()
@@ -71,7 +75,8 @@ def main() -> int:
 
     print(
         f"repository valid: marketplace={marketplace['name']} "
-        f"plugin={manifest['name']} version={manifest['version']} skills=1"
+        f"plugin={manifest['name']} version={manifest['version']} "
+        "skills=stable-user-path"
     )
     return 0
 

@@ -21,13 +21,29 @@ codex plugin marketplace add LOLer001/workflow-manager --json
 codex plugin add workflow-manager@workflow-manager --json
 ```
 
+安装命令完成后，把插件内的 Skill 资产同步到不含版本号的用户级稳定路径。Windows：
+
+```powershell
+$CodexHome = Join-Path $env:USERPROFILE ".codex"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.20\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+```
+
+Linux、WSL 或 macOS：
+
+```bash
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.20/scripts/install_stable_skill.py" --codex-home "$codex_home"
+```
+
 检查安装状态：
 
 ```bash
 codex plugin list --json
 ```
 
-首次安装或升级后请重启 Codex 并新建一次会话，以重新加载插件和 Skills 目录。自 1.0.19 起，Workflow Manager 不会仅因新版 hook 已接管就删除旧版本缓存：必须先由宿主支持的迁移接口验证全部保留任务的 Skill 路径，或让后续 Skills 注入改用不含语义版本号的稳定路径并完成新旧任务验收。插件不会直接改写 Codex 的 rollout JSONL、SQLite、索引或活动任务文件。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
+同步成功时会输出 `"status": "installed"`、`"updated"` 或 `"current"`，目标固定为 `$CODEX_HOME/skills/workflow-manager`。随后重启 Codex 并新建会话，以重新加载 Skills 目录。Hook 会在 `SessionStart` 自动补建或更新稳定副本，但显式同步可以保证安装后的第一条新任务就能发现它。若稳定目录已存在但不带 Workflow Manager 受管标记，安装器会拒绝覆盖。
+
+Workflow Manager 不会仅因新版 Hook 已接管就删除旧版本缓存：旧任务仍可能保留原有版本化注入记录。插件不会直接改写 Codex 的 rollout JSONL、SQLite、索引或活动任务文件。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
 
 ## 使用
 
@@ -54,12 +70,12 @@ codex plugin marketplace upgrade workflow-manager --json
 codex plugin add workflow-manager@workflow-manager --json
 ```
 
-1.0.17 及后续版本的已注册钩子会自动跨版本续接，无需为常规升级重启 Codex 或放弃当前任务。
+升级后再次运行对应平台的 `install_stable_skill.py` 命令。1.0.17 及后续版本的已注册钩子会自动跨版本续接当前任务；稳定 Skill 同步完成并重启 Codex 后，新任务会从无版本路径加载。
 
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.19 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.20 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -83,9 +99,10 @@ codex plugin add workflow-manager@workflow-manager --json
 .agents/plugins/marketplace.json       GitHub 插件市场
 plugins/workflow-manager/              插件源码
   .codex-plugin/plugin.json            插件清单
-  skills/workflow-manager/SKILL.md     唯一技能
+  assets/stable-skill/workflow-manager/  稳定 Skill 的安装源
   hooks/hooks.json                     生命周期钩子
-  scripts/                             跨平台运行脚本
+  scripts/install_stable_skill.py      用户级稳定路径安装器
+  scripts/                             其他跨平台运行脚本
   tests/                               策略与 Windows 原生测试
 ```
 
