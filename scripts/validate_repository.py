@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -20,6 +21,7 @@ def read_json(path: Path) -> dict:
 def main() -> int:
     marketplace = read_json(ROOT / ".agents" / "plugins" / "marketplace.json")
     manifest = read_json(PLUGIN / ".codex-plugin" / "plugin.json")
+    hooks = read_json(PLUGIN / "hooks" / "hooks.json")["hooks"]
     entries = marketplace.get("plugins")
 
     assert marketplace.get("name") == PLUGIN_NAME
@@ -39,6 +41,21 @@ def main() -> int:
     assert isinstance(prompts, list) and 1 <= len(prompts) <= 3
     assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
     assert (PLUGIN / "skills" / PLUGIN_NAME / "SKILL.md").is_file()
+    declared = [
+        hook
+        for matchers in hooks.values()
+        for matcher in matchers
+        for hook in matcher["hooks"]
+    ]
+    windows_commands = {hook["commandWindows"] for hook in declared}
+    assert len(declared) == 9 and len(windows_commands) == 1
+    windows_command = windows_commands.pop()
+    assert " -EncodedCommand " in windows_command
+    resolver = base64.b64decode(windows_command.rsplit(" ", 1)[-1]).decode("utf-16le")
+    expected_resolver = (
+        PLUGIN / "scripts" / "resolve_orchestrator_hook.ps1"
+    ).read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert resolver == expected_resolver
 
     generated = [
         path

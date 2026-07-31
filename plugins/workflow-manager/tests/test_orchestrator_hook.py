@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import importlib.util
 import json
@@ -17,6 +18,7 @@ from unittest.mock import patch
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "scripts" / "orchestrator_hook.py"
 WRAPPER = PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.sh"
+WINDOWS_RESOLVER = PLUGIN_ROOT / "scripts" / "resolve_orchestrator_hook.ps1"
 MANIFEST = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
 ORCHESTRATOR_SKILL = PLUGIN_ROOT / "skills" / "workflow-manager" / "SKILL.md"
@@ -112,8 +114,13 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn('parent="$(dirname "$root")"', posix_commands[0])
         self.assertIn('"$parent"/*/scripts/run_orchestrator_hook.sh', posix_commands[0])
         self.assertIn("powershell.exe", windows_commands[0])
-        self.assertIn("[IO.Directory]::EnumerateDirectories", windows_commands[0])
-        self.assertIn("$env:PLUGIN_ROOT=$selectedRoot", windows_commands[0])
+        self.assertIn("-EncodedCommand", windows_commands[0])
+        encoded = windows_commands[0].rsplit(" ", 1)[-1]
+        decoded = base64.b64decode(encoded).decode("utf-16le")
+        expected_resolver = WINDOWS_RESOLVER.read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertEqual(decoded, expected_resolver)
+        self.assertIn("[IO.Directory]::EnumerateDirectories", decoded)
+        self.assertIn("$env:PLUGIN_ROOT = $selectedRoot", decoded)
 
         missing_root = Path(self.temporary.name) / "removed-plugin-cache"
         env = os.environ.copy()

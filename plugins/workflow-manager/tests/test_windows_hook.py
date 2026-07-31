@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -18,7 +19,13 @@ assert SPEC and SPEC.loader
 HOOK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HOOK)
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
-EXPECTED_WINDOWS_COMMAND = 'cmd.exe /d /c powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$root=$env:PLUGIN_ROOT; $selectedRoot=$root; $runner=Join-Path $root \'scripts\\run_orchestrator_hook.ps1\'; if(-not (Test-Path -LiteralPath $runner -PathType Leaf)){ $runner=$null; $latest=[DateTime]::MinValue; $parent=Split-Path -Parent $root; if(Test-Path -LiteralPath $parent -PathType Container){ foreach($directory in [IO.Directory]::EnumerateDirectories($parent)){ $candidate=Join-Path $directory \'scripts\\run_orchestrator_hook.ps1\'; if(Test-Path -LiteralPath $candidate -PathType Leaf){ $modified=[IO.File]::GetLastWriteTimeUtc($candidate); if($modified -gt $latest){ $latest=$modified; $runner=$candidate } } } }; if($null -ne $runner){ $selectedRoot=Split-Path -Parent (Split-Path -Parent $runner) } }; if($null -ne $runner){ $env:PLUGIN_ROOT=$selectedRoot; & $runner }"'
+WINDOWS_RESOLVER = PLUGIN_ROOT / "scripts" / "resolve_orchestrator_hook.ps1"
+RESOLVER_TEXT = WINDOWS_RESOLVER.read_text(encoding="utf-8").replace("\r\n", "\n")
+EXPECTED_WINDOWS_COMMAND = (
+    "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+    "-EncodedCommand "
+    + base64.b64encode(RESOLVER_TEXT.encode("utf-16le")).decode("ascii")
+)
 
 
 @unittest.skipUnless(os.name == "nt", "native Windows test")
