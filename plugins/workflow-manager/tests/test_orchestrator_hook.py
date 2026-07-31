@@ -115,7 +115,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn('"$parent"/*/scripts/run_orchestrator_hook.sh', posix_commands[0])
         self.assertIn("powershell.exe", windows_commands[0])
         self.assertIn("-EncodedCommand", windows_commands[0])
-        encoded = windows_commands[0].rsplit(" ", 1)[-1]
+        self.assertTrue(windows_commands[0].endswith(" 2>NUL"))
+        encoded = windows_commands[0].split(" -EncodedCommand ", 1)[1].split(" ", 1)[0]
         decoded = base64.b64decode(encoded).decode("utf-16le")
         expected_resolver = WINDOWS_RESOLVER.read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertEqual(decoded, expected_resolver)

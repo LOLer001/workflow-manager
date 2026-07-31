@@ -25,6 +25,7 @@ EXPECTED_WINDOWS_COMMAND = (
     "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass "
     "-EncodedCommand "
     + base64.b64encode(RESOLVER_TEXT.encode("utf-16le")).decode("ascii")
+    + " 2>NUL"
 )
 
 
@@ -209,7 +210,7 @@ class WindowsHookTests(unittest.TestCase):
         driver_bytes = self.driver.read_bytes()
         self.assertTrue(driver_bytes.isascii())
         driver_text = driver_bytes.decode("ascii")
-        self.assertIn("%PLUGIN_ROOT%", driver_text)
+        self.assertIn("-EncodedCommand", driver_text)
         self.assertNotIn(str(fake_root), driver_text)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("hookSpecificOutput", json.loads(result.stdout))

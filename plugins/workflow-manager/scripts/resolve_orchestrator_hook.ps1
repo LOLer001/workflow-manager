@@ -1,4 +1,5 @@
 $ErrorActionPreference = "SilentlyContinue"
+$ProgressPreference = "SilentlyContinue"
 
 $root = $env:PLUGIN_ROOT
 if ([String]::IsNullOrWhiteSpace($root)) {
@@ -6,14 +7,14 @@ if ([String]::IsNullOrWhiteSpace($root)) {
 }
 
 $selectedRoot = $root
-$runner = Join-Path $root "scripts\run_orchestrator_hook.ps1"
+$runner = [IO.Path]::Combine($root, "scripts", "run_orchestrator_hook.ps1")
 if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
     $runner = $null
     $latest = [DateTime]::MinValue
     $parent = Split-Path -Parent $root
     if (Test-Path -LiteralPath $parent -PathType Container) {
         foreach ($directory in [IO.Directory]::EnumerateDirectories($parent)) {
-            $candidate = Join-Path $directory "scripts\run_orchestrator_hook.ps1"
+            $candidate = [IO.Path]::Combine($directory, "scripts", "run_orchestrator_hook.ps1")
             if (Test-Path -LiteralPath $candidate -PathType Leaf) {
                 $modified = [IO.File]::GetLastWriteTimeUtc($candidate)
                 if ($modified -gt $latest) {

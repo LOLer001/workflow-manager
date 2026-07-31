@@ -51,7 +51,9 @@ def main() -> int:
     assert len(declared) == 9 and len(windows_commands) == 1
     windows_command = windows_commands.pop()
     assert " -EncodedCommand " in windows_command
-    resolver = base64.b64decode(windows_command.rsplit(" ", 1)[-1]).decode("utf-16le")
+    assert windows_command.endswith(" 2>NUL")
+    encoded = windows_command.split(" -EncodedCommand ", 1)[1].split(" ", 1)[0]
+    resolver = base64.b64decode(encoded).decode("utf-16le")
     expected_resolver = (
         PLUGIN / "scripts" / "resolve_orchestrator_hook.ps1"
     ).read_text(encoding="utf-8").replace("\r\n", "\n")
