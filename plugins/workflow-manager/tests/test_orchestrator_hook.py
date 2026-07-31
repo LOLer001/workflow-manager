@@ -5,6 +5,7 @@ import io
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -177,7 +178,237 @@ class OrchestratorHookTests(unittest.TestCase):
         prompts = manifest["interface"].get("defaultPrompt", [])
         self.assertLessEqual(len(prompts), 3)
         self.assertTrue(all(len(prompt) <= 128 for prompt in prompts), prompts)
-        self.assertLess(ORCHESTRATOR_SKILL.stat().st_size, 6500)
+        self.assertLess(ORCHESTRATOR_SKILL.stat().st_size, 6000)
+
+    def test_new_version_removes_only_strictly_older_sibling_caches(self) -> None:
+        cache = (
+            Path(self.temporary.name)
+            / "cache"
+            / "workflow-manager"
+            / "workflow-manager"
+        )
+        current = cache / HOOK.WRITER_VERSION
+        manifest_dir = current / ".codex-plugin"
+        manifest_dir.mkdir(parents=True)
+        (manifest_dir / "plugin.json").write_text(
+            json.dumps({"name": "workflow-manager", "version": HOOK.WRITER_VERSION}),
+            encoding="utf-8",
+        )
+        old_versions = [cache / "1.0.15", cache / "1.0.17"]
+        for old in old_versions:
+            (old / "scripts").mkdir(parents=True)
+        non_version = cache / "current"
+        non_version.mkdir()
+        noncanonical = cache / "1.0.017"
+        noncanonical.mkdir()
+        symlink = cache / "1.0.16"
+        symlink_created = False
+        try:
+            symlink.symlink_to(old_versions[0], target_is_directory=True)
+            symlink_created = True
+        except OSError:
+            pass
+
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(current), 2)
+        self.assertTrue(current.is_dir())
+        self.assertTrue(non_version.is_dir())
+        self.assertTrue(noncanonical.is_dir())
+        self.assertTrue(all(not old.exists() for old in old_versions))
+        if symlink_created:
+            self.assertTrue(symlink.is_symlink())
+
+        blocked_cache = (
+            Path(self.temporary.name)
+            / "blocked"
+            / "workflow-manager"
+            / "workflow-manager"
+        )
+        blocked_current = blocked_cache / HOOK.WRITER_VERSION
+        blocked_manifest = blocked_current / ".codex-plugin"
+        blocked_manifest.mkdir(parents=True)
+        (blocked_manifest / "plugin.json").write_text(
+            json.dumps({"name": "workflow-manager", "version": HOOK.WRITER_VERSION}),
+            encoding="utf-8",
+        )
+        blocked_old = blocked_cache / "1.0.17"
+        blocked_old.mkdir()
+        (blocked_cache / "1.0.19").mkdir()
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(blocked_current), 0)
+        self.assertTrue(blocked_old.is_dir())
+        shutil.rmtree(blocked_cache / "1.0.19")
+
+        (blocked_manifest / "plugin.json").write_text(
+            json.dumps({"name": "other", "version": HOOK.WRITER_VERSION}),
+            encoding="utf-8",
+        )
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(blocked_current), 0)
+        self.assertTrue(blocked_old.is_dir())
+
+    def test_cache_cleanup_rejects_wrong_layout_and_manifest_symlinks(self) -> None:
+        wrong_cache = Path(self.temporary.name) / "documents" / "workflow-manager"
+        wrong_current = wrong_cache / HOOK.WRITER_VERSION
+        wrong_manifest = wrong_current / ".codex-plugin" / "plugin.json"
+        wrong_manifest.parent.mkdir(parents=True)
+        wrong_manifest.write_text(
+            json.dumps({"name": "workflow-manager", "version": HOOK.WRITER_VERSION}),
+            encoding="utf-8",
+        )
+        wrong_old = wrong_cache / "1.0.17"
+        wrong_old.mkdir()
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(wrong_current), 0)
+        self.assertTrue(wrong_old.is_dir())
+
+        cache = (
+            Path(self.temporary.name)
+            / "linked"
+            / "workflow-manager"
+            / "workflow-manager"
+        )
+        current = cache / HOOK.WRITER_VERSION
+        manifest_dir = current / ".codex-plugin"
+        manifest_dir.mkdir(parents=True)
+        external_manifest = Path(self.temporary.name) / "external-plugin.json"
+        external_manifest.write_text(
+            json.dumps({"name": "workflow-manager", "version": HOOK.WRITER_VERSION}),
+            encoding="utf-8",
+        )
+        linked_manifest = manifest_dir / "plugin.json"
+        old = cache / "1.0.17"
+        old.mkdir()
+        try:
+            linked_manifest.symlink_to(external_manifest)
+        except OSError:
+            return
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(current), 0)
+        self.assertTrue(old.is_dir())
+
+        linked_cache = (
+            Path(self.temporary.name)
+            / "root-linked"
+            / "workflow-manager"
+            / "workflow-manager"
+        )
+        linked_cache.mkdir(parents=True)
+        root_target = Path(self.temporary.name) / "root-target"
+        root_target.mkdir()
+        linked_current = linked_cache / HOOK.WRITER_VERSION
+        linked_current.symlink_to(root_target, target_is_directory=True)
+        linked_old = linked_cache / "1.0.17"
+        linked_old.mkdir()
+        self.assertEqual(HOOK.cleanup_old_plugin_versions(linked_current), 0)
+        self.assertTrue(linked_old.is_dir())
+
+    def test_wrapper_cleanup_uses_plugin_root_and_session_start_fails_open(self) -> None:
+        cache = (
+            Path(self.temporary.name)
+            / "wrapper-cache"
+            / "workflow-manager"
+            / "workflow-manager"
+        )
+        current = cache / HOOK.WRITER_VERSION
+        scripts = current / "scripts"
+        manifest_dir = current / ".codex-plugin"
+        scripts.mkdir(parents=True)
+        manifest_dir.mkdir()
+        shutil.copy2(SCRIPT, scripts / SCRIPT.name)
+        shutil.copy2(WRAPPER, scripts / WRAPPER.name)
+        (manifest_dir / "plugin.json").write_text(
+            json.dumps({"name": "workflow-manager", "version": HOOK.WRITER_VERSION}),
+            encoding="utf-8",
+        )
+        old = cache / "1.0.17"
+        old.mkdir()
+        data = Path(self.temporary.name) / "wrapper-data"
+        env = os.environ.copy()
+        env.update(
+            {
+                "PLUGIN_ROOT": str(current),
+                "PLUGIN_DATA": str(data),
+                "XDG_RUNTIME_DIR": str(Path(self.temporary.name) / "runtime"),
+            }
+        )
+        Path(env["XDG_RUNTIME_DIR"]).mkdir()
+        result = subprocess.run(
+            ["sh", str(scripts / WRAPPER.name)],
+            input=json.dumps(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "wrapper-cleanup",
+                    "source": "startup",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+        self.assertFalse(old.exists())
+        self.assertTrue(current.is_dir())
+
+        output = io.StringIO()
+        fail_open_data = Path(self.temporary.name) / "fail-open-data"
+        payload = {
+            "hook_event_name": "SessionStart",
+            "session_id": "cleanup-fail-open",
+            "source": "startup",
+        }
+        with (
+            patch.dict(os.environ, {"PLUGIN_DATA": str(fail_open_data)}),
+            patch.object(
+                HOOK,
+                "cleanup_old_plugin_versions",
+                side_effect=RuntimeError("simulated"),
+            ),
+            patch("sys.stdout", output),
+        ):
+            HOOK.session_start(payload)
+        self.assertIn("hookSpecificOutput", json.loads(output.getvalue()))
+        self.assertEqual(len(list((fail_open_data / "sessions").glob("*.json"))), 1)
+
+    def test_invalid_cleanup_manifests_do_not_break_session_start(self) -> None:
+        cache = (
+            Path(self.temporary.name)
+            / "invalid"
+            / "workflow-manager"
+            / "workflow-manager"
+        )
+        current = cache / HOOK.WRITER_VERSION
+        manifest = current / ".codex-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True)
+        old = cache / "1.0.17"
+        old.mkdir()
+        cases = {"list": "[]", "damaged": "{"}
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                manifest.write_text(content, encoding="utf-8")
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": f"invalid-{name}",
+                        "source": "startup",
+                    },
+                    data=Path(self.temporary.name) / f"invalid-data-{name}",
+                    extra_env={"PLUGIN_ROOT": str(current)},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+                self.assertTrue(old.is_dir())
+
+        manifest.unlink()
+        result = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "invalid-missing",
+                "source": "startup",
+            },
+            data=Path(self.temporary.name) / "invalid-data-missing",
+            extra_env={"PLUGIN_ROOT": str(current)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+        self.assertTrue(old.is_dir())
 
     def test_redaction_matrix(self) -> None:
         samples = [

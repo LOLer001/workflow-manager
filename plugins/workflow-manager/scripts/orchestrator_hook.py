@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.17"
+WRITER_VERSION = "1.0.18"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -863,6 +864,76 @@ def mutate_state(
     except OSError as error:
         debug_persistence(payload, path_resolved=True, outcome="write_error", error=error)
         return new_state(payload), False
+
+
+def cleanup_old_plugin_versions(plugin_root: Path | None = None) -> int:
+    """Best-effort removal of strictly older sibling cache versions."""
+    configured_root = plugin_root or os.environ.get("PLUGIN_ROOT")
+    root = Path(configured_root) if configured_root else Path(__file__).resolve().parents[1]
+    semver_pattern = r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    try:
+        root_info = root.lstat()
+        if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+            return 0
+        absolute_root = Path(os.path.abspath(root))
+        resolved_root = root.resolve(strict=True)
+        if os.path.normcase(str(absolute_root)) != os.path.normcase(str(resolved_root)):
+            return 0
+        root = resolved_root
+        if (
+            root.parent.name != "workflow-manager"
+            or root.parent.parent.name != "workflow-manager"
+        ):
+            return 0
+        manifest_dir = root / ".codex-plugin"
+        manifest_dir_info = manifest_dir.lstat()
+        if not stat.S_ISDIR(manifest_dir_info.st_mode) or stat.S_ISLNK(manifest_dir_info.st_mode):
+            return 0
+        manifest_path = manifest_dir / "plugin.json"
+        manifest_info = manifest_path.lstat()
+        if (
+            not stat.S_ISREG(manifest_info.st_mode)
+            or stat.S_ISLNK(manifest_info.st_mode)
+            or manifest_info.st_size > 64 * 1024
+            or manifest_path.resolve(strict=True) != manifest_path
+        ):
+            return 0
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return 0
+        current_label = str(manifest.get("version") or "")
+        match = re.fullmatch(semver_pattern, current_label)
+        if (
+            not match
+            or manifest.get("name") != "workflow-manager"
+            or current_label != WRITER_VERSION
+            or root.name != current_label
+        ):
+            return 0
+        current = tuple(int(part) for part in match.groups())
+        older: list[Path] = []
+        for candidate in root.parent.iterdir():
+            version_match = re.fullmatch(semver_pattern, candidate.name)
+            if not version_match:
+                continue
+            info = candidate.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                continue
+            version = tuple(int(part) for part in version_match.groups())
+            if version > current:
+                return 0
+            if version < current:
+                older.append(candidate)
+        removed = 0
+        for candidate in older:
+            try:
+                shutil.rmtree(candidate)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
 
 
 def cleanup_old_sessions() -> None:
@@ -2274,6 +2345,10 @@ def quality_continuity(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def session_start(payload: dict[str, Any]) -> None:
+    try:
+        cleanup_old_plugin_versions()
+    except Exception:
+        pass
     cleanup_old_sessions()
     telemetry = latest_token_telemetry(payload)
 
