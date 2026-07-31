@@ -2,8 +2,6 @@ name: Publish GitHub Releases
 
 on:
   push:
-    branches:
-      - "main"
     tags:
       - "v*.*.*"
   workflow_dispatch:
@@ -30,7 +28,7 @@ jobs:
       - name: Publish missing releases
         env:
           GH_TOKEN: ${{ github.token }}
-          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || startsWith(github.ref, 'refs/tags/') && github.ref_name || 'all' }}
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           if [[ "$REQUESTED_TAG" == "all" ]]; then
