@@ -175,6 +175,8 @@ class OrchestratorHookTests(unittest.TestCase):
             "Implement one small parser function.": "focused",
             "Implement one small parser function and test it.": "focused",
             "preview this sentence": "direct",
+            "查看当前版本": "focused",
+            "现在帮我确认一下 Workflow Manager 的配置是否一切正常，你全面查看一下！！！": "complex",
             "Test authentication and optimize CI": "complex",
             "编译、合包、实机录像验证": "complex",
             "排查设备反复重启，编译合包后完成实机录像验证": "extensive",
@@ -610,6 +612,7 @@ class OrchestratorHookTests(unittest.TestCase):
         blocked_output = json.loads(blocked.stdout)["hookSpecificOutput"]
         self.assertEqual(blocked_output["permissionDecision"], "deny")
         self.assertIn("delegation gate is closed", blocked_output["permissionDecisionReason"])
+        self.assertIn("current route", blocked_output["permissionDecisionReason"])
         closed_state = self.load_only_state(closed_data)
         self.assertEqual(HOOK.active_agent_count(closed_state), 0)
         self.assertFalse(any(item["event"] == "request" for item in closed_state["subagents"]))

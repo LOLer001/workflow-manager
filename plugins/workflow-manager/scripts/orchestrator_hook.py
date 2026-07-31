@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.15"
+WRITER_VERSION = "1.0.16"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -953,6 +953,10 @@ EN_ACTIONS = (
 ZH_ACTIONS = (
     "编译",
     "构建",
+    "检查",
+    "核对",
+    "确认",
+    "查看",
     "调试",
     "部署",
     "诊断",
@@ -2472,8 +2476,8 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     elif gate == "closed":
         deny_kind = "subagent_gate"
         deny_reason = (
-            "Subagent spawn denied before start: the delegation gate is closed by dependency/shared-resource "
-            "routing. Keep this work serialized."
+            "Subagent spawn denied before start: the delegation gate is closed by the current route "
+            "(for example, focused work, dependency ordering, or a shared resource). Keep this work serialized."
         )
     elif duplicate_scope:
         deny_kind = "subagent_duplicate"
