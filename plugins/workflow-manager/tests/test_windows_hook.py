@@ -87,7 +87,10 @@ class WindowsHookTests(unittest.TestCase):
             text=True,
             capture_output=True,
             env=resolved_env,
-            timeout=10,
+            # These tests exercise the complete cmd -> PowerShell -> launcher chain. Hosted
+            # runners can cold-start any link slowly, including the intentional no-Python
+            # fail-open path, so the timeout is a harness allowance rather than a product SLA.
+            timeout=45,
         )
 
     def test_all_declared_events_use_same_windows_command(self) -> None:
@@ -329,7 +332,7 @@ class WindowsHookTests(unittest.TestCase):
         for process in processes:
             stderr = process.stderr.read() if process.stderr else ""
             diagnostics.append(stderr)
-            process.wait(timeout=10)
+            process.wait(timeout=45)
             if process.stderr:
                 process.stderr.close()
             self.assertEqual(process.returncode, 0, stderr)

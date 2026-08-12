@@ -10,7 +10,7 @@
 - 状态 Schema 升级到 10：Schema 9 的已确认计划迁移为尚未启动的 `spawn_required`，不会猜测旧任务已经创建执行者或完成执行。
 - 日常请求、简单工作和既有正收益并行策略保持不变；合同执行细节下沉到 `references/confirmed-execution.md`，继续仅暴露一个可调用 Skill，主 `SKILL.md` 保持低于 5900 字节。
 - Windows 原生端到端测试随执行合同往返覆盖增至 12 项。
-- 放宽 Windows PowerShell 完整链路测试的冷启动超时，只修复托管 Runner 性能波动造成的误报，不降低任何功能断言。
+- 放宽 Windows `cmd -> PowerShell -> Python/失败开放` 完整链路测试的冷启动超时，只修复托管 Runner 性能波动造成的误报，不降低任何功能断言。
 
 ## 1.0.22
 
