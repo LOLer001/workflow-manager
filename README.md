@@ -5,6 +5,8 @@
 ## 核心能力
 
 - 正确性与必要推理、证据、纠错和验收验证始终高于 token 或上下文节省。
+- 先判断日常问题或工作问题：聊天、天气、日报、电脑清理等日常请求保持当前会话模型；设备定制、设备 Bug、App/代码开发、构建部署及工程诊断进入工作评估。
+- 任务类别只控制模型策略，不改变安全边界；删除、覆盖、安装、外发等高风险操作仍需正常确认。
 - 按任务复杂度选择直接处理、聚焦处理或复杂工作流。
 - 复杂任务主动评估关键路径，只要预期节省时间高于协调成本，就优先并行调度独立的读、写、测试、研究或复核工作。
 - Complex 最多 2 个、Extensive 最多 3 个子智能体；上限只是容量，不是固定数量，也不要求必须派一个只读子智能体。
@@ -25,14 +27,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.20\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.21\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.20/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.21/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -75,7 +77,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.20 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.21 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -92,6 +94,8 @@ codex plugin add workflow-manager@workflow-manager --json
 复杂任务按需经过 `Contract → Evidence → Change → Verify → Report`，不会强制简单问题走完整流程。
 
 插件会读取 Codex 生命周期事件来判断路由、输出规模和续接状态；持久化数据只保留摘要、指纹、验收待办状态和计数，不保存原始提示词、命令或子智能体结果。大工具结果会保留给模型正常推理，插件只提示后续查询如何收窄，不会仅因为输出较大而替换必要证据。钩子属于工作流护栏，不是安全边界。子智能体可能减少主会话噪声，但不保证降低总 token 消耗。
+
+1.0.21 中的 `current` 与 `work_assessment` 是可审计的模型策略档位：Hook 会记录并解释判断，但不会虚报已经切换当前会话模型。工作问题的简单/困难判定和受控模型执行将在后续版本逐步加入。
 
 ## 仓库结构
 

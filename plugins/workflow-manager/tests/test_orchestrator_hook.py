@@ -327,7 +327,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         blocked_old = blocked_cache / "1.0.17"
         blocked_old.mkdir()
-        (blocked_cache / "1.0.21").mkdir()
+        future_version = blocked_cache / "99.0.0"
+        future_version.mkdir()
         self.assertEqual(
             HOOK.cleanup_old_plugin_versions(
                 blocked_current,
@@ -336,7 +337,7 @@ class OrchestratorHookTests(unittest.TestCase):
             0,
         )
         self.assertTrue(blocked_old.is_dir())
-        shutil.rmtree(blocked_cache / "1.0.21")
+        shutil.rmtree(future_version)
 
         (blocked_manifest / "plugin.json").write_text(
             json.dumps({"name": "other", "version": HOOK.WRITER_VERSION}),
@@ -594,6 +595,44 @@ class OrchestratorHookTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 self.assertEqual(HOOK.classify_prompt(prompt)["label"], expected)
 
+    def test_task_domain_gold_set_is_independent_from_route_complexity(self) -> None:
+        cases = {
+            "你好": ("daily", "current"),
+            "北京明天天气怎么样": ("daily", "current"),
+            "根据这些工作内容帮我生成日报": ("daily", "current"),
+            "Build me a workout plan for this week": ("daily", "current"),
+            "Package these holiday options into a short list": ("daily", "current"),
+            "帮我清理电脑垃圾文件": ("daily", "current"),
+            "修复 Android 设备反复重启的 bug": ("work", "work_assessment"),
+            "实现客户的设备定制需求": ("work", "work_assessment"),
+            "编写一个 Android App 并完成测试": ("work", "work_assessment"),
+            "编写一个生成日报的 App": ("work", "work_assessment"),
+            "修改 Parser.java 的 parse 方法": ("work", "work_assessment"),
+            "编译 Settings 模块并部署到实机验证": ("work", "work_assessment"),
+            "先问一下天气，然后修改应用代码并发布": ("work", "work_assessment"),
+        }
+        for prompt, expected in cases.items():
+            with self.subTest(prompt=prompt):
+                route = HOOK.classify_prompt(prompt)
+                self.assertEqual((route["task_domain"], route["model_profile"]), expected)
+                self.assertIn(route["domain_confidence"], {"low", "medium", "high"})
+                self.assertTrue(route["domain_rule_codes"])
+                self.assertRegex(route["domain_decision_id"], r"^[0-9a-f]{24}$")
+
+        # The new domain axis must not rewrite the established execution route.
+        self.assertEqual(HOOK.classify_prompt("北京明天天气怎么样")["label"], "direct")
+        self.assertEqual(
+            HOOK.classify_prompt("编译、合包、实机录像验证")["label"], "complex"
+        )
+
+    def test_daily_cleanup_keeps_domain_policy_but_never_claims_a_safety_exemption(self) -> None:
+        route = HOOK.classify_prompt("帮我删除电脑里的垃圾文件并清理缓存")
+        self.assertEqual(route["task_domain"], "daily")
+        context = HOOK.routing_context(route, {})
+        self.assertIn("profile=current", context)
+        self.assertIn("advisory; no switch", context)
+        self.assertNotIn("safety exemption", context.lower())
+
     def test_lane_decision_separates_effort_from_parallelism(self) -> None:
         sequential = HOOK.classify_prompt("编译、合包、实机录像验证")
         self.assertEqual(sequential["label"], "complex")
@@ -666,12 +705,11 @@ class OrchestratorHookTests(unittest.TestCase):
                     "Order:",
                     "Agents:",
                     "Control:",
-                    "Update: phase|done|next|blocker",
-                    "kickoff/material change/~60s wait only",
-                    "never per tool",
+                    "Update phase|done|next|blocker",
+                    "kickoff/change/~60s wait",
                     "Preflight path/input/acceptance",
                     "diagnose once",
-                    "retry after material correction only",
+                    "retry after correction",
                 ):
                     self.assertIn(marker, context)
                 self.assertLess(len(context), 560)
@@ -2073,6 +2111,8 @@ class OrchestratorHookTests(unittest.TestCase):
         first_state = self.load_only_state()
         first_objective = first_state["objective"]["fingerprint"]
         self.assertIn(first_state["last_route"]["label"], {"complex", "extensive"})
+        self.assertEqual(first_state["task_domain"], "work")
+        first_decision = first_state["domain_decision_id"]
 
         self.run_hook(
             {
@@ -2086,6 +2126,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(continued["objective"]["fingerprint"], first_objective)
         self.assertIn(continued["last_route"]["label"], {"complex", "extensive"})
         self.assertEqual(continued["last_route"]["route_source"], "continued")
+        self.assertEqual(continued["task_domain"], "work")
+        self.assertEqual(continued["domain_decision_id"], first_decision)
 
         self.run_hook(
             {
@@ -2098,6 +2140,22 @@ class OrchestratorHookTests(unittest.TestCase):
         changed = self.load_only_state()
         self.assertNotEqual(changed["objective"]["fingerprint"], first_objective)
         self.assertEqual(changed["last_route"]["label"], "direct")
+        self.assertEqual(changed["task_domain"], "daily")
+        self.assertNotEqual(changed["domain_decision_id"], first_decision)
+
+    def test_legacy_state_migrates_with_safe_domain_defaults(self) -> None:
+        legacy = {
+            "schema_version": 7,
+            "writer_version": "1.0.20",
+            "created_at": HOOK.utc_now(),
+            "last_route": {"label": "focused", "score": 1},
+        }
+        migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-domain"})
+        self.assertEqual(migrated["schema_version"], 8)
+        self.assertEqual(migrated["writer_version"], "1.0.21")
+        self.assertEqual(migrated["task_domain"], "unknown")
+        self.assertEqual(migrated["model_profile"], "current")
+        self.assertEqual(migrated["last_route"]["task_domain"], "unknown")
 
     def test_state_bounds_and_permissions(self) -> None:
         with patch.dict(os.environ, {"PLUGIN_DATA": str(self.data)}, clear=False):

@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 7
-WRITER_VERSION = "1.0.20"
+SCHEMA_VERSION = 8
+WRITER_VERSION = "1.0.21"
+DOMAIN_CLASSIFIER_VERSION = "1"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = 1
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -326,6 +327,24 @@ def safe_route(value: Any) -> dict[str, Any]:
         "route_source": safe_label(value.get("route_source"), 32)
         if value.get("route_source")
         else "prompt",
+        "task_domain": value.get("task_domain")
+        if value.get("task_domain") in {"daily", "work", "unknown"}
+        else "unknown",
+        "domain_confidence": value.get("domain_confidence")
+        if value.get("domain_confidence") in {"low", "medium", "high"}
+        else "low",
+        "domain_rule_codes": [
+            safe_label(item, 48)
+            for item in as_list(value.get("domain_rule_codes"))
+            if item
+        ][:8],
+        "model_profile": value.get("model_profile")
+        if value.get("model_profile") in {"current", "work_assessment"}
+        else "current",
+        "domain_classifier_version": safe_label(
+            value.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
+        ),
+        "domain_decision_id": safe_fingerprint(value.get("domain_decision_id")) or None,
         "at": str(value.get("at"))[:40] if value.get("at") else None,
     })
 
@@ -651,6 +670,12 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "session_fingerprint": stable_hash(payload.get("session_id") or payload.get("hook_run_id")),
         "cwd_fingerprint": stable_hash(payload.get("cwd")),
         "model": safe_label(payload.get("model"), 80) if payload.get("model") else None,
+        "task_domain": "unknown",
+        "domain_confidence": "low",
+        "domain_rule_codes": [],
+        "model_profile": "current",
+        "domain_classifier_version": DOMAIN_CLASSIFIER_VERSION,
+        "domain_decision_id": None,
         "created_at": now,
         "updated_at": now,
         "objective": {},
@@ -716,6 +741,24 @@ def _safe_prompt(item: Any) -> dict[str, Any] | None:
         "route_source": safe_label(item.get("route_source"), 32)
         if item.get("route_source")
         else "prompt",
+        "task_domain": item.get("task_domain")
+        if item.get("task_domain") in {"daily", "work", "unknown"}
+        else "unknown",
+        "domain_confidence": item.get("domain_confidence")
+        if item.get("domain_confidence") in {"low", "medium", "high"}
+        else "low",
+        "domain_rule_codes": [
+            safe_label(value, 48)
+            for value in as_list(item.get("domain_rule_codes"))
+            if value
+        ][:8],
+        "model_profile": item.get("model_profile")
+        if item.get("model_profile") in {"current", "work_assessment"}
+        else "current",
+        "domain_classifier_version": safe_label(
+            item.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
+        ),
+        "domain_decision_id": safe_fingerprint(item.get("domain_decision_id")) or None,
     })
 
 
@@ -876,6 +919,31 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["persistence"] = safe_persistence(value.get("persistence"))
     base["migration"] = safe_migration(value.get("migration"))
     base["last_route"] = safe_route(value.get("last_route"))
+    domain_source = value if value.get("task_domain") in {"daily", "work", "unknown"} else base["last_route"]
+    base["task_domain"] = (
+        domain_source.get("task_domain")
+        if domain_source.get("task_domain") in {"daily", "work", "unknown"}
+        else "unknown"
+    )
+    base["domain_confidence"] = (
+        domain_source.get("domain_confidence")
+        if domain_source.get("domain_confidence") in {"low", "medium", "high"}
+        else "low"
+    )
+    base["domain_rule_codes"] = [
+        safe_label(item, 48)
+        for item in as_list(domain_source.get("domain_rule_codes"))
+        if item
+    ][:8]
+    base["model_profile"] = (
+        domain_source.get("model_profile")
+        if domain_source.get("model_profile") in {"current", "work_assessment"}
+        else "current"
+    )
+    base["domain_classifier_version"] = safe_label(
+        domain_source.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
+    )
+    base["domain_decision_id"] = safe_fingerprint(domain_source.get("domain_decision_id")) or None
 
     base["objective"] = safe_metadata(value.get("objective"))
     if not base["objective"] and value.get("last_objective"):
@@ -1432,9 +1500,96 @@ ZH_SMALL_SCOPE = ("一个小", "单个文件", "仅修改", "小改动")
 SEQUENTIAL_PHASES = {"build_package", "delivery_device", "verification", "evidence"}
 ROUTE_RANK = {"direct": 0, "focused": 1, "complex": 2, "extensive": 3}
 
+DAILY_EXACT_PATTERNS = (
+    ("daily_weather", r"(?:天气|气温|下雨|空气质量|weather|forecast)"),
+    ("daily_report", r"(?:生成|整理|写|帮我写|汇总).{0,10}(?:日报|周报|月报|daily report|weekly report)"),
+    ("daily_cleanup", r"(?:清理|删除|整理).{0,16}(?:电脑|磁盘|缓存|垃圾文件|临时文件|重复文件|computer|disk|cache|junk|temporary files?)"),
+    ("daily_chat", r"^(?:你好|您好|嗨|hello|hi|聊聊|陪我聊天|谢谢|早上好|晚上好)[!！。,.，\s]*$"),
+)
+WORK_STRONG_PATTERNS = (
+    ("work_device_customization", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:定制|需求|适配|开发|修改|实现)"),
+    ("work_device_bug", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:bug|问题|异常|故障|崩溃|重启|修复|排查|诊断)"),
+    (
+        "work_app_code",
+        r"(?:写|编写|开发|实现|修改|修复|重构|调试|\b(?:review|write|create|implement|develop|debug|fix|refactor)\b)"
+        r".{0,24}(?:应用|代码|源码|模块|脚本|函数|方法|接口|服务|插件|\b(?:app|java|kotlin|python|javascript|typescript|skill|hook|function|class|service|plugin|script|code)\b)",
+    ),
+    (
+        "work_build_delivery",
+        r"(?:编译|构建|合包|打包|烧录|刷机|部署|实机验证|\b(?:compile|deploy)\b|"
+        r"\b(?:build|package)\b.{0,24}\b(?:project|repository|repo|app|apk|module|code|firmware|image)\b|"
+        r"\bflash\b.{0,24}\b(?:device|firmware|image|rom)\b)",
+    ),
+    ("work_engineering_artifact", r"(?:仓库|代码库|项目|工程|模块|source tree|repository).{0,24}(?:修改|修复|实现|诊断|排查|测试|验证|发布|迁移)"),
+    ("work_engineering_diagnosis", r"(?:排查|诊断|修复|调试|分析|审查|investigate|diagnose|debug|fix|analy[sz]e|review).{0,24}(?:日志|测试|bug|崩溃|重启|异常|故障|失败|log|test|crash|failure|error)"),
+    ("work_engineering_operation", r"(?:测试|验证|优化|迁移|安装|test|verify|optimize|migrate|install).{0,24}(?:ci|api|数据库|服务器|服务|插件|skill|workflow|模块|代码|系统|设备|database|server|service|plugin|module|code|system|device)"),
+)
+WORK_CONTEXT_PATTERNS = (
+    ("work_source_symbol", r"(?:\.java|\.kt|\.py|\.js|\.ts|\.cpp|\.c|\.h|方法|函数|类|源码文件)"),
+    ("work_toolchain", r"(?:adb|gradle|maven|ninja|make|编译器|构建服务器|设备日志|logcat)"),
+    ("work_product_delivery", r"(?:客户需求|交付|验收|版本发布|release|production|线上故障)"),
+)
+
 
 def _english_hits(text: str, terms: tuple[str, ...]) -> int:
     return sum(1 for term in terms if re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", text))
+
+
+def classify_task_domain(prompt: str) -> dict[str, Any]:
+    """Classify the user objective without storing its raw text.
+
+    Domain controls only the model policy suggestion. It never relaxes safety,
+    destructive-action confirmation, evidence, or verification requirements.
+    """
+    normalized = re.sub(r"\s+", " ", prompt.strip())
+    lower = normalized.lower()
+    daily_codes = [code for code, pattern in DAILY_EXACT_PATTERNS if re.search(pattern, lower, re.I)]
+    work_codes = [code for code, pattern in WORK_STRONG_PATTERNS if re.search(pattern, lower, re.I)]
+    context_codes = [code for code, pattern in WORK_CONTEXT_PATTERNS if re.search(pattern, lower, re.I)]
+    report_with_separate_work = bool(
+        re.search(
+            r"(?:然后|同时|并且|此外|还要|再|then|also|and then).{0,40}"
+            r"(?:修改|修复|实现|开发|编译|构建|部署|测试|验证|代码|app|设备|"
+            r"modify|fix|implement|develop|build|compile|deploy|test|verify)",
+            lower,
+            re.I,
+        )
+    )
+
+    # An explicit engineering deliverable outranks an incidental daily phrase in a mixed request.
+    if "daily_report" in daily_codes and not report_with_separate_work and not work_codes:
+        domain = "daily"
+        confidence = "high"
+        rule_codes = ["daily_report"]
+    elif work_codes:
+        domain = "work"
+        confidence = "high"
+        rule_codes = [*work_codes, *(context_codes[:2])]
+    elif context_codes:
+        domain = "work"
+        confidence = "medium"
+        rule_codes = context_codes
+    elif daily_codes:
+        domain = "daily"
+        confidence = "high"
+        rule_codes = daily_codes
+    else:
+        # General conversation, factual questions, and personal assistance stay on the
+        # current model unless concrete engineering work is present.
+        domain = "daily"
+        confidence = "low"
+        rule_codes = ["daily_general_default"]
+    decision_seed = "\0".join(
+        (DOMAIN_CLASSIFIER_VERSION, stable_hash(normalized, 32), domain, *sorted(set(rule_codes)))
+    )
+    return {
+        "task_domain": domain,
+        "domain_confidence": confidence,
+        "domain_rule_codes": list(dict.fromkeys(rule_codes))[:8],
+        "model_profile": "current" if domain == "daily" else "work_assessment",
+        "domain_classifier_version": DOMAIN_CLASSIFIER_VERSION,
+        "domain_decision_id": stable_hash(decision_seed, 24),
+    }
 
 
 def phase_hints(prompt: str) -> list[str]:
@@ -1600,6 +1755,30 @@ def ready_lane_evidence(prompt: str, list_items: int = 0) -> tuple[str, int]:
 
 def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
     result = dict(route)
+    result["task_domain"] = (
+        result.get("task_domain")
+        if result.get("task_domain") in {"daily", "work", "unknown"}
+        else "unknown"
+    )
+    result["domain_confidence"] = (
+        result.get("domain_confidence")
+        if result.get("domain_confidence") in {"low", "medium", "high"}
+        else "low"
+    )
+    result["domain_rule_codes"] = [
+        safe_label(item, 48)
+        for item in as_list(result.get("domain_rule_codes"))
+        if item
+    ][:8]
+    result["model_profile"] = (
+        result.get("model_profile")
+        if result.get("model_profile") in {"current", "work_assessment"}
+        else "current"
+    )
+    result["domain_classifier_version"] = safe_label(
+        result.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
+    )
+    result["domain_decision_id"] = safe_fingerprint(result.get("domain_decision_id")) or None
     label = str(result.get("label") or "direct")
     lane_signal = str(result.get("lane_signal") or "none")
     readiness = str(result.get("readiness_signal") or "none")
@@ -1701,6 +1880,7 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
 def classify_prompt(prompt: str) -> dict[str, Any]:
     normalized = prompt.strip()
     lower = normalized.lower()
+    domain = classify_task_domain(normalized)
     score = 0
     if len(normalized) > 280:
         score += 1
@@ -1791,6 +1971,7 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
     elif dependency_signal == "ordered":
         dependency_hint = "ordered_dependency"
     return decorate_route({
+        **domain,
         "label": label,
         "score": score,
         "future_token_range": future,
@@ -2586,6 +2767,9 @@ def session_start(payload: dict[str, Any]) -> None:
             "schema": SCHEMA_VERSION,
             "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
             "last_route": state.get("last_route", {}).get("label"),
+            "task_domain": state.get("task_domain", "unknown"),
+            "domain_decision_id": state.get("domain_decision_id"),
+            "model_profile": state.get("model_profile", "current"),
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
@@ -2708,6 +2892,15 @@ def merge_followup_route(previous: dict[str, Any], current: dict[str, Any]) -> d
         prior.get("delegation_opt_out") or current.get("delegation_opt_out")
     )
     result["dependency_hint"] = current.get("dependency_hint") or prior.get("dependency_hint")
+    for key in (
+        "task_domain",
+        "domain_confidence",
+        "domain_rule_codes",
+        "model_profile",
+        "domain_classifier_version",
+        "domain_decision_id",
+    ):
+        result[key] = prior.get(key)
     result["route_source"] = "continued"
     result.pop("at", None)
     return decorate_route(result)
@@ -2732,12 +2925,15 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
         if isinstance(pressure, (int, float)) and pressure >= PRESSURE_CHECKPOINT_THRESHOLD
         else ""
     )
+    domain = str(classification.get("task_domain") or "unknown")
+    profile = str(classification.get("model_profile") or "current")
     return (
+        f"Domain: {domain} | profile={profile} (advisory; no switch). "
         f"Route: {label}/{shape} | pressure={pressure_summary} | budget={classification.get('future_token_range')}. "
         f"Order: {order}. {agents}{gate} Control: bounded. "
-        "Update: phase|done|next|blocker at kickoff/material change/~60s wait only; never per tool. "
-        "Preflight path/input/acceptance; diagnose once; retry after material correction only. "
-        "Acceptance in contract; verify to risk; never trim it; reuse only unchanged state/evidence."
+        "Update phase|done|next|blocker at kickoff/change/~60s wait. "
+        "Preflight path/input/acceptance; diagnose once; retry after correction. "
+        "Keep risk-based verification; reuse only unchanged evidence."
     )
 
 
@@ -2755,6 +2951,15 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if not continuation or not state.get("objective"):
             state["objective"] = {**prompt_meta, "updated_at": utc_now()}
         state["last_route"] = {**classification, "at": utc_now()}
+        for key in (
+            "task_domain",
+            "domain_confidence",
+            "domain_rule_codes",
+            "model_profile",
+            "domain_classifier_version",
+            "domain_decision_id",
+        ):
+            state[key] = classification.get(key)
         state.setdefault("prompts", []).append(
             {
                 "at": utc_now(),
@@ -2768,7 +2973,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
 
     mutate_state(payload, update)
     pressure = telemetry.get("pressure")
-    should_inject = classification["label"] in {"complex", "extensive"} or (
+    should_inject = classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
         isinstance(pressure, (int, float)) and pressure >= PRESSURE_TRIM_THRESHOLD
     )
     if not should_inject:
