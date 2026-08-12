@@ -451,6 +451,143 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(final_state["executor_state"], "spawn_pending")
         self.assertEqual(final_state["executor_model"], "gpt-5.6-terra")
 
+    def test_causal_review_roundtrip_is_fingerprint_only_and_ascii_safe(self) -> None:
+        session = "windows-causal-review"
+        initial_events = [
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "causal-objective",
+                "model": "gpt-5.6-sol",
+                "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
+            },
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "causal-plan",
+                "last_assistant_message": (
+                    "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n"
+                    "3. 完成实机验证与回滚检查\n验收：问题不再复现。\n"
+                    "计划已就绪，等待确认后执行"
+                ),
+            },
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "causal-confirm",
+                "prompt": "确认按这个计划执行",
+            },
+        ]
+        for payload in initial_events:
+            result = self.run_command_windows(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout:
+                self.assertTrue(result.stdout.isascii())
+                json.loads(result.stdout)
+
+        state_path = next((self.data / "sessions").glob("*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        contract_id = state["execution_contract_id"]
+        execution_events = [
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "causal-executor-request",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "execute_confirmed_plan",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "medium",
+                    "fork_turns": "none",
+                    "message": (
+                        "Unique exclusive executor. "
+                        f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
+                        f"plan_generation={state['plan_generation']}. Exclusive execution ownership; "
+                        "implement the full actionable plan and run verification acceptance tests."
+                    ),
+                },
+            },
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "causal-executor-start",
+                "agent_id": "windows-causal-executor",
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "causal-change",
+                "agent_id": "windows-causal-executor",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+                "tool_response": {"status": "completed"},
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "causal-verification",
+                "agent_id": "windows-causal-executor",
+                "tool_name": "Bash",
+                "tool_input": {"command": "py -3 -m unittest tests.test_reboot"},
+                "tool_response": {"exit_code": 0, "output": "1 test passed"},
+            },
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": session,
+                "hook_run_id": "causal-executor-stop",
+                "agent_id": "windows-causal-executor",
+                "status": "completed",
+                "last_assistant_message": "implementation and verification complete",
+            },
+        ]
+        for payload in execution_events:
+            result = self.run_command_windows(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout:
+                self.assertTrue(result.stdout.isascii())
+                json.loads(result.stdout)
+
+        feedback = "验收发现修复后新增黑屏，请检查是不是刚才改动导致"
+        submitted = self.run_command_windows(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "causal-feedback",
+                "prompt": feedback,
+            }
+        )
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        self.assertTrue(submitted.stdout.isascii())
+        json.loads(submitted.stdout)
+        triage = json.loads(state_path.read_text(encoding="utf-8"))
+        baseline = triage["last_execution_baseline"]
+        review = triage["causal_review"]
+        self.assertEqual(review["state"], "triage_required")
+        self.assertEqual(review["baseline_id"], baseline["baseline_id"])
+        self.assertRegex(review["review_id"], r"^[0-9a-f]{32}$")
+        self.assertNotIn(feedback, json.dumps(triage, ensure_ascii=False))
+
+        resolved_result = self.run_command_windows(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "causal-conclusion",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={baseline['baseline_id']} review_id={review['review_id']} "
+                    f"outcome=introduced evidence_digest={'c' * 32}"
+                ),
+            }
+        )
+        self.assertEqual(resolved_result.returncode, 0, resolved_result.stderr)
+        self.assertTrue(resolved_result.stdout.isascii())
+        json.loads(resolved_result.stdout)
+        resolved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(resolved["causal_review"]["state"], "resolved")
+        self.assertEqual(resolved["causal_review"]["outcome"], "introduced")
+        self.assertEqual(resolved["plan_state"], "analyzing")
+        self.assertIsNone(resolved["execution_contract_id"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

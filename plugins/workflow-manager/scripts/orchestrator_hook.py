@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 10
-WRITER_VERSION = "1.0.23"
+SCHEMA_VERSION = 11
+WRITER_VERSION = "1.0.24"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "1"
@@ -84,6 +84,9 @@ EXECUTOR_FAILURE_KINDS = {
     "verification_failed",
 }
 MAX_EXECUTOR_ATTEMPTS = 2
+CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
+CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
+BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
 
 SUCCESS_STATUSES = {"ok"}
 ERROR_STATUSES = {
@@ -145,10 +148,74 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     generation = max(safe_int(state.get("plan_generation")), 0)
     if not (objective and difficulty and plan and generation > 0):
         return None
-    return stable_hash(
-        f"{EXECUTION_PROFILE_VERSION}\0{objective}\0{difficulty}\0{generation}\0{plan}",
+    material = f"{EXECUTION_PROFILE_VERSION}\0{objective}\0{difficulty}\0{generation}\0{plan}"
+    review = state.get("causal_review") if isinstance(state.get("causal_review"), dict) else {}
+    review_id = safe_fingerprint(review.get("review_id"))
+    if review.get("state") == "resolved" and review_id:
+        material += f"\0{review_id}"
+    return stable_hash(material, 32)
+
+
+def _fingerprint_digest(values: list[str]) -> str | None:
+    bounded = [value for value in values if re.fullmatch(r"[0-9a-f]{8,64}", value)]
+    return stable_hash("\0".join(bounded), 32) if bounded else None
+
+
+def build_execution_baseline(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Seal bounded facts for the last contract without treating agent completion as acceptance."""
+    contract_id = safe_fingerprint(state.get("execution_contract_id"))
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    plan = safe_fingerprint(state.get("plan_digest"))
+    if not (contract_id and objective and plan):
+        return None
+    operations = [
+        item
+        for item in state.get("operations", [])
+        if isinstance(item, dict) and item.get("execution_contract_id") == contract_id
+    ]
+    change_categories = {"implementation", "build_package", "delivery_device"}
+    verification_categories = {"verification", "evidence"}
+    change_indexes = [
+        index
+        for index, item in enumerate(operations)
+        if item.get("category") in change_categories and item.get("status") in SUCCESS_STATUSES
+    ]
+    last_change_index = max(change_indexes, default=-1)
+    changes = [
+        str(operations[index].get("fingerprint") or "") for index in change_indexes
+    ]
+    verification = [
+        item
+        for index, item in enumerate(operations)
+        if index > last_change_index and item.get("category") in verification_categories
+    ]
+    verification_digest = _fingerprint_digest(
+        [str(item.get("fingerprint") or "") for item in verification]
+    )
+    if not verification:
+        acceptance = "incomplete"
+    else:
+        last_status = str(verification[-1].get("status") or "unknown")
+        if last_status in SUCCESS_STATUSES:
+            acceptance = "passed"
+        elif last_status in ERROR_STATUSES or last_status.startswith("error"):
+            acceptance = "failed"
+        else:
+            acceptance = "incomplete"
+    change_digest = _fingerprint_digest(changes)
+    baseline_id = stable_hash(
+        f"{objective}\0{plan}\0{contract_id}\0{change_digest or ''}\0{verification_digest or ''}",
         32,
     )
+    return {
+        "baseline_id": baseline_id,
+        "objective_fingerprint": objective,
+        "plan_digest": plan,
+        "execution_contract_id": contract_id,
+        "change_set_digest": change_digest,
+        "verification_digest": verification_digest,
+        "acceptance_status": acceptance,
+    }
 
 
 def reset_executor_binding(state: dict[str, Any], *, preserve_failure: bool = False) -> None:
@@ -781,6 +848,15 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "executor_model": None,
         "executor_reasoning_effort": None,
         "executor_fork_turns": None,
+        "last_execution_baseline": {},
+        "causal_review": {
+            "state": "none",
+            "review_id": None,
+            "report_fingerprint": None,
+            "baseline_id": None,
+            "outcome": None,
+            "evidence_digest": None,
+        },
         "created_at": now,
         "updated_at": now,
         "objective": {},
@@ -1021,6 +1097,44 @@ def _safe_continuity(item: Any) -> dict[str, Any]:
     }
 
 
+def _safe_execution_baseline(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    baseline_id = safe_fingerprint(item.get("baseline_id"))
+    objective = safe_fingerprint(item.get("objective_fingerprint"))
+    plan = safe_fingerprint(item.get("plan_digest"))
+    contract = safe_fingerprint(item.get("execution_contract_id"))
+    if not (baseline_id and objective and plan and contract):
+        return {}
+    acceptance = item.get("acceptance_status")
+    return {
+        "baseline_id": baseline_id,
+        "objective_fingerprint": objective,
+        "plan_digest": plan,
+        "execution_contract_id": contract,
+        "change_set_digest": safe_fingerprint(item.get("change_set_digest")) or None,
+        "verification_digest": safe_fingerprint(item.get("verification_digest")) or None,
+        "acceptance_status": (
+            acceptance if acceptance in BASELINE_ACCEPTANCE_STATUSES else "unknown"
+        ),
+    }
+
+
+def _safe_causal_review(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        item = {}
+    state_value = item.get("state")
+    outcome = item.get("outcome")
+    return {
+        "state": state_value if state_value in CAUSAL_REVIEW_STATES else "none",
+        "review_id": safe_fingerprint(item.get("review_id")) or None,
+        "report_fingerprint": safe_fingerprint(item.get("report_fingerprint")) or None,
+        "baseline_id": safe_fingerprint(item.get("baseline_id")) or None,
+        "outcome": outcome if outcome in CAUSAL_REVIEW_OUTCOMES else None,
+        "evidence_digest": safe_fingerprint(item.get("evidence_digest")) or None,
+    }
+
+
 def _safe_compaction(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -1072,6 +1186,10 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             if item.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
             else None
         ),
+        "last_execution_baseline": _safe_execution_baseline(
+            item.get("last_execution_baseline")
+        ),
+        "causal_review": _safe_causal_review(item.get("causal_review")),
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
             if (scope := _safe_active_agent_scope(raw)) is not None
@@ -1229,6 +1347,10 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if fork_turns == "none" or re.fullmatch(r"[1-9]\d*", fork_turns)
         else None
     )
+    base["last_execution_baseline"] = _safe_execution_baseline(
+        value.get("last_execution_baseline")
+    )
+    base["causal_review"] = _safe_causal_review(value.get("causal_review"))
 
     base["objective"] = safe_metadata(value.get("objective"))
     if not base["objective"] and value.get("last_objective"):
@@ -1285,6 +1407,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_model"] = None
         base["executor_reasoning_effort"] = None
         base["executor_fork_turns"] = None
+    if base["causal_review"].get("state") in {"triage_required", "triaging"}:
+        base["model_profile"] = "work_assessment"
 
     base["prompts"] = [item for raw in as_list(value.get("prompts")) if (item := _safe_prompt(raw)) is not None][-MAX_PROMPTS:]
     base["operations"] = [item for raw in as_list(value.get("operations")) if (item := _safe_operation(raw)) is not None][-MAX_OPERATIONS:]
@@ -1303,6 +1427,17 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         for item in as_list(value.get("duplicate_notices"))
         if isinstance(item, dict) and item.get("fingerprint")
     ][-MAX_DUPLICATE_NOTICES:]
+    if (
+        not base["last_execution_baseline"]
+        and safe_int(value.get("schema_version")) <= 10
+        and base.get("executor_state") == "succeeded"
+    ):
+        # Old schemas did not seal a baseline. Reconstruct only contract/change facts and
+        # never infer user acceptance or a causal conclusion from executor completion.
+        migrated_baseline = build_execution_baseline(base)
+        if migrated_baseline:
+            migrated_baseline["acceptance_status"] = "incomplete"
+            base["last_execution_baseline"] = migrated_baseline
     base["schema_version"] = SCHEMA_VERSION
     base["writer_version"] = WRITER_VERSION
     return base
@@ -2825,6 +2960,28 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
     return f"parent or unbound {mutating}"
 
 
+def causal_review_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
+    review = _safe_causal_review(state.get("causal_review"))
+    if review.get("state") not in {"triage_required", "triaging"}:
+        return None
+    tool_key = normalized_key(payload.get("tool_name"))
+    if "updateplan" in tool_key or "requestuserinput" in tool_key:
+        return None
+    if is_subagent_spawn_tool(payload):
+        return None if subagent_request_is_read_only(payload) else "causal review execution subagent"
+    # Reuse the mature hard-plan mutation classifier, independent of the old plan's confirmed state.
+    mutating = plan_confirmation_guard(
+        payload,
+        {
+            **state,
+            "work_difficulty": "hard",
+            "plan_state": "awaiting_confirmation",
+            "confirmed_plan_digest": None,
+        },
+    )
+    return f"causal review {mutating}" if mutating else None
+
+
 def shell_syntax_view(command: str) -> str:
     """Mask quoted/escaped data while preserving shell operators and source offsets."""
     visible = list(command)
@@ -3497,6 +3654,10 @@ def session_start(payload: dict[str, Any]) -> None:
             "executor_model": state.get("executor_model"),
             "executor_reasoning_effort": state.get("executor_reasoning_effort"),
             "executor_fork_turns": state.get("executor_fork_turns"),
+            "last_execution_baseline": _safe_execution_baseline(
+                state.get("last_execution_baseline")
+            ),
+            "causal_review": _safe_causal_review(state.get("causal_review")),
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
@@ -3519,6 +3680,14 @@ def session_start(payload: dict[str, Any]) -> None:
             f"Metadata: {json.dumps(digest, ensure_ascii=False, separators=(',', ':'))}. "
             "Rerun when inputs, state, device, freshness, or evidence changed."
         )
+        review = _safe_causal_review(state.get("causal_review"))
+        if review.get("state") in {"triage_required", "triaging"}:
+            base += (
+                " Resume the active causal review read-only from the native summary and recorded baseline; "
+                "do not reuse the old executor or mutate speculatively. Re-check only stale/missing evidence, "
+                f"then bind the structured conclusion to baseline_id={review.get('baseline_id')} and "
+                f"review_id={review.get('review_id')}."
+            )
     emit_context("SessionStart", base)
 
 
@@ -3569,6 +3738,41 @@ NEW_OBJECTIVE_MARKERS = (
     "现在帮我",
     "再帮我",
     "顺便帮我",
+)
+
+REGRESSION_REPORT_MARKERS = (
+    "验收",
+    "仍然",
+    "还是",
+    "没修好",
+    "未修好",
+    "又出现",
+    "新出现",
+    "新增",
+    "修复后",
+    "改动后",
+    "刚才改动",
+    "回归",
+    "导致",
+    "是否相关",
+    "是不是",
+    "regression",
+    "still fails",
+    "not fixed",
+    "after the fix",
+    "introduced",
+)
+SUCCESS_FEEDBACK_MARKERS = (
+    "验收通过",
+    "验证通过",
+    "已经解决",
+    "问题已解决",
+    "没有其他问题",
+    "没问题了",
+    "修好了",
+    "acceptance passed",
+    "verified fixed",
+    "issue resolved",
 )
 
 
@@ -3639,6 +3843,59 @@ def explicit_new_objective(prompt: str) -> bool:
             normalized,
         )
         or re.match(r"^现在帮我.{0,24}(?:写一个|创建|实现|解决|处理)(?:新的?|另一个)", normalized)
+    )
+
+
+def successful_acceptance_feedback(prompt: str) -> bool:
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    regression_signal = any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
+    contrast_signal = bool(
+        re.search(r"(?:但是|但|不过|然而|却|同时|另外|可是|but|however|yet)", normalized)
+    )
+    return any(marker in normalized for marker in SUCCESS_FEEDBACK_MARKERS) and not (
+        regression_signal and contrast_signal
+    )
+
+
+def regression_feedback(
+    prompt: str, previous: dict[str, Any], *, new_objective: bool = False
+) -> bool:
+    baseline = _safe_execution_baseline(previous.get("last_execution_baseline"))
+    review = _safe_causal_review(previous.get("causal_review"))
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    return bool(
+        baseline.get("change_set_digest")
+        and previous.get("plan_state") == "confirmed"
+        and previous.get("executor_state") == "succeeded"
+        and baseline.get("execution_contract_id")
+        == safe_fingerprint(previous.get("execution_contract_id"))
+        and review.get("state") not in {"triage_required", "triaging"}
+        and not new_objective
+        and not is_control_followup(prompt)
+        and not successful_acceptance_feedback(prompt)
+        and any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
+    )
+
+
+def unmet_acceptance_without_recorded_change(
+    prompt: str, previous: dict[str, Any], *, new_objective: bool = False
+) -> bool:
+    """Replan a failed outcome without inventing a change-caused regression."""
+    baseline = _safe_execution_baseline(previous.get("last_execution_baseline"))
+    review = _safe_causal_review(previous.get("causal_review"))
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    return bool(
+        baseline
+        and not baseline.get("change_set_digest")
+        and previous.get("plan_state") == "confirmed"
+        and previous.get("executor_state") == "succeeded"
+        and baseline.get("execution_contract_id")
+        == safe_fingerprint(previous.get("execution_contract_id"))
+        and review.get("state") == "none"
+        and not new_objective
+        and not is_control_followup(prompt)
+        and not successful_acceptance_feedback(prompt)
+        and any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
     )
 
 
@@ -3745,12 +4002,32 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     previous = snapshot_state(payload)
     pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
     active_plan = pending_plan or previous.get("plan_state") == "confirmed"
-    new_objective = active_plan and explicit_new_objective(prompt)
+    explicit_new = explicit_new_objective(prompt)
+    new_objective = bool(
+        explicit_new
+        and (
+            active_plan
+            or previous.get("last_execution_baseline")
+            or previous.get("causal_review", {}).get("state") != "none"
+        )
+    )
+    causal_active = (
+        _safe_causal_review(previous.get("causal_review")).get("state")
+        in {"triage_required", "triaging"}
+    )
+    acceptance_success = successful_acceptance_feedback(prompt)
+    causal_report = regression_feedback(prompt, previous, new_objective=new_objective)
+    acceptance_miss = unmet_acceptance_without_recorded_change(
+        prompt, previous, new_objective=new_objective
+    )
     already_confirmed = previous.get("plan_state") == "confirmed"
     confirmed_plan = pending_plan and pure_plan_confirmation(prompt)
-    replan = active_plan and plan_replan_request(prompt)
+    replan = active_plan and not causal_active and plan_replan_request(prompt)
     plan_changed = (
         active_plan
+        and not causal_active
+        and not causal_report
+        and not acceptance_miss
         and not new_objective
         and prompt_changes_pending_plan(prompt)
         and not confirmed_plan
@@ -3759,17 +4036,66 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         is_control_followup(prompt) or is_progress_followup(prompt) or active_plan
     )
     classification = classify_prompt(prompt)
-    if continuation and previous.get("last_route"):
+    if continuation and not causal_report and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
-    if already_confirmed and continuation and not plan_changed and not new_objective:
+    if causal_active and not new_objective:
+        classification["model_profile"] = "work_assessment"
+    elif (
+        already_confirmed
+        and continuation
+        and not causal_report
+        and not acceptance_miss
+        and not plan_changed
+        and not new_objective
+    ):
         classification["model_profile"] = previous.get(
             "model_profile", "work_executor_low_latest"
+        )
+    if causal_report:
+        classification["model_profile"] = "work_assessment"
+    if acceptance_miss:
+        classification.update(
+            {
+                "task_domain": "work",
+                "model_profile": "work_assessment",
+                "work_difficulty": "hard",
+                "difficulty_confidence": "high",
+                "difficulty_rule_codes": ["acceptance_unmet_without_change"],
+                "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
+                "difficulty_decision_id": stable_hash(
+                    f"acceptance_miss\0{previous.get('difficulty_decision_id')}\0{stable_hash(prompt)}",
+                    24,
+                ),
+            }
         )
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
         prompt_meta = text_metadata(prompt)
-        if plan_changed and state.get("objective"):
+        if causal_report:
+            baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
+            review_id = stable_hash(
+                f"{baseline.get('baseline_id')}\0{prompt_meta.get('fingerprint')}", 32
+            )
+            state["causal_review"] = {
+                "state": "triage_required",
+                "review_id": review_id,
+                "report_fingerprint": prompt_meta.get("fingerprint"),
+                "baseline_id": baseline.get("baseline_id"),
+                "outcome": None,
+                "evidence_digest": None,
+            }
+            state["model_profile"] = "work_assessment"
+        elif acceptance_miss and state.get("objective"):
+            prior = state["objective"]
+            state["objective"] = {
+                "fingerprint": stable_hash(
+                    f"{prior.get('fingerprint')}\0{prompt_meta.get('fingerprint')}", 16
+                ),
+                "length": max(safe_int(prior.get("length")), 0) + prompt_meta["length"],
+                "updated_at": utc_now(),
+            }
+        elif plan_changed and state.get("objective"):
             prior = state["objective"]
             state["objective"] = {
                 "fingerprint": stable_hash(
@@ -3795,10 +4121,29 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "difficulty_decision_id",
         ):
             state[key] = classification.get(key)
-        if already_confirmed and continuation and not plan_changed and not new_objective:
+        if causal_report or acceptance_miss or (causal_active and not new_objective):
+            state["model_profile"] = "work_assessment"
+        elif already_confirmed and continuation and not plan_changed and not new_objective:
             state["model_profile"] = previous.get("model_profile", "work_executor_low_latest")
         objective_fingerprint = state.get("objective", {}).get("fingerprint")
-        if confirmed_plan:
+        if causal_report:
+            # Freeze the old plan/contract for comparison. The causal guard allows only
+            # evidence collection until a structured, baseline-bound conclusion is recorded.
+            pass
+        elif acceptance_miss:
+            state["plan_state"] = "analyzing"
+            state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            state["confirmed_plan_digest"] = None
+            state["confirmed_at"] = None
+            reset_executor_binding(state)
+            state["causal_review"] = _safe_causal_review(None)
+            if state.get("last_execution_baseline"):
+                state["last_execution_baseline"]["acceptance_status"] = "failed"
+            state["model_profile"] = "work_assessment"
+        elif confirmed_plan:
             binding_valid = bool(
                 state.get("plan_digest")
                 and state.get("plan_objective_fingerprint") == objective_fingerprint
@@ -3839,6 +4184,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["plan_state"] = (
                 "analyzing" if classification.get("work_difficulty") == "hard" else "none"
             )
+            state["causal_review"] = _safe_causal_review(None)
+            state["last_execution_baseline"] = {}
+        if acceptance_success and state.get("last_execution_baseline"):
+            state["last_execution_baseline"]["acceptance_status"] = "passed"
+            if causal_active:
+                state["causal_review"] = _safe_causal_review(None)
         state.setdefault("prompts", []).append(
             {
                 "at": utc_now(),
@@ -3852,13 +4203,42 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
 
     mutate_state(payload, update)
     pressure = telemetry.get("pressure")
-    should_inject = classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
+    should_inject = causal_report or acceptance_miss or causal_active or classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
         isinstance(pressure, (int, float)) and pressure >= PRESSURE_TRIM_THRESHOLD
     )
     if not should_inject:
         return
     context = routing_context(classification, telemetry)
-    if confirmed_plan:
+    if causal_report:
+        refreshed = snapshot_state(payload)
+        review = _safe_causal_review(refreshed.get("causal_review"))
+        context += (
+            " Causal review required before any corrective mutation. Compare the prior objective, confirmed plan, "
+            "execution contract, bounded change/verification baseline, temporal order, changed inputs/environment, "
+            "and the reported symptom. User wording is a trigger, never proof. Keep work read-only until evidence "
+            f"supports a bound conclusion. baseline_id={review.get('baseline_id')} "
+            f"review_id={review.get('review_id')}. End the assessment with exactly: CAUSAL_REVIEW "
+            f"baseline_id={review.get('baseline_id')} review_id={review.get('review_id')} "
+            "outcome=<introduced|fix_ineffective|unrelated|uncertain> evidence_digest=<32hex>."
+        )
+    elif acceptance_miss:
+        context += (
+            " Acceptance was not met, but the completed executor recorded no successful change set, so do not "
+            "claim that a prior mutation introduced the symptom and do not open a causal-review contract. The old "
+            "execution contract is invalidated. Use high-reasoning read-only analysis, then present one coherent "
+            "replacement Hard plan covering the original acceptance, current symptom, verification, risk, and "
+            "rollback; wait for strict confirmation before mutation."
+        )
+    elif causal_active and not new_objective and not acceptance_success:
+        refreshed = snapshot_state(payload)
+        review = _safe_causal_review(refreshed.get("causal_review"))
+        context += (
+            " Continue the active causal review read-only; do not reactivate or reuse the old confirmed executor. "
+            "Relate any new facts to the original objective, plan, contract, change baseline, and verification, "
+            f"then bind the conclusion to baseline_id={review.get('baseline_id')} and "
+            f"review_id={review.get('review_id')}."
+        )
+    elif confirmed_plan:
         context += (
             " Confirmed plan binding is valid. The parent remains the high-reasoning coordinator; before any "
             "mutation, spawn exactly one exclusive confirmed-plan executor using the newest actually available "
@@ -4096,6 +4476,32 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
+    causal_block = causal_review_guard(payload, state)
+    if causal_block:
+        def record_causal_guard(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "causal_review",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+            review = _safe_causal_review(current.get("causal_review"))
+            if review.get("state") == "triage_required":
+                review["state"] = "triaging"
+                current["causal_review"] = review
+
+        mutate_state(payload, record_causal_guard)
+        emit_pretool_deny(
+            f"Workflow Manager blocked {causal_block}: causal review is read-only until a conclusion bound to "
+            "the current baseline_id and review_id records introduced, fix_ineffective, unrelated, or uncertain. "
+            "Compare prior plan/change/verification evidence before corrective mutation; do not reuse the old executor."
+        )
+        return
     executor_block = executor_gate_guard(payload, state)
     if executor_block:
         def record_executor_guard(current: dict[str, Any]) -> None:
@@ -4431,6 +4837,10 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "execution_contract_id": state.get("execution_contract_id"),
                 "executor_attempt": safe_int(state.get("executor_attempt")),
                 "executor_failure_kind": state.get("executor_failure_kind"),
+                "last_execution_baseline": _safe_execution_baseline(
+                    state.get("last_execution_baseline")
+                ),
+                "causal_review": _safe_causal_review(state.get("causal_review")),
             "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
@@ -4671,6 +5081,10 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             elif successful and state.get("executor_state") == "running":
                 state["executor_state"] = "succeeded"
                 state["executor_failure_kind"] = None
+                baseline = build_execution_baseline(state)
+                if baseline:
+                    state["last_execution_baseline"] = baseline
+                    state["causal_review"] = _safe_causal_review(None)
             elif not successful:
                 state["executor_state"] = (
                     "recovery_required"
@@ -4696,8 +5110,20 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         )
     else:
         emit_continue()
+
+
+CAUSAL_REVIEW_RESULT_RE = re.compile(
+    r"(?im)^\s*CAUSAL_REVIEW\s+"
+    r"baseline_id=([0-9a-f]{32})\s+"
+    r"review_id=([0-9a-f]{32})\s+"
+    r"outcome=(introduced|fix_ineffective|unrelated|uncertain)\s+"
+    r"evidence_digest=([0-9a-f]{32})\s*$"
+)
+
+
 def stop(payload: dict[str, Any]) -> None:
     assistant_message = str(payload.get("last_assistant_message") or "")
+    causal_match = CAUSAL_REVIEW_RESULT_RE.search(assistant_message)
     plan_ready = bool(
         len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", assistant_message)) >= 2
         and re.search(r"(?:验收|验证|test|verify|acceptance)", assistant_message, re.I)
@@ -4707,6 +5133,100 @@ def stop(payload: dict[str, Any]) -> None:
     def update(state: dict[str, Any]) -> None:
         state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
+        review = _safe_causal_review(state.get("causal_review"))
+        if review.get("state") in {"triage_required", "triaging"}:
+            if causal_match:
+                baseline_id, review_id, outcome, evidence_digest = causal_match.groups()
+                binding_valid = bool(
+                    baseline_id == review.get("baseline_id")
+                    and review_id == review.get("review_id")
+                    and baseline_id
+                    == _safe_execution_baseline(
+                        state.get("last_execution_baseline")
+                    ).get("baseline_id")
+                )
+                if binding_valid:
+                    review["outcome"] = outcome
+                    review["evidence_digest"] = evidence_digest
+                    if outcome == "uncertain":
+                        review["state"] = "triaging"
+                        state["model_profile"] = "work_assessment"
+                    else:
+                        review["state"] = "resolved"
+                        report_fingerprint = str(review.get("report_fingerprint") or "")
+                        prior_objective = str(
+                            state.get("objective", {}).get("fingerprint") or ""
+                        )
+                        state["objective"] = {
+                            "fingerprint": stable_hash(
+                                f"{prior_objective}\0{report_fingerprint}\0{review_id}", 16
+                            ),
+                            "length": max(
+                                safe_int(state.get("objective", {}).get("length")), 0
+                            ),
+                            "updated_at": utc_now(),
+                        }
+                        state["plan_state"] = "analyzing"
+                        state["plan_generation"] = max(
+                            safe_int(state.get("plan_generation")), 0
+                        ) + 1
+                        state["plan_digest"] = None
+                        state["plan_objective_fingerprint"] = None
+                        state["plan_difficulty_decision_id"] = None
+                        state["confirmed_plan_digest"] = None
+                        state["confirmed_at"] = None
+                        reset_executor_binding(state)
+                        prior_followup_difficulty = state.get("work_difficulty")
+                        prior_followup_confidence = state.get("difficulty_confidence")
+                        prior_followup_rules = list(state.get("difficulty_rule_codes") or [])
+                        prior_followup_decision = state.get("difficulty_decision_id")
+                        state["task_domain"] = "work"
+                        state["work_difficulty"] = (
+                            "hard"
+                            if outcome in {"introduced", "fix_ineffective"}
+                            else (
+                                prior_followup_difficulty
+                                if prior_followup_difficulty in {"simple", "hard"}
+                                else "unknown"
+                            )
+                        )
+                        state["difficulty_confidence"] = (
+                            "high"
+                            if outcome in {"introduced", "fix_ineffective"}
+                            else (
+                                prior_followup_confidence
+                                if prior_followup_confidence in {"low", "medium", "high"}
+                                else "low"
+                            )
+                        )
+                        state["difficulty_rule_codes"] = (
+                            ["causal_regression_review"]
+                            if outcome in {"introduced", "fix_ineffective"}
+                            else prior_followup_rules or ["causal_unrelated_followup"]
+                        )
+                        state["difficulty_decision_id"] = (
+                            stable_hash(f"causal\0{outcome}\0{review_id}", 24)
+                            if outcome in {"introduced", "fix_ineffective"}
+                            else safe_fingerprint(prior_followup_decision)
+                            or stable_hash(f"causal\0{outcome}\0{review_id}", 24)
+                        )
+                        state["model_profile"] = "work_assessment"
+                        route = dict(state.get("last_route") or {})
+                        route.update(
+                            {
+                                "task_domain": state["task_domain"],
+                                "model_profile": state["model_profile"],
+                                "work_difficulty": state["work_difficulty"],
+                                "difficulty_confidence": state["difficulty_confidence"],
+                                "difficulty_rule_codes": state["difficulty_rule_codes"],
+                                "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
+                                "difficulty_decision_id": state["difficulty_decision_id"],
+                                "at": utc_now(),
+                            }
+                        )
+                        state["last_route"] = route
+                    state["causal_review"] = review
+            return
         if state.get("work_difficulty") == "hard" and state.get("plan_state") in {
             "analyzing",
             "invalidated",

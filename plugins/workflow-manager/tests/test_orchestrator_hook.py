@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import io
 import importlib.util
@@ -103,6 +104,22 @@ class OrchestratorHookTests(unittest.TestCase):
                 "Stop",
             },
         )
+
+    def test_hook_test_method_names_are_unique(self) -> None:
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        target = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == self.__class__.__name__
+        )
+        names = [
+            node.name
+            for node in target.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        ]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        self.assertEqual(duplicates, [], duplicates)
 
     def test_declared_hook_commands_recover_removed_version_and_fail_open_without_candidate(self) -> None:
         hooks = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]
@@ -781,7 +798,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_pending_plan_constraint_change_invalidates_and_never_confirms(self) -> None:
         session = "hard-plan-change"
-        self.run_hook(
+        submitted = self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
@@ -897,6 +914,66 @@ class OrchestratorHookTests(unittest.TestCase):
             "tool_name": "collaboration.spawn_agent",
             "tool_input": tool_input,
         }
+
+    def create_completed_execution_baseline(
+        self,
+        session: str,
+        data: Path | None = None,
+    ) -> dict:
+        state = self.create_confirmed_executor_state(session, data)
+        self.run_hook(
+            self.executor_spawn_payload(
+                state,
+                session=session,
+                hook_run_id=f"{session}-executor-request",
+            ),
+            data=data,
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": f"{session}-executor-start",
+                "agent_id": f"{session}-executor",
+            },
+            data=data,
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": f"{session}-change",
+                "agent_id": f"{session}-executor",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+                "tool_response": {"status": "completed"},
+            },
+            data=data,
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": f"{session}-verification",
+                "agent_id": f"{session}-executor",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -m unittest tests.test_reboot"},
+                "tool_response": {"exit_code": 0, "output": "1 test passed"},
+            },
+            data=data,
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": session,
+                "hook_run_id": f"{session}-executor-stop",
+                "agent_id": f"{session}-executor",
+                "status": "completed",
+                "last_assistant_message": "implementation and verification complete",
+            },
+            data=data,
+        )
+        return self.load_only_state(data)
 
     def test_confirmed_executor_requires_explicit_profile_and_exact_contract(self) -> None:
         session = "executor-contract"
@@ -1162,7 +1239,7 @@ class OrchestratorHookTests(unittest.TestCase):
         ):
             legacy.pop(key, None)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema-nine"})
-        self.assertEqual(migrated["schema_version"], 10)
+        self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
         self.assertEqual(migrated["executor_state"], "spawn_required")
         self.assertEqual(migrated["executor_attempt"], 0)
         self.assertEqual(migrated["model_profile"], "work_executor_low_latest")
@@ -1211,6 +1288,527 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(invalidated["plan_state"], "analyzing")
         self.assertIsNone(invalidated["execution_contract_id"])
         self.assertEqual(invalidated["executor_state"], "none")
+
+    def test_completed_executor_seals_fingerprint_only_execution_baseline(self) -> None:
+        state = self.create_completed_execution_baseline("causal-baseline")
+        self.assertEqual(state["executor_state"], "succeeded")
+        baseline = state["last_execution_baseline"]
+        self.assertRegex(baseline["baseline_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(
+            baseline["objective_fingerprint"],
+            state["objective"]["fingerprint"],
+        )
+        self.assertEqual(baseline["plan_digest"], state["plan_digest"])
+        self.assertEqual(
+            baseline["execution_contract_id"],
+            state["execution_contract_id"],
+        )
+        self.assertRegex(baseline["change_set_digest"], r"^[0-9a-f]{32}$")
+        self.assertRegex(baseline["verification_digest"], r"^[0-9a-f]{32}$")
+        self.assertEqual(baseline["acceptance_status"], "passed")
+        serialized = json.dumps(state, ensure_ascii=False)
+        self.assertNotIn("implementation and verification complete", serialized)
+        self.assertNotIn("1 test passed", serialized)
+
+    def test_regression_feedback_requires_review_before_causal_outcome(self) -> None:
+        cases = {
+            "ineffective": (
+                "验收时发现设备还是会反复重启，之前的问题仍然没修好",
+                "fix_ineffective",
+            ),
+            "introduced": (
+                "验收发现修复重启后新增了黑屏问题",
+                "introduced",
+            ),
+        }
+        for label, (prompt, outcome) in cases.items():
+            with self.subTest(label=label):
+                data = Path(self.temporary.name) / f"causal-{label}"
+                completed = self.create_completed_execution_baseline(label, data)
+                old_contract = completed["execution_contract_id"]
+                baseline_id = completed["last_execution_baseline"]["baseline_id"]
+                submitted = self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": label,
+                        "hook_run_id": f"{label}-feedback",
+                        "prompt": prompt,
+                    },
+                    data=data,
+                )
+                self.assertIn("causal", submitted.stdout.lower())
+                triage = self.load_only_state(data)
+                review = triage["causal_review"]
+                self.assertEqual(review["state"], "triage_required")
+                self.assertEqual(review["baseline_id"], baseline_id)
+                self.assertRegex(review["review_id"], r"^[0-9a-f]{32}$")
+                self.assertEqual(
+                    review["report_fingerprint"],
+                    HOOK.text_metadata(prompt)["fingerprint"],
+                )
+                self.assertIsNone(review["outcome"])
+                self.assertNotIn(prompt, json.dumps(triage, ensure_ascii=False))
+
+                evidence_digest = "e" * 32
+                self.run_hook(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": label,
+                        "hook_run_id": f"{label}-causal-conclusion",
+                        "last_assistant_message": (
+                            "CAUSAL_REVIEW "
+                            f"baseline_id={baseline_id} review_id={review['review_id']} "
+                            f"outcome={outcome} evidence_digest={evidence_digest}"
+                        ),
+                    },
+                    data=data,
+                )
+                resolved = self.load_only_state(data)
+                self.assertEqual(resolved["causal_review"]["state"], "resolved")
+                self.assertEqual(resolved["causal_review"]["outcome"], outcome)
+                self.assertEqual(
+                    resolved["causal_review"]["evidence_digest"], evidence_digest
+                )
+                self.assertEqual(resolved["work_difficulty"], "hard")
+                self.assertEqual(resolved["plan_state"], "analyzing")
+                self.assertIsNone(resolved["execution_contract_id"])
+                self.assertNotEqual(resolved.get("execution_contract_id"), old_contract)
+
+    def test_success_status_and_explicit_new_objective_do_not_open_causal_review(self) -> None:
+        cases = {
+            "accepted": "验收通过，问题已经解决，没有其他问题",
+            "status": "现在进展怎么样了",
+            "new-objective": "新任务：帮我写一个 CSV 转 JSON 脚本",
+        }
+        for label, prompt in cases.items():
+            with self.subTest(label=label):
+                data = Path(self.temporary.name) / f"non-regression-{label}"
+                state = self.create_completed_execution_baseline(label, data)
+                baseline_id = state["last_execution_baseline"]["baseline_id"]
+                self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": label,
+                        "hook_run_id": f"{label}-followup",
+                        "prompt": prompt,
+                    },
+                    data=data,
+                )
+                updated = self.load_only_state(data)
+                self.assertEqual(updated["causal_review"]["state"], "none")
+                if label != "new-objective":
+                    self.assertEqual(
+                        updated["last_execution_baseline"]["baseline_id"], baseline_id
+                    )
+
+    def test_success_for_original_symptom_does_not_hide_a_new_regression(self) -> None:
+        session = "mixed-acceptance-regression"
+        self.create_completed_execution_baseline(session)
+        prompt = "原来的重启问题已经解决，但修复后新出现黑屏，请整体检查"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "mixed-feedback",
+                "prompt": prompt,
+            }
+        )
+        state = self.load_only_state()
+        self.assertEqual(state["causal_review"]["state"], "triage_required")
+        self.assertEqual(
+            state["causal_review"]["report_fingerprint"],
+            HOOK.text_metadata(prompt)["fingerprint"],
+        )
+
+    def test_no_change_acceptance_failure_replans_without_causal_claim(self) -> None:
+        session = "no-change-baseline"
+        state = self.create_confirmed_executor_state(session)
+        self.run_hook(
+            self.executor_spawn_payload(
+                state,
+                session=session,
+                hook_run_id="no-change-request",
+            )
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "no-change-start",
+                "agent_id": "no-change-executor",
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": session,
+                "hook_run_id": "no-change-stop",
+                "agent_id": "no-change-executor",
+                "status": "completed",
+                "last_assistant_message": "analysis complete without mutation",
+            }
+        )
+        completed = self.load_only_state()
+        self.assertEqual(completed["executor_state"], "succeeded")
+        self.assertIsNone(
+            completed.get("last_execution_baseline", {}).get("change_set_digest")
+        )
+        submitted = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "no-change-feedback",
+                "prompt": "验收发现又出现重启",
+            }
+        )
+        replanning = self.load_only_state()
+        self.assertEqual(replanning["causal_review"]["state"], "none")
+        self.assertEqual(replanning["plan_state"], "analyzing")
+        self.assertEqual(replanning["executor_state"], "none")
+        self.assertIsNone(replanning["execution_contract_id"])
+        self.assertEqual(
+            replanning["last_execution_baseline"]["acceptance_status"], "failed"
+        )
+        self.assertIn("recorded no successful change set", submitted.stdout)
+
+    def test_no_change_causal_wording_still_replans_without_invented_review(self) -> None:
+        session = "causal-no-change"
+        state = self.create_confirmed_executor_state(session)
+        self.run_hook(
+            self.executor_spawn_payload(
+                state,
+                session=session,
+                hook_run_id="no-change-executor-request",
+            )
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "no-change-executor-start",
+                "agent_id": "no-change-executor",
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": session,
+                "hook_run_id": "no-change-executor-stop",
+                "agent_id": "no-change-executor",
+                "status": "completed",
+                "last_assistant_message": "no source change was required",
+            }
+        )
+        completed = self.load_only_state()
+        self.assertEqual(completed["executor_state"], "succeeded")
+        self.assertIsNone(
+            completed.get("last_execution_baseline", {}).get("change_set_digest")
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "no-change-feedback",
+                "prompt": "验收发现仍然会重启，请检查是不是前面处理导致",
+            }
+        )
+        state = self.load_only_state()
+        self.assertEqual(state["causal_review"]["state"], "none")
+        self.assertEqual(state["plan_state"], "analyzing")
+        self.assertIsNone(state["execution_contract_id"])
+
+    def test_causal_triage_allows_read_only_and_blocks_mutation_or_executor(self) -> None:
+        session = "causal-guard"
+        completed = self.create_completed_execution_baseline(session)
+        old_contract = completed["execution_contract_id"]
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "causal-guard-feedback",
+                "prompt": "验收时发现修复后新增黑屏，请检查是不是刚才改动导致",
+            }
+        )
+        triage = self.load_only_state()
+        self.assertEqual(triage["causal_review"]["state"], "triage_required")
+
+        read_only = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "causal-read",
+                "tool_name": "Bash",
+                "tool_input": {"command": "rg -n reboot /tmp/device.log"},
+            }
+        )
+        self.assertEqual(read_only.stdout, "")
+
+        blocked_write = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "causal-write",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        write_output = json.loads(blocked_write.stdout)["hookSpecificOutput"]
+        self.assertEqual(write_output["permissionDecision"], "deny")
+        self.assertIn("causal", write_output["permissionDecisionReason"].lower())
+
+        blocked_executor = self.run_hook(
+            self.executor_spawn_payload(
+                completed,
+                session=session,
+                hook_run_id="causal-old-executor",
+                contract_id=old_contract,
+            )
+        )
+        executor_output = json.loads(blocked_executor.stdout)["hookSpecificOutput"]
+        self.assertEqual(executor_output["permissionDecision"], "deny")
+        self.assertIn("causal", executor_output["permissionDecisionReason"].lower())
+
+    def test_causal_conclusion_must_bind_review_and_replacement_contract(self) -> None:
+        session = "causal-binding"
+        completed = self.create_completed_execution_baseline(session)
+        old_contract = completed["execution_contract_id"]
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "causal-binding-feedback",
+                "prompt": "验收发现修复后新出现黑屏，请排查关联性",
+            }
+        )
+        triage = self.load_only_state()
+        baseline_id = triage["last_execution_baseline"]["baseline_id"]
+        review_id = triage["causal_review"]["review_id"]
+        wrong = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "wrong-causal-binding",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={'f' * 32} review_id={review_id} "
+                    f"outcome=introduced evidence_digest={'d' * 32}"
+                ),
+            }
+        )
+        self.assertEqual(wrong.returncode, 0)
+        unchanged = self.load_only_state()
+        self.assertIn(
+            unchanged["causal_review"]["state"],
+            {"triage_required", "triaging"},
+        )
+        self.assertIsNone(unchanged["causal_review"]["outcome"])
+
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "wrong-causal-review-binding",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={baseline_id} review_id={'e' * 32} "
+                    f"outcome=introduced evidence_digest={'d' * 32}"
+                ),
+            }
+        )
+        wrong_review = self.load_only_state()
+        self.assertIn(
+            wrong_review["causal_review"]["state"],
+            {"triage_required", "triaging"},
+        )
+        self.assertIsNone(wrong_review["causal_review"]["outcome"])
+
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "bound-causal-conclusion",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={baseline_id} review_id={review_id} "
+                    f"outcome=introduced evidence_digest={'d' * 32}"
+                ),
+            }
+        )
+        resolved = self.load_only_state()
+        self.assertEqual(resolved["causal_review"]["outcome"], "introduced")
+        self.assertEqual(resolved["plan_state"], "analyzing")
+        self.assertIsNone(resolved["execution_contract_id"])
+
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "replacement-plan",
+                "last_assistant_message": (
+                    "1. 对照前序变更与黑屏日志确认根因\n"
+                    "2. 修正对应模块并审查受影响路径\n"
+                    "3. 编译部署并验证重启与黑屏回归\n"
+                    "验收：重启和黑屏均不再复现。\n"
+                    "计划已就绪，等待确认后执行"
+                ),
+            }
+        )
+        ready = self.load_only_state()
+        self.assertEqual(ready["plan_state"], "awaiting_confirmation")
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "confirm-replacement-plan",
+                "prompt": "确认按这个计划执行",
+            }
+        )
+        confirmed = self.load_only_state()
+        self.assertEqual(confirmed["plan_state"], "confirmed")
+        self.assertNotEqual(confirmed["execution_contract_id"], old_contract)
+        self.assertEqual(
+            confirmed["execution_contract_id"],
+            HOOK.execution_contract_id(confirmed),
+        )
+        self.assertEqual(confirmed["causal_review"]["review_id"], review_id)
+
+    def test_unrelated_causal_outcome_reclassifies_without_reusing_old_contract(self) -> None:
+        session = "causal-unrelated"
+        completed = self.create_completed_execution_baseline(session)
+        old_contract = completed["execution_contract_id"]
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "unrelated-feedback",
+                "prompt": "验收时另一个独立模块出现网络断开，请判断是否相关",
+            }
+        )
+        triage = self.load_only_state()
+        review = triage["causal_review"]
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "unrelated-conclusion",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={review['baseline_id']} review_id={review['review_id']} "
+                    f"outcome=unrelated evidence_digest={'a' * 32}"
+                ),
+            }
+        )
+        state = self.load_only_state()
+        self.assertEqual(state["causal_review"]["state"], "resolved")
+        self.assertEqual(state["causal_review"]["outcome"], "unrelated")
+        self.assertNotEqual(state.get("execution_contract_id"), old_contract)
+        self.assertNotEqual(
+            state["objective"]["fingerprint"],
+            completed["objective"]["fingerprint"],
+        )
+
+    def test_uncertain_causal_outcome_stays_read_only(self) -> None:
+        session = "causal-uncertain"
+        self.create_completed_execution_baseline(session)
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "uncertain-feedback",
+                "prompt": "验收时又出现重启，但设备版本和输入都换过了，请整体排查",
+            }
+        )
+        triage = self.load_only_state()
+        review = triage["causal_review"]
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "uncertain-conclusion",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={review['baseline_id']} review_id={review['review_id']} "
+                    f"outcome=uncertain evidence_digest={'b' * 32}"
+                ),
+            }
+        )
+        state = self.load_only_state()
+        self.assertEqual(state["causal_review"]["state"], "triaging")
+        self.assertEqual(state["causal_review"]["outcome"], "uncertain")
+        blocked = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "uncertain-write",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        self.assertEqual(
+            json.loads(blocked.stdout)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+    def test_causal_review_survives_compaction_without_raw_feedback(self) -> None:
+        session = "causal-compaction"
+        state = self.create_completed_execution_baseline(session)
+        feedback = "验收发现刚才修复后新增黑屏，需要判断是否由前序改动导致"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "causal-compaction-feedback",
+                "prompt": feedback,
+            }
+        )
+        before = self.load_only_state()
+        baseline_id = state["last_execution_baseline"]["baseline_id"]
+        review_id = before["causal_review"]["review_id"]
+        self.run_hook(
+            {
+                "hook_event_name": "PreCompact",
+                "session_id": session,
+                "hook_run_id": "causal-precompact",
+                "trigger": "auto",
+            }
+        )
+        compacted = self.load_only_state()
+        checkpoint = compacted["compactions"][-1]
+        self.assertEqual(
+            checkpoint["last_execution_baseline"]["baseline_id"], baseline_id
+        )
+        self.assertEqual(checkpoint["causal_review"]["review_id"], review_id)
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        self.assertNotIn(feedback, serialized)
+
+        resumed = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "hook_run_id": "causal-resume",
+                "source": "resume",
+            }
+        )
+        self.assertIn(baseline_id, resumed.stdout)
+        self.assertIn(review_id, resumed.stdout)
+        self.assertNotIn(feedback, resumed.stdout)
+
+    def test_schema_ten_migration_never_invents_acceptance_or_causality(self) -> None:
+        legacy = self.create_confirmed_executor_state("schema-ten")
+        legacy["schema_version"] = 10
+        legacy["writer_version"] = "1.0.23"
+        legacy["executor_state"] = "succeeded"
+        legacy["operations"] = []
+        legacy.pop("last_execution_baseline", None)
+        legacy.pop("causal_review", None)
+        migrated = HOOK.normalize_state(legacy, {"session_id": "schema-ten"})
+        self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
+        self.assertEqual(migrated["causal_review"]["state"], "none")
+        self.assertIsNone(migrated["causal_review"]["outcome"])
+        self.assertNotEqual(
+            migrated.get("last_execution_baseline", {}).get("acceptance_status"),
+            "passed",
+        )
 
     def test_new_objective_while_plan_is_pending_clears_old_plan_binding(self) -> None:
         session = "pending-plan-new-objective"
@@ -2826,8 +3424,8 @@ class OrchestratorHookTests(unittest.TestCase):
             "last_route": {"label": "focused", "score": 1},
         }
         migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-domain"})
-        self.assertEqual(migrated["schema_version"], 10)
-        self.assertEqual(migrated["writer_version"], "1.0.23")
+        self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
+        self.assertEqual(migrated["writer_version"], HOOK.WRITER_VERSION)
         self.assertEqual(migrated["task_domain"], "unknown")
         self.assertEqual(migrated["model_profile"], "current")
         self.assertEqual(migrated["work_difficulty"], "unknown")

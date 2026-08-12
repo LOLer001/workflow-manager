@@ -12,6 +12,7 @@
 - 严格确认后，父会话继续以高推理负责协调和复核；从宿主当时实际暴露的选项中选择最新的较低档 Codex 模型，创建唯一合同执行子智能体并固定 `reasoning_effort=medium`，不硬编码具体模型名。
 - Hook 不能切换父会话模型；只有宿主接受带显式 `model` 覆盖且 `fork_turns=none` 或正整数的创建请求，才算子智能体切换证据。
 - `execution_contract_id` 同时绑定目标、难度决策、计划代次和计划摘要；失败按类型记录，初次失败后最多允许一次有实质修正的恢复，禁止原样重试。
+- 已确认计划执行后封存不含原文的改动/验证基线；同一会话验收发现新问题时，先结合前目标、计划、合同和证据做只读因果复核，再决定重规划、重分类或继续取证。
 - 新增约束、范围或目标会使待确认计划失效并要求重新规划；日常/工作与简单/困难分类都不改变删除、覆盖、安装、外发等安全边界。
 - 按任务复杂度选择直接处理、聚焦处理或复杂工作流。
 - 复杂任务主动评估关键路径，只要预期节省时间高于协调成本，就优先并行调度独立的读、写、测试、研究或复核工作。
@@ -34,14 +35,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.23\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.24\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.23/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.24/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -84,7 +85,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.23 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.24 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -108,7 +109,11 @@ codex plugin add workflow-manager@workflow-manager --json
 
 执行合同由目标指纹、难度决策 ID、正数计划代次与已确认计划摘要共同生成。创建请求还必须带完整可执行计划、独占范围、验收与回退。初次执行失败会记录为模型、配置、创建、启动匹配、合同过期、实现、构建、部署或验证等类型；仅在修正对应原因后允许一次恢复，总尝试最多两次。第二次失败或没有实质修正时停止并交回父会话重新评估，禁止换一种命令写法原样重试。
 
-状态 Schema 10 从 Schema 9 续接已确认计划时，只保留有效计划绑定并初始化为“尚未启动”的 `spawn_required`；不会因为旧状态写着 `confirmed` 就猜测子智能体已经创建或计划已经执行。
+合同执行完成后，Schema 11 会封存上一次目标、计划、合同、改动和后续验证的有界指纹基线。用户在同一会话验收发现遗留、复现或新症状时，表述只会触发只读复核，不会直接被当作因果证据。`introduced` 或 `fix_ineffective` 会要求整体重规划和再次确认，`unrelated` 会脱离旧合同重新分类，`uncertain` 会保持只读并继续取得缺失证据。
+
+压缩和恢复只携带基线/复核 ID、指纹、摘要和枚举，不保存用户原话或计划正文。Schema 10 迁移到 Schema 11 时不会猜测用户验收状态或自行生成因果结论。
+
+如果执行者结束但没有记录任何成功改动，随后又未通过验收，系统不会伪造“前序改动引入问题”的因果结论，也不会继续复用旧成功合同；它会标记验收失败，回到高推理分析并重新给出待确认的完整计划。
 
 ## 仓库结构
 
@@ -119,6 +124,7 @@ plugins/workflow-manager/              插件源码
   assets/stable-skill/workflow-manager/  唯一可调用 Skill 的安装源
     references/work-routing.md          困难判断、计划确认与防误拦边界
     references/confirmed-execution.md   合同执行、模型证据、失败恢复与迁移
+    references/regression-continuity.md 验收回归、因果复核、重规划与压缩续接
   hooks/hooks.json                     生命周期钩子
   scripts/install_stable_skill.py      用户级稳定路径安装器
   scripts/                             其他跨平台运行脚本
@@ -146,7 +152,7 @@ Set-Location plugins/workflow-manager
 py -3 -m unittest -v tests.test_windows_hook
 ```
 
-提交前应同时通过仓库校验、完整 Python 测试和 Windows 12 项原生测试。GitHub Actions 会自动执行这些检查。
+提交前应同时通过仓库校验、完整 Python 测试和 Windows 13 项原生测试。GitHub Actions 会自动执行这些检查。
 
 ## 贡献与发布
 
