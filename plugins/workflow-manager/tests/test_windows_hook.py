@@ -290,7 +290,10 @@ class WindowsHookTests(unittest.TestCase):
             text=True,
             capture_output=True,
             env=env,
-            timeout=10,
+            # Hosted Windows runners may cold-start nested Windows PowerShell and the Python
+            # launcher much more slowly than a developer workstation. This is an end-to-end
+            # compatibility probe, not a responsiveness SLA.
+            timeout=45,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("hookSpecificOutput", json.loads(result.stdout))
