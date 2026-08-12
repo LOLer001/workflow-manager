@@ -101,6 +101,14 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(len(commands), 9)
         self.assertEqual(set(commands), {EXPECTED_WINDOWS_COMMAND})
 
+    def test_hook_stdout_is_ascii_safe_for_non_utf8_windows_code_pages(self) -> None:
+        source = (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(encoding="utf-8")
+        for function in ("emit_pretool_deny", "emit_posttool_advisory", "emit_context"):
+            start = source.index(f"def {function}")
+            end = source.find("\ndef ", start + 4)
+            body = source[start : end if end >= 0 else None]
+            self.assertIn("ensure_ascii=True", body, function)
+
     def test_missing_wrapper_fails_open(self) -> None:
         missing_root = self.root / "removed plugin cache"
         missing_root.mkdir()

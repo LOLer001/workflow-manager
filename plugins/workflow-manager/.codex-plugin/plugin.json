@@ -1,14 +1,14 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.21",
-  "description": "Quality-first, context-efficient workflow management with daily/work domain classification, adaptive routing, compaction recovery, and dynamic subagent orchestration.",
+  "version": "1.0.22",
+  "description": "Quality-first, context-efficient workflow management with daily/work and simple/hard routing, confirmed plans, compaction recovery, and dynamic subagent orchestration.",
   "author": {
     "name": "Cong"
   },
   "interface": {
     "displayName": "Workflow Manager",
-    "shortDescription": "Classify intent, protect reasoning quality, and manage workflows.",
-    "longDescription": "Separates daily requests from engineering work before routing complexity, keeps daily tasks on the current model, preserves required reasoning and evidence, resumes across compaction, and dynamically delegates positive-utility independent lanes.",
+    "shortDescription": "Classify work, gate hard plans, and protect reasoning quality.",
+    "longDescription": "Keeps daily requests on current settings, requests highest-model assessment for work, solves simple work directly, and requires strict confirmation of detailed hard-work plans while preserving evidence and compaction continuity.",
     "developerName": "Cong",
     "category": "Productivity",
     "capabilities": [

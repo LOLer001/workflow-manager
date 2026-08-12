@@ -625,6 +625,35 @@ class OrchestratorHookTests(unittest.TestCase):
             HOOK.classify_prompt("编译、合包、实机录像验证")["label"], "complex"
         )
 
+    def test_work_difficulty_gold_set_is_independent_from_route_and_domain(self) -> None:
+        cases = {
+            "生成日报": ("daily", "not_applicable"),
+            "编写生成日报的单文件脚本": ("work", "simple"),
+            "编写含离线同步后台的日报 App": ("work", "hard"),
+            "修正 README 一个错字并检查链接": ("work", "simple"),
+            "Parser.java 增加空值判断并跑现有单测": ("work", "simple"),
+            "按给定输入输出写单文件 CSV 转 JSON 脚本": ("work", "simple"),
+            "查看 Parser.java 当前实现并解释": ("work", "simple"),
+            "排查 Android 设备反复重启并修复、编译部署实机验证": ("work", "hard"),
+            "实现跨 Settings/framework/SystemUI 的客户定制": ("work", "hard"),
+            "从零开发含登录和离线同步的 App": ("work", "hard"),
+            "数据库零停机迁移并提供回滚": ("work", "hard"),
+            "编译 Settings 并部署到唯一设备": ("work", "hard"),
+            "小改一下 framework 中导致重启的 bug": ("work", "hard"),
+        }
+        for prompt, expected in cases.items():
+            with self.subTest(prompt=prompt):
+                route = HOOK.classify_prompt(prompt)
+                self.assertEqual((route["task_domain"], route["work_difficulty"]), expected)
+                self.assertIn(route["difficulty_confidence"], {"low", "medium", "high"})
+                self.assertTrue(route["difficulty_rule_codes"])
+                self.assertRegex(route["difficulty_decision_id"], r"^[0-9a-f]{24}$")
+
+        # Execution shape and difficulty remain separate axes.
+        self.assertEqual(HOOK.classify_prompt("查看 Parser.java 当前实现并解释")["work_difficulty"], "simple")
+        self.assertEqual(HOOK.classify_prompt("查看 Parser.java 当前实现并解释")["label"], "complex")
+        self.assertEqual(HOOK.classify_prompt("编写含离线同步后台的日报 App")["label"], "direct")
+
     def test_daily_cleanup_keeps_domain_policy_but_never_claims_a_safety_exemption(self) -> None:
         route = HOOK.classify_prompt("帮我删除电脑里的垃圾文件并清理缓存")
         self.assertEqual(route["task_domain"], "daily")
@@ -632,6 +661,268 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn("profile=current", context)
         self.assertIn("advisory; no switch", context)
         self.assertNotIn("safety exemption", context.lower())
+
+    def test_hard_work_requires_a_digest_bound_plan_and_strict_confirmation(self) -> None:
+        session = "hard-plan-confirmation"
+        prompt = "排查 Android 设备反复重启并修复、编译部署实机验证"
+        submitted = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": prompt,
+            }
+        )
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        self.assertIn("Hard work", submitted.stdout)
+        state = self.load_only_state()
+        self.assertEqual(state["work_difficulty"], "hard")
+        self.assertEqual(state["plan_state"], "analyzing")
+
+        blocked = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "write-before-plan",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        denied = json.loads(blocked.stdout)["hookSpecificOutput"]
+        self.assertEqual(denied["permissionDecision"], "deny")
+        self.assertIn("not strictly confirmed", denied["permissionDecisionReason"])
+
+        incomplete = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "incomplete-plan",
+                "last_assistant_message": "1. 查看日志\n2. 修改代码\n请确认",
+            }
+        )
+        self.assertEqual(incomplete.returncode, 0)
+        self.assertEqual(self.load_only_state()["plan_state"], "analyzing")
+
+        ready_message = (
+            "1. 收集日志并定位根因\n"
+            "2. 修改对应模块并做代码审查\n"
+            "3. 编译、部署并进行实机验证与回滚检查\n\n"
+            "验收：重启问题不再复现，相关回归通过。\n"
+            "计划已就绪，等待确认后执行"
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "ready-plan",
+                "last_assistant_message": ready_message,
+            }
+        )
+        ready = self.load_only_state()
+        self.assertEqual(ready["plan_state"], "awaiting_confirmation")
+        self.assertRegex(ready["plan_digest"], r"^[0-9a-f]{32}$")
+        self.assertEqual(ready["plan_objective_fingerprint"], ready["objective"]["fingerprint"])
+        self.assertEqual(ready["plan_difficulty_decision_id"], ready["difficulty_decision_id"])
+        self.assertNotIn(ready_message, json.dumps(ready, ensure_ascii=False))
+
+        vague = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "vague",
+                "prompt": "可以",
+            }
+        )
+        self.assertIn("Awaiting strict plan confirmation", vague.stdout)
+        self.assertEqual(self.load_only_state()["plan_state"], "awaiting_confirmation")
+
+        confirmed = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "confirmed",
+                "prompt": "同意按这个计划执行",
+            }
+        )
+        self.assertIn("Confirmed plan binding is valid", confirmed.stdout)
+        state = self.load_only_state()
+        self.assertEqual(state["plan_state"], "confirmed")
+        self.assertEqual(state["confirmed_plan_digest"], state["plan_digest"])
+
+        repeated = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "confirmed-again",
+                "prompt": "确认按新计划执行",
+            }
+        )
+        self.assertIn("Confirmed plan binding is valid", repeated.stdout)
+        repeated_state = self.load_only_state()
+        self.assertEqual(repeated_state["plan_state"], "confirmed")
+        self.assertEqual(repeated_state["plan_digest"], state["plan_digest"])
+        self.assertEqual(repeated_state["plan_generation"], state["plan_generation"])
+
+        allowed = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "write-after-confirm",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        self.assertEqual(allowed.stdout, "")
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "write-after-confirm-post",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+                "tool_response": {"exit_code": 0},
+            }
+        )
+        recorded = self.load_only_state()["operations"][-1]
+        self.assertEqual(recorded["plan_digest"], state["plan_digest"])
+
+    def test_pending_plan_constraint_change_invalidates_and_never_confirms(self) -> None:
+        session = "hard-plan-change"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": "实现跨 Settings/framework/SystemUI 的客户定制",
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "plan",
+                "last_assistant_message": (
+                    "1. 定位三个模块的接口\n2. 修改实现并编译\n3. 完成验证和回滚测试\n"
+                    "验收：三个模块状态一致。\n计划已就绪，等待确认后执行"
+                ),
+            }
+        )
+        before = self.load_only_state()
+        old_digest = before["plan_digest"]
+        old_generation = before["plan_generation"]
+        old_objective = before["objective"]["fingerprint"]
+        changed = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "changed",
+                "prompt": "确认执行，但是先不要修改 SystemUI",
+            }
+        )
+        self.assertIn("Pending plan invalidated", changed.stdout)
+        state = self.load_only_state()
+        self.assertEqual(state["plan_state"], "analyzing")
+        self.assertIsNone(state["plan_digest"])
+        self.assertIsNone(state["confirmed_plan_digest"])
+        self.assertGreater(state["plan_generation"], old_generation)
+        self.assertNotEqual(state.get("plan_digest"), old_digest)
+        self.assertNotEqual(state["objective"]["fingerprint"], old_objective)
+
+    def test_new_objective_while_plan_is_pending_clears_old_plan_binding(self) -> None:
+        session = "pending-plan-new-objective"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": "实现跨 Settings/framework/SystemUI 的客户定制",
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "plan",
+                "last_assistant_message": (
+                    "1. 定位接口\n2. 修改并编译\n3. 完成验证与回滚检查\n"
+                    "验收：状态一致。\n计划已就绪，等待确认后执行"
+                ),
+            }
+        )
+        old_objective = self.load_only_state()["objective"]["fingerprint"]
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "new-objective",
+                "prompt": "换个问题，生成今天的日报",
+            }
+        )
+        state = self.load_only_state()
+        self.assertNotEqual(state["objective"]["fingerprint"], old_objective)
+        self.assertEqual(state["task_domain"], "daily")
+        self.assertEqual(state["work_difficulty"], "not_applicable")
+        self.assertEqual(state["plan_state"], "none")
+        self.assertIsNone(state["plan_digest"])
+
+    def test_pending_plan_guard_blocks_mutation_but_allows_read_only_evidence(self) -> None:
+        state = HOOK.new_state({"session_id": "guard-unit"})
+        state.update(
+            {
+                "work_difficulty": "hard",
+                "plan_state": "awaiting_confirmation",
+                "plan_digest": "a" * 32,
+                "confirmed_plan_digest": None,
+            }
+        )
+        allowed = (
+            ("Bash", "rg -n failure src"),
+            ("Bash", "sed -n '1,40p' file.txt"),
+            ("Bash", "adb get-state"),
+            ("Bash", "adb pull /data/local/tmp/log.txt /tmp/log.txt"),
+            ("Bash", "adb shell dumpsys activity"),
+        )
+        blocked = (
+            ("apply_patch", ""),
+            ("Bash", "sed -i s/a/b/ file.txt"),
+            ("Bash", "printf x > file.txt"),
+            ("Bash", "make module"),
+            ("Bash", "adb push app.apk /system/app/app.apk"),
+            ("Bash", "adb shell settings put secure demo 1"),
+            ("Bash", "git commit -m change"),
+        )
+        for tool, command in allowed:
+            with self.subTest(allowed=command):
+                payload = {"tool_name": tool, "tool_input": {"command": command}}
+                self.assertIsNone(HOOK.plan_confirmation_guard(payload, state))
+        for tool, command in blocked:
+            with self.subTest(blocked=command or tool):
+                payload = {"tool_name": tool, "tool_input": {"command": command}}
+                self.assertIsNotNone(HOOK.plan_confirmation_guard(payload, state))
+
+    def test_confirmed_plan_survives_compaction_and_invalid_binding_does_not(self) -> None:
+        objective = HOOK.text_metadata("hard objective")
+        valid = {
+            **HOOK.new_state({"session_id": "plan-compact"}),
+            "task_domain": "work",
+            "work_difficulty": "hard",
+            "difficulty_decision_id": "b" * 24,
+            "objective": objective,
+            "plan_state": "confirmed",
+            "plan_generation": 2,
+            "plan_digest": "c" * 32,
+            "plan_objective_fingerprint": objective["fingerprint"],
+            "plan_difficulty_decision_id": "b" * 24,
+            "confirmed_plan_digest": "c" * 32,
+        }
+        migrated = HOOK.normalize_state(valid, {"session_id": "plan-compact"})
+        self.assertEqual(migrated["plan_state"], "confirmed")
+
+        invalid = dict(valid)
+        invalid["plan_objective_fingerprint"] = "d" * 16
+        migrated = HOOK.normalize_state(invalid, {"session_id": "plan-compact"})
+        self.assertEqual(migrated["plan_state"], "analyzing")
+        self.assertIsNone(migrated["confirmed_plan_digest"])
 
     def test_lane_decision_separates_effort_from_parallelism(self) -> None:
         sequential = HOOK.classify_prompt("编译、合包、实机录像验证")
@@ -2151,10 +2442,12 @@ class OrchestratorHookTests(unittest.TestCase):
             "last_route": {"label": "focused", "score": 1},
         }
         migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-domain"})
-        self.assertEqual(migrated["schema_version"], 8)
-        self.assertEqual(migrated["writer_version"], "1.0.21")
+        self.assertEqual(migrated["schema_version"], 9)
+        self.assertEqual(migrated["writer_version"], "1.0.22")
         self.assertEqual(migrated["task_domain"], "unknown")
         self.assertEqual(migrated["model_profile"], "current")
+        self.assertEqual(migrated["work_difficulty"], "unknown")
+        self.assertEqual(migrated["plan_state"], "none")
         self.assertEqual(migrated["last_route"]["task_domain"], "unknown")
 
     def test_state_bounds_and_permissions(self) -> None:

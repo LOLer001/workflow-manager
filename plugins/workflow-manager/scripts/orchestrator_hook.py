@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 8
-WRITER_VERSION = "1.0.21"
+SCHEMA_VERSION = 9
+WRITER_VERSION = "1.0.22"
 DOMAIN_CLASSIFIER_VERSION = "1"
+DIFFICULTY_CLASSIFIER_VERSION = "1"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = 1
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -345,6 +346,21 @@ def safe_route(value: Any) -> dict[str, Any]:
             value.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
         ),
         "domain_decision_id": safe_fingerprint(value.get("domain_decision_id")) or None,
+        "work_difficulty": value.get("work_difficulty")
+        if value.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
+        else "unknown",
+        "difficulty_confidence": value.get("difficulty_confidence")
+        if value.get("difficulty_confidence") in {"low", "medium", "high"}
+        else "low",
+        "difficulty_rule_codes": [
+            safe_label(item, 48)
+            for item in as_list(value.get("difficulty_rule_codes"))
+            if item
+        ][:8],
+        "difficulty_classifier_version": safe_label(
+            value.get("difficulty_classifier_version") or DIFFICULTY_CLASSIFIER_VERSION, 16
+        ),
+        "difficulty_decision_id": safe_fingerprint(value.get("difficulty_decision_id")) or None,
         "at": str(value.get("at"))[:40] if value.get("at") else None,
     })
 
@@ -676,6 +692,18 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "model_profile": "current",
         "domain_classifier_version": DOMAIN_CLASSIFIER_VERSION,
         "domain_decision_id": None,
+        "work_difficulty": "unknown",
+        "difficulty_confidence": "low",
+        "difficulty_rule_codes": [],
+        "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
+        "difficulty_decision_id": None,
+        "plan_state": "none",
+        "plan_generation": 0,
+        "plan_digest": None,
+        "plan_objective_fingerprint": None,
+        "plan_difficulty_decision_id": None,
+        "confirmed_plan_digest": None,
+        "confirmed_at": None,
         "created_at": now,
         "updated_at": now,
         "objective": {},
@@ -759,6 +787,21 @@ def _safe_prompt(item: Any) -> dict[str, Any] | None:
             item.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
         ),
         "domain_decision_id": safe_fingerprint(item.get("domain_decision_id")) or None,
+        "work_difficulty": item.get("work_difficulty")
+        if item.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
+        else "unknown",
+        "difficulty_confidence": item.get("difficulty_confidence")
+        if item.get("difficulty_confidence") in {"low", "medium", "high"}
+        else "low",
+        "difficulty_rule_codes": [
+            safe_label(value, 48)
+            for value in as_list(item.get("difficulty_rule_codes"))
+            if value
+        ][:8],
+        "difficulty_classifier_version": safe_label(
+            item.get("difficulty_classifier_version") or DIFFICULTY_CLASSIFIER_VERSION, 16
+        ),
+        "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
     })
 
 
@@ -769,6 +812,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
     if not re.fullmatch(r"[0-9a-f]{8,64}", fingerprint):
         return None
     status_value = safe_label(item.get("status"), 32).lower()
+    plan_digest = safe_fingerprint(item.get("plan_digest")) or None
     return {
         "at": item.get("at"),
         "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
@@ -776,6 +820,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "fingerprint": fingerprint[:64],
         "status": status_value,
         "category": safe_label(item.get("category"), 32) if item.get("category") else "other",
+        "plan_digest": plan_digest,
         "risk_kind": safe_label(item.get("risk_kind"), 32) if item.get("risk_kind") else None,
         "output_chars": max(safe_int(item.get("output_chars")), 0),
         "output_lines": max(safe_int(item.get("output_lines")), 0),
@@ -884,6 +929,8 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         for value in item.get("recent_successes", [])
         if re.fullmatch(r"[0-9a-f]{8,64}", str(value))
     ]
+    plan_digest = safe_fingerprint(item.get("plan_digest")) or None
+    confirmed_plan_digest = safe_fingerprint(item.get("confirmed_plan_digest")) or None
     return {
         "at": item.get("at"),
         "phase": item.get("phase") if item.get("phase") in {"pre", "post"} else "unknown",
@@ -894,6 +941,17 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         "current_stage": safe_label(item.get("current_stage"), 32)
         if item.get("current_stage")
         else "unknown",
+        "work_difficulty": item.get("work_difficulty")
+        if item.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
+        else "unknown",
+        "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
+        "plan_state": item.get("plan_state")
+        if item.get("plan_state")
+        in {"none", "analyzing", "plan_ready", "awaiting_confirmation", "confirmed", "invalidated"}
+        else "none",
+        "plan_generation": max(safe_int(item.get("plan_generation")), 0),
+        "plan_digest": plan_digest,
+        "confirmed_plan_digest": confirmed_plan_digest,
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
             if (scope := _safe_active_agent_scope(raw)) is not None
@@ -944,11 +1002,96 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         domain_source.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
     )
     base["domain_decision_id"] = safe_fingerprint(domain_source.get("domain_decision_id")) or None
+    difficulty_source = (
+        value
+        if value.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
+        else base["last_route"]
+    )
+    base["work_difficulty"] = (
+        difficulty_source.get("work_difficulty")
+        if difficulty_source.get("work_difficulty")
+        in {"not_applicable", "simple", "hard", "unknown"}
+        else "unknown"
+    )
+    base["difficulty_confidence"] = (
+        difficulty_source.get("difficulty_confidence")
+        if difficulty_source.get("difficulty_confidence") in {"low", "medium", "high"}
+        else "low"
+    )
+    base["difficulty_rule_codes"] = [
+        safe_label(item, 48)
+        for item in as_list(difficulty_source.get("difficulty_rule_codes"))
+        if item
+    ][:8]
+    base["difficulty_classifier_version"] = safe_label(
+        difficulty_source.get("difficulty_classifier_version")
+        or DIFFICULTY_CLASSIFIER_VERSION,
+        16,
+    )
+    base["difficulty_decision_id"] = (
+        safe_fingerprint(difficulty_source.get("difficulty_decision_id")) or None
+    )
+    if base["work_difficulty"] == "unknown":
+        if base["task_domain"] == "daily":
+            base["work_difficulty"] = "not_applicable"
+            base["difficulty_confidence"] = "high"
+            base["difficulty_rule_codes"] = ["migrated_daily"]
+        elif base["task_domain"] == "work":
+            legacy_route = base["last_route"]
+            legacy_rules = set(base["domain_rule_codes"])
+            legacy_hard = (
+                legacy_route.get("label") in {"complex", "extensive"}
+                or bool(
+                    legacy_rules
+                    & {"work_device_bug", "work_device_customization", "work_build_delivery"}
+                )
+            )
+            base["work_difficulty"] = "hard" if legacy_hard else "simple"
+            base["difficulty_confidence"] = "low"
+            base["difficulty_rule_codes"] = [
+                "migrated_hard_route" if legacy_hard else "migrated_simple_route"
+            ]
+
+    plan_state = value.get("plan_state")
+    base["plan_state"] = (
+        plan_state
+        if plan_state
+        in {"none", "analyzing", "plan_ready", "awaiting_confirmation", "confirmed", "invalidated"}
+        else "none"
+    )
+    base["plan_generation"] = max(safe_int(value.get("plan_generation")), 0)
+    base["plan_digest"] = safe_fingerprint(value.get("plan_digest")) or None
+    base["plan_objective_fingerprint"] = (
+        safe_fingerprint(value.get("plan_objective_fingerprint")) or None
+    )
+    base["plan_difficulty_decision_id"] = (
+        safe_fingerprint(value.get("plan_difficulty_decision_id")) or None
+    )
+    base["confirmed_plan_digest"] = (
+        safe_fingerprint(value.get("confirmed_plan_digest")) or None
+    )
+    base["confirmed_at"] = str(value.get("confirmed_at"))[:40] if value.get("confirmed_at") else None
 
     base["objective"] = safe_metadata(value.get("objective"))
     if not base["objective"] and value.get("last_objective"):
         base["objective"] = text_metadata(value.get("last_objective"))
     base["last_assistant"] = safe_metadata(value.get("last_assistant"))
+
+    valid_plan_binding = bool(
+        base["plan_digest"]
+        and base["plan_objective_fingerprint"]
+        and base["plan_objective_fingerprint"] == base["objective"].get("fingerprint")
+        and base["plan_difficulty_decision_id"]
+        and base["plan_difficulty_decision_id"] == base["difficulty_decision_id"]
+    )
+    if base["plan_state"] in {"plan_ready", "awaiting_confirmation", "confirmed"} and not valid_plan_binding:
+        base["plan_state"] = "analyzing" if base["work_difficulty"] == "hard" else "none"
+        base["confirmed_plan_digest"] = None
+        base["confirmed_at"] = None
+    if base["plan_state"] == "confirmed" and base["confirmed_plan_digest"] != base["plan_digest"]:
+        base["plan_state"] = "awaiting_confirmation"
+        base["confirmed_plan_digest"] = None
+        base["confirmed_at"] = None
 
     base["prompts"] = [item for raw in as_list(value.get("prompts")) if (item := _safe_prompt(raw)) is not None][-MAX_PROMPTS:]
     base["operations"] = [item for raw in as_list(value.get("operations")) if (item := _safe_operation(raw)) is not None][-MAX_OPERATIONS:]
@@ -1528,6 +1671,12 @@ WORK_CONTEXT_PATTERNS = (
     ("work_source_symbol", r"(?:\.java|\.kt|\.py|\.js|\.ts|\.cpp|\.c|\.h|方法|函数|类|源码文件)"),
     ("work_toolchain", r"(?:adb|gradle|maven|ninja|make|编译器|构建服务器|设备日志|logcat)"),
     ("work_product_delivery", r"(?:客户需求|交付|验收|版本发布|release|production|线上故障)"),
+    (
+        "work_repository_artifact",
+        r"(?:(?:readme|changelog|仓库文档|代码文档).{0,24}(?:错字|链接|修改|修正|更新|typo|link|fix|update)|"
+        r"(?:数据库|database).{0,30}(?:迁移|回滚|零停机|migration|rollback|zero[- ]downtime)|"
+        r"(?:migration|迁移).{0,24}(?:数据库|database|回滚|rollback))",
+    ),
 )
 
 
@@ -1589,6 +1738,93 @@ def classify_task_domain(prompt: str) -> dict[str, Any]:
         "model_profile": "current" if domain == "daily" else "work_assessment",
         "domain_classifier_version": DOMAIN_CLASSIFIER_VERSION,
         "domain_decision_id": stable_hash(decision_seed, 24),
+    }
+
+
+HARD_WORK_PATTERNS = (
+    ("hard_unknown_root_cause", r"(?:根因未知|未知根因|原因不明|反复|间歇|偶现|复现|root cause|intermittent|flaky|keeps|repeated)"),
+    ("hard_cross_module", r"(?:跨模块|多个模块|多模块|跨组件|多个组件|framework.{0,28}systemui|settings.{0,28}framework|cross[- ]module|multiple modules?|several modules?)"),
+    ("hard_architecture", r"(?:从零开发|完整开发|架构|离线同步|后台同步|认证系统|zero[- ]downtime|rollback|migration|迁移|生产发布|production)"),
+    ("hard_external_chain", r"(?:编译|构建|compile|build).{0,60}(?:部署|安装|烧录|刷机|实机|deploy|install|flash|device)"),
+    ("hard_shared_resource", r"(?:唯一|同一|共享|only|single|same|shared).{0,20}(?:设备|构建服务器|账号|资源|device|build server|account|resource)"),
+)
+SIMPLE_WORK_PATTERNS = (
+    ("simple_explicit_small", r"(?:一个错字|单个错字|一处文案|小改动|单文件|one typo|single file|small change|tiny change)"),
+    ("simple_bounded_contract", r"(?:给定输入输出|已有单测|现有单测|明确验收|provided input|existing tests?|clear acceptance)"),
+    ("simple_explain_only", r"(?:查看|阅读|解释|说明|read|inspect|explain).{0,32}(?:当前实现|代码|源码|方法|函数|implementation|code|method|function)"),
+)
+
+
+def classify_work_difficulty(
+    prompt: str, domain: dict[str, Any], route: dict[str, Any]
+) -> dict[str, Any]:
+    """Classify work difficulty independently from execution shape and agent count."""
+    normalized = re.sub(r"\s+", " ", prompt.strip())
+    lower = normalized.lower()
+    if domain.get("task_domain") != "work":
+        difficulty = "not_applicable"
+        confidence = "high"
+        rule_codes = ["daily_not_applicable"]
+    else:
+        hard_codes = [
+            code for code, pattern in HARD_WORK_PATTERNS if re.search(pattern, lower, re.I)
+        ]
+        question_only = bool(
+            re.search(r"^(?:what|why|how|when|where|who|is|are|can|could|would)\b", lower)
+            or re.search(r"^(?:什么是|为什么|如何理解|怎么理解|请解释|解释一下)", normalized)
+        )
+        if question_only and not re.search(
+            r"(?:修改|修复|实现|开发|编写|执行|部署|迁移|回滚|fix|implement|develop|write|execute|deploy|migrate|rollback)",
+            lower,
+            re.I,
+        ):
+            hard_codes = []
+        domain_codes = set(as_list(domain.get("domain_rule_codes")))
+        phases = set(as_list(route.get("phase_hints")))
+        if domain_codes & {"work_device_bug", "work_device_customization"}:
+            hard_codes.append("hard_device_change")
+        if len(phases) >= 3:
+            hard_codes.append("hard_three_phase_chain")
+        if route.get("dependency_signal") in {"shared_resource", "ordered_shared"}:
+            hard_codes.append("hard_shared_or_ordered")
+        if question_only and not hard_codes:
+            difficulty = "simple"
+            confidence = "high"
+            rule_codes = ["simple_explanation_request"]
+        elif hard_codes:
+            difficulty = "hard"
+            confidence = "high"
+            rule_codes = list(dict.fromkeys(hard_codes))[:8]
+        else:
+            simple_codes = [
+                code for code, pattern in SIMPLE_WORK_PATTERNS if re.search(pattern, lower, re.I)
+            ]
+            route_label = str(route.get("label") or "direct")
+            if route_label in {"direct", "focused"} and len(phases) <= 2:
+                simple_codes.append("simple_bounded_route")
+            if simple_codes:
+                difficulty = "simple"
+                confidence = "high" if route_label in {"direct", "focused"} else "medium"
+                rule_codes = list(dict.fromkeys(simple_codes))[:8]
+            else:
+                difficulty = "hard"
+                confidence = "medium"
+                rule_codes = ["hard_ambiguous_work"]
+    decision_seed = "\0".join(
+        (
+            DIFFICULTY_CLASSIFIER_VERSION,
+            str(domain.get("domain_decision_id") or "unknown"),
+            stable_hash(normalized, 32),
+            difficulty,
+            *sorted(set(rule_codes)),
+        )
+    )
+    return {
+        "work_difficulty": difficulty,
+        "difficulty_confidence": confidence,
+        "difficulty_rule_codes": rule_codes,
+        "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
+        "difficulty_decision_id": stable_hash(decision_seed, 24),
     }
 
 
@@ -1779,6 +2015,25 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
         result.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
     )
     result["domain_decision_id"] = safe_fingerprint(result.get("domain_decision_id")) or None
+    result["work_difficulty"] = (
+        result.get("work_difficulty")
+        if result.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
+        else "unknown"
+    )
+    result["difficulty_confidence"] = (
+        result.get("difficulty_confidence")
+        if result.get("difficulty_confidence") in {"low", "medium", "high"}
+        else "low"
+    )
+    result["difficulty_rule_codes"] = [
+        safe_label(item, 48)
+        for item in as_list(result.get("difficulty_rule_codes"))
+        if item
+    ][:8]
+    result["difficulty_classifier_version"] = safe_label(
+        result.get("difficulty_classifier_version") or DIFFICULTY_CLASSIFIER_VERSION, 16
+    )
+    result["difficulty_decision_id"] = safe_fingerprint(result.get("difficulty_decision_id")) or None
     label = str(result.get("label") or "direct")
     lane_signal = str(result.get("lane_signal") or "none")
     readiness = str(result.get("readiness_signal") or "none")
@@ -1970,7 +2225,7 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
         dependency_hint = "shared_artifact_or_device"
     elif dependency_signal == "ordered":
         dependency_hint = "ordered_dependency"
-    return decorate_route({
+    route = {
         **domain,
         "label": label,
         "score": score,
@@ -1986,7 +2241,9 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
         "phase_hints": phases,
         "dependency_hint": dependency_hint,
         "route_source": "prompt",
-    })
+    }
+    route.update(classify_work_difficulty(normalized, domain, route))
+    return decorate_route(route)
 def extract_command(payload: dict[str, Any]) -> str:
     tool_input = payload.get("tool_input")
     if isinstance(tool_input, dict):
@@ -2111,6 +2368,130 @@ def request_supports_delegation_reaudit(payload: dict[str, Any], route: dict[str
         if not excludes_shared_resource or conflicting_shared_action:
             return False
     return ready_now and independent and (read_only or exclusive_write_owner)
+
+
+PLAN_MUTATING_GIT_COMMANDS = {
+    "add",
+    "am",
+    "apply",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "switch",
+    "tag",
+}
+
+
+def command_mutates_device(command: str) -> bool:
+    for candidate in command_views(command):
+        visible = shell_syntax_view(candidate)
+        if re.search(
+            r"(?i)(?:^|[;&|]\s*)(?:adb(?:\.exe)?(?:\s+-s\s+\S+)?\s+)"
+            r"(?:install|uninstall|push|sync|reboot|root|remount)\b",
+            visible,
+        ):
+            return True
+        if re.search(
+            r"(?i)(?:^|[;&|]\s*)adb(?:\.exe)?(?:\s+-s\s+\S+)?\s+shell\s+"
+            r"(?:(?:pm\s+(?:install|uninstall|clear|grant|revoke))|"
+            r"(?:settings\s+(?:put|delete))|(?:setprop|svc|reboot)\b)",
+            visible,
+        ):
+            return True
+        if re.search(
+            r"(?i)(?:^|[;&|]\s*)fastboot(?:\.exe)?(?:\s+-s\s+\S+)?\s+"
+            r"(?:flash|erase|format|update|set_active|reboot)\b",
+            visible,
+        ):
+            return True
+    return False
+
+
+def command_mutates_files(command: str) -> bool:
+    for candidate in command_views(command):
+        visible = shell_syntax_view(candidate)
+        if re.search(r"(?<!\d)(?:>>?|&>)\s*(?!&)[^\s;&|]+", visible):
+            return True
+        if re.search(
+            rf"(?i){_COMMAND_BOUNDARY_RE}{_COMMAND_PREFIX_RE}(?:"
+            r"rm|mv|cp|install|truncate|tee|patch)\b",
+            visible,
+        ):
+            return True
+        if re.search(r"(?i)(?:^|[;&|]\s*)sed\s+(?:-[A-Za-z]*i[A-Za-z]*|--in-place)\b", visible):
+            return True
+    return False
+
+
+def subagent_request_is_read_only(payload: dict[str, Any]) -> bool:
+    request = subagent_request_text(payload)
+    if not request:
+        return False
+    lower = request.lower()
+    explicit_read_only = bool(
+        re.search(r"\b(?:read[- ]only|no writes?|without modifying|do not modify)\b", lower)
+        or any(term in request for term in ("只读", "不修改", "不要修改", "不写入"))
+    )
+    mutation = bool(
+        re.search(
+            r"\b(?:edit|write|modify|implement|fix|build|compile|deploy|install|flash|commit|push)\b",
+            lower,
+        )
+        or any(
+            term in request
+            for term in ("修改", "写入", "实现", "修复", "编译", "构建", "部署", "安装", "烧录", "刷机", "提交", "推送")
+        )
+    )
+    analysis_only = bool(
+        re.search(r"\b(?:inspect|review|analyze|analyse|research|search|read|explain)\b", lower)
+        or any(term in request for term in ("检查", "审查", "分析", "调研", "搜索", "阅读", "解释"))
+    )
+    return (explicit_read_only or analysis_only) and not mutation
+
+
+def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
+    if state.get("work_difficulty") != "hard":
+        return None
+    if state.get("plan_state") == "confirmed" and state.get("confirmed_plan_digest") == state.get("plan_digest"):
+        return None
+    tool_key = normalized_key(payload.get("tool_name"))
+    if "updateplan" in tool_key or "requestuserinput" in tool_key:
+        return None
+    if is_subagent_spawn_tool(payload):
+        return None if subagent_request_is_read_only(payload) else "subagent execution"
+    if tool_key in {
+        "applypatch",
+        "edit",
+        "write",
+        "create",
+        "replace",
+        "createfile",
+        "updatefile",
+        "deletefile",
+    } or any(marker in tool_key for marker in ("applypatch", "createfile", "updatefile", "deletefile")):
+        return "file mutation"
+    command = extract_command(payload)
+    if not command:
+        return None
+    subcommand = git_subcommand(command)
+    if subcommand in PLAN_MUTATING_GIT_COMMANDS:
+        return "Git mutation"
+    if any(BUILD_COMMAND_RE.search(shell_syntax_view(candidate)) for candidate in command_views(command)):
+        return "build or package"
+    if command_mutates_device(command):
+        return "device mutation"
+    if command_mutates_files(command):
+        return "file mutation"
+    return None
 
 
 def shell_syntax_view(command: str) -> str:
@@ -2550,7 +2931,7 @@ def emit_pretool_deny(reason: str) -> None:
                     "permissionDecisionReason": reason,
                 }
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
     )
 
@@ -2573,7 +2954,7 @@ def emit_posttool_advisory(status_value: str, meta: dict[str, Any]) -> None:
                     "additionalContext": summary,
                 },
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
     )
 
@@ -2627,7 +3008,7 @@ def emit_context(event: str, text: str) -> None:
                     "additionalContext": text,
                 },
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
     )
 
@@ -2769,7 +3150,13 @@ def session_start(payload: dict[str, Any]) -> None:
             "last_route": state.get("last_route", {}).get("label"),
             "task_domain": state.get("task_domain", "unknown"),
             "domain_decision_id": state.get("domain_decision_id"),
+            "work_difficulty": state.get("work_difficulty", "unknown"),
+            "difficulty_decision_id": state.get("difficulty_decision_id"),
             "model_profile": state.get("model_profile", "current"),
+            "plan_state": state.get("plan_state", "none"),
+            "plan_generation": safe_int(state.get("plan_generation")),
+            "plan_digest": state.get("plan_digest"),
+            "confirmed_plan_digest": state.get("confirmed_plan_digest"),
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
@@ -2850,6 +3237,71 @@ def is_control_followup(prompt: str) -> bool:
     return normalized in FOLLOWUP_CONTROLS
 
 
+PLAN_CONFIRM_PATTERNS = (
+    r"确认执行",
+    r"确认按(?:这个|上述|该|此|新)计划执行",
+    r"同意按(?:这个|上述|该|此|新)计划执行",
+    r"按(?:这个|上述|该|此|新)计划执行",
+    r"开始执行(?:这个|上述|该|此|新)计划",
+    r"confirm and execute (?:this|the) plan",
+    r"execute (?:this|the) plan",
+)
+PLAN_CHANGE_MARKERS = (
+    "但是",
+    "但",
+    "不过",
+    "另外",
+    "增加",
+    "新增",
+    "删除",
+    "去掉",
+    "改为",
+    "改成",
+    "先不要",
+    "but",
+    "except",
+    "add",
+    "remove",
+    "change",
+)
+PLAN_REPLAN_PATTERNS = (
+    r"重新规划",
+    r"重做计划",
+    r"修改计划",
+    r"replan",
+    r"revise (?:this|the) plan",
+)
+
+
+def pure_plan_confirmation(prompt: str) -> bool:
+    normalized = re.sub(r"[?!？！。,.，]+", "", prompt.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized or any(marker in normalized for marker in PLAN_CHANGE_MARKERS):
+        return False
+    return any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_CONFIRM_PATTERNS)
+
+
+def plan_replan_request(prompt: str) -> bool:
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    return any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_REPLAN_PATTERNS)
+
+
+def prompt_changes_pending_plan(prompt: str) -> bool:
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    return any(marker in normalized for marker in PLAN_CHANGE_MARKERS)
+
+
+def explicit_new_objective(prompt: str) -> bool:
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    return bool(
+        re.match(
+            r"^(?:another task|new task|separately|换个问题|另一个任务|新任务|另外一个|顺便帮我|再帮我)",
+            normalized,
+        )
+        or re.match(r"^现在帮我.{0,24}(?:写一个|创建|实现|解决|处理)(?:新的?|另一个)", normalized)
+    )
+
+
 def is_progress_followup(prompt: str) -> bool:
     normalized = re.sub(r"\s+", " ", prompt.strip().lower())
     if not normalized or len(normalized) > 220:
@@ -2899,6 +3351,11 @@ def merge_followup_route(previous: dict[str, Any], current: dict[str, Any]) -> d
         "model_profile",
         "domain_classifier_version",
         "domain_decision_id",
+        "work_difficulty",
+        "difficulty_confidence",
+        "difficulty_rule_codes",
+        "difficulty_classifier_version",
+        "difficulty_decision_id",
     ):
         result[key] = prior.get(key)
     result["route_source"] = "continued"
@@ -2926,9 +3383,10 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
         else ""
     )
     domain = str(classification.get("task_domain") or "unknown")
+    difficulty = str(classification.get("work_difficulty") or "unknown")
     profile = str(classification.get("model_profile") or "current")
     return (
-        f"Domain: {domain} | profile={profile} (advisory; no switch). "
+        f"Domain: {domain}/{difficulty} | profile={profile} (advisory; no switch). "
         f"Route: {label}/{shape} | pressure={pressure_summary} | budget={classification.get('future_token_range')}. "
         f"Order: {order}. {agents}{gate} Control: bounded. "
         "Update phase|done|next|blocker at kickoff/change/~60s wait. "
@@ -2939,16 +3397,38 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
 
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
-    classification = classify_prompt(prompt)
     previous = snapshot_state(payload)
-    continuation = is_control_followup(prompt) or is_progress_followup(prompt)
+    pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
+    active_plan = pending_plan or previous.get("plan_state") == "confirmed"
+    new_objective = active_plan and explicit_new_objective(prompt)
+    confirmed_plan = active_plan and pure_plan_confirmation(prompt)
+    replan = active_plan and plan_replan_request(prompt)
+    plan_changed = (
+        active_plan
+        and not new_objective
+        and prompt_changes_pending_plan(prompt)
+        and not confirmed_plan
+    )
+    continuation = not new_objective and (
+        is_control_followup(prompt) or is_progress_followup(prompt) or active_plan
+    )
+    classification = classify_prompt(prompt)
     if continuation and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
         prompt_meta = text_metadata(prompt)
-        if not continuation or not state.get("objective"):
+        if plan_changed and state.get("objective"):
+            prior = state["objective"]
+            state["objective"] = {
+                "fingerprint": stable_hash(
+                    f"{prior.get('fingerprint')}\0{prompt_meta.get('fingerprint')}", 16
+                ),
+                "length": max(safe_int(prior.get("length")), 0) + prompt_meta["length"],
+                "updated_at": utc_now(),
+            }
+        elif not continuation or not state.get("objective"):
             state["objective"] = {**prompt_meta, "updated_at": utc_now()}
         state["last_route"] = {**classification, "at": utc_now()}
         for key in (
@@ -2958,8 +3438,47 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "model_profile",
             "domain_classifier_version",
             "domain_decision_id",
+            "work_difficulty",
+            "difficulty_confidence",
+            "difficulty_rule_codes",
+            "difficulty_classifier_version",
+            "difficulty_decision_id",
         ):
             state[key] = classification.get(key)
+        objective_fingerprint = state.get("objective", {}).get("fingerprint")
+        if confirmed_plan:
+            binding_valid = bool(
+                state.get("plan_digest")
+                and state.get("plan_objective_fingerprint") == objective_fingerprint
+                and state.get("plan_difficulty_decision_id")
+                == state.get("difficulty_decision_id")
+            )
+            if binding_valid:
+                state["plan_state"] = "confirmed"
+                state["confirmed_plan_digest"] = state.get("plan_digest")
+                state["confirmed_at"] = utc_now()
+            else:
+                state["plan_state"] = "invalidated"
+                state["confirmed_plan_digest"] = None
+                state["confirmed_at"] = None
+        elif replan or plan_changed:
+            state["plan_state"] = "analyzing"
+            state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            state["confirmed_plan_digest"] = None
+            state["confirmed_at"] = None
+        elif not continuation:
+            state["plan_generation"] = 0
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            state["confirmed_plan_digest"] = None
+            state["confirmed_at"] = None
+            state["plan_state"] = (
+                "analyzing" if classification.get("work_difficulty") == "hard" else "none"
+            )
         state.setdefault("prompts", []).append(
             {
                 "at": utc_now(),
@@ -2978,7 +3497,20 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     )
     if not should_inject:
         return
-    emit_context("UserPromptSubmit", routing_context(classification, telemetry))
+    context = routing_context(classification, telemetry)
+    if confirmed_plan:
+        context += " Confirmed plan binding is valid; execution may begin within the confirmed scope."
+    elif replan or plan_changed:
+        context += " Pending plan invalidated by changed constraints; re-analyze and present a replacement plan before mutation."
+    elif classification.get("work_difficulty") == "hard" and not pending_plan:
+        context += (
+            " Hard work: use the highest available model/reasoning for analysis; present a detailed file/method, "
+            "build/deploy, verification, risk, and rollback plan ending with '计划已就绪，等待确认后执行'. "
+            "Do not mutate, build, or deploy before strict confirmation."
+        )
+    elif pending_plan and not confirmed_plan:
+        context += " Awaiting strict plan confirmation; answer plan questions but do not mutate, build, or deploy."
+    emit_context("UserPromptSubmit", context)
 
 
 def operation_is_recent(operation: dict[str, Any]) -> bool:
@@ -3147,6 +3679,38 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
 
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
+    state = snapshot_state(payload)
+    if is_subagent_spawn_tool(payload):
+        route = safe_route(state.get("last_route"))
+        gate = str(route.get("delegation_gate") or "closed")
+        if gate == "closed":
+            if handle_subagent_pretool(payload, state, fingerprint):
+                return
+        elif subagent_request_is_read_only(payload):
+            if handle_subagent_pretool(payload, state, fingerprint):
+                return
+    blocked_action = plan_confirmation_guard(payload, state)
+    if blocked_action:
+        def record_plan_guard(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "plan_confirmation",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+
+        mutate_state(payload, record_plan_guard)
+        emit_pretool_deny(
+            f"Workflow Manager blocked {blocked_action}: this hard work plan is not strictly confirmed. "
+            "Continue read-only analysis or evidence collection, present the detailed plan ending with "
+            "'计划已就绪，等待确认后执行', and wait for a pure confirmation bound to the current plan."
+        )
+        return
     guard = command_guard(payload)
     if guard:
         kind, reason = guard
@@ -3166,7 +3730,6 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         emit_pretool_deny(reason)
         return
 
-    state = snapshot_state(payload)
     if handle_subagent_pretool(payload, state, fingerprint):
         return
     duplicate = next(
@@ -3319,6 +3882,12 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     budgeted = command_output_budget(payload, command, risk_kind) if command and risk_kind else False
 
     def update(state: dict[str, Any]) -> None:
+        active_plan_digest = (
+            state.get("plan_digest")
+            if state.get("plan_state") == "confirmed"
+            and state.get("confirmed_plan_digest") == state.get("plan_digest")
+            else None
+        )
         state.setdefault("operations", []).append(
             {
                 "at": utc_now(),
@@ -3327,6 +3896,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "fingerprint": fingerprint,
                 "status": status_value,
                 "category": category,
+                "plan_digest": active_plan_digest,
                 "risk_kind": risk_kind,
                 **response_meta,
                 "budgeted": budgeted,
@@ -3358,8 +3928,14 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
                 "telemetry": telemetry,
                 "objective_meta": state.get("objective", {}),
-                "current_stage": current_execution_stage(state),
-                "continuity": quality_continuity(state),
+            "current_stage": current_execution_stage(state),
+            "work_difficulty": state.get("work_difficulty", "unknown"),
+            "difficulty_decision_id": state.get("difficulty_decision_id"),
+            "plan_state": state.get("plan_state", "none"),
+            "plan_generation": safe_int(state.get("plan_generation")),
+            "plan_digest": state.get("plan_digest"),
+            "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+            "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
                     op.get("fingerprint")
@@ -3529,9 +4105,30 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     else:
         emit_continue()
 def stop(payload: dict[str, Any]) -> None:
+    assistant_message = str(payload.get("last_assistant_message") or "")
+    plan_ready = bool(
+        len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", assistant_message)) >= 2
+        and re.search(r"(?:验收|验证|test|verify|acceptance)", assistant_message, re.I)
+        and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", assistant_message)
+    )
+
     def update(state: dict[str, Any]) -> None:
-        state["last_assistant"] = text_metadata(payload.get("last_assistant_message"))
+        state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
+        if state.get("work_difficulty") == "hard" and state.get("plan_state") in {
+            "analyzing",
+            "invalidated",
+        }:
+            if plan_ready:
+                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+                state["plan_digest"] = stable_hash(assistant_message, 32)
+                state["plan_objective_fingerprint"] = state.get("objective", {}).get("fingerprint")
+                state["plan_difficulty_decision_id"] = state.get("difficulty_decision_id")
+                state["confirmed_plan_digest"] = None
+                state["confirmed_at"] = None
+                state["plan_state"] = "awaiting_confirmation"
+            else:
+                state["plan_state"] = "analyzing"
 
     mutate_state(payload, update)
     emit_continue()
