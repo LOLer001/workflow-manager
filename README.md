@@ -9,10 +9,14 @@
 - 工作评估请求使用可用的最高模型和最高推理强度判断简单或困难；Hook 只记录和提示该策略，不能虚报宿主已经完成切模。
 - 简单工作问题由评估档直接解决和验证，不额外增加计划确认轮次。
 - 困难工作问题先只读取证据，再给出包含模块、文件、方法、改动、构建部署、验收、风险和回退的详细计划；只有用户严格确认当前计划后才开始写入、构建或部署。
+- 严格确认后，父会话继续以高推理负责协调和复核；从宿主当时实际暴露的选项中选择最新的较低档 Codex 模型，创建唯一合同执行子智能体并固定 `reasoning_effort=medium`，不硬编码具体模型名。
+- Hook 不能切换父会话模型；只有宿主接受带显式 `model` 覆盖且 `fork_turns=none` 或正整数的创建请求，才算子智能体切换证据。
+- `execution_contract_id` 同时绑定目标、难度决策、计划代次和计划摘要；失败按类型记录，初次失败后最多允许一次有实质修正的恢复，禁止原样重试。
 - 新增约束、范围或目标会使待确认计划失效并要求重新规划；日常/工作与简单/困难分类都不改变删除、覆盖、安装、外发等安全边界。
 - 按任务复杂度选择直接处理、聚焦处理或复杂工作流。
 - 复杂任务主动评估关键路径，只要预期节省时间高于协调成本，就优先并行调度独立的读、写、测试、研究或复核工作。
 - Complex 最多 2 个、Extensive 最多 3 个子智能体；上限只是容量，不是固定数量，也不要求必须派一个只读子智能体。
+- 日常请求、简单工作及原有并行收益判断保持不变；唯一执行合同只约束已确认困难计划的变更范围，其他并行通道不得成为第二个执行者。
 - 通过明确文件/模块所有权避免写冲突；共享构建服务器、设备或交付物只串行化实际冲突的阶段。
 - 在上下文压力升高时只收窄冗余展示并提前保存检查点；必要调查继续进行。
 - 压缩后复用原生摘要、计划和已验证结果，不从头重复。
@@ -30,14 +34,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.22\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.23\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.22/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.23/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -80,7 +84,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.22 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.23 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -100,7 +104,11 @@ codex plugin add workflow-manager@workflow-manager --json
 
 插件会读取 Codex 生命周期事件来判断路由、输出规模和续接状态；持久化数据只保留摘要、指纹、验收待办状态和计数，不保存原始提示词、命令或子智能体结果。大工具结果会保留给模型正常推理，插件只提示后续查询如何收窄，不会仅因为输出较大而替换必要证据。钩子属于工作流护栏，不是安全边界。子智能体可能减少主会话噪声，但不保证降低总 token 消耗。
 
-1.0.22 中的 `current` 与 `work_assessment` 是可审计的逻辑策略：`work_assessment` 表达“请求可用最高模型和最高推理强度进行工作难度分析”，Hook 会记录并解释判断，但没有切换或验证宿主模型的权限。真正使用了什么模型必须以宿主提供的证据为准。
+1.0.23 增加 `work_executor_low_latest` 逻辑策略：它表示“选择宿主当前实际可用的最新较低档 Codex 模型执行已确认计划”，不是固定产品名。父会话仍以高推理负责合同、协调、恢复决策和最终验收；唯一执行子智能体使用显式模型覆盖、`reasoning_effort=medium`，并在覆盖模型时提供 `fork_turns=none` 或正整数。Hook 不能切换父模型，也不能仅凭状态字段证明子智能体切换；只有宿主接受该显式创建请求才是切换证据。若没有合格模型，必须报告类型化的 `model_unavailable`，不能静默回退或虚构模型标识。
+
+执行合同由目标指纹、难度决策 ID、正数计划代次与已确认计划摘要共同生成。创建请求还必须带完整可执行计划、独占范围、验收与回退。初次执行失败会记录为模型、配置、创建、启动匹配、合同过期、实现、构建、部署或验证等类型；仅在修正对应原因后允许一次恢复，总尝试最多两次。第二次失败或没有实质修正时停止并交回父会话重新评估，禁止换一种命令写法原样重试。
+
+状态 Schema 10 从 Schema 9 续接已确认计划时，只保留有效计划绑定并初始化为“尚未启动”的 `spawn_required`；不会因为旧状态写着 `confirmed` 就猜测子智能体已经创建或计划已经执行。
 
 ## 仓库结构
 
@@ -110,6 +118,7 @@ plugins/workflow-manager/              插件源码
   .codex-plugin/plugin.json            插件清单
   assets/stable-skill/workflow-manager/  唯一可调用 Skill 的安装源
     references/work-routing.md          困难判断、计划确认与防误拦边界
+    references/confirmed-execution.md   合同执行、模型证据、失败恢复与迁移
   hooks/hooks.json                     生命周期钩子
   scripts/install_stable_skill.py      用户级稳定路径安装器
   scripts/                             其他跨平台运行脚本
@@ -137,7 +146,7 @@ Set-Location plugins/workflow-manager
 py -3 -m unittest -v tests.test_windows_hook
 ```
 
-提交前应同时通过仓库校验、完整 Python 测试和 Windows 10 项原生测试。GitHub Actions 会自动执行这些检查。
+提交前应同时通过仓库校验、完整 Python 测试和 Windows 12 项原生测试。GitHub Actions 会自动执行这些检查。
 
 ## 贡献与发布
 

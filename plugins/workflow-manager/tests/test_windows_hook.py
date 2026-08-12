@@ -382,6 +382,69 @@ class WindowsHookTests(unittest.TestCase):
         self.assertFalse(operations[0]["compacted"])
         self.assertNotIn("failure line", json.dumps(states))
 
+    def test_confirmed_executor_contract_roundtrip_is_ascii_safe(self) -> None:
+        session = "windows-executor-contract"
+        events = [
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "executor-objective",
+                "model": "gpt-5.6-sol",
+                "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
+            },
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "executor-plan",
+                "last_assistant_message": (
+                    "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n"
+                    "3. 完成实机验证与回滚检查\n验收：问题不再复现。\n"
+                    "计划已就绪，等待确认后执行"
+                ),
+            },
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "executor-confirm",
+                "prompt": "确认按这个计划执行",
+            },
+        ]
+        for payload in events:
+            result = self.run_command_windows(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout:
+                self.assertTrue(result.stdout.isascii())
+                json.loads(result.stdout)
+        state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        contract_id = state["execution_contract_id"]
+        request = self.run_command_windows(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "executor-request",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "execute_confirmed_plan",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "medium",
+                    "fork_turns": "none",
+                    "message": (
+                        "Unique exclusive executor. "
+                        f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
+                        f"plan_generation={state['plan_generation']}. Exclusive execution ownership; "
+                        "implement the full actionable plan and run verification acceptance tests."
+                    ),
+                },
+            }
+        )
+        self.assertEqual(request.returncode, 0, request.stderr)
+        self.assertTrue(request.stdout.isascii())
+        request_output = json.loads(request.stdout)["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", request_output)
+        final_state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(final_state["executor_state"], "spawn_pending")
+        self.assertEqual(final_state["executor_model"], "gpt-5.6-terra")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

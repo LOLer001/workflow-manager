@@ -63,4 +63,6 @@ Allow targeted reads, searches, static inspection, safe metadata queries, plan u
 
 Block explicit file creation/edit/deletion, mutating child execution, mutating Git, compilation or packaging, deployment/install/flash/device mutation, and equivalent nested commands. After confirmation, normal mounted-source, destructive-action, output-budget, shared-resource, and project-specific gates still apply.
 
+After a valid confirmation, continue with [confirmed-execution.md](confirmed-execution.md); confirmation opens creation of one bound executor contract, not parent mutation or an unbound child.
+
 Do not apply the Hard plan gate to Daily or Simple work. If a safe read is falsely blocked, record the first guard reason and fix the narrow classifier/guard boundary; do not weaken the confirmation binding or bypass the guard with an equivalent command form.

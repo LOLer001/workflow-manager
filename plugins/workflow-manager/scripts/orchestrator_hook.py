@@ -20,10 +20,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 9
-WRITER_VERSION = "1.0.22"
+SCHEMA_VERSION = 10
+WRITER_VERSION = "1.0.23"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
+EXECUTION_PROFILE_VERSION = "1"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = 1
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -59,6 +60,30 @@ DEFAULT_OUTPUT_LINE_LIMIT = 300
 DEFAULT_VISUAL_ITEM_LIMIT = 3
 PRESSURE_TRIM_THRESHOLD = 0.55
 PRESSURE_CHECKPOINT_THRESHOLD = 0.70
+
+MODEL_PROFILES = {"current", "work_assessment", "work_executor_low_latest"}
+EXECUTOR_STATES = {
+    "none",
+    "spawn_required",
+    "spawn_pending",
+    "running",
+    "succeeded",
+    "recovery_required",
+    "exhausted",
+}
+EXECUTOR_FAILURE_KINDS = {
+    "model_unavailable",
+    "invalid_spawn_config",
+    "spawn_failed",
+    "start_mismatch",
+    "stale_contract",
+    "executor_failed",
+    "implementation_failed",
+    "build_failed",
+    "deploy_failed",
+    "verification_failed",
+}
+MAX_EXECUTOR_ATTEMPTS = 2
 
 SUCCESS_STATUSES = {"ok"}
 ERROR_STATUSES = {
@@ -110,6 +135,49 @@ def stable_hash(value: Any, length: int = 16) -> str:
     else:
         raw = str(value or "").encode("utf-8", errors="replace")
     return hashlib.sha256(raw).hexdigest()[:length]
+
+
+def execution_contract_id(state: dict[str, Any]) -> str | None:
+    """Bind one executor to the exact confirmed objective and plan without storing plan text."""
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    difficulty = safe_fingerprint(state.get("difficulty_decision_id"))
+    plan = safe_fingerprint(state.get("plan_digest"))
+    generation = max(safe_int(state.get("plan_generation")), 0)
+    if not (objective and difficulty and plan and generation > 0):
+        return None
+    return stable_hash(
+        f"{EXECUTION_PROFILE_VERSION}\0{objective}\0{difficulty}\0{generation}\0{plan}",
+        32,
+    )
+
+
+def reset_executor_binding(state: dict[str, Any], *, preserve_failure: bool = False) -> None:
+    failure = state.get("executor_failure_kind") if preserve_failure else None
+    attempt = safe_int(state.get("executor_attempt")) if preserve_failure else 0
+    state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
+    state["executor_state"] = "recovery_required" if failure else "none"
+    state["execution_contract_id"] = None
+    state["executor_agent_id"] = None
+    state["executor_attempt"] = min(max(attempt, 0), MAX_EXECUTOR_ATTEMPTS)
+    state["executor_failure_kind"] = failure if failure in EXECUTOR_FAILURE_KINDS else None
+    state["executor_model"] = None
+    state["executor_reasoning_effort"] = None
+    state["executor_fork_turns"] = None
+
+
+def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
+    contract_id = execution_contract_id(state)
+    if not contract_id:
+        return False
+    if state.get("execution_contract_id") != contract_id:
+        reset_executor_binding(state)
+        state["execution_contract_id"] = contract_id
+        state["executor_state"] = "spawn_required"
+    elif state.get("executor_state") not in EXECUTOR_STATES - {"none"}:
+        state["executor_state"] = "spawn_required"
+    state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
+    state["model_profile"] = "work_executor_low_latest"
+    return True
 
 
 def normalized_key(value: Any) -> str:
@@ -340,7 +408,7 @@ def safe_route(value: Any) -> dict[str, Any]:
             if item
         ][:8],
         "model_profile": value.get("model_profile")
-        if value.get("model_profile") in {"current", "work_assessment"}
+        if value.get("model_profile") in MODEL_PROFILES
         else "current",
         "domain_classifier_version": safe_label(
             value.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
@@ -704,6 +772,15 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_difficulty_decision_id": None,
         "confirmed_plan_digest": None,
         "confirmed_at": None,
+        "execution_profile_version": EXECUTION_PROFILE_VERSION,
+        "executor_state": "none",
+        "execution_contract_id": None,
+        "executor_agent_id": None,
+        "executor_attempt": 0,
+        "executor_failure_kind": None,
+        "executor_model": None,
+        "executor_reasoning_effort": None,
+        "executor_fork_turns": None,
         "created_at": now,
         "updated_at": now,
         "objective": {},
@@ -781,7 +858,7 @@ def _safe_prompt(item: Any) -> dict[str, Any] | None:
             if value
         ][:8],
         "model_profile": item.get("model_profile")
-        if item.get("model_profile") in {"current", "work_assessment"}
+        if item.get("model_profile") in MODEL_PROFILES
         else "current",
         "domain_classifier_version": safe_label(
             item.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
@@ -813,6 +890,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         return None
     status_value = safe_label(item.get("status"), 32).lower()
     plan_digest = safe_fingerprint(item.get("plan_digest")) or None
+    contract_id = safe_fingerprint(item.get("execution_contract_id")) or None
     return {
         "at": item.get("at"),
         "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
@@ -821,6 +899,12 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "status": status_value,
         "category": safe_label(item.get("category"), 32) if item.get("category") else "other",
         "plan_digest": plan_digest,
+        "execution_contract_id": contract_id,
+        "executor_agent_id": (
+            safe_label(item.get("executor_agent_id"), 120)
+            if item.get("executor_agent_id")
+            else None
+        ),
         "risk_kind": safe_label(item.get("risk_kind"), 32) if item.get("risk_kind") else None,
         "output_chars": max(safe_int(item.get("output_chars")), 0),
         "output_lines": max(safe_int(item.get("output_lines")), 0),
@@ -859,6 +943,15 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
     request_fingerprint = str(item.get("request_fingerprint") or "")
     if not re.fullmatch(r"[0-9a-f]{8,64}", request_fingerprint):
         request_fingerprint = ""
+    contract_id = safe_fingerprint(item.get("contract_id")) or None
+    role = (
+        item.get("role")
+        if item.get("role") in {"lane", "confirmed_executor"}
+        else "lane"
+    )
+    fork_turns = str(item.get("fork_turns") or "")
+    if fork_turns != "none" and not re.fullmatch(r"[1-9]\d*", fork_turns):
+        fork_turns = ""
     value = {
         "at": item.get("at"),
         "event": item.get("event") if item.get("event") in {"request", "start", "stop"} else "unknown",
@@ -876,6 +969,16 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         else None,
         "request_cap": min(max(safe_int(item.get("request_cap")), 0), 3),
         "reaudited": bool(item.get("reaudited")),
+        "role": role,
+        "contract_id": contract_id,
+        "model": safe_label(item.get("model"), 80) if item.get("model") else None,
+        "reasoning_effort": (
+            safe_label(item.get("reasoning_effort"), 24)
+            if item.get("reasoning_effort")
+            else None
+        ),
+        "fork_turns": fork_turns or None,
+        "attempt": min(max(safe_int(item.get("attempt")), 0), MAX_EXECUTOR_ATTEMPTS),
     }
     if isinstance(result_meta, dict):
         value["result_meta"] = {
@@ -952,6 +1055,23 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         "plan_generation": max(safe_int(item.get("plan_generation")), 0),
         "plan_digest": plan_digest,
         "confirmed_plan_digest": confirmed_plan_digest,
+        "execution_profile_version": safe_label(
+            item.get("execution_profile_version") or EXECUTION_PROFILE_VERSION, 16
+        ),
+        "executor_state": (
+            item.get("executor_state")
+            if item.get("executor_state") in EXECUTOR_STATES
+            else "none"
+        ),
+        "execution_contract_id": safe_fingerprint(item.get("execution_contract_id")) or None,
+        "executor_attempt": min(
+            max(safe_int(item.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS
+        ),
+        "executor_failure_kind": (
+            item.get("executor_failure_kind")
+            if item.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
+            else None
+        ),
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
             if (scope := _safe_active_agent_scope(raw)) is not None
@@ -995,7 +1115,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     ][:8]
     base["model_profile"] = (
         domain_source.get("model_profile")
-        if domain_source.get("model_profile") in {"current", "work_assessment"}
+        if domain_source.get("model_profile") in MODEL_PROFILES
         else "current"
     )
     base["domain_classifier_version"] = safe_label(
@@ -1071,6 +1191,44 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         safe_fingerprint(value.get("confirmed_plan_digest")) or None
     )
     base["confirmed_at"] = str(value.get("confirmed_at"))[:40] if value.get("confirmed_at") else None
+    base["execution_profile_version"] = safe_label(
+        value.get("execution_profile_version") or EXECUTION_PROFILE_VERSION, 16
+    )
+    base["executor_state"] = (
+        value.get("executor_state")
+        if value.get("executor_state") in EXECUTOR_STATES
+        else "none"
+    )
+    base["execution_contract_id"] = (
+        safe_fingerprint(value.get("execution_contract_id")) or None
+    )
+    base["executor_agent_id"] = (
+        safe_label(value.get("executor_agent_id"), 120)
+        if value.get("executor_agent_id")
+        else None
+    )
+    base["executor_attempt"] = min(
+        max(safe_int(value.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS
+    )
+    base["executor_failure_kind"] = (
+        value.get("executor_failure_kind")
+        if value.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
+        else None
+    )
+    base["executor_model"] = (
+        safe_label(value.get("executor_model"), 80) if value.get("executor_model") else None
+    )
+    base["executor_reasoning_effort"] = (
+        safe_label(value.get("executor_reasoning_effort"), 24)
+        if value.get("executor_reasoning_effort")
+        else None
+    )
+    fork_turns = str(value.get("executor_fork_turns") or "")
+    base["executor_fork_turns"] = (
+        fork_turns
+        if fork_turns == "none" or re.fullmatch(r"[1-9]\d*", fork_turns)
+        else None
+    )
 
     base["objective"] = safe_metadata(value.get("objective"))
     if not base["objective"] and value.get("last_objective"):
@@ -1092,6 +1250,41 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["plan_state"] = "awaiting_confirmation"
         base["confirmed_plan_digest"] = None
         base["confirmed_at"] = None
+
+    expected_contract = execution_contract_id(base) if base["plan_state"] == "confirmed" else None
+    valid_execution_binding = bool(
+        expected_contract
+        and base["execution_contract_id"] == expected_contract
+        and base["execution_profile_version"] == EXECUTION_PROFILE_VERSION
+    )
+    if base["plan_state"] == "confirmed" and not valid_execution_binding:
+        # Schema 9 confirmations never proved an executor handoff. Recreate the contract, but never
+        # infer that execution had started or succeeded.
+        base["execution_profile_version"] = EXECUTION_PROFILE_VERSION
+        base["execution_contract_id"] = expected_contract
+        base["executor_state"] = "spawn_required"
+        base["executor_agent_id"] = None
+        base["executor_attempt"] = 0
+        base["executor_failure_kind"] = None
+        base["executor_model"] = None
+        base["executor_reasoning_effort"] = None
+        base["executor_fork_turns"] = None
+        base["model_profile"] = "work_executor_low_latest"
+    elif base["plan_state"] == "confirmed":
+        base["model_profile"] = (
+            "work_assessment"
+            if base["executor_state"] in {"recovery_required", "exhausted"}
+            else "work_executor_low_latest"
+        )
+    elif base["plan_state"] != "confirmed":
+        base["execution_contract_id"] = None
+        base["executor_state"] = "none"
+        base["executor_agent_id"] = None
+        base["executor_attempt"] = 0
+        base["executor_failure_kind"] = None
+        base["executor_model"] = None
+        base["executor_reasoning_effort"] = None
+        base["executor_fork_turns"] = None
 
     base["prompts"] = [item for raw in as_list(value.get("prompts")) if (item := _safe_prompt(raw)) is not None][-MAX_PROMPTS:]
     base["operations"] = [item for raw in as_list(value.get("operations")) if (item := _safe_operation(raw)) is not None][-MAX_OPERATIONS:]
@@ -2008,7 +2201,7 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
     ][:8]
     result["model_profile"] = (
         result.get("model_profile")
-        if result.get("model_profile") in {"current", "work_assessment"}
+        if result.get("model_profile") in MODEL_PROFILES
         else "current"
     )
     result["domain_classifier_version"] = safe_label(
@@ -2297,6 +2490,96 @@ def subagent_request_fields(payload: dict[str, Any]) -> tuple[str | None, str | 
     return task_name, stable_hash(scope_value) if scope_value else None
 
 
+def subagent_request_options(payload: dict[str, Any]) -> dict[str, str | None]:
+    tool_input = payload.get("tool_input")
+    candidates: list[dict[str, Any]] = []
+    if isinstance(tool_input, dict):
+        candidates.append(tool_input)
+        for key in ("args", "arguments", "input"):
+            nested = tool_input.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+    result: dict[str, str | None] = {
+        "model": None,
+        "reasoning_effort": None,
+        "fork_turns": None,
+    }
+    for candidate in candidates:
+        for key in tuple(result):
+            if result[key] is None and candidate.get(key) not in (None, ""):
+                result[key] = str(candidate.get(key)).strip()
+    return result
+
+
+def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
+    contract_id = str(state.get("execution_contract_id") or "")
+    request = subagent_request_text(payload)
+    if not contract_id or not request:
+        return False, "missing execution contract"
+    options = subagent_request_options(payload)
+    model = str(options.get("model") or "").strip()
+    effort = str(options.get("reasoning_effort") or "").strip().lower()
+    fork_turns = str(options.get("fork_turns") or "").strip().lower()
+    contract_marker = bool(
+        re.search(
+            rf"(?:execution_contract_id|execution-contract-id|执行合同)\s*[:=：]\s*{re.escape(contract_id)}\b",
+            request,
+            re.I,
+        )
+    )
+    plan_marker = str(state.get("plan_digest") or "") in request
+    generation_marker = bool(
+        re.search(
+            rf"(?:plan_generation|plan-generation|计划代次)\s*[:=：]\s*{safe_int(state.get('plan_generation'))}\b",
+            request,
+            re.I,
+        )
+    )
+    exclusive_scope = bool(
+        re.search(r"\b(?:exclusive (?:owner|executor)|only executor)\b", request, re.I)
+        or any(term in request for term in ("唯一执行者", "独占执行", "独占修改"))
+    )
+    acceptance = bool(
+        re.search(r"\b(?:acceptance|verification|verify|test)\b", request, re.I)
+        or any(term in request for term in ("验收", "验证", "测试"))
+    )
+    if state.get("executor_state") == "recovery_required":
+        failure_kind = str(state.get("executor_failure_kind") or "")
+        recovery_marker = bool(
+            failure_kind
+            and re.search(
+                rf"(?:recovery_from|recovery-from|恢复自)\s*[:=：]\s*{re.escape(failure_kind)}\b",
+                request,
+                re.I,
+            )
+        )
+        correction_marker = bool(
+            re.search(
+                r"(?:material_correction|material-correction|实质修正)\s*[:=：]\s*.{8,}",
+                request,
+                re.I,
+            )
+        )
+        if not recovery_marker or not correction_marker:
+            return False, "recovery request lacks the typed failure and a material correction"
+    if not model:
+        return False, "model_unavailable"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
+        return False, "invalid executor model identifier"
+    current_model = str(state.get("model") or "").strip()
+    if current_model and safe_label(model, 80) == safe_label(current_model, 80):
+        return False, "executor model is not a lower-tier override"
+    if effort != "medium":
+        return False, "reasoning_effort must be medium"
+    if fork_turns != "none" and not re.fullmatch(r"[1-9]\d*", fork_turns):
+        return False, "fork_turns must be none or a positive integer when overriding model"
+    if not contract_marker or not plan_marker or not generation_marker:
+        return False, "executor request is not bound to the exact confirmed plan"
+    if not exclusive_scope or not acceptance:
+        return False, "executor request must declare exclusive execution ownership and acceptance"
+    return True, None
+
+
 def subagent_request_text(payload: dict[str, Any]) -> str:
     tool_input = payload.get("tool_input")
     candidates: list[dict[str, Any]] = []
@@ -2492,6 +2775,54 @@ def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> s
     if command_mutates_files(command):
         return "file mutation"
     return None
+
+
+def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
+    """Keep confirmed hard-work mutation with the one explicitly configured executor."""
+    if state.get("work_difficulty") != "hard" or state.get("plan_state") != "confirmed":
+        return None
+    if state.get("confirmed_plan_digest") != state.get("plan_digest"):
+        return "invalid confirmed-plan binding"
+    tool_key = normalized_key(payload.get("tool_name"))
+    if "updateplan" in tool_key or "requestuserinput" in tool_key:
+        return None
+    if is_subagent_spawn_tool(payload):
+        if subagent_request_is_read_only(payload):
+            return None
+        valid, reason = confirmed_executor_request(payload, state)
+        if valid and state.get("executor_state") in {"spawn_required", "recovery_required"}:
+            return None
+        if valid and state.get("executor_state") not in {"spawn_required", "recovery_required"}:
+            return "duplicate confirmed executor"
+        return reason or "non-contract execution subagent"
+    mutating = plan_confirmation_guard(
+        payload,
+        {
+            **state,
+            "plan_state": "awaiting_confirmation",
+            "confirmed_plan_digest": None,
+        },
+    )
+    if not mutating:
+        return None
+    # Hooks are an orchestration guard, not an identity sandbox. Some hosts expose the active
+    # subagent id on tool events; honor it when present, otherwise fail closed for the parent.
+    caller_id = next(
+        (
+            safe_label(payload.get(key), 120)
+            for key in ("agent_id", "subagent_id")
+            if payload.get(key)
+        ),
+        None,
+    )
+    if (
+        caller_id
+        and state.get("executor_state") == "running"
+        and caller_id == state.get("executor_agent_id")
+        and state.get("execution_contract_id") == execution_contract_id(state)
+    ):
+        return None
+    return f"parent or unbound {mutating}"
 
 
 def shell_syntax_view(command: str) -> str:
@@ -3157,6 +3488,15 @@ def session_start(payload: dict[str, Any]) -> None:
             "plan_generation": safe_int(state.get("plan_generation")),
             "plan_digest": state.get("plan_digest"),
             "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+            "execution_profile_version": state.get("execution_profile_version"),
+            "executor_state": state.get("executor_state", "none"),
+            "execution_contract_id": state.get("execution_contract_id"),
+            "executor_agent_id": state.get("executor_agent_id"),
+            "executor_attempt": safe_int(state.get("executor_attempt")),
+            "executor_failure_kind": state.get("executor_failure_kind"),
+            "executor_model": state.get("executor_model"),
+            "executor_reasoning_effort": state.get("executor_reasoning_effort"),
+            "executor_fork_turns": state.get("executor_fork_turns"),
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
@@ -3385,8 +3725,13 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
     domain = str(classification.get("task_domain") or "unknown")
     difficulty = str(classification.get("work_difficulty") or "unknown")
     profile = str(classification.get("model_profile") or "current")
+    profile_note = (
+        "requested executor profile; proof requires accepted explicit child override"
+        if profile == "work_executor_low_latest"
+        else "advisory; no switch"
+    )
     return (
-        f"Domain: {domain}/{difficulty} | profile={profile} (advisory; no switch). "
+        f"Domain: {domain}/{difficulty} | profile={profile} ({profile_note}). "
         f"Route: {label}/{shape} | pressure={pressure_summary} | budget={classification.get('future_token_range')}. "
         f"Order: {order}. {agents}{gate} Control: bounded. "
         "Update phase|done|next|blocker at kickoff/change/~60s wait. "
@@ -3401,7 +3746,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
     active_plan = pending_plan or previous.get("plan_state") == "confirmed"
     new_objective = active_plan and explicit_new_objective(prompt)
-    confirmed_plan = active_plan and pure_plan_confirmation(prompt)
+    already_confirmed = previous.get("plan_state") == "confirmed"
+    confirmed_plan = pending_plan and pure_plan_confirmation(prompt)
     replan = active_plan and plan_replan_request(prompt)
     plan_changed = (
         active_plan
@@ -3415,6 +3761,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     classification = classify_prompt(prompt)
     if continuation and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
+    if already_confirmed and continuation and not plan_changed and not new_objective:
+        classification["model_profile"] = previous.get(
+            "model_profile", "work_executor_low_latest"
+        )
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
@@ -3445,6 +3795,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "difficulty_decision_id",
         ):
             state[key] = classification.get(key)
+        if already_confirmed and continuation and not plan_changed and not new_objective:
+            state["model_profile"] = previous.get("model_profile", "work_executor_low_latest")
         objective_fingerprint = state.get("objective", {}).get("fingerprint")
         if confirmed_plan:
             binding_valid = bool(
@@ -3457,10 +3809,15 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 state["plan_state"] = "confirmed"
                 state["confirmed_plan_digest"] = state.get("plan_digest")
                 state["confirmed_at"] = utc_now()
+                if not initialize_confirmed_executor(state):
+                    state["plan_state"] = "invalidated"
+                    state["confirmed_plan_digest"] = None
+                    state["confirmed_at"] = None
             else:
                 state["plan_state"] = "invalidated"
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
+                reset_executor_binding(state)
         elif replan or plan_changed:
             state["plan_state"] = "analyzing"
             state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
@@ -3469,6 +3826,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["plan_difficulty_decision_id"] = None
             state["confirmed_plan_digest"] = None
             state["confirmed_at"] = None
+            reset_executor_binding(state)
+            state["model_profile"] = "work_assessment"
         elif not continuation:
             state["plan_generation"] = 0
             state["plan_digest"] = None
@@ -3476,6 +3835,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["plan_difficulty_decision_id"] = None
             state["confirmed_plan_digest"] = None
             state["confirmed_at"] = None
+            reset_executor_binding(state)
             state["plan_state"] = (
                 "analyzing" if classification.get("work_difficulty") == "hard" else "none"
             )
@@ -3499,9 +3859,21 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         return
     context = routing_context(classification, telemetry)
     if confirmed_plan:
-        context += " Confirmed plan binding is valid; execution may begin within the confirmed scope."
+        context += (
+            " Confirmed plan binding is valid. The parent remains the high-reasoning coordinator; before any "
+            "mutation, spawn exactly one exclusive confirmed-plan executor using the newest actually available "
+            "lower-tier Codex model, reasoning_effort=medium, and fork_turns=none or a positive integer. Bind its "
+            "request to execution_contract_id, plan_digest, plan_generation, full actionable plan, scope, and "
+            "acceptance. Do not claim a model switch until the host accepts that explicit spawn override."
+        )
     elif replan or plan_changed:
         context += " Pending plan invalidated by changed constraints; re-analyze and present a replacement plan before mutation."
+    elif already_confirmed and not plan_changed and not new_objective:
+        context += (
+            " Confirmed plan binding is valid; the existing execution contract remains active. Continue from "
+            "its recorded executor/recovery "
+            "state instead of treating this follow-up as a new confirmation or redoing completed work."
+        )
     elif classification.get("work_difficulty") == "hard" and not pending_plan:
         context += (
             " Hard work: use the highest available model/reasoning for analysis; present a detailed file/method, "
@@ -3583,16 +3955,27 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     if not is_subagent_spawn_tool(payload):
         return False
 
+    executor_request, _ = confirmed_executor_request(payload, state)
     route_value = state.get("last_route")
     route_known = isinstance(route_value, dict) and bool(route_value)
     route = safe_route(route_value)
     gate = str(route.get("delegation_gate") or "closed")
     cap = safe_int(route.get("recommended_agent_cap"))
-    reaudited = gate == "closed" and request_supports_delegation_reaudit(payload, route)
+    if executor_request and state.get("executor_state") in {"spawn_required", "recovery_required"}:
+        # This is a sequential model-profile handoff, not an extra parallel lane. It still has a
+        # strict singleton contract, but must not be blocked by a shared-device route cap of zero.
+        route_known = True
+        gate = "open"
+        cap = 1
+    reaudited = (
+        not executor_request
+        and gate == "closed"
+        and request_supports_delegation_reaudit(payload, route)
+    )
     if reaudited:
         gate = "audit"
         cap = 1
-    active = active_agent_records(state)
+    active = [] if executor_request else active_agent_records(state)
     task_name, scope_fingerprint = subagent_request_fields(payload)
     duplicate_scope = any(
         (task_name and item.get("task_name") == task_name)
@@ -3638,6 +4021,11 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
         return True
 
     def record_request(current: dict[str, Any]) -> None:
+        options = subagent_request_options(payload)
+        attempt = min(
+            max(safe_int(current.get("executor_attempt")), 0) + 1,
+            MAX_EXECUTOR_ATTEMPTS,
+        ) if executor_request else 0
         current.setdefault("subagents", []).append(
             {
                 "at": utc_now(),
@@ -3654,11 +4042,39 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
                 "request_gate": gate,
                 "request_cap": cap,
                 "reaudited": reaudited,
+                "role": "confirmed_executor" if executor_request else "lane",
+                "contract_id": current.get("execution_contract_id") if executor_request else None,
+                "model": safe_label(options.get("model"), 80) if options.get("model") else None,
+                "reasoning_effort": (
+                    safe_label(options.get("reasoning_effort"), 24)
+                    if options.get("reasoning_effort")
+                    else None
+                ),
+                "fork_turns": options.get("fork_turns"),
+                "attempt": attempt,
             }
         )
+        if executor_request:
+            current["executor_state"] = "spawn_pending"
+            current["executor_attempt"] = attempt
+            current["executor_failure_kind"] = None
+            current["executor_model"] = safe_label(options.get("model"), 80)
+            current["executor_reasoning_effort"] = safe_label(
+                options.get("reasoning_effort"), 24
+            )
+            current["executor_fork_turns"] = str(options.get("fork_turns"))
+            current["model_profile"] = "work_executor_low_latest"
 
     mutate_state(payload, record_request)
-    if reaudited:
+    if executor_request:
+        emit_context(
+            "PreToolUse",
+            "Confirmed-plan executor request accepted: the explicit host model override, medium reasoning, "
+            "non-full-history fork, exact execution contract, exclusive ownership, and acceptance markers match. "
+            "This records a requested profile, not proof that the child started; wait for SubagentStart. The "
+            "parent remains coordinator/reviewer and must not perform the executor's mutation.",
+        )
+    elif reaudited:
         emit_context(
             "PreToolUse",
             "Delegation re-audit accepted one positive-utility side lane: its prompt proves that the child is "
@@ -3680,7 +4096,43 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
+    executor_block = executor_gate_guard(payload, state)
+    if executor_block:
+        def record_executor_guard(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "executor_contract",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+            if is_subagent_spawn_tool(payload):
+                if current.get("executor_state") != "recovery_required":
+                    current["executor_failure_kind"] = (
+                        "model_unavailable"
+                        if executor_block == "model_unavailable"
+                        else "invalid_spawn_config"
+                    )
+                current["model_profile"] = "work_assessment"
+
+        mutate_state(payload, record_executor_guard)
+        emit_pretool_deny(
+            f"Workflow Manager blocked {executor_block}: this confirmed hard-work plan requires exactly one "
+            "contract-bound executor. Resolve the newest actually available lower-tier model, explicitly spawn "
+            "it with reasoning_effort=medium and fork_turns=none or a positive integer, and include the exact "
+            "execution_contract_id, plan_digest, plan_generation, exclusive scope, full actionable plan, and "
+            "acceptance. The parent model was not switched and must not silently execute the mutation."
+        )
+        return
     if is_subagent_spawn_tool(payload):
+        valid_executor, _ = confirmed_executor_request(payload, state)
+        if valid_executor:
+            if handle_subagent_pretool(payload, state, fingerprint):
+                return
         route = safe_route(state.get("last_route"))
         gate = str(route.get("delegation_gate") or "closed")
         if gate == "closed":
@@ -3880,6 +4332,14 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     oversized = output_needs_compaction(response_meta, telemetry)
     compacted = False
     budgeted = command_output_budget(payload, command, risk_kind) if command and risk_kind else False
+    caller_id = next(
+        (
+            safe_label(payload.get(key), 120)
+            for key in ("agent_id", "subagent_id")
+            if payload.get(key)
+        ),
+        None,
+    )
 
     def update(state: dict[str, Any]) -> None:
         active_plan_digest = (
@@ -3897,6 +4357,14 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "status": status_value,
                 "category": category,
                 "plan_digest": active_plan_digest,
+                "execution_contract_id": (
+                    state.get("execution_contract_id")
+                    if active_plan_digest and caller_id == state.get("executor_agent_id")
+                    else None
+                ),
+                "executor_agent_id": (
+                    caller_id if caller_id == state.get("executor_agent_id") else None
+                ),
                 "risk_kind": risk_kind,
                 **response_meta,
                 "budgeted": budgeted,
@@ -3904,6 +4372,29 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "compacted": compacted,
             }
         )
+        failed = status_value.startswith("error") or status_value in ERROR_STATUSES
+        executor_operation = bool(
+            caller_id
+            and caller_id == state.get("executor_agent_id")
+            and state.get("executor_state") == "running"
+        )
+        if executor_operation and failed:
+            failure_by_category = {
+                "implementation": "implementation_failed",
+                "build_package": "build_failed",
+                "delivery_device": "deploy_failed",
+                "verification": "verification_failed",
+                "evidence": "verification_failed",
+            }
+            state["executor_failure_kind"] = failure_by_category.get(
+                category, "executor_failed"
+            )
+            state["executor_state"] = (
+                "recovery_required"
+                if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS
+                else "exhausted"
+            )
+            state["model_profile"] = "work_assessment"
         if telemetry:
             state["telemetry"] = telemetry
 
@@ -3934,7 +4425,12 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
             "plan_state": state.get("plan_state", "none"),
             "plan_generation": safe_int(state.get("plan_generation")),
             "plan_digest": state.get("plan_digest"),
-            "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+                "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+                "execution_profile_version": state.get("execution_profile_version"),
+                "executor_state": state.get("executor_state", "none"),
+                "execution_contract_id": state.get("execution_contract_id"),
+                "executor_attempt": safe_int(state.get("executor_attempt")),
+                "executor_failure_kind": state.get("executor_failure_kind"),
             "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
@@ -3965,6 +4461,11 @@ def active_agent_records(state: dict[str, Any]) -> list[dict[str, Any]]:
         if not agent_id:
             continue
         if item.get("event") == "start":
+            role = item.get("role") or "lane"
+            if role == "confirmed_executor":
+                for active_id, active_item in list(active.items()):
+                    if active_item.get("role") == "confirmed_executor":
+                        active.pop(active_id, None)
             active[agent_id] = item
         elif item.get("event") == "stop":
             active.pop(agent_id, None)
@@ -3987,26 +4488,44 @@ def active_agent_scope_summary(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
-    used = {
-        str(item.get("request_fingerprint"))
-        for item in state.get("subagents", [])
-        if item.get("event") == "start" and item.get("request_fingerprint")
-    }
-    candidates = [
-        item
-        for item in state.get("subagents", [])
-        if item.get("event") == "request"
-        and item.get("request_fingerprint")
-        and str(item.get("request_fingerprint")) not in used
-    ]
+    used_counts: dict[str, int] = {}
+    for item in state.get("subagents", []):
+        if item.get("event") != "start" or not item.get("request_fingerprint"):
+            continue
+        fingerprint = str(item.get("request_fingerprint"))
+        used_counts[fingerprint] = used_counts.get(fingerprint, 0) + 1
+    seen_counts: dict[str, int] = {}
+    candidates: list[dict[str, Any]] = []
+    for item in state.get("subagents", []):
+        if item.get("event") != "request" or not item.get("request_fingerprint"):
+            continue
+        fingerprint = str(item.get("request_fingerprint"))
+        occurrence = seen_counts.get(fingerprint, 0)
+        seen_counts[fingerprint] = occurrence + 1
+        if occurrence >= used_counts.get(fingerprint, 0):
+            candidates.append(item)
     if not candidates:
         return None
     turn_id = safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None
     if turn_id:
         same_turn = [item for item in candidates if item.get("turn_id") == turn_id]
         if same_turn:
-            return same_turn[-1]
-    return candidates[-1]
+            executor_same_turn = [
+                item
+                for item in same_turn
+                if item.get("role") == "confirmed_executor"
+                and item.get("contract_id") == state.get("execution_contract_id")
+                and safe_int(item.get("attempt")) == safe_int(state.get("executor_attempt"))
+            ]
+            return (executor_same_turn or same_turn)[-1]
+    executor_pending = [
+        item
+        for item in candidates
+        if item.get("role") == "confirmed_executor"
+        and item.get("contract_id") == state.get("execution_contract_id")
+        and safe_int(item.get("attempt")) == safe_int(state.get("executor_attempt"))
+    ]
+    return (executor_pending or candidates)[-1]
 
 
 def subagent_start(payload: dict[str, Any]) -> None:
@@ -4016,6 +4535,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
     scope_fingerprint = (stable_hash(scope_value) if scope_value else None) or request.get("scope_fingerprint")
     task_name = task_name_from_payload(payload) or request.get("task_name")
     request_fingerprint = request.get("request_fingerprint")
+    executor_request = request.get("role") == "confirmed_executor"
     active = active_agent_records(previous)
     objective_fingerprint = request.get("objective_fingerprint") or previous.get("objective", {}).get("fingerprint")
     route = safe_route(previous.get("last_route"))
@@ -4029,12 +4549,23 @@ def subagent_start(payload: dict[str, Any]) -> None:
     over_cap = len(active) >= cap
 
     def update(state: dict[str, Any]) -> None:
+        agent_id = safe_label(payload.get("agent_id"), 120)
+        request_contract = request.get("contract_id")
+        contract_matches = bool(
+            executor_request
+            and request_contract
+            and request_contract == state.get("execution_contract_id")
+            and request_contract == execution_contract_id(state)
+            and request.get("model") == state.get("executor_model")
+            and request.get("reasoning_effort") == "medium"
+            and request.get("fork_turns") == state.get("executor_fork_turns")
+        )
         state.setdefault("subagents", []).append(
             {
                 "at": utc_now(),
                 "event": "start",
                 "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
-                "agent_id": safe_label(payload.get("agent_id"), 120),
+                "agent_id": agent_id,
                 "agent_type": safe_label(payload.get("agent_type"), 80),
                 "task_name": task_name,
                 "scope_fingerprint": scope_fingerprint,
@@ -4042,11 +4573,36 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 "objective_fingerprint": objective_fingerprint,
                 "stale": False,
                 "status": "running",
+                "role": request.get("role") or "lane",
+                "contract_id": request_contract,
+                "model": request.get("model"),
+                "reasoning_effort": request.get("reasoning_effort"),
+                "fork_turns": request.get("fork_turns"),
+                "attempt": request.get("attempt"),
             }
         )
+        if executor_request:
+            if contract_matches:
+                state["executor_state"] = "running"
+                state["executor_agent_id"] = agent_id
+                state["executor_failure_kind"] = None
+            else:
+                state["executor_state"] = "recovery_required"
+                state["executor_agent_id"] = None
+                state["executor_failure_kind"] = "start_mismatch"
 
     _, changed = mutate_state(payload, update)
     warnings: list[str] = []
+    if executor_request:
+        refreshed = snapshot_state(payload)
+        if refreshed.get("executor_state") != "running":
+            warnings.append(
+                "Confirmed executor start did not match the persisted contract/config; do not mutate and return control for recovery."
+            )
+        else:
+            warnings.append(
+                "Confirmed executor is active. Execute only the bound plan and acceptance, preserve evidence, and stop on contract drift."
+            )
     if duplicate_scope and changed:
         warnings.append("Existing active subagent already has the same task name or scope; reuse it or send one bounded follow-up.")
     if over_cap and changed:
@@ -4078,6 +4634,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     started_objective = str((started or {}).get("objective_fingerprint") or "")
     current_objective = str(previous.get("objective", {}).get("fingerprint") or "")
     stale = bool(started_objective and current_objective and started_objective != current_objective)
+    executor_agent = bool((started or {}).get("role") == "confirmed_executor")
 
     def update(state: dict[str, Any]) -> None:
         state.setdefault("subagents", []).append(
@@ -4092,8 +4649,36 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 "stale": stale,
                 "status": status_value,
                 "result_meta": text_metadata(result),
+                "role": (started or {}).get("role") or "lane",
+                "contract_id": (started or {}).get("contract_id"),
+                "model": (started or {}).get("model"),
+                "reasoning_effort": (started or {}).get("reasoning_effort"),
+                "fork_turns": (started or {}).get("fork_turns"),
+                "attempt": (started or {}).get("attempt"),
             }
         )
+        if executor_agent and state.get("executor_agent_id") == agent_id:
+            contract_current = bool(
+                not stale
+                and (started or {}).get("contract_id") == state.get("execution_contract_id")
+                and state.get("execution_contract_id") == execution_contract_id(state)
+            )
+            successful = status_value in {"completed", "ok"}
+            if not contract_current:
+                state["executor_state"] = "recovery_required"
+                state["executor_failure_kind"] = "stale_contract"
+                state["model_profile"] = "work_assessment"
+            elif successful and state.get("executor_state") == "running":
+                state["executor_state"] = "succeeded"
+                state["executor_failure_kind"] = None
+            elif not successful:
+                state["executor_state"] = (
+                    "recovery_required"
+                    if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS
+                    else "exhausted"
+                )
+                state["executor_failure_kind"] = "executor_failed"
+                state["model_profile"] = "work_assessment"
 
     mutate_state(payload, update)
     if stale:
@@ -4101,6 +4686,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             "SubagentStop",
             "Stale subagent result: the objective changed after this agent started. Use it only as verification; "
             "it must not drive mutation for the previous objective.",
+        )
+    elif executor_agent and status_value not in {"completed", "ok"}:
+        emit_context(
+            "SubagentStop",
+            "Confirmed executor failed. Return to the high-reasoning parent for one diagnosis. Do not repeat "
+            "unchanged actions: either make a material correction and use the one remaining bounded executor "
+            "attempt, or invalidate/replan when scope or acceptance changes.",
         )
     else:
         emit_continue()
