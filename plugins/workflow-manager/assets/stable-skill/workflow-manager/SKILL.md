@@ -13,9 +13,9 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 
 ## Route and run
 
-1. Classify **Daily** (chat, weather, reports, personal help, cleanup) versus **Work** (device changes/bugs, App/code, engineering delivery/diagnosis). Inseparable engineering output is Work. Daily keeps current settings and safety.
-2. For Work, make an objective-bound `work_assessment`: request the host's highest Codex model/effort to decide **Simple**/**Hard**. If parent already is that profile, record real local input and assess locally. Never fabricate acceptance.
-3. Simple continues with that same high assessor (follow it up if needed), with no confirmation round; normal safety gates still apply.
+1. Classify **Daily** (chat, weather, reports, personal help, cleanup) versus **Work** (device/App/code/engineering). Daily keeps current settings and safety.
+2. Work creates one objective+generation-bound high assessor, always spawned with highest available model/effort and explicit `fork_turns=none`/positive integer. Record requested versus observed profile only.
+3. First assessor turn is read-only: **Simple** returns `WORK_ASSESSMENT`, then the same bound child follow-up solves+verifies and returns `SIMPLE_EXECUTION`; **Hard** returns detailed plan+marker and ends `计划已就绪，等待确认后执行`.
 4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan modules/files, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
 5. Before strict Hard-plan confirmation, allow reads; block writes, mutating children/Git, builds, deployment, and device mutation. Changed constraints invalidate it. Read [references/work-routing.md](references/work-routing.md).
 6. After confirmation read [references/confirmed-execution.md](references/confirmed-execution.md). The high parent coordinates/reviews; request one newest lower-tier medium executor bound to objective/difficulty/plan generation/digest. Keep handoff silent; report typed failure only when blocked. One corrected recovery, never identical retry.

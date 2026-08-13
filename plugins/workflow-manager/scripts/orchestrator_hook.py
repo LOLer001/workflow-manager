@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 13
-WRITER_VERSION = "1.0.26"
+SCHEMA_VERSION = 14
+WRITER_VERSION = "1.0.27"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "1"
@@ -67,6 +67,7 @@ EXECUTOR_STATES = {
     "spawn_required",
     "spawn_pending",
     "running",
+    "local_running",
     "succeeded",
     "recovery_required",
     "exhausted",
@@ -84,6 +85,7 @@ EXECUTOR_FAILURE_KINDS = {
     "verification_failed",
 }
 MAX_EXECUTOR_ATTEMPTS = 2
+ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "simple_execution_required", "simple_running", "simple_complete", "hard_plan_ready", "recovery_required", "failed"}
 CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
 CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
@@ -158,6 +160,12 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     if reference["enabled"] and reference["contract_digest"]:
         material += f"\0{reference['contract_digest']}"
     return stable_hash(material, 32)
+
+
+def assessor_binding_id(state: dict[str, Any]) -> str | None:
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    generation = max(safe_int(state.get("assessor_generation")), 0)
+    return stable_hash(f"assessor-v1\0{objective}\0{generation}", 32) if objective and generation else None
 
 
 def reference_requested(prompt: str) -> bool:
@@ -283,7 +291,11 @@ def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
     elif state.get("executor_state") not in EXECUTOR_STATES - {"none"}:
         state["executor_state"] = "spawn_required"
     state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
-    state["model_profile"] = "work_executor_low_latest"
+    if safe_route(state.get("last_route")).get("delegation_opt_out"):
+        state["executor_state"] = "local_running"
+        state["model_profile"] = "current"
+    else:
+        state["model_profile"] = "work_executor_low_latest"
     return True
 
 
@@ -877,6 +889,14 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "assessor_model": None,
         "assessor_reasoning_effort": None,
         "assessor_input_fingerprint": None,
+        "assessor_generation": 0,
+        "assessor_binding_id": None,
+        "assessor_failure_kind": None,
+        "assessor_observed_effective": False,
+        "assessor_observed_model": None,
+        "assessor_observed_reasoning_effort": None,
+        "assessor_fork_turns": None,
+        "assessor_attempt": 0,
         "plan_state": "none",
         "plan_generation": 0,
         "plan_digest": None,
@@ -1022,6 +1042,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "category": safe_label(item.get("category"), 32) if item.get("category") else "other",
         "plan_digest": plan_digest,
         "execution_contract_id": contract_id,
+        "assessor_binding_id": safe_fingerprint(item.get("assessor_binding_id")) or None,
         "executor_agent_id": (
             safe_label(item.get("executor_agent_id"), 120)
             if item.get("executor_agent_id")
@@ -1068,7 +1089,7 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
     contract_id = safe_fingerprint(item.get("contract_id")) or None
     role = (
         item.get("role")
-        if item.get("role") in {"lane", "confirmed_executor"}
+        if item.get("role") in {"lane", "confirmed_executor", "high_assessor"}
         else "lane"
     )
     fork_turns = str(item.get("fork_turns") or "")
@@ -1381,6 +1402,19 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     base["reference_acceptance"] = _safe_reference_acceptance(value.get("reference_acceptance"))
+    base["assessor_generation"] = max(safe_int(value.get("assessor_generation")), 0)
+    base["assessor_binding_id"] = safe_fingerprint(value.get("assessor_binding_id")) or None
+    base["assessor_state"] = value.get("assessor_state") if value.get("assessor_state") in ASSESSOR_STATES else "none"
+    base["assessor_failure_kind"] = safe_label(value.get("assessor_failure_kind"), 48) if value.get("assessor_failure_kind") else None
+    base["assessor_observed_effective"] = bool(value.get("assessor_observed_effective"))
+    base["assessor_observed_model"] = safe_label(value.get("assessor_observed_model"), 80) if value.get("assessor_observed_model") else None
+    base["assessor_observed_reasoning_effort"] = safe_label(value.get("assessor_observed_reasoning_effort"), 24) if value.get("assessor_observed_reasoning_effort") else None
+    base["assessor_agent_id"] = safe_label(value.get("assessor_agent_id"), 120) if value.get("assessor_agent_id") else None
+    base["assessor_model"] = safe_label(value.get("assessor_model"), 80) if value.get("assessor_model") else None
+    base["assessor_reasoning_effort"] = safe_label(value.get("assessor_reasoning_effort"), 24) if value.get("assessor_reasoning_effort") else None
+    base["assessor_input_fingerprint"] = safe_fingerprint(value.get("assessor_input_fingerprint")) or None
+    base["assessor_fork_turns"] = str(value.get("assessor_fork_turns")) if value.get("assessor_fork_turns") is not None else None
+    base["assessor_attempt"] = min(max(safe_int(value.get("assessor_attempt")), 0), 2)
     base["executor_model"] = (
         safe_label(value.get("executor_model"), 80) if value.get("executor_model") else None
     )
@@ -1404,6 +1438,23 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     if not base["objective"] and value.get("last_objective"):
         base["objective"] = text_metadata(value.get("last_objective"))
     base["last_assistant"] = safe_metadata(value.get("last_assistant"))
+    expected_assessor = assessor_binding_id(base) if base["assessor_generation"] else None
+    if base["assessor_state"] in {"spawn_pending", "running", "hard_plan_ready"} and base["assessor_binding_id"] != expected_assessor:
+        base["assessor_state"] = "recovery_required"
+        base["assessor_failure_kind"] = "stale_binding"
+    # Schema 13 predates the assessor handoff.  Preserve a genuinely confirmed
+    # executor contract, but never treat an old unconfirmed Work route as assessed.
+    if (
+        safe_int(value.get("schema_version")) <= 13
+        and base["task_domain"] == "work"
+        and base["plan_state"] != "confirmed"
+        and base["assessor_state"] == "none"
+        and base["objective"].get("fingerprint")
+    ):
+        base["assessor_generation"] = 1
+        base["assessor_binding_id"] = assessor_binding_id(base)
+        base["assessor_input_fingerprint"] = base["objective"].get("fingerprint")
+        base["assessor_state"] = "spawn_required"
 
     valid_plan_binding = bool(
         base["plan_digest"]
@@ -1439,12 +1490,12 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_model"] = None
         base["executor_reasoning_effort"] = None
         base["executor_fork_turns"] = None
-        base["model_profile"] = "work_executor_low_latest"
+        base["model_profile"] = "current" if base["last_route"].get("delegation_opt_out") else "work_executor_low_latest"
+        if base["last_route"].get("delegation_opt_out"):
+            base["executor_state"] = "local_running"
     elif base["plan_state"] == "confirmed":
-        base["model_profile"] = (
-            "work_assessment"
-            if base["executor_state"] in {"recovery_required", "exhausted"}
-            else "work_executor_low_latest"
+        base["model_profile"] = "current" if base["executor_state"] == "local_running" else (
+            "work_assessment" if base["executor_state"] in {"recovery_required", "exhausted"} else "work_executor_low_latest"
         )
     elif base["plan_state"] != "confirmed":
         base["execution_contract_id"] = None
@@ -2769,6 +2820,45 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
     return True, None
 
 
+def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
+    binding = str(state.get("assessor_binding_id") or "")
+    request = subagent_request_text(payload)
+    options = subagent_request_options(payload)
+    if not binding or not request:
+        return False, "missing assessor binding"
+    if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
+        return False, "duplicate assessor"
+    if not re.search(rf"assessor_binding_id\s*[:=]\s*{re.escape(binding)}\b", request) or "profile_resolution=highest_available" not in request:
+        return False, "assessor binding mismatch"
+    objective = str(state.get("objective", {}).get("fingerprint") or "")
+    if not objective or not re.search(rf"objective_fingerprint\s*[:=]\s*{re.escape(objective)}\b", request):
+        return False, "assessor objective mismatch"
+    raw_model = str(options.get("model") or "").strip()
+    model = safe_label(raw_model, 80)
+    if not raw_model or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
+        return False, "assessor requires explicit highest model and effort"
+    if str(options.get("reasoning_effort") or "").lower() not in {"high", "xhigh", "max", "ultra"}:
+        return False, "assessor requires explicit highest model and effort"
+    fork = str(options.get("fork_turns") or "").lower()
+    if fork != "none" and not re.fullmatch(r"[1-9]\d*", fork):
+        return False, "assessor fork_turns invalid"
+    simple_contract = bool(re.search(r"(?:simple.{0,32}(?:direct|solve|execute|解决|直接).{0,40}(?:verify|验证|测试)|(?:直接|解决).{0,40}simple)", request, re.I))
+    hard_contract = bool(re.search(r"(?:hard.{0,48}(?:read[- ]only|plan|confirmation|只读|计划|确认)|hard.{0,48}(?:plan|只读|计划).{0,48}(?:read[- ]only|confirmation|只读|确认))", request, re.I))
+    if not simple_contract or not hard_contract:
+        return False, "assessor request lacks the Simple/Hard assessment contract"
+    if safe_int(state.get("assessor_attempt")) >= 2:
+        return False, "assessor retry exhausted"
+    if state.get("assessor_state") == "recovery_required":
+        failure = safe_label(state.get("assessor_failure_kind"), 48)
+        if (
+            not failure
+            or f"recovery_from={failure}" not in request
+            or not re.search(r"material_correction\s*[:=]\s*\S.{7,}", request)
+        ):
+            return False, "assessor recovery lacks typed cause or material correction"
+    return True, None
+
+
 def subagent_request_text(payload: dict[str, Any]) -> str:
     for candidate in subagent_request_candidates(payload):
         for key in ("message", "prompt", "task"):
@@ -2798,7 +2888,7 @@ def request_supports_delegation_reaudit(payload: dict[str, Any], route: dict[str
     )
     read_only = bool(
         re.search(r"\b(?:read[- ]only|no writes?|without modifying|do not modify)\b", lower)
-        or any(term in request for term in ("只读", "不修改", "不要修改", "不写入"))
+        or any(term in request for term in ("只读", "只读检查", "不修改", "不要修改", "不写入"))
     )
     exclusive_write_owner = bool(
         re.search(
@@ -2915,6 +3005,8 @@ def subagent_request_is_read_only(payload: dict[str, Any]) -> bool:
             for term in ("修改", "写入", "实现", "修复", "编译", "构建", "部署", "安装", "烧录", "刷机", "提交", "推送")
         )
     )
+    if re.search(r"(?:不(?:构建|编译|安装|部署|重启|烧录|刷机|操作设备)|do not\s+(?:build|compile|install|deploy|reboot|flash|use device))", request, re.I):
+        mutation = False
     analysis_only = bool(
         re.search(r"\b(?:inspect|review|analyze|analyse|research|search|read|explain)\b", lower)
         or any(term in request for term in ("检查", "审查", "分析", "调研", "搜索", "阅读", "解释"))
@@ -2922,13 +3014,30 @@ def subagent_request_is_read_only(payload: dict[str, Any]) -> bool:
     return (explicit_read_only or analysis_only) and not mutation
 
 
+def request_touches_shared_resource(request: str) -> bool:
+    text = str(request or "")
+    positive = re.search(r"(?:\b(?:build|compile|install|deploy|reboot|flash|adb|device)\b|构建|编译|安装|部署|重启|烧录|刷机|设备|设备验证|操作设备)", text, re.I)
+    if not positive:
+        return False
+    negated = re.search(r"(?:不(?:构建|编译|安装|部署|重启|烧录|刷机|操作设备|使用设备)|do not\s+(?:build|compile|install|deploy|reboot|flash|use device)|without\s+(?:building|deploying|device))", text, re.I)
+    read_existing = re.search(r"(?:只读|read[- ]only|检查|审查|分析).{0,24}(?:日志|log|失败|输出|build|deploy|构建|部署)", text, re.I)
+    return not bool(negated or read_existing)
+
+
 def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
     if state.get("work_difficulty") != "hard":
+        return None
+    caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
+    if caller and state.get("assessor_state") == "simple_running" and caller == state.get("assessor_agent_id"):
         return None
     if state.get("plan_state") == "confirmed" and state.get("confirmed_plan_digest") == state.get("plan_digest"):
         return None
     tool_key = normalized_key(payload.get("tool_name"))
     if "updateplan" in tool_key or "requestuserinput" in tool_key:
+        return None
+    if state.get("executor_state") == "local_running":
+        if is_subagent_spawn_tool(payload):
+            return "delegation is explicitly opted out for this confirmed local contract"
         return None
     if is_subagent_spawn_tool(payload):
         return None if subagent_request_is_read_only(payload) else "subagent execution"
@@ -3004,6 +3113,31 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
     ):
         return None
     return f"parent or unbound {mutating}"
+
+
+def assessor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
+    assessor_state = state.get("assessor_state")
+    if assessor_state not in {"spawn_required", "spawn_pending", "running", "simple_execution_required", "simple_running", "recovery_required", "failed"}:
+        return None
+    if assessor_state == "failed" and state.get("assessor_failure_kind") == "delegation_opt_out":
+        return None
+    if is_subagent_spawn_tool(payload):
+        if assessor_state == "running" and subagent_request_is_read_only(payload):
+            route = safe_route(state.get("last_route"))
+            request = subagent_request_text(payload)
+            touches_shared = request_touches_shared_resource(request)
+            if not touches_shared:
+                return None
+        return "non-assessor subagent while high assessment is incomplete"
+    if assessor_state == "simple_execution_required":
+        return "Simple assessment requires the bound assessor follow-up before mutation"
+    mutating = plan_confirmation_guard(payload, {**state, "work_difficulty": "hard", "plan_state": "awaiting_confirmation"})
+    if not mutating:
+        return None
+    caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
+    if caller and caller == state.get("assessor_agent_id") and assessor_state == "simple_running":
+        return None
+    return f"parent or unbound {mutating} while high assessor is active; hard work plan is not strictly confirmed"
 
 
 def causal_review_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
@@ -3687,6 +3821,13 @@ def session_start(payload: dict[str, Any]) -> None:
             "work_difficulty": state.get("work_difficulty", "unknown"),
             "difficulty_decision_id": state.get("difficulty_decision_id"),
             "model_profile": state.get("model_profile", "current"),
+            "assessor_state": state.get("assessor_state", "none"),
+            "assessor_binding_id": state.get("assessor_binding_id"),
+            "assessor_attempt": safe_int(state.get("assessor_attempt")),
+            "assessor_failure_kind": state.get("assessor_failure_kind"),
+            "assessor_observed_effective": bool(state.get("assessor_observed_effective")),
+            "assessor_observed_model": state.get("assessor_observed_model"),
+            "assessor_observed_reasoning_effort": state.get("assessor_observed_reasoning_effort"),
             "plan_state": state.get("plan_state", "none"),
             "plan_generation": safe_int(state.get("plan_generation")),
             "plan_digest": state.get("plan_digest"),
@@ -4113,6 +4254,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         )
     if continuation and not causal_report and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
+    if pending_plan and pure_plan_confirmation(prompt):
+        classification["difficulty_decision_id"] = previous.get("difficulty_decision_id")
+        classification["work_difficulty"] = previous.get("work_difficulty", "hard")
     if causal_active and not new_objective:
         classification["model_profile"] = "work_assessment"
     elif (
@@ -4301,6 +4445,28 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
             state["causal_review"] = _safe_causal_review(None)
             state["last_execution_baseline"] = {}
+        assessor_needed = classification.get("task_domain") == "work" and (
+            not continuation or causal_report or reference_failure or replan or plan_changed
+        )
+        if assessor_needed:
+            state["assessor_generation"] = max(safe_int(state.get("assessor_generation")), 0) + 1
+            state["assessor_binding_id"] = assessor_binding_id(state)
+            state["assessor_state"] = "spawn_required"
+            state["assessor_agent_id"] = None
+            state["assessor_model"] = None
+            state["assessor_reasoning_effort"] = None
+            state["assessor_failure_kind"] = None
+            state["assessor_observed_effective"] = False
+            state["assessor_observed_model"] = None
+            state["assessor_observed_reasoning_effort"] = None
+            state["assessor_input_fingerprint"] = state.get("objective", {}).get("fingerprint")
+            state["assessor_fork_turns"] = None
+            state["assessor_attempt"] = 0
+            if classification.get("delegation_opt_out"):
+                state["assessor_state"] = "failed"
+                state["assessor_failure_kind"] = "delegation_opt_out"
+        elif classification.get("task_domain") == "daily" and not continuation:
+            state["assessor_state"] = "none"
         if acceptance_success and state.get("last_execution_baseline"):
             state["last_execution_baseline"]["acceptance_status"] = "passed"
             if causal_active:
@@ -4324,6 +4490,17 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     if not should_inject:
         return
     context = routing_context(classification, telemetry)
+    refreshed_for_assessor = snapshot_state(payload)
+    if classification.get("task_domain") == "work" and refreshed_for_assessor.get("assessor_state") == "spawn_required":
+        context += (
+            " Work requires one high-tier assessor before execution. Spawn exactly one child with the host's highest "
+            "available Codex model and reasoning (high/xhigh/max/ultra), explicit model/effort and fork_turns=none "
+            f"or positive integer; include assessor_binding_id={refreshed_for_assessor.get('assessor_binding_id')} "
+            f"objective_fingerprint={refreshed_for_assessor.get('objective', {}).get('fingerprint')} and profile_resolution=highest_available. The self-contained child "
+            "contract is: assess Simple and directly solve+verify before WORK_ASSESSMENT; for Hard remain read-only, "
+            "return a detailed executable plan plus WORK_ASSESSMENT, and end exactly 计划已就绪，等待确认后执行. "
+            "Record requested versus observed profile separately."
+        )
     if causal_report:
         refreshed = snapshot_state(payload)
         review = _safe_causal_review(refreshed.get("causal_review"))
@@ -4446,7 +4623,7 @@ def runtime_route_escalation(state: dict[str, Any], current_category: str) -> di
     })
 
 
-def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fingerprint: str) -> bool:
+def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fingerprint: str, *, assessor_safe_side_lane: bool = False) -> bool:
     if not is_subagent_spawn_tool(payload):
         return False
 
@@ -4456,6 +4633,10 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     route = safe_route(route_value)
     gate = str(route.get("delegation_gate") or "closed")
     cap = safe_int(route.get("recommended_agent_cap"))
+    if assessor_safe_side_lane:
+        route_known = True
+        gate = "audit"
+        cap = max(cap, 1)
     if executor_request and state.get("executor_state") in {"spawn_required", "recovery_required"}:
         # This is a sequential model-profile handoff, not an extra parallel lane. It still has a
         # strict singleton contract, but must not be blocked by a shared-device route cap of zero.
@@ -4470,7 +4651,10 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     if reaudited:
         gate = "audit"
         cap = 1
-    active = [] if executor_request else active_agent_records(state)
+    active = [] if executor_request else [
+        item for item in active_agent_records(state)
+        if not (assessor_safe_side_lane and item.get("role") == "high_assessor")
+    ]
     task_name, scope_fingerprint = subagent_request_fields(payload)
     duplicate_scope = any(
         (task_name and item.get("task_name") == task_name)
@@ -4591,6 +4775,59 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
+    if normalized_key(payload.get("tool_name")).endswith("followuptask") and state.get("assessor_state") in {"simple_execution_required", "recovery_required"}:
+        request = subagent_request_text(payload)
+        target = next((str(candidate.get("target") or "") for candidate in subagent_request_candidates(payload) if candidate.get("target")), "")
+        binding = str(state.get("assessor_binding_id") or "")
+        solve = bool(re.search(r"(?:solve|解决)", request, re.I))
+        verify = bool(re.search(r"(?:verify|验证|测试)", request, re.I))
+        recovery_ok = state.get("assessor_state") != "recovery_required" or (
+            f"recovery_from={state.get('assessor_failure_kind')}" in request
+            and bool(re.search(r"material_correction\s*[:=]\s*\S.{7,}", request))
+            and safe_int(state.get("assessor_attempt")) < 2
+        )
+        if target == str(state.get("assessor_agent_id") or "") and binding and f"assessor_binding_id={binding}" in request and solve and verify and recovery_ok:
+            def start_simple_execution(current: dict[str, Any]) -> None:
+                current["assessor_state"] = "simple_running"
+                if current.get("assessor_failure_kind") == "simple_execution_invalid":
+                    current["assessor_attempt"] = safe_int(current.get("assessor_attempt")) + 1
+                current["assessor_failure_kind"] = None
+            mutate_state(payload, start_simple_execution)
+            return
+        emit_pretool_deny("Workflow Manager blocked Simple assessor follow-up: target, binding, and solve/verify contract must match the original assessor.")
+        return
+    if is_subagent_spawn_tool(payload):
+        assessor_ok, assessor_reason = confirmed_assessor_request(payload, state)
+        if assessor_ok:
+            def record_assessor(current: dict[str, Any]) -> None:
+                options = subagent_request_options(payload)
+                task_name, scope_fingerprint = subagent_request_fields(payload)
+                current["assessor_state"] = "spawn_pending"
+                current["assessor_attempt"] = safe_int(current.get("assessor_attempt")) + 1
+                current["assessor_model"] = safe_label(options.get("model"), 80)
+                current["assessor_reasoning_effort"] = safe_label(options.get("reasoning_effort"), 24)
+                current["assessor_fork_turns"] = options.get("fork_turns")
+                current.setdefault("subagents", []).append({"at": utc_now(), "event": "request", "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "task_name": task_name, "scope_fingerprint": scope_fingerprint, "status": "pending", "request_gate": "open", "request_cap": 1, "role": "high_assessor", "contract_id": current.get("assessor_binding_id"), "request_fingerprint": fingerprint, "objective_fingerprint": current.get("objective", {}).get("fingerprint"), "model": current["assessor_model"], "reasoning_effort": current["assessor_reasoning_effort"], "fork_turns": current["assessor_fork_turns"], "attempt": current["assessor_attempt"]})
+            mutate_state(payload, record_assessor)
+            return
+        request_text = subagent_request_text(payload)
+        assessor_intent = "assessor_binding_id" in request_text or subagent_request_fields(payload)[0] == "high_assessor"
+        if state.get("assessor_state") in {"spawn_required", "spawn_pending", "running", "recovery_required"} and assessor_intent:
+            if assessor_reason == "assessor retry exhausted":
+                def exhaust_assessor(current: dict[str, Any]) -> None:
+                    current["assessor_state"] = "failed"
+                    current["assessor_failure_kind"] = "retry_exhausted"
+                mutate_state(payload, exhaust_assessor)
+            emit_pretool_deny(f"Workflow Manager blocked assessor spawn: {assessor_reason}.")
+            return
+        route = safe_route(state.get("last_route"))
+        request_is_shared = request_touches_shared_resource(request_text)
+        if state.get("assessor_state") in {"spawn_required", "spawn_pending", "running", "recovery_required"} and route.get("delegation_gate") == "closed" and route.get("dependency_signal") in {"shared_resource", "ordered_shared"} and request_is_shared:
+            def record_shared_gate(current: dict[str, Any]) -> None:
+                current.setdefault("guards", []).append({"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "subagent_gate", "action": "deny", "fingerprint": fingerprint})
+            mutate_state(payload, record_shared_gate)
+            emit_pretool_deny("Workflow Manager blocked subagent spawn: delegation gate is closed by dependency/shared-resource policy.")
+            return
     causal_block = causal_review_guard(payload, state)
     if causal_block:
         def record_causal_guard(current: dict[str, Any]) -> None:
@@ -4616,6 +4853,10 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             "the current baseline_id and review_id records introduced, fix_ineffective, unrelated, or uncertain. "
             "Compare prior plan/change/verification evidence before corrective mutation; do not reuse the old executor."
         )
+        return
+    assessor_block = assessor_gate_guard(payload, state)
+    if assessor_block:
+        emit_pretool_deny(f"Workflow Manager blocked {assessor_block}; complete the bound high-tier assessment first.")
         return
     executor_block = executor_gate_guard(payload, state)
     if executor_block:
@@ -4656,11 +4897,19 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 return
         route = safe_route(state.get("last_route"))
         gate = str(route.get("delegation_gate") or "closed")
+        assessor_safe_side_lane = bool(
+            state.get("assessor_state") == "running"
+            and subagent_request_is_read_only(payload)
+            and not request_touches_shared_resource(subagent_request_text(payload))
+            and not route.get("delegation_opt_out")
+        )
+        caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
+        assessor_safe_side_lane = assessor_safe_side_lane and caller != state.get("assessor_agent_id")
         if gate == "closed":
-            if handle_subagent_pretool(payload, state, fingerprint):
+            if handle_subagent_pretool(payload, state, fingerprint, assessor_safe_side_lane=assessor_safe_side_lane):
                 return
         elif subagent_request_is_read_only(payload):
-            if handle_subagent_pretool(payload, state, fingerprint):
+            if handle_subagent_pretool(payload, state, fingerprint, assessor_safe_side_lane=assessor_safe_side_lane):
                 return
     blocked_action = plan_confirmation_guard(payload, state)
     if blocked_action:
@@ -4880,12 +5129,13 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "plan_digest": active_plan_digest,
                 "execution_contract_id": (
                     state.get("execution_contract_id")
-                    if active_plan_digest and caller_id == state.get("executor_agent_id")
+                    if active_plan_digest and (caller_id == state.get("executor_agent_id") or state.get("executor_state") == "local_running")
                     else None
                 ),
                 "executor_agent_id": (
                     caller_id if caller_id == state.get("executor_agent_id") else None
                 ),
+                "assessor_binding_id": state.get("assessor_binding_id") if caller_id == state.get("assessor_agent_id") else None,
                 "risk_kind": risk_kind,
                 **response_meta,
                 "budgeted": budgeted,
@@ -4894,6 +5144,19 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             }
         )
         failed = status_value.startswith("error") or status_value in ERROR_STATUSES
+        pending_spawn = next(
+            (item for item in reversed(state.get("subagents", [])) if item.get("event") == "request" and item.get("request_fingerprint") == fingerprint),
+            None,
+        )
+        if failed and pending_spawn and pending_spawn.get("role") == "high_assessor" and state.get("assessor_state") == "spawn_pending":
+            if safe_int(pending_spawn.get("attempt")) == safe_int(state.get("assessor_attempt")):
+                state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
+                state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "spawn_failed"
+        if failed and pending_spawn and pending_spawn.get("role") == "confirmed_executor" and state.get("executor_state") == "spawn_pending":
+            if safe_int(pending_spawn.get("attempt")) == safe_int(state.get("executor_attempt")):
+                state["executor_state"] = "exhausted" if safe_int(state.get("executor_attempt")) >= MAX_EXECUTOR_ATTEMPTS else "recovery_required"
+                state["executor_failure_kind"] = "spawn_failed"
+                state["model_profile"] = "work_assessment"
         executor_operation = bool(
             caller_id
             and caller_id == state.get("executor_agent_id")
@@ -4952,6 +5215,12 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "execution_contract_id": state.get("execution_contract_id"),
                 "executor_attempt": safe_int(state.get("executor_attempt")),
                 "executor_failure_kind": state.get("executor_failure_kind"),
+                "assessor_state": state.get("assessor_state", "none"),
+                "assessor_binding_id": state.get("assessor_binding_id"),
+                "assessor_attempt": safe_int(state.get("assessor_attempt")),
+                "assessor_failure_kind": state.get("assessor_failure_kind"),
+                "assessor_observed_model": state.get("assessor_observed_model"),
+                "assessor_observed_reasoning_effort": state.get("assessor_observed_reasoning_effort"),
                 "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
                 "last_execution_baseline": _safe_execution_baseline(
                     state.get("last_execution_baseline")
@@ -5051,7 +5320,8 @@ def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> 
         and item.get("contract_id") == state.get("execution_contract_id")
         and safe_int(item.get("attempt")) == safe_int(state.get("executor_attempt"))
     ]
-    return (executor_pending or candidates)[-1]
+    assessor_pending = [item for item in candidates if item.get("role") == "high_assessor" and item.get("contract_id") == state.get("assessor_binding_id")]
+    return (executor_pending or assessor_pending or candidates)[-1]
 
 
 def subagent_start(payload: dict[str, Any]) -> None:
@@ -5062,6 +5332,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
     task_name = task_name_from_payload(payload) or request.get("task_name")
     request_fingerprint = request.get("request_fingerprint")
     executor_request = request.get("role") == "confirmed_executor"
+    assessor_request = request.get("role") == "high_assessor"
     active = active_agent_records(previous)
     objective_fingerprint = request.get("objective_fingerprint") or previous.get("objective", {}).get("fingerprint")
     route = safe_route(previous.get("last_route"))
@@ -5079,12 +5350,14 @@ def subagent_start(payload: dict[str, Any]) -> None:
         request_contract = request.get("contract_id")
         contract_matches = bool(
             executor_request
+            and state.get("executor_state") == "spawn_pending"
             and request_contract
             and request_contract == state.get("execution_contract_id")
             and request_contract == execution_contract_id(state)
             and request.get("model") == state.get("executor_model")
             and request.get("reasoning_effort") == "medium"
             and request.get("fork_turns") == state.get("executor_fork_turns")
+            and safe_int(request.get("attempt")) == safe_int(state.get("executor_attempt"))
         )
         state.setdefault("subagents", []).append(
             {
@@ -5116,6 +5389,19 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 state["executor_state"] = "recovery_required"
                 state["executor_agent_id"] = None
                 state["executor_failure_kind"] = "start_mismatch"
+        if assessor_request:
+            echoed_model = safe_label(payload.get("model"), 80) if payload.get("model") else None
+            echoed_effort = safe_label(payload.get("reasoning_effort"), 24) if payload.get("reasoning_effort") else None
+            bound = bool(state.get("assessor_state") == "spawn_pending" and request.get("contract_id") == state.get("assessor_binding_id") and objective_fingerprint == state.get("objective", {}).get("fingerprint") and safe_int(request.get("attempt")) == safe_int(state.get("assessor_attempt")))
+            model_matches = echoed_model is None or echoed_model == state.get("assessor_model")
+            effort_matches = echoed_effort is None or echoed_effort == state.get("assessor_reasoning_effort")
+            matched = bound and model_matches and effort_matches
+            state["assessor_agent_id"] = agent_id if matched else None
+            state["assessor_observed_model"] = echoed_model
+            state["assessor_observed_reasoning_effort"] = echoed_effort
+            state["assessor_observed_effective"] = bool(matched and echoed_model is not None and echoed_effort is not None)
+            state["assessor_state"] = "running" if matched else ("failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required")
+            state["assessor_failure_kind"] = None if matched else ("retry_exhausted" if state["assessor_state"] == "failed" else "start_mismatch")
 
     _, changed = mutate_state(payload, update)
     warnings: list[str] = []
@@ -5161,6 +5447,11 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     current_objective = str(previous.get("objective", {}).get("fingerprint") or "")
     stale = bool(started_objective and current_objective and started_objective != current_objective)
     executor_agent = bool((started or {}).get("role") == "confirmed_executor")
+    assessor_agent = bool((started or {}).get("role") == "high_assessor") or bool(
+        previous.get("assessor_state") == "simple_running" and agent_id == previous.get("assessor_agent_id")
+    )
+    assessment = re.search(r"(?im)^\s*WORK_ASSESSMENT\s+binding_id=([0-9a-f]{32})\s+outcome=(simple|hard)\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
+    simple_execution = re.search(r"(?im)^\s*SIMPLE_EXECUTION\s+binding_id=([0-9a-f]{32})\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
 
     def update(state: dict[str, Any]) -> None:
         state.setdefault("subagents", []).append(
@@ -5202,13 +5493,51 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                     state["last_execution_baseline"] = baseline
                     state["causal_review"] = _safe_causal_review(None)
             elif not successful:
-                state["executor_state"] = (
-                    "recovery_required"
-                    if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS
-                    else "exhausted"
-                )
+                state["executor_state"] = "recovery_required" if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS else "exhausted"
                 state["executor_failure_kind"] = "executor_failed"
                 state["model_profile"] = "work_assessment"
+        if assessor_agent and state.get("assessor_agent_id") == agent_id:
+            if state.get("assessor_state") == "simple_running":
+                if status_value in {"completed", "ok"} and simple_execution and simple_execution.group(1) == state.get("assessor_binding_id"):
+                    state["assessor_state"] = "simple_complete"
+                    state["assessor_failure_kind"] = None
+                else:
+                    state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
+                    state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "simple_execution_invalid"
+                return
+            mutated = any(item.get("assessor_binding_id") == state.get("assessor_binding_id") and item.get("category") in {"implementation", "build_package", "delivery_device", "git"} and item.get("status") in SUCCESS_STATUSES for item in state.get("operations", []))
+            valid = bool(not stale and status_value in {"completed", "ok"} and assessment and assessment.group(1) == state.get("assessor_binding_id"))
+            if assessment and assessment.group(2).lower() == "hard" and mutated:
+                state["assessor_state"] = "failed"
+                state["assessor_failure_kind"] = "hard_mutation_before_confirmation"
+            elif not valid:
+                state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
+                state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "assessment_result_invalid"
+            elif assessment.group(2).lower() == "simple":
+                state["assessor_state"] = "simple_execution_required"
+                state["work_difficulty"] = "simple"
+                state["difficulty_confidence"] = "high"
+                state["difficulty_rule_codes"] = ["assessor_simple"]
+                state["difficulty_decision_id"] = stable_hash(f"{state.get('assessor_binding_id')}\0{assessment.group(3)}", 24)
+                state["plan_state"] = "none"
+            else:
+                detailed = bool(len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", str(result or ""))) >= 2 and re.search(r"(?:验收|验证|test|verify|acceptance)", str(result or ""), re.I) and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", str(result or "")))
+                if not detailed:
+                    state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
+                    state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "hard_plan_incomplete"
+                    return
+                state["assessor_state"] = "hard_plan_ready"
+                state["work_difficulty"] = "hard"
+                state["difficulty_confidence"] = "high"
+                state["difficulty_rule_codes"] = ["assessor_hard"]
+                state["difficulty_decision_id"] = stable_hash(f"{state.get('assessor_binding_id')}\0{assessment.group(3)}", 24)
+                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+                state["plan_digest"] = stable_hash(str(result or ""), 32)
+                state["plan_objective_fingerprint"] = state.get("objective", {}).get("fingerprint")
+                state["plan_difficulty_decision_id"] = state.get("difficulty_decision_id")
+                state["plan_state"] = "awaiting_confirmation"
+                state["model_profile"] = "work_executor_low_latest"
+            state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
     mutate_state(payload, update)
     if stale:
@@ -5239,6 +5568,7 @@ CAUSAL_REVIEW_RESULT_RE = re.compile(
 
 def stop(payload: dict[str, Any]) -> None:
     assistant_message = str(payload.get("last_assistant_message") or "")
+    local_execution = re.search(r"(?im)^\s*LOCAL_EXECUTION\s+execution_contract_id=([0-9a-f]{32})\s+outcome=(succeeded|failed)\s+evidence_digest=([0-9a-f]{32})\s*$", assistant_message)
     causal_match = CAUSAL_REVIEW_RESULT_RE.search(assistant_message)
     plan_ready = bool(
         len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", assistant_message)) >= 2
@@ -5249,6 +5579,30 @@ def stop(payload: dict[str, Any]) -> None:
     def update(state: dict[str, Any]) -> None:
         state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
+        if state.get("plan_state") == "confirmed" and state.get("executor_state") == "local_running":
+            if local_execution and local_execution.group(1) == state.get("execution_contract_id"):
+                if local_execution.group(2) == "succeeded":
+                    bound_operations = [item for item in state.get("operations", []) if item.get("execution_contract_id") == state.get("execution_contract_id") and item.get("status") in SUCCESS_STATUSES]
+                    substantive_indexes = [index for index, item in enumerate(bound_operations) if item.get("category") in {"implementation", "build_package", "delivery_device", "evidence"}]
+                    verification_indexes = [index for index, item in enumerate(bound_operations) if item.get("category") == "verification"]
+                    if substantive_indexes and verification_indexes and max(verification_indexes) > min(substantive_indexes):
+                        state["executor_state"] = "succeeded"
+                        state["executor_failure_kind"] = None
+                        baseline = build_execution_baseline(state)
+                        if baseline:
+                            state["last_execution_baseline"] = baseline
+                            state["causal_review"] = _safe_causal_review(None)
+                    else:
+                        state["executor_state"] = "recovery_required"
+                        state["executor_failure_kind"] = "verification_failed"
+                else:
+                    state["executor_state"] = "recovery_required"
+                    state["executor_failure_kind"] = "executor_failed"
+                    state["model_profile"] = "current"
+            return
+        review_state = _safe_causal_review(state.get("causal_review")).get("state")
+        if state.get("task_domain") == "work" and review_state not in {"triage_required", "triaging"} and state.get("assessor_state") not in {"hard_plan_ready", "simple_complete"} and state.get("assessor_failure_kind") != "delegation_opt_out":
+            return
         review = _safe_causal_review(state.get("causal_review"))
         if review.get("state") in {"triage_required", "triaging"}:
             if causal_match:
@@ -5341,6 +5695,13 @@ def stop(payload: dict[str, Any]) -> None:
                             }
                         )
                         state["last_route"] = route
+                        state["assessor_generation"] = max(safe_int(state.get("assessor_generation")), 0) + 1
+                        state["assessor_binding_id"] = assessor_binding_id(state)
+                        state["assessor_state"] = "spawn_required"
+                        state["assessor_agent_id"] = None
+                        state["assessor_attempt"] = 0
+                        state["assessor_failure_kind"] = None
+                        state["assessor_input_fingerprint"] = state.get("objective", {}).get("fingerprint")
                     state["causal_review"] = review
             return
         if state.get("work_difficulty") == "hard" and state.get("plan_state") in {

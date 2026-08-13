@@ -390,32 +390,47 @@ class WindowsHookTests(unittest.TestCase):
 
     def test_confirmed_executor_contract_roundtrip_is_ascii_safe(self) -> None:
         session = "windows-executor-contract"
-        events = [
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": session,
-                "hook_run_id": "executor-objective",
-                "model": "gpt-5.6-sol",
-                "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
-            },
-            {
-                "hook_event_name": "Stop",
-                "session_id": session,
-                "hook_run_id": "executor-plan",
-                "last_assistant_message": (
-                    "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n"
-                    "3. 完成实机验证与回滚检查\n验收：问题不再复现。\n"
-                    "计划已就绪，等待确认后执行"
-                ),
-            },
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": session,
-                "hook_run_id": "executor-confirm",
-                "prompt": "确认按这个计划执行",
-            },
-        ]
+        events = [{
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": session,
+            "hook_run_id": "executor-objective",
+            "model": "gpt-5.6-sol",
+            "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
+        }]
         for payload in events:
+            result = self.run_command_windows(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout:
+                self.assertTrue(result.stdout.isascii())
+                json.loads(result.stdout)
+        state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        binding = state["assessor_binding_id"]
+        assessor_request = self.run_command_windows({
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "executor-assessor-request", "tool_name": "collaboration.spawn_agent",
+            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none", "message": (
+                f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
+                "profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+            )},
+        })
+        self.assertEqual(assessor_request.returncode, 0, assessor_request.stderr)
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(assessor_request.stdout or "{}").get("hookSpecificOutput", {}),
+        )
+        requested_state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(requested_state["assessor_state"], "spawn_pending")
+        self.assertEqual(requested_state["subagents"][-1]["role"], "high_assessor")
+        for payload in (
+            {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-assessor-start", "agent_id": "windows-executor-assessor", "model": "gpt-5.6-sol"},
+            {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "executor-assessor-stop", "agent_id": "windows-executor-assessor", "status": "completed", "last_assistant_message": (
+                "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n3. 完成实机验证与回滚检查\n"
+                "验收：问题不再复现。\n"
+                f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n"
+                "计划已就绪，等待确认后执行"
+            )},
+            {"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "executor-confirm", "prompt": "确认按这个计划执行"},
+        ):
             result = self.run_command_windows(payload)
             self.assertEqual(result.returncode, 0, result.stderr)
             if result.stdout:
@@ -461,22 +476,6 @@ class WindowsHookTests(unittest.TestCase):
                 "model": "gpt-5.6-sol",
                 "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
             },
-            {
-                "hook_event_name": "Stop",
-                "session_id": session,
-                "hook_run_id": "causal-plan",
-                "last_assistant_message": (
-                    "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n"
-                    "3. 完成实机验证与回滚检查\n验收：问题不再复现。\n"
-                    "计划已就绪，等待确认后执行"
-                ),
-            },
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "session_id": session,
-                "hook_run_id": "causal-confirm",
-                "prompt": "确认按这个计划执行",
-            },
         ]
         for payload in initial_events:
             result = self.run_command_windows(payload)
@@ -486,6 +485,39 @@ class WindowsHookTests(unittest.TestCase):
                 json.loads(result.stdout)
 
         state_path = next((self.data / "sessions").glob("*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        binding = state["assessor_binding_id"]
+        assessor = self.run_command_windows({
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "causal-assessor-request", "tool_name": "collaboration.spawn_agent",
+            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none", "message": (
+                f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
+                "profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+            )},
+        })
+        self.assertEqual(assessor.returncode, 0, assessor.stderr)
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(assessor.stdout or "{}").get("hookSpecificOutput", {}),
+        )
+        requested_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(requested_state["assessor_state"], "spawn_pending")
+        self.assertEqual(requested_state["subagents"][-1]["role"], "high_assessor")
+        for payload in (
+            {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "causal-assessor-start", "agent_id": "windows-causal-assessor", "model": "gpt-5.6-sol"},
+            {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "causal-assessor-stop", "agent_id": "windows-causal-assessor", "status": "completed", "last_assistant_message": (
+                "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n3. 完成实机验证与回滚检查\n"
+                "验收：问题不再复现。\n"
+                f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'b' * 32}\n"
+                "计划已就绪，等待确认后执行"
+            )},
+            {"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "causal-confirm", "prompt": "确认按这个计划执行"},
+        ):
+            result = self.run_command_windows(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout:
+                self.assertTrue(result.stdout.isascii())
+                json.loads(result.stdout)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         contract_id = state["execution_contract_id"]
         execution_events = [

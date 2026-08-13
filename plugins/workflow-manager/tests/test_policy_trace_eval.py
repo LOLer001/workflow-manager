@@ -686,6 +686,11 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                     },
                 )
                 objective = self._load_hook_state(session)["objective"]["fingerprint"]
+                assessor_state = self._load_hook_state(session)
+                binding = assessor_state["assessor_binding_id"]
+                assessor_message = f"assessor_binding_id={binding} objective_fingerprint={objective} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+                self._capture_hook(HOOK.pre_tool_use, {"hook_event_name": "PreToolUse", "session_id": session, "turn_id": "turn-1", "hook_run_id": "assessor-request", "tool_name": "Agent", "tool_input": {"description": "high_assessor", "prompt": assessor_message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})
+                self._capture_hook(HOOK.subagent_start, {"hook_event_name": "SubagentStart", "session_id": session, "turn_id": "turn-1", "hook_run_id": "assessor-start", "agent_id": "high-assessor", "model": "gpt-5.6-sol"})
                 approved_output = self._capture_hook(
                     HOOK.pre_tool_use,
                     {
@@ -715,9 +720,9 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                 )
                 started = self._load_hook_state(session)
                 active = HOOK.active_agent_records(started)
-                self.assertEqual(len(active), 1)
+                self.assertEqual(len([item for item in active if item["role"] == "lane"]), 1)
                 self.assertEqual(active[0]["objective_fingerprint"], objective)
-                self.assertEqual(active[0]["task_name"], "audit_01_source")
+                self.assertEqual([item for item in active if item["role"] == "lane"][0]["task_name"], "audit_01_source")
                 self.assertIsNotNone(active[0]["scope_fingerprint"])
 
                 self._capture_hook(
@@ -733,7 +738,7 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                 compacted = self._load_hook_state(session)
                 checkpoint = compacted["compactions"][-1]
                 self.assertEqual(checkpoint["current_stage"], "contract")
-                self.assertEqual(len(checkpoint["active_agent_scopes"]), 1)
+                self.assertEqual(len(checkpoint["active_agent_scopes"]), 2)
                 scope = checkpoint["active_agent_scopes"][0]
                 self.assertEqual(scope["objective_fingerprint"], objective)
                 self.assertEqual(scope["scope_fingerprint"], active[0]["scope_fingerprint"])
@@ -748,10 +753,10 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                     },
                 )
                 resumed = self._load_hook_state(session)
-                self.assertEqual(HOOK.active_agent_count(resumed), 1)
+                self.assertEqual(len([item for item in HOOK.active_agent_records(resumed) if item["role"] == "lane"]), 1)
                 self.assertEqual(
-                    HOOK.active_agent_records(resumed)[0]["scope_fingerprint"],
-                    active[0]["scope_fingerprint"],
+                    [item for item in HOOK.active_agent_records(resumed) if item["role"] == "lane"][0]["scope_fingerprint"],
+                    [item for item in active if item["role"] == "lane"][0]["scope_fingerprint"],
                 )
                 duplicate_output = self._capture_hook(
                     HOOK.pre_tool_use,
@@ -772,10 +777,10 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                 self.assertIn("same task name or scope", duplicate_event["permissionDecisionReason"])
 
                 after_denial = self._load_hook_state(session)
-                self.assertEqual(HOOK.active_agent_count(after_denial), 1)
+                self.assertEqual(len([item for item in HOOK.active_agent_records(after_denial) if item["role"] == "lane"]), 1)
                 self.assertEqual(after_denial["last_route"]["recommended_agent_cap"], 2)
                 self.assertEqual(
-                    sum(item["event"] == "start" for item in after_denial["subagents"]),
+                    sum(item["event"] == "start" and item["role"] == "lane" for item in after_denial["subagents"]),
                     1,
                 )
 

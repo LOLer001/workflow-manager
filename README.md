@@ -6,7 +6,7 @@
 
 - 正确性与必要推理、证据、纠错和验收验证始终高于 token 或上下文节省。
 - 先判断日常问题或工作问题：聊天、天气、日报、电脑清理等日常请求保持当前会话设置；设备定制、设备 Bug、App/代码开发、构建部署及工程诊断进入工作评估。
-- 工作评估请求使用可用的最高模型和最高推理强度判断简单或困难；Hook 只记录和提示该策略，不能虚报宿主已经完成切模。
+- 每个 Work 新目标显式创建一个最高可用模型/推理的绑定评估子智能体；PreTool 仅接受完整证明请求。Start 的 active model 匹配可证明模型，推理强度只有宿主明确回显才可观测，缺失不算失败。
 - 简单工作问题由评估档直接解决和验证，不额外增加计划确认轮次。
 - 困难工作问题先只读取证据，再给出包含模块、文件、方法、改动、构建部署、验收、风险和回退的详细计划；只有用户严格确认当前计划后才开始写入、构建或部署。
 - 严格确认后，父会话继续以高推理负责协调和复核；从宿主当时实际暴露的选项中选择最新的较低档 Codex 模型，创建唯一合同执行子智能体并固定 `reasoning_effort=medium`，不硬编码具体模型名。
@@ -17,7 +17,7 @@
 - 按任务复杂度选择直接处理、聚焦处理或复杂工作流。
 - 复杂任务主动评估关键路径，只要预期节省时间高于协调成本，就优先并行调度独立的读、写、测试、研究或复核工作。
 - Complex 最多 2 个、Extensive 最多 3 个子智能体；上限只是容量，不是固定数量，也不要求必须派一个只读子智能体。
-- 日常请求、简单工作及原有并行收益判断保持不变；唯一执行合同只约束已确认困难计划的变更范围，其他并行通道不得成为第二个执行者。
+- 日常请求保持当前策略；明确“不使用子智能体”会硬关闭评估者并本地处理。唯一执行合同只约束已确认困难计划的变更范围，其他并行通道不得成为第二个执行者。
 - 通过明确文件/模块所有权避免写冲突；共享构建服务器、设备或交付物只串行化实际冲突的阶段。
 - 在上下文压力升高时只收窄冗余展示并提前保存检查点；必要调查继续进行。
 - 压缩后复用原生摘要、计划和已验证结果，不从头重复。
@@ -35,14 +35,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.26\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.27\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.26/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.27/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -85,7 +85,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.26 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.27 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -99,7 +99,7 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ## 工作方式与边界
 
-处理顺序是“日常/工作 → 仅工作再判简单/困难 → 独立判断 Direct/Focused/Complex/Extensive”。困难不等于必须创建子智能体，子智能体数量也不能反向决定问题难度。任务仍只按需经过 `Contract → Evidence → Change → Verify → Report`。
+处理顺序是“日常/工作 → Work 的高档评估者判简单/困难 → 独立判断 Direct/Focused/Complex/Extensive”。困难不等于增加执行者数量；除高评估者和已确认的唯一执行者外，子智能体数量也不能反向决定问题难度。任务仍只按需经过 `Contract → Evidence → Change → Verify → Report`。
 
 困难计划等待确认期间，目标读取、搜索、静态检查、计划更新、澄清问题和明确只读的子智能体调查可以继续；明确文件写入、变更型子智能体或 Git、构建打包、部署安装和设备变更会被拦截。确认只绑定当前计划、目标和难度判断；任何新增约束或重规划请求都会使原确认失效。
 

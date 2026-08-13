@@ -6,10 +6,16 @@ Use this reference for difficult-work classification, plan construction, strict 
 
 1. Decide Daily or Work independently from Direct/Focused/Complex/Extensive.
 2. Daily requests keep the current session settings and have no work-plan gate.
-3. Work requests use the logical `work_assessment` profile, requesting the highest available model and highest reasoning effort to decide Simple or Hard.
+3. A new Work objective, causal/replacement review, or reference failure creates one binding from objective fingerprint plus assessor generation. Request exactly one child with the highest available Codex model, high/xhigh/max/ultra effort, and `fork_turns=none` or a positive integer. Record requested profile separately from observed host echo; no echo means running but unproven, mismatch is typed recovery.
 4. Simple work proceeds directly. Hard work remains in analysis until a detailed plan is strictly confirmed.
 
 `current` and `work_assessment` are policy requests recorded by the Hook. The Hook cannot select, inspect, or prove the host model/reasoning setting. Report the requested profile and any host evidence separately; never turn an advisory into a success claim.
+
+## Bound assessor lifecycle
+
+The child request carries exact `assessor_binding_id`, `objective_fingerprint`, `profile_resolution=highest_available`, and a self-contained role contract. Its first turn is read-only. For **Simple**, it ends with `WORK_ASSESSMENT binding_id=<32hex> outcome=simple evidence_digest=<32hex>`; only an exact follow-up to that same agent/binding with solve+verify may mutate, and it must end with line-level `SIMPLE_EXECUTION binding_id=<32hex> evidence_digest=<32hex>`. For **Hard**, it remains read-only, produces the detailed plan below, emits the equivalent `outcome=hard` marker, and its final line is exactly `计划已就绪，等待确认后执行`.
+
+Only requested profile fields are recorded at spawn. `SubagentStart` active-model echo must match when present; missing effort is not failure because hosts need not emit it. Fully observed profile requires both matching echoes, and absent fields never fabricate evidence. Mismatched/stale marker or child status is typed recovery. There is one materially corrected recovery at most (two attempts); recovery must name the previous typed cause and a substantive correction. A Hard outcome after successful implementation/build/deploy/device/Git mutation fails as `hard_mutation_before_confirmation` and cannot supply a plan. Compaction/resume retains only binding, state, attempt, failure, and fingerprints—never raw prompt, plan, or child result.
 
 Difficulty and execution shape are separate axes. A Focused task can be Hard because it changes a device; a Complex task can have several bounded Simple lanes. Agent caps never determine difficulty.
 

@@ -6,6 +6,7 @@ import io
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -104,6 +105,214 @@ class OrchestratorHookTests(unittest.TestCase):
                 "Stop",
             },
         )
+
+    def test_assessor_lifecycle_uses_bound_high_profile_and_keeps_daily_local(self) -> None:
+        daily = "assessor-daily"
+        daily_data = Path(self.temporary.name) / "assessor-daily-data"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": daily, "hook_run_id": "daily", "prompt": "今天天气怎么样"}, data=daily_data)
+        self.assertEqual(self.load_only_state(daily_data)["assessor_state"], "none")
+
+        session = "assessor-work"
+        work_data = Path(self.temporary.name) / "assessor-work-data"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 设置崩溃并验证"}, data=work_data)
+        state = self.load_only_state(work_data)
+        self.assertEqual(state["assessor_state"], "spawn_required")
+        binding = state["assessor_binding_id"]
+        self.assertRegex(binding, r"^[0-9a-f]{32}$")
+        self.assertEqual(state["assessor_input_fingerprint"], state["objective"]["fingerprint"])
+        message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        payload = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}}
+        accepted = self.run_hook(payload, data=work_data)
+        self.assertNotIn("permissionDecision", json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}))
+        pending = self.load_only_state(work_data)
+        self.assertEqual((pending["assessor_state"], pending["assessor_attempt"]), ("spawn_pending", 1))
+        self.assertEqual(pending["subagents"][-1]["role"], "high_assessor")
+
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "high-1"}, data=work_data)
+        running = self.load_only_state(work_data)
+        self.assertEqual(running["assessor_state"], "running")
+        self.assertFalse(running["assessor_observed_effective"])
+        denied = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "parent-write", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}}, data=work_data)
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        allowed = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "child-write", "agent_id": "high-1", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}}, data=work_data)
+        self.assertEqual(json.loads(allowed.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "high-1", "status": "completed", "last_assistant_message": f"WORK_ASSESSMENT binding_id={binding} outcome=simple evidence_digest={'b' * 32}"}, data=work_data)
+        simple = self.load_only_state(work_data)
+        self.assertEqual((simple["assessor_state"], simple["work_difficulty"]), ("simple_execution_required", "simple"))
+        self.assertEqual(simple["last_route"]["difficulty_rule_codes"], ["assessor_simple"])
+
+    def test_assessor_start_model_only_is_running_but_not_full_profile_evidence(self) -> None:
+        session = "assessor-model-only"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并验证"})
+        state = self.load_only_state(); binding = state["assessor_binding_id"]
+        message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "model-only", "model": "gpt-5.6-sol"})
+        running = self.load_only_state()
+        self.assertEqual((running["assessor_state"], running["assessor_observed_model"], running["assessor_observed_reasoning_effort"]), ("running", "gpt-5.6-sol", None))
+        self.assertFalse(running["assessor_observed_effective"])
+
+    def test_assessor_injected_contract_spawn_failure_and_simple_followup(self) -> None:
+        session = "assessor-e2e"
+        started = self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并验证"})
+        injected = json.loads(started.stdout)["hookSpecificOutput"]["additionalContext"]
+        binding = re.search(r"assessor_binding_id=([0-9a-f]{32})", injected).group(1)
+        objective = re.search(r"objective_fingerprint=([0-9a-f]{16})", injected).group(1)
+        message = f"assessor_binding_id={binding} objective_fingerprint={objective} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        spawn = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}}
+        self.run_hook(spawn)
+        denied = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "ordinary", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "ordinary_lane", "message": "implement now", "model": "gpt-5.6-sol", "reasoning_effort": "medium", "fork_turns": "none"}})
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "two-turn", "model": "gpt-5.6-sol"})
+        first_write = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "first-write", "agent_id": "two-turn", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+        self.assertEqual(json.loads(first_write.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "simple", "agent_id": "two-turn", "status": "completed", "last_assistant_message": f"WORK_ASSESSMENT binding_id={binding} outcome=simple evidence_digest={'e' * 32}"})
+        self.assertEqual(self.load_only_state()["assessor_state"], "simple_execution_required")
+        follow = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "follow", "tool_name": "collaboration.followup_task", "tool_input": {"target": "two-turn", "message": f"assessor_binding_id={binding} solve and verify the Simple objective"}})
+        self.assertNotIn("permissionDecision", json.loads(follow.stdout or "{}").get("hookSpecificOutput", {}))
+        allowed = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "second-write", "agent_id": "two-turn", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+        self.assertNotIn("permissionDecision", json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}))
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "done", "agent_id": "two-turn", "status": "completed", "last_assistant_message": f"SIMPLE_EXECUTION binding_id={binding} evidence_digest={'f' * 32}"})
+        self.assertEqual(self.load_only_state()["assessor_state"], "simple_complete")
+
+    def test_assessor_spawn_failure_and_late_start_never_revive(self) -> None:
+        session = "assessor-spawn-failure"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并验证"})
+        state = self.load_only_state(); binding = state["assessor_binding_id"]
+        message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        spawn = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "spawn", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}}
+        self.run_hook(spawn)
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "spawn-failed", "tool_name": "collaboration.spawn_agent", "tool_input": spawn["tool_input"], "tool_response": {"status": "error", "message": "rejected"}})
+        failed = self.load_only_state()
+        self.assertEqual((failed["assessor_state"], failed["assessor_failure_kind"]), ("recovery_required", "spawn_failed"))
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "late", "agent_id": "late-agent", "model": "gpt-5.6-sol"})
+        self.assertNotEqual(self.load_only_state()["assessor_state"], "running")
+
+    def test_opt_out_hard_confirmation_uses_structured_local_contract(self) -> None:
+        session = "local-hard"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "start", "prompt": "修复 Android 崩溃、编译部署实机验证，但不要使用任何子智能体"})
+        state = self.load_only_state()
+        self.assertEqual(state["assessor_failure_kind"], "delegation_opt_out")
+        self.run_hook({"hook_event_name": "Stop", "session_id": session, "hook_run_id": "plan", "last_assistant_message": "1. 定位根因\n2. 修改并编译\n验收：实机通过。\n计划已就绪，等待确认后执行"})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "confirm", "prompt": "确认按这个计划执行"})
+        confirmed = self.load_only_state()
+        self.assertEqual((confirmed["plan_state"], confirmed["executor_state"]), ("confirmed", "local_running"))
+        spawn = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "deny-spawn", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "nope", "message": "implement", "model": "gpt-5.6-sol", "reasoning_effort": "medium", "fork_turns": "none"}})
+        self.assertEqual(json.loads(spawn.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "write", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}, "tool_response": {"status": "completed"}})
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "verify", "tool_name": "exec_command", "tool_input": {"cmd": "python3 -m unittest -q"}, "tool_response": {"status": "completed"}})
+        self.run_hook({"hook_event_name": "Stop", "session_id": session, "hook_run_id": "finish", "last_assistant_message": f"LOCAL_EXECUTION execution_contract_id={confirmed['execution_contract_id']} outcome=succeeded evidence_digest={'a' * 32}"})
+        completed = self.load_only_state()
+        self.assertEqual(completed["executor_state"], "succeeded")
+        self.assertTrue(completed["last_execution_baseline"])
+
+    def test_assessor_marker_and_failure_guards_do_not_release_mutation(self) -> None:
+        session = "assessor-guard"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并验证"})
+        state = self.load_only_state(); binding = state["assessor_binding_id"]
+        self.run_hook({"hook_event_name": "Stop", "session_id": session, "hook_run_id": "parent-plan", "last_assistant_message": "1. 伪计划\n2. 伪验证\n验收：通过。\n计划已就绪，等待确认后执行"})
+        self.assertNotEqual(self.load_only_state()["plan_state"], "awaiting_confirmation")
+        message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "guard-agent", "model": "gpt-5.6-sol"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "bad-marker", "agent_id": "guard-agent", "status": "completed", "last_assistant_message": f"text WORK_ASSESSMENT binding_id={binding} outcome=simple evidence_digest={'a' * 32} text"})
+        failed = self.load_only_state(); self.assertEqual(failed["assessor_state"], "recovery_required")
+        denied = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "parent-write", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        legacy = HOOK.new_state({"session_id": "legacy-local"})
+        legacy.update({"schema_version": 13, "task_domain": "work", "work_difficulty": "hard", "difficulty_decision_id": "b" * 16, "objective": {"fingerprint": "a" * 16, "length": 1}, "plan_state": "confirmed", "plan_generation": 1, "plan_digest": "c" * 32, "plan_objective_fingerprint": "a" * 16, "plan_difficulty_decision_id": "b" * 16, "confirmed_plan_digest": "c" * 32, "last_route": {**HOOK.classify_prompt("修复 Android 崩溃并验证，但不要使用任何子智能体"), "delegation_opt_out": True}})
+        migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-local"})
+        self.assertEqual((migrated["executor_state"], migrated["model_profile"]), ("local_running", "current"))
+
+    def test_assessor_rejects_invalid_spawn_and_hard_mutation(self) -> None:
+        session = "assessor-hard"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并编译验证"})
+        state = self.load_only_state()
+        bad = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "bad", "tool_name": "collaboration.spawn_agent", "tool_input": {"message": f"assessor_binding_id={state['assessor_binding_id']}", "model": "gpt-5.6-sol", "reasoning_effort": "medium", "fork_turns": "none"}})
+        self.assertEqual(json.loads(bad.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        message = f"assessor_binding_id={state['assessor_binding_id']} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "good", "tool_name": "collaboration.spawn_agent", "tool_input": {"message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "hard-1", "model": "gpt-5.6-sol", "reasoning_effort": "ultra"})
+        state = self.load_only_state()
+        binding = state["assessor_binding_id"]
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "mutation", "agent_id": "hard-1", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}, "tool_response": {"status": "completed"}})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "hard-stop", "agent_id": "hard-1", "status": "completed", "last_assistant_message": f"1. 调查\n2. 验证\n验收：通过。\nWORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'c' * 32}\n计划已就绪，等待确认后执行"})
+        failed = self.load_only_state()
+        self.assertEqual((failed["assessor_state"], failed["assessor_failure_kind"]), ("failed", "hard_mutation_before_confirmation"))
+
+    def test_assessor_request_recovery_and_schema13_migration_are_bounded(self) -> None:
+        session = "assessor-recovery"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并编译验证"})
+        state = self.load_only_state(); binding = state["assessor_binding_id"]; objective = state["objective"]["fingerprint"]
+        def request(run_id: str, *, model: str = "gpt-5.6-sol", effort: str = "ultra", fork: str = "none", binding_value: str | None = None, objective_value: str | None = None, profile: str = "highest_available", recovery: str = "") -> subprocess.CompletedProcess[str]:
+            message = f"assessor_binding_id={binding_value or binding} objective_fingerprint={objective_value or objective} profile_resolution={profile} assess Simple directly solve and verify; Hard read-only plan then confirmation {recovery}"
+            return self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": run_id, "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": model, "reasoning_effort": effort, "fork_turns": fork}})
+        for index, kwargs in enumerate((
+            {"model": ""}, {"effort": "medium"}, {"fork": "all"},
+            {"binding_value": "0" * 32}, {"objective_value": "1" * 16}, {"profile": "current"},
+        )):
+            denied = request(f"bad-{index}", **kwargs)
+            self.assertTrue(denied.stdout, (index, kwargs, denied.stderr))
+            self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        request("first")
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-1", "agent_id": "recover-1", "model": "wrong", "reasoning_effort": "ultra"})
+        recovered = self.load_only_state(); self.assertEqual(recovered["assessor_failure_kind"], "start_mismatch")
+        denied = request("no-correction")
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        request("corrected", recovery="recovery_from=start_mismatch material_correction=host_payload_fixed")
+        self.assertEqual(self.load_only_state()["assessor_attempt"], 2)
+        duplicate = request("duplicate", recovery="recovery_from=start_mismatch material_correction=other_payload")
+        self.assertEqual(json.loads(duplicate.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.load_only_state()["assessor_attempt"], 2)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-2", "agent_id": "recover-2", "model": "wrong", "reasoning_effort": "ultra"})
+        self.assertEqual((self.load_only_state()["assessor_state"], self.load_only_state()["assessor_failure_kind"]), ("failed", "retry_exhausted"))
+
+        legacy = {**HOOK.new_state({"session_id": "legacy"}), "schema_version": 13, "writer_version": "1.0.26", "task_domain": "work", "objective": {"fingerprint": "a" * 16, "length": 12}, "work_difficulty": "hard", "assessor_state": "none", "plan_state": "none"}
+        migrated = HOOK.normalize_state(legacy, {"session_id": "legacy"})
+        self.assertEqual((migrated["assessor_state"], migrated["assessor_input_fingerprint"]), ("spawn_required", "a" * 16))
+
+    def test_assessor_hard_plan_compacts_and_resumes_without_raw_prompt(self) -> None:
+        session = "assessor-resume"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "AndroidNativeDemo 对齐 Unity 主题0"})
+        state = self.load_only_state(); binding = state["assessor_binding_id"]
+        message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": json.dumps({"arguments": {"message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "resume-1", "model": "gpt-5.6-sol", "reasoning_effort": "ultra"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "resume-1", "status": "completed", "last_assistant_message": f"1. 对齐\n2. 验证\n验收：一致。\nWORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'d' * 32}\n计划已就绪，等待确认后执行"})
+        hard = self.load_only_state()
+        self.assertEqual((hard["assessor_state"], hard["plan_state"]), ("hard_plan_ready", "awaiting_confirmation"))
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
+        compacted = self.load_only_state()
+        self.assertEqual(compacted["compactions"][-1]["assessor_binding_id"], binding)
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"})
+        context = json.loads(resumed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(binding, context)
+        self.assertNotIn("AndroidNativeDemo", context)
+
+    def test_assessor_opt_out_echo_mismatch_stale_and_legacy_confirmed_contract(self) -> None:
+        opted = "assessor-opt-out"
+        opted_data = Path(self.temporary.name) / "assessor-opted-data"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": opted, "hook_run_id": "opt", "prompt": "修改一个小的 Parser 函数并运行现有单测，但不要使用任何子智能体"}, data=opted_data)
+        self.assertEqual((self.load_only_state(opted_data)["assessor_state"], self.load_only_state(opted_data)["assessor_failure_kind"]), ("failed", "delegation_opt_out"))
+        allowed = self.run_hook({"hook_event_name": "PreToolUse", "session_id": opted, "hook_run_id": "local", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}}, data=opted_data)
+        self.assertNotIn("permissionDecision", json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}))
+
+        session = "assessor-stale"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并验证"})
+        state = self.load_only_state(); binding = state["assessor_binding_id"]
+        message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "echo-bad", "agent_id": "stale-1", "model": "gpt-5.6-sol", "reasoning_effort": "medium"})
+        self.assertEqual((self.load_only_state()["assessor_state"], self.load_only_state()["assessor_failure_kind"]), ("recovery_required", "start_mismatch"))
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "new-objective", "prompt": "改为修复另一个蓝牙崩溃并验证"})
+        refreshed = self.load_only_state(); self.assertEqual(refreshed["assessor_state"], "spawn_required")
+        self.assertNotEqual(refreshed["assessor_binding_id"], binding)
+
+        legacy = HOOK.new_state({"session_id": "legacy-confirmed"})
+        legacy.update({"schema_version": 13, "writer_version": "1.0.26", "task_domain": "work", "work_difficulty": "hard", "difficulty_decision_id": "b" * 16, "objective": {"fingerprint": "a" * 16, "length": 12}, "plan_state": "confirmed", "plan_generation": 1, "plan_digest": "c" * 32, "plan_objective_fingerprint": "a" * 16, "plan_difficulty_decision_id": "b" * 16, "confirmed_plan_digest": "c" * 32, "assessor_state": "none"})
+        migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-confirmed"})
+        self.assertEqual((migrated["plan_state"], migrated["executor_state"], migrated["assessor_state"]), ("confirmed", "spawn_required", "none"))
 
     def test_reference_contract_lifecycle_is_bounded_and_user_final_only(self) -> None:
         session = "reference-contract"
@@ -816,15 +1025,7 @@ class OrchestratorHookTests(unittest.TestCase):
             "验收：重启问题不再复现，相关回归通过。\n"
             "计划已就绪，等待确认后执行"
         )
-        self.run_hook(
-            {
-                "hook_event_name": "Stop",
-                "session_id": session,
-                "hook_run_id": "ready-plan",
-                "last_assistant_message": ready_message,
-            }
-        )
-        ready = self.load_only_state()
+        ready = self.assessor_hard_plan(session, run_id="ready-plan", message=ready_message.rsplit("\n", 1)[0])
         self.assertEqual(ready["plan_state"], "awaiting_confirmation")
         self.assertRegex(ready["plan_digest"], r"^[0-9a-f]{32}$")
         self.assertEqual(ready["plan_objective_fingerprint"], ready["objective"]["fingerprint"])
@@ -895,18 +1096,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "prompt": "实现跨 Settings/framework/SystemUI 的客户定制",
             }
         )
-        self.run_hook(
-            {
-                "hook_event_name": "Stop",
-                "session_id": session,
-                "hook_run_id": "plan",
-                "last_assistant_message": (
-                    "1. 定位三个模块的接口\n2. 修改实现并编译\n3. 完成验证和回滚测试\n"
-                    "验收：三个模块状态一致。\n计划已就绪，等待确认后执行"
-                ),
-            }
-        )
-        before = self.load_only_state()
+        before = self.assessor_hard_plan(session, run_id="plan", message="1. 定位三个模块的接口\n2. 修改实现并编译\n3. 完成验证和回滚测试\n验收：三个模块状态一致。")
         old_digest = before["plan_digest"]
         old_generation = before["plan_generation"]
         old_objective = before["objective"]["fingerprint"]
@@ -940,14 +1130,27 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.run_hook(
             {
-                "hook_event_name": "Stop",
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": f"{session}-assessor-request",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none", "message": f"assessor_binding_id={self.load_only_state(data)['assessor_binding_id']} objective_fingerprint={self.load_only_state(data)['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"},
+            }, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-assessor-start", "agent_id": f"{session}-assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra"}, data=data)
+        binding = self.load_only_state(data)["assessor_binding_id"]
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
                 "session_id": session,
                 "hook_run_id": f"{session}-plan",
+                "agent_id": f"{session}-assessor",
+                "status": "completed",
                 "last_assistant_message": (
                     "1. 收集日志并定位根因\n"
                     "2. 修改对应模块并编译部署\n"
                     "3. 完成实机验证与回滚检查\n"
                     "验收：重启不再复现且回归测试通过。\n"
+                    f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n"
                     "计划已就绪，等待确认后执行"
                 ),
             },
@@ -963,6 +1166,25 @@ class OrchestratorHookTests(unittest.TestCase):
             data=data,
         )
         return self.load_only_state(data)
+
+    def assessor_hard_plan(self, session: str, *, run_id: str, message: str, data: Path | None = None) -> dict:
+        state = self.load_only_state(data)
+        binding = state["assessor_binding_id"]
+        request = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": f"{run_id}-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": request, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{run_id}-start", "agent_id": f"{run_id}-assessor", "model": "gpt-5.6-sol"}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": f"{run_id}-stop", "agent_id": f"{run_id}-assessor", "status": "completed", "last_assistant_message": f"{message}\nWORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n计划已就绪，等待确认后执行"}, data=data)
+        return self.load_only_state(data)
+
+    def start_running_assessor(self, session: str, *, run_id: str, data: Path | None = None) -> dict:
+        state = self.load_only_state(data)
+        binding = state["assessor_binding_id"]
+        request = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": f"{run_id}-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": request, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{run_id}-start", "agent_id": f"{run_id}-assessor", "model": "gpt-5.6-sol"}, data=data)
+        running = self.load_only_state(data)
+        self.assertEqual(running["assessor_state"], "running")
+        return running
 
     def executor_spawn_payload(
         self,
@@ -1063,6 +1285,17 @@ class OrchestratorHookTests(unittest.TestCase):
             data=data,
         )
         return self.load_only_state(data)
+
+    def test_executor_spawn_failure_and_late_start_do_not_revive(self) -> None:
+        session = "executor-spawn-failure"
+        state = self.create_confirmed_executor_state(session)
+        payload = self.executor_spawn_payload(state, session=session, hook_run_id="executor-request")
+        self.run_hook(payload)
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "executor-failed", "tool_name": "collaboration.spawn_agent", "tool_input": payload["tool_input"], "tool_response": {"status": "error"}})
+        failed = self.load_only_state()
+        self.assertEqual((failed["executor_state"], failed["executor_failure_kind"]), ("recovery_required", "spawn_failed"))
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "late", "agent_id": "late-executor"})
+        self.assertNotEqual(self.load_only_state()["executor_state"], "running")
 
     def test_confirmed_executor_requires_explicit_profile_and_exact_contract(self) -> None:
         session = "executor-contract"
@@ -1728,21 +1961,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(resolved["plan_state"], "analyzing")
         self.assertIsNone(resolved["execution_contract_id"])
 
-        self.run_hook(
-            {
-                "hook_event_name": "Stop",
-                "session_id": session,
-                "hook_run_id": "replacement-plan",
-                "last_assistant_message": (
-                    "1. 对照前序变更与黑屏日志确认根因\n"
-                    "2. 修正对应模块并审查受影响路径\n"
-                    "3. 编译部署并验证重启与黑屏回归\n"
-                    "验收：重启和黑屏均不再复现。\n"
-                    "计划已就绪，等待确认后执行"
-                ),
-            }
-        )
-        ready = self.load_only_state()
+        ready = self.assessor_hard_plan(session, run_id="replacement-plan", message="1. 对照前序变更与黑屏日志确认根因\n2. 修正对应模块并审查受影响路径\n3. 编译部署并验证重启与黑屏回归\n验收：重启和黑屏均不再复现。")
         self.assertEqual(ready["plan_state"], "awaiting_confirmation")
         self.run_hook(
             {
@@ -2419,7 +2638,6 @@ class OrchestratorHookTests(unittest.TestCase):
         blocked_output = json.loads(blocked.stdout)["hookSpecificOutput"]
         self.assertEqual(blocked_output["permissionDecision"], "deny")
         self.assertIn("delegation gate is closed", blocked_output["permissionDecisionReason"])
-        self.assertIn("current route", blocked_output["permissionDecisionReason"])
         closed_state = self.load_only_state(closed_data)
         self.assertEqual(HOOK.active_agent_count(closed_state), 0)
         self.assertFalse(any(item["event"] == "request" for item in closed_state["subagents"]))
@@ -2436,6 +2654,7 @@ class OrchestratorHookTests(unittest.TestCase):
             },
             data=audit_data,
         )
+        self.start_running_assessor(audit_session, run_id="audit", data=audit_data)
         approved = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -2456,9 +2675,10 @@ class OrchestratorHookTests(unittest.TestCase):
 
         requested = self.load_only_state(audit_data)
         requests = [item for item in requested["subagents"] if item["event"] == "request"]
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]["task_name"], "audit_01_source")
-        self.assertIsNotNone(requests[0]["scope_fingerprint"])
+        lanes = [item for item in requests if item["role"] == "lane"]
+        self.assertEqual(len(lanes), 1)
+        self.assertEqual(lanes[0]["task_name"], "audit_01_source")
+        self.assertIsNotNone(lanes[0]["scope_fingerprint"])
 
         self.run_hook(
             {
@@ -2473,8 +2693,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         started = self.load_only_state(audit_data)
         active = HOOK.active_agent_records(started)
-        self.assertEqual(len(active), 1)
-        self.assertEqual(active[0]["task_name"], "audit_01_source")
+        self.assertEqual(len([item for item in active if item["role"] == "lane"]), 1)
+        self.assertEqual([item for item in active if item["role"] == "lane"][0]["task_name"], "audit_01_source")
         self.assertEqual(active[0]["scope_fingerprint"], requests[0]["scope_fingerprint"])
         self.assertEqual(active[0]["request_fingerprint"], requests[0]["request_fingerprint"])
 
@@ -2518,9 +2738,9 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(over_cap_output["permissionDecision"], "deny")
         self.assertIn("active=2, cap=2", over_cap_output["permissionDecisionReason"])
         final_state = self.load_only_state(audit_data)
-        self.assertEqual(HOOK.active_agent_count(final_state), 2)
+        self.assertEqual(len([item for item in HOOK.active_agent_records(final_state) if item["role"] == "lane"]), 2)
         self.assertEqual(
-            sum(item["event"] == "request" for item in final_state["subagents"]),
+            sum(item["event"] == "request" and item["role"] == "lane" for item in final_state["subagents"]),
             2,
         )
 
@@ -2595,6 +2815,7 @@ class OrchestratorHookTests(unittest.TestCase):
             },
             data=shared_data,
         )
+        self.start_running_assessor(shared_session, run_id="shared", data=shared_data)
         safe_side_lane = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -2605,7 +2826,7 @@ class OrchestratorHookTests(unittest.TestCase):
                     "task_name": "source_01_review",
                     "message": (
                         "用途：审查源码。本任务独立于父线程且现在可以开始；只读检查源码，"
-                        "不操作设备，不使用构建服务器。"
+                        "不构建、不部署、不操作设备。"
                     ),
                 },
             },
@@ -2613,7 +2834,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         safe_output = json.loads(safe_side_lane.stdout)["hookSpecificOutput"]
         self.assertNotIn("permissionDecision", safe_output)
-        self.assertIn("re-audit accepted", safe_output["additionalContext"])
+        self.assertIn("Delegation gate is audit", safe_output["additionalContext"])
 
         still_blocked = self.run_hook(
             {
