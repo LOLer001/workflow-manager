@@ -105,6 +105,65 @@ class OrchestratorHookTests(unittest.TestCase):
             },
         )
 
+    def test_reference_contract_lifecycle_is_bounded_and_user_final_only(self) -> None:
+        session = "reference-contract"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "reference-start", "prompt": "以参考为准，对齐这个界面的视觉保真",
+        })
+        planned = self.load_only_state()
+        reference = planned["reference_acceptance"]
+        self.assertTrue(reference["enabled"])
+        self.assertEqual(reference["state"], "planned")
+        self.assertEqual(reference["fidelity_candidate"], "unknown")
+        self.assertNotIn("prompt", json.dumps(reference))
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "reference-reject", "prompt": "验收仍然不一致",
+        })
+        rejected = self.load_only_state()["reference_acceptance"]
+        self.assertEqual((rejected["state"], rejected["fidelity_candidate"], rejected["user_final_acceptance"]), ("failed", "failed", "failed"))
+
+        session = "reference-accepted"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "reference-start", "prompt": "以参考为准复刻交互",
+        })
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "reference-accept", "prompt": "验收通过",
+        })
+        accepted = json.loads(next((self.data / "sessions").glob("reference-accepted-*.json")).read_text(encoding="utf-8"))["reference_acceptance"]
+        self.assertEqual((accepted["state"], accepted["user_final_acceptance"]), ("accepted", "accepted"))
+        self.assertEqual(accepted["engineering_health"], "unknown")
+        self.assertEqual(accepted["functional_acceptance"], "unknown")
+
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "reference-replan", "hook_run_id": "reference-replan-start", "prompt": "AndroidNativeDemo 对齐 Unity 效果，按 Unity 效果为准"})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "reference-replan", "hook_run_id": "reference-replan-reject", "prompt": "验收仍然不一致"})
+        replanned = json.loads(next((self.data / "sessions").glob("reference-replan-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(replanned["reference_acceptance"]["state"], "failed")
+        self.assertEqual(replanned["plan_state"], "analyzing")
+        self.assertIsNone(replanned["execution_contract_id"])
+        self.assertTrue(HOOK.reference_requested("AndroidNativeDemo 对齐 Unity 效果，按 Unity 效果为准"))
+        self.assertTrue(HOOK.reference_requested("AndroidNativeDemo 对齐 Unity 主题0"))
+        self.assertTrue(HOOK.reference_requested("以 Unity 主题0 为参考对齐 AndroidNativeDemo"))
+        self.assertFalse(HOOK.reference_requested("对齐代码格式并运行 lint"))
+        self.assertFalse(HOOK.successful_acceptance_feedback("验收通过，动画方向不对"))
+        old_digest = replanned["reference_acceptance"]["contract_digest"]
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "reference-replan", "hook_run_id": "reference-phase", "prompt": "切换到横屏方向和稳定态"})
+        changed = json.loads(next((self.data / "sessions").glob("reference-replan-*.json")).read_text(encoding="utf-8"))
+        self.assertNotEqual(changed["reference_acceptance"]["contract_digest"], old_digest)
+        self.assertEqual(changed["plan_state"], "analyzing")
+
+    def test_spawn_json_arguments_shape_preserves_confirmed_executor_binding(self) -> None:
+        state = self.create_confirmed_executor_state("json-spawn")
+        raw = self.executor_spawn_payload(state, session="json-spawn", hook_run_id="json-spawn-request")
+        payload = {**raw, "tool_input": json.dumps({"arguments": raw["tool_input"]})}
+        result = self.run_hook(payload)
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", output)
+        self.assertEqual(self.load_only_state()["executor_state"], "spawn_pending")
+
     def test_hook_test_method_names_are_unique(self) -> None:
         tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         target = next(

@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.26
+
+- 仅在用户明确要求以参考对齐、复刻、一致或视觉/行为保真时启用参考驱动验收；有界参考合同摘要绑定 Hard 执行合同、失效和压缩恢复，绝不保存媒体、原始提示或大输出。
+- 参考验收分离工程健康、功能验收、保真候选与用户最终验收；A/B 条件不等、错误场景/方向/版本/状态、过期或静态替代动态均拒绝，客观阈值未获用户授权时 AI 只报告 candidate/差异。
+- 修复 collaboration.spawn_agent 宿主归一化载荷：顶层、args、arguments、input 和 JSON 字符串嵌套请求均可被完整合同校验，不再把正确执行者误判为未绑定。
+
 ## 1.0.25
 
 - Work assessment now uses an objective-bound high-tier assessor lifecycle: request the highest available Codex model and reasoning, preserve real local-high input state only when the parent is already highest, and keep Daily on current settings.

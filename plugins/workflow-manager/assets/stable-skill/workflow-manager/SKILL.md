@@ -8,25 +8,25 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 ## Quality invariant
 
 - Correctness and required reasoning, evidence, safety, and acceptance outrank savings.
-- Remove redundancy, never required stages, evidence, corrections, or checks.
-- Pressure may change order or checkpoint timing, never the depth needed to solve the task.
+- Remove redundancy, never required stages, evidence, correction, or checks.
+- Pressure may change order/checkpoints, never the depth needed to solve the task.
 
 ## Route and run
 
 1. Classify **Daily** (chat, weather, reports, personal help, cleanup) versus **Work** (device changes/bugs, App/code, engineering delivery/diagnosis). Inseparable engineering output is Work. Daily keeps current settings and safety.
 2. For Work, make an objective-bound `work_assessment`: request the host's highest Codex model/effort to decide **Simple**/**Hard**. If parent already is that profile, record real local input and assess locally. Never fabricate acceptance.
 3. Simple continues with that same high assessor (follow it up if needed), with no confirmation round; normal safety gates still apply.
-4. Hard covers unknown cause, cross-module design, device change, shared resources, or long delivery. Gather read-only evidence; plan modules/files/methods, changes, ownership, delivery, verification, risk, and rollback. End with `计划已就绪，等待确认后执行`.
+4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan modules/files, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
 5. Before strict Hard-plan confirmation, allow reads; block writes, mutating children/Git, builds, deployment, and device mutation. Changed constraints invalidate it. Read [references/work-routing.md](references/work-routing.md).
-6. After confirmation read [references/confirmed-execution.md](references/confirmed-execution.md). The high parent coordinates/reviews; request one newest lower-tier Codex executor at medium reasoning, bound to objective/difficulty/plan generation/digest. Keep successful model handoff silent. Host acceptance proves it; report typed failure only when blocked. One corrected recovery, never an identical retry.
+6. After confirmation read [references/confirmed-execution.md](references/confirmed-execution.md). The high parent coordinates/reviews; request one newest lower-tier medium executor bound to objective/difficulty/plan generation/digest. Keep handoff silent; report typed failure only when blocked. One corrected recovery, never identical retry.
 7. Independently route **Direct**, **Focused**, or **Complex/Extensive** execution shape. Use only relevant `Contract > Evidence > Change > Verify > Report` stages.
 8. After confirmed execution, seal a fingerprint-only baseline. If same-task acceptance reports a symptom, read [references/regression-continuity.md](references/regression-continuity.md): compare prior objective/plan/contract/change/verification read-only. Wording is only a trigger. `introduced`/`fix_ineffective` replan and reconfirm; `unrelated` reclassifies; `uncertain` needs evidence.
-9. Follow-ups inherit valid bindings; reclassify new objectives. Reuse native summaries/plans and unchanged evidence.
-10. With tools, update `phase | done | next | blocker` only at kickoff, change, or ~60s wait.
+9. Only for an explicit reference-match request, read [reference acceptance](references/reference-acceptance.md); bind it to Hard execution and separate engineering, function, fidelity candidate, and user acceptance.
+10. Follow-ups inherit valid bindings; reclassify new objectives. Update `phase | done | next | blocker` only at kickoff, change, or ~60s wait.
 
 ## Context gates
 
-- Below 55% work normally; at 55-70% trim presentation; at 70% checkpoint, stop broad exploration, and continue needed evidence narrowly.
+- Below 55% work normally; at 55-70% trim presentation; at 70% checkpoint and narrow exploration.
 - After compaction resume native summary and gates; never reconstruct finished work. Reclassify on new phases, repeated failures, long builds, or large output.
 
 ## Delegation
@@ -51,11 +51,11 @@ Optimize critical-path time. Launch ready positive-utility lanes only when time 
 
 ## Output and command guards
 
-- Bound output by exact paths/patterns/ranges or full-log redirection. Budget large status, logs, recordings, and frames.
+- Bound output by paths/patterns/ranges or full-log redirection; budget large output.
 - Before mutation, preflight only unverified paths, inputs, and acceptance sources.
 - Obey Hook denials; do not retry an equivalent unbounded route.
 - Keep the first error; diagnose once; retry only after correction or one bounded alternate. Same-cause repetition or ~25 stage actions requires `checkpoint > reclassify`.
-- Run one acceptance loop per unchanged revision unless criteria require more. Preserve oversized results; ignore unrelated history.
+- Run one acceptance loop per unchanged revision unless required; preserve oversized results.
 
 ## Mounted-source safety
 

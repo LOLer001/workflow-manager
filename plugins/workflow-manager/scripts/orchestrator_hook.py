@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 12
-WRITER_VERSION = "1.0.25"
+SCHEMA_VERSION = 13
+WRITER_VERSION = "1.0.26"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "1"
@@ -87,6 +87,7 @@ MAX_EXECUTOR_ATTEMPTS = 2
 CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
 CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
+REFERENCE_ACCEPTANCE_STATES = {"disabled", "planned", "candidate", "accepted", "failed"}
 
 SUCCESS_STATUSES = {"ok"}
 ERROR_STATUSES = {
@@ -153,7 +154,46 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     review_id = safe_fingerprint(review.get("review_id"))
     if review.get("state") == "resolved" and review_id:
         material += f"\0{review_id}"
+    reference = _safe_reference_acceptance(state.get("reference_acceptance"))
+    if reference["enabled"] and reference["contract_digest"]:
+        material += f"\0{reference['contract_digest']}"
     return stable_hash(material, 32)
+
+
+def reference_requested(prompt: str) -> bool:
+    """Opt in only for an explicit request to match a supplied reference."""
+    lower = prompt.lower()
+    return bool(
+        re.search(r"\b(?:reference[- ]driven|match (?:the )?reference|visual fidelity|faithful(?:ly)? reproduce)\b", lower)
+        or any(token in prompt for token in ("以参考为准", "对齐参考", "复刻参考", "与参考一致", "视觉保真", "行为保真"))
+        or bool(re.search(r"(?:按|以)\s*[A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff -]{1,28}\s*(?:效果|界面|动画|视觉|行为|主题\d*)\s*为(?:准|参考)", prompt))
+        or bool(re.search(r"(?:对齐|复刻|还原)\s*[A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff -]{1,28}\s*(?:效果|界面|动画|视觉|行为|主题\d*)", prompt))
+        or bool(re.search(r"与\s*[A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff -]{1,28}\s*(?:效果|界面|动画|视觉|行为|主题\d*)\s*一致", prompt))
+    )
+
+
+def reference_contract_changed(prompt: str) -> bool:
+    return bool(re.search(r"(?:版本|version|方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态)", prompt, re.I))
+
+
+def _safe_reference_acceptance(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        item = {}
+    enabled = bool(item.get("enabled"))
+    state_value = item.get("state") if item.get("state") in REFERENCE_ACCEPTANCE_STATES else "disabled"
+    return {
+        "enabled": enabled,
+        "contract_digest": safe_fingerprint(item.get("contract_digest")) or None,
+        "reference_fingerprint": safe_fingerprint(item.get("reference_fingerprint")) or None,
+        "version_fingerprint": safe_fingerprint(item.get("version_fingerprint")) or None,
+        "phase": safe_label(item.get("phase"), 32) if item.get("phase") else "unknown",
+        "state": state_value if enabled else "disabled",
+        "engineering_health": item.get("engineering_health") in {"unknown", "passed", "failed"} and item.get("engineering_health") or "unknown",
+        "functional_acceptance": item.get("functional_acceptance") in {"unknown", "passed", "failed"} and item.get("functional_acceptance") or "unknown",
+        "fidelity_candidate": item.get("fidelity_candidate") in {"unknown", "candidate", "failed"} and item.get("fidelity_candidate") or "unknown",
+        "user_final_acceptance": item.get("user_final_acceptance") in {"unknown", "accepted", "failed"} and item.get("user_final_acceptance") or "unknown",
+        "evidence_digest": safe_fingerprint(item.get("evidence_digest")) or None,
+    }
 
 
 def _fingerprint_digest(values: list[str]) -> str | None:
@@ -853,6 +893,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "executor_model": None,
         "executor_reasoning_effort": None,
         "executor_fork_turns": None,
+        "reference_acceptance": _safe_reference_acceptance(None),
         "last_execution_baseline": {},
         "causal_review": {
             "state": "none",
@@ -1191,6 +1232,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             if item.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
             else None
         ),
+        "reference_acceptance": _safe_reference_acceptance(item.get("reference_acceptance")),
         "last_execution_baseline": _safe_execution_baseline(
             item.get("last_execution_baseline")
         ),
@@ -1338,6 +1380,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if value.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
         else None
     )
+    base["reference_acceptance"] = _safe_reference_acceptance(value.get("reference_acceptance"))
     base["executor_model"] = (
         safe_label(value.get("executor_model"), 80) if value.get("executor_model") else None
     )
@@ -2609,6 +2652,11 @@ def subagent_request_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]
     seen: set[int] = set()
     while pending:
         value = pending.pop(0)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                continue
         if not isinstance(value, dict) or id(value) in seen:
             continue
         seen.add(id(value))
@@ -3850,7 +3898,8 @@ def successful_acceptance_feedback(prompt: str) -> bool:
     contrast_signal = bool(
         re.search(r"(?:但是|但|不过|然而|却|同时|另外|可是|but|however|yet)", normalized)
     )
-    return any(marker in normalized for marker in SUCCESS_FEEDBACK_MARKERS) and not (
+    fidelity_negative = any(marker in normalized for marker in ("不一致", "不对", "不像", "方向错误", "方向不对"))
+    return any(marker in normalized for marker in SUCCESS_FEEDBACK_MARKERS) and not fidelity_negative and not (
         regression_signal and contrast_signal
     )
 
@@ -3998,6 +4047,8 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
     previous = snapshot_state(payload)
+    requested_reference = reference_requested(prompt)
+    reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and reference_contract_changed(prompt))
     pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
     active_plan = pending_plan or previous.get("plan_state") == "confirmed"
     explicit_new = explicit_new_objective(prompt)
@@ -4014,10 +4065,16 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         in {"triage_required", "triaging"}
     )
     acceptance_success = successful_acceptance_feedback(prompt)
+    reference_rejection = bool(
+        _safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"]
+        and not acceptance_success
+        and any(marker in prompt.lower() for marker in REGRESSION_REPORT_MARKERS)
+    )
     causal_report = regression_feedback(prompt, previous, new_objective=new_objective)
     acceptance_miss = unmet_acceptance_without_recorded_change(
         prompt, previous, new_objective=new_objective
     )
+    reference_failure = acceptance_miss or (reference_rejection and not causal_report)
     already_confirmed = previous.get("plan_state") == "confirmed"
     confirmed_plan = pending_plan and pure_plan_confirmation(prompt)
     replan = active_plan and not causal_active and plan_replan_request(prompt)
@@ -4031,9 +4088,21 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and not confirmed_plan
     )
     continuation = not new_objective and (
-        is_control_followup(prompt) or is_progress_followup(prompt) or active_plan
+        is_control_followup(prompt) or is_progress_followup(prompt) or active_plan or reference_changed
     )
     classification = classify_prompt(prompt)
+    if requested_reference:
+        classification.update(
+            {
+                "task_domain": "work",
+                "model_profile": "work_assessment",
+                "work_difficulty": "hard",
+                "difficulty_confidence": "high",
+                "difficulty_rule_codes": ["explicit_reference_acceptance"],
+                "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
+                "difficulty_decision_id": stable_hash(f"reference\0{stable_hash(prompt)}", 24),
+            }
+        )
     if continuation and not causal_report and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
     if causal_active and not new_objective:
@@ -4051,7 +4120,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         )
     if causal_report:
         classification["model_profile"] = "work_assessment"
-    if acceptance_miss:
+    if reference_failure:
         classification.update(
             {
                 "task_domain": "work",
@@ -4104,6 +4173,45 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             }
         elif not continuation or not state.get("objective"):
             state["objective"] = {**prompt_meta, "updated_at": utc_now()}
+        reference = _safe_reference_acceptance(state.get("reference_acceptance"))
+        if requested_reference:
+            # Keep only fingerprints/enumerations: never retain media, raw prompt, frames, or observations.
+            reference_contract_digest = stable_hash(
+                f"reference-v1\0{prompt_meta['fingerprint']}\0{state.get('objective', {}).get('fingerprint')}", 32
+            )
+            state["reference_acceptance"] = {
+                "enabled": True,
+                "contract_digest": reference_contract_digest,
+                "reference_fingerprint": prompt_meta["fingerprint"],
+                "version_fingerprint": stable_hash(WRITER_VERSION, 16),
+                "phase": "planned", "state": "planned", "engineering_health": "unknown",
+                "functional_acceptance": "unknown", "fidelity_candidate": "unknown",
+                "user_final_acceptance": "unknown", "evidence_digest": None,
+            }
+            if reference.get("contract_digest") != reference_contract_digest:
+                state["plan_state"] = "analyzing"
+                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+                state["plan_digest"] = None
+                state["plan_objective_fingerprint"] = None
+                state["plan_difficulty_decision_id"] = None
+                state["confirmed_plan_digest"] = None
+                state["confirmed_at"] = None
+                reset_executor_binding(state)
+        elif reference["enabled"] and reference_changed:
+            reference.update({"contract_digest": stable_hash(f"{reference['contract_digest']}\0{prompt_meta['fingerprint']}", 32), "version_fingerprint": prompt_meta["fingerprint"], "phase": "planned", "state": "planned", "fidelity_candidate": "unknown", "user_final_acceptance": "unknown", "evidence_digest": None})
+            state["reference_acceptance"] = reference
+            state["plan_state"] = "analyzing"
+            state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+            state["plan_digest"] = state["plan_objective_fingerprint"] = state["plan_difficulty_decision_id"] = None
+            state["confirmed_plan_digest"] = state["confirmed_at"] = None
+            reset_executor_binding(state)
+        elif reference["enabled"] and (causal_report or reference_failure or reference_rejection):
+            reference.update({"state": "failed", "fidelity_candidate": "failed", "user_final_acceptance": "failed"})
+            state["reference_acceptance"] = reference
+        elif reference["enabled"] and acceptance_success:
+            # Only an explicit user acceptance may finalise reference fidelity.
+            reference.update({"state": "accepted", "user_final_acceptance": "accepted"})
+            state["reference_acceptance"] = reference
         state["last_route"] = {**classification, "at": utc_now()}
         for key in (
             "task_domain",
@@ -4119,7 +4227,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "difficulty_decision_id",
         ):
             state[key] = classification.get(key)
-        if causal_report or acceptance_miss or (causal_active and not new_objective):
+        if causal_report or reference_failure or (causal_active and not new_objective):
             state["model_profile"] = "work_assessment"
         elif already_confirmed and continuation and not plan_changed and not new_objective:
             state["model_profile"] = previous.get("model_profile", "work_executor_low_latest")
@@ -4127,8 +4235,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if causal_report:
             # Freeze the old plan/contract for comparison. The causal guard allows only
             # evidence collection until a structured, baseline-bound conclusion is recorded.
-            pass
-        elif acceptance_miss:
+            if state.get("last_execution_baseline"):
+                state["last_execution_baseline"]["acceptance_status"] = "failed"
+        elif reference_failure:
             state["plan_state"] = "analyzing"
             state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
             state["plan_digest"] = None
@@ -4201,7 +4310,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
 
     mutate_state(payload, update)
     pressure = telemetry.get("pressure")
-    should_inject = causal_report or acceptance_miss or causal_active or classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
+    should_inject = causal_report or reference_failure or causal_active or classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
         isinstance(pressure, (int, float)) and pressure >= PRESSURE_TRIM_THRESHOLD
     )
     if not should_inject:
@@ -4219,7 +4328,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             f"baseline_id={review.get('baseline_id')} review_id={review.get('review_id')} "
             "outcome=<introduced|fix_ineffective|unrelated|uncertain> evidence_digest=<32hex>."
         )
-    elif acceptance_miss:
+    elif reference_failure:
         context += (
             " Acceptance was not met, but the completed executor recorded no successful change set, so do not "
             "claim that a prior mutation introduced the symptom and do not open a causal-review contract. The old "
@@ -4835,10 +4944,12 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "execution_contract_id": state.get("execution_contract_id"),
                 "executor_attempt": safe_int(state.get("executor_attempt")),
                 "executor_failure_kind": state.get("executor_failure_kind"),
+                "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
                 "last_execution_baseline": _safe_execution_baseline(
                     state.get("last_execution_baseline")
                 ),
-                "causal_review": _safe_causal_review(state.get("causal_review")),
+            "causal_review": _safe_causal_review(state.get("causal_review")),
+            "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
             "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
