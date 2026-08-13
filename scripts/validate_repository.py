@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -55,6 +56,19 @@ def main() -> int:
     assert manifest.get("name") == PLUGIN_NAME
     assert manifest.get("interface", {}).get("displayName") == "Workflow Manager"
     assert "skills" not in manifest
+    release_version = manifest.get("version")
+    assert isinstance(release_version, str) and re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+", release_version
+    )
+    orchestrator_source = (
+        PLUGIN / "scripts" / "orchestrator_hook.py"
+    ).read_text(encoding="utf-8")
+    writer_version = re.search(
+        r'^WRITER_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$',
+        orchestrator_source,
+        re.MULTILINE,
+    )
+    assert writer_version and writer_version.group(1) == release_version
     prompts = manifest.get("interface", {}).get("defaultPrompt")
     assert isinstance(prompts, list) and 1 <= len(prompts) <= 3
     assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
@@ -62,6 +76,37 @@ def main() -> int:
     assert stable_asset.is_file()
     assert not (PLUGIN / "skills").exists()
     assert (PLUGIN / "scripts" / "install_stable_skill.py").is_file()
+    doctor_path = PLUGIN / "scripts" / "hook_trust_doctor.py"
+    assert doctor_path.is_file()
+    doctor_source = doctor_path.read_text(encoding="utf-8")
+    doctor_source_lower = doctor_source.lower()
+    assert '"hooks/list"' in doctor_source
+    for forbidden in ("config/" + "batchwrite", "by" + "pass"):
+        assert forbidden not in doctor_source_lower
+    production_sources = [
+        path
+        for path in PLUGIN.rglob("*")
+        if path.is_file()
+        and "tests" not in path.parts
+        and path.suffix.lower() in {".json", ".ps1", ".py", ".sh"}
+    ]
+    assert all(
+        "trusted_" + "hash" not in path.read_text(
+            encoding="utf-8", errors="replace"
+        ).lower()
+        for path in production_sources
+    )
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert fr"\{release_version}\scripts\install_stable_skill.py" in readme
+    assert f"workflow-manager/{release_version}/scripts/install_stable_skill.py" in readme
+    assert f"--ref v{release_version} --json" in readme
+    latest_changelog = re.search(r"(?m)^## ([0-9]+\.[0-9]+\.[0-9]+)\s*$", changelog)
+    assert latest_changelog and latest_changelog.group(1) == release_version
+    absolute_hash = re.compile(r"(?i)\b(?:sha256:)?[0-9a-f]{64}\b")
+    assert absolute_hash.search(readme) is None
+    assert absolute_hash.search(changelog) is None
     release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )

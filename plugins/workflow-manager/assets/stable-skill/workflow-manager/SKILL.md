@@ -18,7 +18,7 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 3. First assessor turn is read-only: **Simple** returns `WORK_ASSESSMENT`, then the same bound child follow-up solves+verifies and returns `SIMPLE_EXECUTION`; **Hard** returns detailed plan+marker and ends `计划已就绪，等待确认后执行`.
 4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan modules/files, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
 5. Before strict Hard-plan confirmation, allow reads; block writes, mutating children/Git, builds, deployment, and device mutation. Changed constraints invalidate it. Read [references/work-routing.md](references/work-routing.md).
-6. After confirmation read [references/confirmed-execution.md](references/confirmed-execution.md). The high parent coordinates/reviews; request one newest lower-tier medium executor bound to objective/difficulty/plan generation/digest. Keep handoff silent; report typed failure only when blocked. One corrected recovery, never identical retry.
+6. Default confirmed Hard uses one lower-tier/medium executor; an explicit whole-session highest-model+effort policy instead requests the assessor tier and host-max effort. Read [references/confirmed-execution.md](references/confirmed-execution.md) for proof/reset/resume.
 7. Independently route **Direct**, **Focused**, or **Complex/Extensive** execution shape. Use only relevant `Contract > Evidence > Change > Verify > Report` stages.
 8. After confirmed execution, seal a fingerprint-only baseline. If same-task acceptance reports a symptom, read [references/regression-continuity.md](references/regression-continuity.md): compare prior objective/plan/contract/change/verification read-only. Wording is only a trigger. `introduced`/`fix_ineffective` replan and reconfirm; `unrelated` reclassifies; `uncertain` needs evidence.
 9. Only for an explicit reference-match request, read [reference acceptance](references/reference-acceptance.md); bind it to Hard execution and separate engineering, function, fidelity candidate, and user acceptance.
@@ -27,7 +27,7 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 ## Context gates
 
 - Below 55% work normally; at 55-70% trim presentation; at 70% checkpoint and narrow exploration.
-- After compaction resume native summary and gates; never reconstruct finished work. Reclassify on new phases, repeated failures, long builds, or large output.
+- After compaction resume native summary/gates and normalized profile preference, never its raw prompt. Reclassify on new phases, repeated failures, long builds, or large output.
 
 ## Delegation
 
@@ -63,7 +63,7 @@ Never run Git from CIFS, Samba, UNC, DrvFS, or other WSL mounts. Use `android-re
 
 ## Truthfulness and boundaries
 
-- Profiles request policy only; the Hook cannot switch the parent. Only host acceptance of an explicit child override proves switching.
+- Profiles only request policy; Hooks cannot switch models. Claim overrides only from matching host acceptance/echo.
 - Availability or agent count do not prove effectiveness; agents may raise total tokens. PreToolUse is not security.
 - Quality is the release gate. Savings remove redundancy, never required reasoning, evidence, correction, or verification.
 - User instructions, safety, project-local skills, and required gates take precedence.

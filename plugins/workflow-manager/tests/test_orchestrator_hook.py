@@ -107,6 +107,76 @@ class OrchestratorHookTests(unittest.TestCase):
             },
         )
 
+    def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
+        self.assertEqual(HOOK.SCHEMA_VERSION, 15)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.30")
+        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
+        self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
+        for ambiguous in (
+            "这次任务请用最高模型和最高推理强度",
+            "本会话请用最高模型和最高推理强度",
+            "说明“本会话全程使用最高可用模型和最高推理强度”是什么意思",
+        ):
+            self.assertIsNone(HOOK.session_execution_preference_directive(ambiguous))
+        prompt = "本会话全程使用最高可用模型和最高推理强度"
+        result = self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "highest-daily", "hook_run_id": "enable", "model": "gpt-5.6-sol", "prompt": prompt})
+        state = self.load_only_state()
+        self.assertEqual(state["session_execution_preference"], "highest_throughout")
+        self.assertEqual((state["task_domain"], state["model_profile"]), ("daily", "current"))
+        self.assertNotIn(prompt, json.dumps(state, ensure_ascii=False))
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("policy state only", context)
+        self.assertNotIn("override was applied", context)
+
+    def test_highest_confirmed_executor_binds_max_rejects_medium_and_restores_default(self) -> None:
+        session = "highest-executor"
+        state = self.create_confirmed_executor_state(session, highest=True, assessor_effort="max")
+        self.assertEqual(state["session_execution_preference"], "highest_throughout")
+        self.assertEqual(state["model_profile"], "work_executor_highest_available")
+        original_contract = state["execution_contract_id"]
+        missing_marker = self.executor_spawn_payload(state, session=session, hook_run_id="missing-marker", model="gpt-5.6-sol", effort="max")
+        missing_marker["tool_input"]["message"] = missing_marker["tool_input"]["message"].replace(" profile_resolution=highest_available", "")
+        for payload in (
+            missing_marker,
+            self.executor_spawn_payload(state, session=session, hook_run_id="lower-medium", model="gpt-5.6-terra", effort="medium"),
+            self.executor_spawn_payload(state, session=session, hook_run_id="same-medium", model="gpt-5.6-sol", effort="medium"),
+        ):
+            denied = self.run_hook(payload)
+            self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        accepted = self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="highest-max", model="gpt-5.6-sol", effort="max"))
+        self.assertNotIn("permissionDecision", json.loads(accepted.stdout)["hookSpecificOutput"])
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "highest-start", "agent_id": "highest-max-agent", "model": "gpt-5.6-sol", "reasoning_effort": "max"})
+        running = self.load_only_state()
+        self.assertTrue(running["executor_observed_effective"])
+        self.assertEqual(running["executor_state"], "running")
+        restored = self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "restore", "prompt": "本会话恢复默认执行档位策略"})
+        state = self.load_only_state()
+        self.assertEqual(state["session_execution_preference"], "default")
+        self.assertEqual(state["model_profile"], "work_executor_low_latest")
+        self.assertEqual(state["executor_state"], "spawn_required")
+        self.assertNotEqual(state["execution_contract_id"], original_contract)
+        self.assertIn("policy state only", json.loads(restored.stdout)["hookSpecificOutput"]["additionalContext"])
+        default_executor = self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="default-medium"))
+        self.assertNotIn("permissionDecision", json.loads(default_executor.stdout)["hookSpecificOutput"])
+
+    def test_highest_preference_survives_target_compaction_and_schema14_migrates_default(self) -> None:
+        session = "highest-resume"
+        prompt = "For this entire session, always use the highest available model and maximum reasoning effort"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "enable", "model": "gpt-5.6-sol", "prompt": prompt})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "target", "prompt": "修复 Android 崩溃并验证"})
+        self.assertEqual(self.load_only_state()["session_execution_preference"], "highest_throughout")
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
+        compacted = self.load_only_state()
+        self.assertEqual(compacted["compactions"][-1]["session_execution_preference"], "highest_throughout")
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"})
+        context = json.loads(resumed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"session_execution_preference":"highest_throughout"', context)
+        self.assertNotIn(prompt, context)
+        legacy = HOOK.new_state({"session_id": "legacy-14"})
+        legacy.update({"schema_version": 14, "writer_version": "1.0.29", "session_execution_preference": "highest_throughout"})
+        migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-14"})
+        self.assertEqual(migrated["session_execution_preference"], "default")
+
     def test_assessor_lifecycle_uses_bound_high_profile_and_keeps_daily_local(self) -> None:
         daily = "assessor-daily"
         daily_data = Path(self.temporary.name) / "assessor-daily-data"
@@ -1252,7 +1322,12 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertNotEqual(state.get("plan_digest"), old_digest)
         self.assertNotEqual(state["objective"]["fingerprint"], old_objective)
 
-    def create_confirmed_executor_state(self, session: str, data: Path | None = None) -> dict:
+    def create_confirmed_executor_state(
+        self, session: str, data: Path | None = None, *, highest: bool = False,
+        assessor_effort: str = "ultra",
+    ) -> dict:
+        if highest:
+            self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": f"{session}-highest", "model": "gpt-5.6-sol", "prompt": "本会话全程使用最高可用模型和最高推理强度"}, data=data)
         self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -1269,9 +1344,9 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": f"{session}-assessor-request",
                 "tool_name": "collaboration.spawn_agent",
-                "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none", "message": f"assessor_binding_id={self.load_only_state(data)['assessor_binding_id']} objective_fingerprint={self.load_only_state(data)['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"},
+                "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": assessor_effort, "fork_turns": "none", "message": f"assessor_binding_id={self.load_only_state(data)['assessor_binding_id']} objective_fingerprint={self.load_only_state(data)['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"},
             }, data=data)
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-assessor-start", "agent_id": f"{session}-assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra"}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-assessor-start", "agent_id": f"{session}-assessor", "model": "gpt-5.6-sol", "reasoning_effort": assessor_effort}, data=data)
         binding = self.load_only_state(data)["assessor_binding_id"]
         self.run_hook(
             {
@@ -1337,6 +1412,11 @@ class OrchestratorHookTests(unittest.TestCase):
         tool_input = {
             "task_name": "execute_confirmed_plan",
             "message": (
+                (
+                    " profile_resolution=highest_available"
+                    if state.get("session_execution_preference") == "highest_throughout" else ""
+                )
+                +
                 "You are the unique exclusive executor for this confirmed plan. "
                 f"execution_contract_id={contract_id or state['execution_contract_id']} "
                 f"plan_digest={state['plan_digest']} plan_generation={state['plan_generation']}. "
@@ -3831,7 +3911,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         migrated = self.load_only_state(data)
-        self.assertEqual(migrated["schema_version"], 14)
+        self.assertEqual(migrated["schema_version"], 15)
+        self.assertEqual(migrated["session_execution_preference"], "default")
         self.assertEqual(migrated["writer_version"], HOOK.WRITER_VERSION)
         self.assertEqual(
             {key: migrated.get(key) for key in preserved_keys},

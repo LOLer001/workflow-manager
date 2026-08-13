@@ -18,6 +18,8 @@
 - 复杂任务主动评估关键路径，只要预期节省时间高于协调成本，就优先并行调度独立的读、写、测试、研究或复核工作。
 - Complex 最多 2 个、Extensive 最多 3 个子智能体；上限只是容量，不是固定数量，也不要求必须派一个只读子智能体。
 - 日常请求保持当前策略；明确“不使用子智能体”会硬关闭评估者并本地处理。唯一执行合同只约束已确认困难计划的变更范围，其他并行通道不得成为第二个执行者。
+- 只有用户明确要求“本/整个会话始终使用最高可用模型和最高推理强度”时，才启用跨目标与压缩恢复保留的 `highest_throughout` 会话偏好；普通的“最高模型”、单次任务高推理或日常请求不会触发，明确恢复默认策略才退出。
+- 默认策略保持不变：Daily 使用当前策略，Work 使用最高档评估者，困难计划确认后仍由最新较低档、中等推理执行者实施。`highest_throughout` 只把已确认困难计划的执行者请求改为宿主实际可用最高档；Hook 只记录和校验请求及宿主回显，不宣称父会话或子智能体已成功切档。
 - 通过明确文件/模块所有权避免写冲突；共享构建服务器、设备或交付物只串行化实际冲突的阶段。
 - 在上下文压力升高时只收窄冗余展示并提前保存检查点；必要调查继续进行。
 - 压缩后复用原生摘要、计划和已验证结果，不从头重复。
@@ -35,14 +37,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.29\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.30\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.29/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.30/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -54,6 +56,32 @@ codex plugin list --json
 同步成功时会输出 `"status": "installed"`、`"updated"` 或 `"current"`，目标固定为 `$CODEX_HOME/skills/workflow-manager`。随后重启 Codex 并新建会话，以重新加载 Skills 目录。Hook 会在 `SessionStart` 自动补建或更新稳定副本，但显式同步可以保证安装后的第一条新任务就能发现它。若稳定目录已存在但不带 Workflow Manager 受管标记，安装器会拒绝覆盖。
 
 Workflow Manager 不会仅因新版 Hook 已接管就删除旧版本缓存：旧任务仍可能保留原有版本化注入记录。插件不会直接改写 Codex 的 rollout JSONL、SQLite、索引或活动任务文件。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
+
+## Hook 命令信任
+
+插件已安装或已启用，不等于 Codex Desktop 已信任其 Hook 命令。首次启用以及 Hook 命令定义发生变化后，都应在实际运行 Desktop 的宿主中打开 `/hooks` 或 Hooks 设置，审核 Workflow Manager 当前定义；只有企业 `managed` 策略可以由管理员自动信任。插件不会自行写入 `trusted_hash`，也不要启用 `dangerously-bypass-hook-trust` 或任何同类危险 bypass 来跳过审核。
+
+可在与 Desktop 相同的宿主上运行只读检查；`--cwd` 应指向实际使用插件的工作目录，按需增加 `--json`。Windows：
+
+```powershell
+$CodexHome = Join-Path $env:USERPROFILE ".codex"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.30\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+```
+
+Linux、WSL 或 macOS：
+
+```bash
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.30/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+```
+
+`hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
+
+- `0`：9 个 Hook 均已启用且状态为 `trusted` 或 `managed`。
+- `2`：至少一项被禁用或处于 `untrusted`/`modified`，需要回到 Desktop 审核。
+- `1`：CLI、app-server、参数、协议或发现错误，本次检查无法得出结论。
+
+Windows 与 WSL 共享配置时，两端的命令定义及其哈希仍可能不同。审核必须以实际运行 Codex Desktop 的宿主所显示的当前定义为准；切换宿主后应重新审核，不要复制或固化旧宿主的哈希。
 
 ## 使用
 
@@ -85,7 +113,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.29 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.30 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：

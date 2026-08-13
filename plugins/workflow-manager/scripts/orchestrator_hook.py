@@ -20,11 +20,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 14
-WRITER_VERSION = "1.0.29"
+SCHEMA_VERSION = 15
+WRITER_VERSION = "1.0.30"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
-EXECUTION_PROFILE_VERSION = "1"
+EXECUTION_PROFILE_VERSION = "2"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = 1
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -61,7 +61,13 @@ DEFAULT_VISUAL_ITEM_LIMIT = 3
 PRESSURE_TRIM_THRESHOLD = 0.55
 PRESSURE_CHECKPOINT_THRESHOLD = 0.70
 
-MODEL_PROFILES = {"current", "work_assessment", "work_executor_low_latest"}
+MODEL_PROFILES = {
+    "current",
+    "work_assessment",
+    "work_executor_low_latest",
+    "work_executor_highest_available",
+}
+SESSION_EXECUTION_PREFERENCES = {"default", "highest_throughout"}
 EXECUTOR_STATES = {
     "none",
     "spawn_required",
@@ -151,7 +157,18 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     generation = max(safe_int(state.get("plan_generation")), 0)
     if not (objective and difficulty and plan and generation > 0):
         return None
-    material = f"{EXECUTION_PROFILE_VERSION}\0{objective}\0{difficulty}\0{generation}\0{plan}"
+    preference = safe_session_execution_preference(
+        state.get("session_execution_preference")
+    )
+    material = (
+        f"{EXECUTION_PROFILE_VERSION}\0{preference}\0{objective}\0{difficulty}"
+        f"\0{generation}\0{plan}"
+    )
+    if preference == "highest_throughout":
+        material += (
+            f"\0{highest_execution_model(state) or 'unresolved'}"
+            f"\0{highest_execution_effort(state) or 'unresolved'}"
+        )
     review = state.get("causal_review") if isinstance(state.get("causal_review"), dict) else {}
     review_id = safe_fingerprint(review.get("review_id"))
     if review.get("state") == "resolved" and review_id:
@@ -278,6 +295,44 @@ def reset_executor_binding(state: dict[str, Any], *, preserve_failure: bool = Fa
     state["executor_model"] = None
     state["executor_reasoning_effort"] = None
     state["executor_fork_turns"] = None
+    state["executor_observed_effective"] = False
+    state["executor_observed_model"] = None
+    state["executor_observed_reasoning_effort"] = None
+
+
+def safe_session_execution_preference(value: Any) -> str:
+    return str(value) if value in SESSION_EXECUTION_PREFERENCES else "default"
+
+
+def highest_execution_model(state: dict[str, Any]) -> str | None:
+    """Resolve the bound same-tier request without claiming host availability."""
+    candidates = (
+        state.get("assessor_observed_model")
+        if state.get("assessor_observed_effective")
+        else None,
+        state.get("assessor_model"),
+        state.get("model"),
+    )
+    for candidate in candidates:
+        model = safe_label(candidate, 80) if candidate else ""
+        if model and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
+            return model
+    return None
+
+
+def highest_execution_effort(state: dict[str, Any]) -> str | None:
+    effort = str(state.get("assessor_reasoning_effort") or "").lower()
+    return effort if effort in {"high", "xhigh", "max", "ultra"} else None
+
+
+def confirmed_executor_model_profile(state: dict[str, Any]) -> str:
+    if safe_route(state.get("last_route")).get("delegation_opt_out"):
+        return "current"
+    if safe_session_execution_preference(
+        state.get("session_execution_preference")
+    ) == "highest_throughout":
+        return "work_executor_highest_available"
+    return "work_executor_low_latest"
 
 
 def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
@@ -293,9 +348,7 @@ def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
     state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
     if safe_route(state.get("last_route")).get("delegation_opt_out"):
         state["executor_state"] = "local_running"
-        state["model_profile"] = "current"
-    else:
-        state["model_profile"] = "work_executor_low_latest"
+    state["model_profile"] = confirmed_executor_model_profile(state)
     return True
 
 
@@ -877,6 +930,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "domain_confidence": "low",
         "domain_rule_codes": [],
         "model_profile": "current",
+        "session_execution_preference": "default",
         "domain_classifier_version": DOMAIN_CLASSIFIER_VERSION,
         "domain_decision_id": None,
         "work_difficulty": "unknown",
@@ -913,6 +967,9 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "executor_model": None,
         "executor_reasoning_effort": None,
         "executor_fork_turns": None,
+        "executor_observed_effective": False,
+        "executor_observed_model": None,
+        "executor_observed_reasoning_effort": None,
         "reference_acceptance": _safe_reference_acceptance(None),
         "last_execution_baseline": {},
         "causal_review": {
@@ -1236,6 +1293,9 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         "plan_generation": max(safe_int(item.get("plan_generation")), 0),
         "plan_digest": plan_digest,
         "confirmed_plan_digest": confirmed_plan_digest,
+        "session_execution_preference": safe_session_execution_preference(
+            item.get("session_execution_preference")
+        ),
         "execution_profile_version": safe_label(
             item.get("execution_profile_version") or EXECUTION_PROFILE_VERSION, 16
         ),
@@ -1278,6 +1338,13 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             base[key] = fingerprint
     if value.get("model"):
         base["model"] = safe_label(value.get("model"), 80)
+    # Schema 14 had no session-wide preference. Never infer opt-in from legacy
+    # profile names, prompts, or execution state.
+    base["session_execution_preference"] = (
+        safe_session_execution_preference(value.get("session_execution_preference"))
+        if safe_int(value.get("schema_version")) >= 15
+        else "default"
+    )
     base["telemetry"] = safe_telemetry(value.get("telemetry"))
     base["event_counts"] = safe_event_counts(value.get("event_counts"))
     base["persistence"] = safe_persistence(value.get("persistence"))
@@ -1429,6 +1496,17 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if fork_turns == "none" or re.fullmatch(r"[1-9]\d*", fork_turns)
         else None
     )
+    base["executor_observed_effective"] = bool(
+        value.get("executor_observed_effective")
+    )
+    base["executor_observed_model"] = (
+        safe_label(value.get("executor_observed_model"), 80)
+        if value.get("executor_observed_model") else None
+    )
+    base["executor_observed_reasoning_effort"] = (
+        safe_label(value.get("executor_observed_reasoning_effort"), 24)
+        if value.get("executor_observed_reasoning_effort") else None
+    )
     base["last_execution_baseline"] = _safe_execution_baseline(
         value.get("last_execution_baseline")
     )
@@ -1490,12 +1568,14 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_model"] = None
         base["executor_reasoning_effort"] = None
         base["executor_fork_turns"] = None
-        base["model_profile"] = "current" if base["last_route"].get("delegation_opt_out") else "work_executor_low_latest"
+        base["model_profile"] = confirmed_executor_model_profile(base)
         if base["last_route"].get("delegation_opt_out"):
             base["executor_state"] = "local_running"
     elif base["plan_state"] == "confirmed":
-        base["model_profile"] = "current" if base["executor_state"] == "local_running" else (
-            "work_assessment" if base["executor_state"] in {"recovery_required", "exhausted"} else "work_executor_low_latest"
+        base["model_profile"] = (
+            "work_assessment"
+            if base["executor_state"] in {"recovery_required", "exhausted"}
+            else confirmed_executor_model_profile(base)
         )
     elif base["plan_state"] != "confirmed":
         base["execution_contract_id"] = None
@@ -2760,6 +2840,9 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
     model = str(options.get("model") or "").strip()
     effort = str(options.get("reasoning_effort") or "").strip().lower()
     fork_turns = str(options.get("fork_turns") or "").strip().lower()
+    preference = safe_session_execution_preference(
+        state.get("session_execution_preference")
+    )
     contract_marker = bool(
         re.search(
             rf"(?:execution_contract_id|execution-contract-id|执行合同)\s*[:=：]\s*{re.escape(contract_id)}\b",
@@ -2806,11 +2889,23 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
         return False, "model_unavailable"
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
         return False, "invalid executor model identifier"
-    current_model = str(state.get("model") or "").strip()
-    if current_model and safe_label(model, 80) == safe_label(current_model, 80):
-        return False, "executor model is not a lower-tier override"
-    if effort != "medium":
-        return False, "reasoning_effort must be medium"
+    if preference == "highest_throughout":
+        expected_model = highest_execution_model(state)
+        expected_effort = highest_execution_effort(state)
+        if "profile_resolution=highest_available" not in request:
+            return False, "highest executor requires profile_resolution=highest_available"
+        if not expected_model or not expected_effort:
+            return False, "model_unavailable"
+        if safe_label(model, 80) != expected_model:
+            return False, "executor model must match the bound highest-tier model"
+        if effort != expected_effort:
+            return False, "reasoning_effort must match the bound highest assessor request"
+    else:
+        current_model = str(state.get("model") or "").strip()
+        if current_model and safe_label(model, 80) == safe_label(current_model, 80):
+            return False, "executor model is not a lower-tier override"
+        if effort != "medium":
+            return False, "reasoning_effort must be medium"
     if fork_turns != "none" and not re.fullmatch(r"[1-9]\d*", fork_turns):
         return False, "fork_turns must be none or a positive integer when overriding model"
     if not contract_marker or not plan_marker or not generation_marker:
@@ -3797,6 +3892,9 @@ def session_start(payload: dict[str, Any]) -> None:
 
     state, _ = mutate_state(payload, update)
     source = str(payload.get("source") or "startup")
+    preference = safe_session_execution_preference(
+        state.get("session_execution_preference")
+    )
     base = (
         "Workflow Manager: availability only, not proof of effectiveness. Acceptance outranks "
         "context savings. Protocol: Contract > Evidence > Change > Verify > Report; skip irrelevant stages. "
@@ -3804,6 +3902,13 @@ def session_start(payload: dict[str, Any]) -> None:
         "review lanes and bias low-risk close calls parallel. Reuse unchanged evidence; "
         f"checkpoint before compaction. Pressure: {pressure_text(telemetry)}."
     )
+    if preference == "highest_throughout":
+        base += (
+            " Session execution preference=highest_throughout: request explicit highest_available child "
+            "contracts matching the bound highest assessor model/reasoning profile. Daily remains current. "
+            "This Hook cannot switch the parent or prove that the host applied a requested override; "
+            "record request and observed start metadata separately."
+        )
     if stable_skill.get("status") not in {"installed", "updated", "current"}:
         base += (
             " Stable Workflow Manager Skill activation is not verified "
@@ -3820,6 +3925,7 @@ def session_start(payload: dict[str, Any]) -> None:
             "domain_decision_id": state.get("domain_decision_id"),
             "work_difficulty": state.get("work_difficulty", "unknown"),
             "difficulty_decision_id": state.get("difficulty_decision_id"),
+            "session_execution_preference": preference,
             "model_profile": state.get("model_profile", "current"),
             "assessor_state": state.get("assessor_state", "none"),
             "assessor_binding_id": state.get("assessor_binding_id"),
@@ -3840,6 +3946,9 @@ def session_start(payload: dict[str, Any]) -> None:
             "executor_failure_kind": state.get("executor_failure_kind"),
             "executor_model": state.get("executor_model"),
             "executor_reasoning_effort": state.get("executor_reasoning_effort"),
+            "executor_observed_effective": bool(state.get("executor_observed_effective")),
+            "executor_observed_model": state.get("executor_observed_model"),
+            "executor_observed_reasoning_effort": state.get("executor_observed_reasoning_effort"),
             "executor_fork_turns": state.get("executor_fork_turns"),
             "last_execution_baseline": _safe_execution_baseline(
                 state.get("last_execution_baseline")
@@ -4003,6 +4112,54 @@ PLAN_REPLAN_PATTERNS = (
     r"replan",
     r"revise (?:this|the) plan",
 )
+
+
+def session_execution_preference_directive(prompt: str) -> str | None:
+    """Recognize only explicit, session-scoped policy commands; retain no raw text."""
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    if not normalized or re.search(
+        r"^(?:解释|说明|分析|判断|告诉我|what|why|how|does|is|explain|document)\b",
+        normalized,
+        re.I,
+    ):
+        return None
+    chinese_scope = bool(re.search(r"(?:本|当前|这个|整个|此|该)(?:次)?会话", normalized))
+    english_scope = bool(
+        re.search(
+            r"\b(?:this|current)(?: entire| whole)? session\b|"
+            r"\b(?:entire|whole) session\b|"
+            r"\b(?:rest|remainder) of (?:this|the current) session\b",
+            normalized,
+            re.I,
+        )
+    )
+    if not (chinese_scope or english_scope):
+        return None
+    restore = bool(
+        re.search(
+            r"(?:恢复|改回|切回|回到).{0,20}默认.{0,20}(?:模型|推理|执行|档位|策略|配置)|"
+            r"(?:restore|reset|revert|switch back).{0,24}default.{0,24}"
+            r"(?:model|reasoning|execution|profile|policy|setting)",
+            normalized,
+            re.I,
+        )
+    )
+    if restore:
+        return "default"
+    if re.search(r"(?:不要|无需|不再|do not|don't|without)", normalized, re.I):
+        return None
+    throughout = bool(
+        re.search(r"(?:全程|始终|一直|整个会话|接下来.{0,10}(?:都|全程))", normalized)
+        or re.search(r"\b(?:throughout|always|for the (?:entire|whole|rest of the))\b", normalized)
+    )
+    highest_model = bool(
+        re.search(r"最高(?:可用)?(?:的)?模型|\bhighest(?: available)? (?:codex )?model\b", normalized)
+    )
+    highest_reasoning = bool(
+        re.search(r"最高(?:可用)?(?:的)?推理(?:强度|力度|等级)?", normalized)
+        or re.search(r"\b(?:highest|maximum|max) reasoning(?: effort| level| intensity)?\b", normalized)
+    )
+    return "highest_throughout" if throughout and highest_model and highest_reasoning else None
 
 
 def pure_plan_confirmation(prompt: str) -> bool:
@@ -4180,7 +4337,7 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
     profile = str(classification.get("model_profile") or "current")
     profile_note = (
         "requested executor profile; proof requires accepted explicit child override"
-        if profile == "work_executor_low_latest"
+        if profile in {"work_executor_low_latest", "work_executor_highest_available"}
         else "advisory; no switch"
     )
     return (
@@ -4196,6 +4353,8 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
     previous = snapshot_state(payload)
+    preference_directive = session_execution_preference_directive(prompt)
+    preference_changed = preference_directive not in {None, previous.get("session_execution_preference", "default")}
     requested_reference = reference_requested(prompt)
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
@@ -4237,7 +4396,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and not confirmed_plan
     )
     continuation = not new_objective and (
-        is_control_followup(prompt) or is_progress_followup(prompt) or active_plan or reference_changed
+        preference_directive is not None or is_control_followup(prompt) or is_progress_followup(prompt) or active_plan or reference_changed
     )
     classification = classify_prompt(prompt)
     if requested_reference:
@@ -4287,10 +4446,23 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 ),
             }
         )
+    if preference_directive is not None and previous.get("last_route"):
+        classification = merge_followup_route(previous["last_route"], classification)
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
         prompt_meta = text_metadata(prompt)
+        if preference_directive is not None:
+            state["session_execution_preference"] = preference_directive
+            if preference_changed and state.get("plan_state") == "confirmed":
+                reset_executor_binding(state)
+                state["execution_contract_id"] = execution_contract_id(state)
+                state["executor_state"] = (
+                    "local_running"
+                    if safe_route(state.get("last_route")).get("delegation_opt_out")
+                    else "spawn_required"
+                )
+                state["model_profile"] = confirmed_executor_model_profile(state)
         if causal_report:
             baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
             review_id = stable_hash(
@@ -4382,7 +4554,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if causal_report or reference_failure or (causal_active and not new_objective):
             state["model_profile"] = "work_assessment"
         elif already_confirmed and continuation and not plan_changed and not new_objective:
-            state["model_profile"] = previous.get("model_profile", "work_executor_low_latest")
+            state["model_profile"] = (
+                confirmed_executor_model_profile(state) if preference_changed else previous.get("model_profile", "work_executor_low_latest")
+            )
         objective_fingerprint = state.get("objective", {}).get("fingerprint")
         if causal_report:
             # Freeze the old plan/contract for comparison. The causal guard allows only
@@ -4484,13 +4658,18 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
 
     mutate_state(payload, update)
     pressure = telemetry.get("pressure")
-    should_inject = causal_report or reference_failure or causal_active or classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
+    should_inject = preference_directive is not None or causal_report or reference_failure or causal_active or classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
         isinstance(pressure, (int, float)) and pressure >= PRESSURE_TRIM_THRESHOLD
     )
     if not should_inject:
         return
     context = routing_context(classification, telemetry)
     refreshed_for_assessor = snapshot_state(payload)
+    if preference_directive is not None:
+        context += (
+            f" Session execution preference request recorded as {preference_directive}; this is policy "
+            "state only and does not prove that the host changed the parent model or reasoning settings."
+        )
     if classification.get("task_domain") == "work" and refreshed_for_assessor.get("assessor_state") == "spawn_required":
         context += (
             " Work requires one high-tier assessor before execution. Spawn exactly one child with the host's highest "
@@ -4531,13 +4710,22 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             f"review_id={review.get('review_id')}."
         )
     elif confirmed_plan:
-        context += (
-            " Confirmed plan binding is valid. The parent remains the high-reasoning coordinator; before any "
-            "mutation, spawn exactly one exclusive confirmed-plan executor using the newest actually available "
-            "lower-tier Codex model, reasoning_effort=medium, and fork_turns=none or a positive integer. Bind its "
-            "request to execution_contract_id, plan_digest, plan_generation, full actionable plan, scope, and "
-            "acceptance. Do not claim a model switch until the host accepts that explicit spawn override."
-        )
+        if refreshed_for_assessor.get("session_execution_preference") == "highest_throughout":
+            context += (
+                " Confirmed plan binding is valid. Before mutation, spawn exactly one exclusive executor with "
+                "profile_resolution=highest_available, the bound assessor/current highest-tier model, the same "
+                "requested reasoning_effort as the bound assessor, and a non-full-history fork. Bind the exact "
+                "execution contract, full plan, ownership, and acceptance. This is a request contract, not proof "
+                "that the host applied the override; wait for matching SubagentStart metadata."
+            )
+        else:
+            context += (
+                " Confirmed plan binding is valid. The parent remains the high-reasoning coordinator; before any "
+                "mutation, spawn exactly one exclusive confirmed-plan executor using the newest actually available "
+                "lower-tier Codex model, reasoning_effort=medium, and fork_turns=none or a positive integer. Bind its "
+                "request to execution_contract_id, plan_digest, plan_generation, full actionable plan, scope, and "
+                "acceptance. Do not claim a model switch until the host accepts that explicit spawn override."
+            )
     elif replan or plan_changed:
         context += " Pending plan invalidated by changed constraints; re-analyze and present a replacement plan before mutation."
     elif already_confirmed and not plan_changed and not new_objective:
@@ -4742,15 +4930,22 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
                 options.get("reasoning_effort"), 24
             )
             current["executor_fork_turns"] = str(options.get("fork_turns"))
-            current["model_profile"] = "work_executor_low_latest"
+            current["model_profile"] = confirmed_executor_model_profile(current)
 
     mutate_state(payload, record_request)
     if executor_request:
+        preference = safe_session_execution_preference(state.get("session_execution_preference"))
+        profile_text = (
+            "highest_available model/reasoning request"
+            if preference == "highest_throughout"
+            else "lower-tier model and medium reasoning request"
+        )
         emit_context(
             "PreToolUse",
-            "Confirmed-plan executor request accepted: the explicit host model override, medium reasoning, "
-            "non-full-history fork, exact execution contract, exclusive ownership, and acceptance markers match. "
-            "This records a requested profile, not proof that the child started; wait for SubagentStart. The "
+            f"Confirmed-plan executor request accepted: the explicit {profile_text}, non-full-history fork, "
+            "exact execution contract, exclusive ownership, and acceptance markers match. This records a "
+            "requested profile, not proof that the child started or that the host applied it; wait for a matching "
+            "SubagentStart. The "
             "parent remains coordinator/reviewer and must not perform the executor's mutation.",
         )
     elif reaudited:
@@ -4882,12 +5077,21 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 current["model_profile"] = "work_assessment"
 
         mutate_state(payload, record_executor_guard)
+        if safe_session_execution_preference(state.get("session_execution_preference")) == "highest_throughout":
+            profile_instruction = (
+                "Use profile_resolution=highest_available and explicitly request the bound assessor/current "
+                "highest-tier model plus the exact bound assessor reasoning_effort"
+            )
+        else:
+            profile_instruction = (
+                "Resolve the newest actually available lower-tier model and explicitly request "
+                "reasoning_effort=medium"
+            )
         emit_pretool_deny(
             f"Workflow Manager blocked {executor_block}: this confirmed hard-work plan requires exactly one "
-            "contract-bound executor. Resolve the newest actually available lower-tier model, explicitly spawn "
-            "it with reasoning_effort=medium and fork_turns=none or a positive integer, and include the exact "
-            "execution_contract_id, plan_digest, plan_generation, exclusive scope, full actionable plan, and "
-            "acceptance. The parent model was not switched and must not silently execute the mutation."
+            f"contract-bound executor. {profile_instruction} with fork_turns=none or a positive integer, and "
+            "include the exact execution_contract_id, plan_digest, plan_generation, exclusive scope, full "
+            "actionable plan, and acceptance. The Hook did not switch the parent and cannot prove host support."
         )
         return
     if is_subagent_spawn_tool(payload):
@@ -5210,6 +5414,9 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "plan_generation": safe_int(state.get("plan_generation")),
                 "plan_digest": state.get("plan_digest"),
                 "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+                "session_execution_preference": safe_session_execution_preference(
+                    state.get("session_execution_preference")
+                ),
                 "execution_profile_version": state.get("execution_profile_version"),
                 "executor_state": state.get("executor_state", "none"),
                 "execution_contract_id": state.get("execution_contract_id"),
@@ -5348,6 +5555,13 @@ def subagent_start(payload: dict[str, Any]) -> None:
     def update(state: dict[str, Any]) -> None:
         agent_id = safe_label(payload.get("agent_id"), 120)
         request_contract = request.get("contract_id")
+        highest = safe_session_execution_preference(
+            state.get("session_execution_preference")
+        ) == "highest_throughout"
+        expected_model = highest_execution_model(state) if highest else None
+        expected_effort = highest_execution_effort(state) if highest else "medium"
+        echoed_model = safe_label(payload.get("model"), 80) if payload.get("model") else None
+        echoed_effort = safe_label(payload.get("reasoning_effort"), 24) if payload.get("reasoning_effort") else None
         contract_matches = bool(
             executor_request
             and state.get("executor_state") == "spawn_pending"
@@ -5355,7 +5569,10 @@ def subagent_start(payload: dict[str, Any]) -> None:
             and request_contract == state.get("execution_contract_id")
             and request_contract == execution_contract_id(state)
             and request.get("model") == state.get("executor_model")
-            and request.get("reasoning_effort") == "medium"
+            and request.get("reasoning_effort") == expected_effort
+            and (not highest or request.get("model") == expected_model)
+            and (echoed_model is None or echoed_model == request.get("model"))
+            and (echoed_effort is None or echoed_effort == request.get("reasoning_effort"))
             and request.get("fork_turns") == state.get("executor_fork_turns")
             and safe_int(request.get("attempt")) == safe_int(state.get("executor_attempt"))
         )
@@ -5381,6 +5598,9 @@ def subagent_start(payload: dict[str, Any]) -> None:
             }
         )
         if executor_request:
+            state["executor_observed_model"] = echoed_model
+            state["executor_observed_reasoning_effort"] = echoed_effort
+            state["executor_observed_effective"] = bool(contract_matches and echoed_model and echoed_effort)
             if contract_matches:
                 state["executor_state"] = "running"
                 state["executor_agent_id"] = agent_id
@@ -5412,9 +5632,14 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 "Confirmed executor start did not match the persisted contract/config; do not mutate and return control for recovery."
             )
         else:
-            warnings.append(
-                "Confirmed executor is active. Execute only the bound plan and acceptance, preserve evidence, and stop on contract drift."
-            )
+            if refreshed.get("executor_observed_effective"):
+                warnings.append(
+                    "Confirmed executor request and observed start profile match. Execute only the bound plan and acceptance."
+                )
+            else:
+                warnings.append(
+                    "Confirmed executor is active under an accepted request, but the host did not expose complete matching model/effort metadata; do not claim the override was observed."
+                )
     if duplicate_scope and changed:
         warnings.append("Existing active subagent already has the same task name or scope; reuse it or send one bounded follow-up.")
     if over_cap and changed:
@@ -5536,7 +5761,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["plan_objective_fingerprint"] = state.get("objective", {}).get("fingerprint")
                 state["plan_difficulty_decision_id"] = state.get("difficulty_decision_id")
                 state["plan_state"] = "awaiting_confirmation"
-                state["model_profile"] = "work_executor_low_latest"
+                state["model_profile"] = confirmed_executor_model_profile(state)
             state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
     mutate_state(payload, update)
