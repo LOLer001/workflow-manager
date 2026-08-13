@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.25
+
+- Work assessment now uses an objective-bound high-tier assessor lifecycle: request the highest available Codex model and reasoning, preserve real local-high input state only when the parent is already highest, and keep Daily on current settings.
+- The same assessor continues Simple work; Hard plans remain strictly confirmed before one lower-tier medium executor runs. Successful handoffs are silent; typed failure is reserved for blocked model or host rejection.
+- Hook guards now bridge top-level and nested collaboration spawn payloads so valid bound executor requests are not rejected as unbound.
+
 ## 1.0.24
 
 - 已确认计划执行后封存有界基线：只保留前目标、计划、执行合同、改动集和验证证据的指纹/摘要及验收枚举，不保存用户原话、计划正文、命令或子智能体结果。

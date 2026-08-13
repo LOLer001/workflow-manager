@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 11
-WRITER_VERSION = "1.0.24"
+SCHEMA_VERSION = 12
+WRITER_VERSION = "1.0.25"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "1"
@@ -832,6 +832,11 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "difficulty_rule_codes": [],
         "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
         "difficulty_decision_id": None,
+        "assessor_state": "none",
+        "assessor_agent_id": None,
+        "assessor_model": None,
+        "assessor_reasoning_effort": None,
+        "assessor_input_fingerprint": None,
         "plan_state": "none",
         "plan_generation": 0,
         "plan_digest": None,
@@ -2597,15 +2602,23 @@ def is_subagent_spawn_tool(payload: dict[str, Any]) -> bool:
     return name == "agent" or name.endswith("spawnagent")
 
 
-def subagent_request_fields(payload: dict[str, Any]) -> tuple[str | None, str | None]:
-    tool_input = payload.get("tool_input")
+def subagent_request_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Accept raw and host-normalized collaboration spawn shapes without inventing bindings."""
     candidates: list[dict[str, Any]] = []
-    if isinstance(tool_input, dict):
-        candidates.append(tool_input)
-        for key in ("args", "arguments", "input"):
-            nested = tool_input.get(key)
-            if isinstance(nested, dict):
-                candidates.append(nested)
+    pending: list[Any] = [payload.get("tool_input"), payload]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop(0)
+        if not isinstance(value, dict) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        candidates.append(value)
+        pending.extend(value.get(key) for key in ("args", "arguments", "input", "tool_input"))
+    return candidates
+
+
+def subagent_request_fields(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    candidates = subagent_request_candidates(payload)
 
     task_name = None
     scope_value = None
@@ -2626,14 +2639,7 @@ def subagent_request_fields(payload: dict[str, Any]) -> tuple[str | None, str | 
 
 
 def subagent_request_options(payload: dict[str, Any]) -> dict[str, str | None]:
-    tool_input = payload.get("tool_input")
-    candidates: list[dict[str, Any]] = []
-    if isinstance(tool_input, dict):
-        candidates.append(tool_input)
-        for key in ("args", "arguments", "input"):
-            nested = tool_input.get(key)
-            if isinstance(nested, dict):
-                candidates.append(nested)
+    candidates = subagent_request_candidates(payload)
     result: dict[str, str | None] = {
         "model": None,
         "reasoning_effort": None,
@@ -2716,15 +2722,7 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
 
 
 def subagent_request_text(payload: dict[str, Any]) -> str:
-    tool_input = payload.get("tool_input")
-    candidates: list[dict[str, Any]] = []
-    if isinstance(tool_input, dict):
-        candidates.append(tool_input)
-        for key in ("args", "arguments", "input"):
-            nested = tool_input.get(key)
-            if isinstance(nested, dict):
-                candidates.append(nested)
-    for candidate in candidates:
+    for candidate in subagent_request_candidates(payload):
         for key in ("message", "prompt", "task"):
             value = candidate.get(key)
             if isinstance(value, str) and value.strip():
