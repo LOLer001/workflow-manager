@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
+import sys
 from pathlib import Path
 
 
@@ -18,10 +20,25 @@ def read_json(path: Path) -> dict:
         return json.load(handle)
 
 
+def load_command_generator():
+    path = ROOT / "scripts" / "generate_hook_commands.py"
+    spec = importlib.util.spec_from_file_location("workflow_manager_hook_commands", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
 def main() -> int:
     marketplace = read_json(ROOT / ".agents" / "plugins" / "marketplace.json")
     manifest = read_json(PLUGIN / ".codex-plugin" / "plugin.json")
-    hooks = read_json(PLUGIN / "hooks" / "hooks.json")["hooks"]
+    hooks_path = PLUGIN / "hooks" / "hooks.json"
+    hooks_document = read_json(hooks_path)
     entries = marketplace.get("plugins")
 
     assert marketplace.get("name") == PLUGIN_NAME
@@ -52,16 +69,21 @@ def main() -> int:
     assert 'gh release create "$tag"' in release_workflow
     assert '--verify-tag' in release_workflow
     assert (ROOT / "scripts" / "extract_release_notes.py").is_file()
-    declared = [
-        hook
-        for matchers in hooks.values()
-        for matcher in matchers
-        for hook in matcher["hooks"]
-    ]
+    generator = load_command_generator()
+    assert (ROOT / "scripts" / "generate_hook_commands.py").is_file()
+    declared = generator.command_hooks(hooks_document)
+    expected_posix, expected_windows = generator.expected_commands()
+    posix_commands = {hook["command"] for hook in declared}
     windows_commands = {hook["commandWindows"] for hook in declared}
-    assert len(declared) == 9 and len(windows_commands) == 1
+    assert len(declared) == 9
+    assert posix_commands == {expected_posix}
+    assert windows_commands == {expected_windows}
+    assert generator.canonical_text(generator.generated_document(hooks_document)) == hooks_path.read_text(
+        encoding="utf-8"
+    )
     windows_command = windows_commands.pop()
     assert len(windows_command) < 8191
+    assert windows_command.isascii()
     assert " -EncodedCommand " in windows_command
     assert "if defined TOKEN_FRUGAL_DEBUG" in windows_command
     assert windows_command.endswith(' 2>NUL)"')
@@ -71,6 +93,16 @@ def main() -> int:
         PLUGIN / "scripts" / "resolve_orchestrator_hook.ps1"
     ).read_text(encoding="utf-8").replace("\r\n", "\n")
     assert resolver == expected_resolver
+    for forbidden in (
+        "EnumerateDirectories",
+        "GetLastWriteTime",
+        "selectedRoot",
+        "Split-Path -Parent",
+    ):
+        assert forbidden not in resolver
+    assert "runner_missing" in resolver
+    assert "dirname" not in expected_posix
+    assert "candidate" not in expected_posix
 
     generated = [
         path

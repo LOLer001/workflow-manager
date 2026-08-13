@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.0.28
+
+- Hook 只执行宿主注入的精确 `PLUGIN_ROOT`；精确 runner 缺失时安全 fail-open，调试模式只输出固定的 `workflow_manager_hook: runner_missing`，不再扫描或执行同级其他版本、marketplace 或稳定 Skill 中未绑定当前信任记录的代码。
+- 九个事件的 Unix/Windows 命令改由单一生成器确定性同步，仓库校验只读检查 JSON 漂移、UTF-16LE 编码和精确 resolver；跨平台回归覆盖伪造同级 runner、固定诊断与 Schema 14 的 1.0.27 状态安全迁移。
+
 ## 1.0.27
 
 - Work 新目标建立有界高档评估者 binding；Daily 保持当前策略。PreTool/Start/Stop 分别校验请求、回显实际档位和 `WORK_ASSESSMENT` 结果，状态可随压缩恢复且不伪造旧任务已评估。

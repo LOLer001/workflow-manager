@@ -123,30 +123,67 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
 
-    def test_removed_version_discovers_latest_installed_wrapper(self) -> None:
-        cache_parent = self.root / "version cache"
-        latest_root = cache_parent / HOOK.WRITER_VERSION
-        scripts = latest_root / "scripts"
-        scripts.mkdir(parents=True)
-        shutil.copy2(PLUGIN_ROOT / "scripts" / "orchestrator_hook.py", scripts)
-        shutil.copy2(PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.ps1", scripts)
-        removed_root = cache_parent / "1.0.16"
-        recovered_data = self.root / "recovered data"
-        result = self.run_command_windows(
+    def test_exact_plugin_root_runs_and_missing_root_never_scans_siblings(self) -> None:
+        exact_data = self.root / "exact data"
+        exact = self.run_command_windows(
             {
                 "hook_event_name": "SessionStart",
-                "session_id": "removed-version",
-                "hook_run_id": "removed-version",
+                "session_id": "exact-root",
+                "hook_run_id": "exact-root",
                 "source": "startup",
             },
-            env=self.environment(plugin_root=removed_root, data=recovered_data),
+            env=self.environment(plugin_root=PLUGIN_ROOT, data=exact_data),
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
-        states = list((recovered_data / "sessions").glob("*.json"))
-        self.assertEqual(len(states), 1)
-        state = json.loads(states[0].read_text(encoding="utf-8"))
-        self.assertEqual(state["writer_version"], HOOK.WRITER_VERSION)
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertIn("hookSpecificOutput", json.loads(exact.stdout))
+        exact_states = list((exact_data / "sessions").glob("*.json"))
+        self.assertEqual(len(exact_states), 1)
+        exact_state = json.loads(exact_states[0].read_text(encoding="utf-8"))
+        self.assertEqual(exact_state["writer_version"], HOOK.WRITER_VERSION)
+
+        cache_parent = self.root / "version cache"
+        sibling_runner = cache_parent / HOOK.WRITER_VERSION / "scripts" / "run_orchestrator_hook.ps1"
+        sibling_runner.parent.mkdir(parents=True)
+        sibling_runner.write_text(
+            '$marker = $env:WORKFLOW_MANAGER_FAKE_MARKER\n'
+            'if ($marker) { Set-Content -LiteralPath $marker -Value "executed" -Encoding ascii }\n',
+            encoding="utf-8",
+        )
+        missing_root = cache_parent / "1.0.16"
+        missing_data = self.root / "missing data"
+        marker = self.root / "fake-runner-executed.txt"
+        env = self.environment(plugin_root=missing_root, data=missing_data)
+        env["WORKFLOW_MANAGER_FAKE_MARKER"] = str(marker)
+        env.pop("TOKEN_FRUGAL_DEBUG", None)
+        missing = self.run_command_windows(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "missing-exact-root",
+                "hook_run_id": "missing-exact-root",
+            },
+            env=env,
+        )
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        self.assertEqual((missing.stdout, missing.stderr), ("", ""))
+        self.assertFalse(marker.exists())
+        self.assertFalse((missing_data / "sessions").exists())
+
+        debug_env = env.copy()
+        debug_env["TOKEN_FRUGAL_DEBUG"] = "1"
+        debug = self.run_command_windows(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "missing-exact-root-debug",
+                "hook_run_id": "missing-exact-root-debug",
+            },
+            env=debug_env,
+        )
+        self.assertEqual(debug.returncode, 0)
+        self.assertEqual(debug.stdout, "")
+        self.assertEqual(debug.stderr, "workflow_manager_hook: runner_missing\n")
+        self.assertNotIn(str(missing_root), debug.stderr)
+        self.assertNotIn(str(sibling_runner), debug.stderr)
+        self.assertFalse(marker.exists())
 
         wrapper_only_root = self.root / "wrapper without source"
         scripts = wrapper_only_root / "scripts"

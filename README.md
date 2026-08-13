@@ -35,14 +35,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.27\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.28\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.27/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.28/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -80,12 +80,12 @@ codex plugin marketplace upgrade workflow-manager --json
 codex plugin add workflow-manager@workflow-manager --json
 ```
 
-升级后再次运行对应平台的 `install_stable_skill.py` 命令。1.0.17 及后续版本的已注册钩子会自动跨版本续接当前任务；稳定 Skill 同步完成并重启 Codex 后，新任务会从无版本路径加载。
+升级后再次运行对应平台的 `install_stable_skill.py` 命令。1.0.28 起 Hook 只执行宿主注入的精确 `PLUGIN_ROOT`；精确缓存缺失时会安全 fail-open，不会接管其他版本、marketplace 或稳定 Skill 中的代码。需要保留旧任务时，请让宿主保留其旧缓存到任务结束；重装或重启后，新任务会从当前精确插件根和无版本 Skill 路径加载。
 
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.27 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.28 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -119,6 +119,7 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```text
 .agents/plugins/marketplace.json       GitHub 插件市场
+scripts/generate_hook_commands.py      九个 Hook 事件的命令单一生成源
 plugins/workflow-manager/              插件源码
   .codex-plugin/plugin.json            插件清单
   assets/stable-skill/workflow-manager/  唯一可调用 Skill 的安装源
@@ -136,6 +137,7 @@ plugins/workflow-manager/              插件源码
 仓库一致性检查：
 
 ```bash
+python scripts/generate_hook_commands.py --check
 python scripts/validate_repository.py
 ```
 

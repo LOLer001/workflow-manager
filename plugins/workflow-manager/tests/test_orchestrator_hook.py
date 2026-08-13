@@ -24,6 +24,7 @@ WRAPPER = PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.sh"
 WINDOWS_RESOLVER = PLUGIN_ROOT / "scripts" / "resolve_orchestrator_hook.ps1"
 MANIFEST = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
+HOOK_COMMAND_GENERATOR = PLUGIN_ROOT.parents[1] / "scripts" / "generate_hook_commands.py"
 ORCHESTRATOR_SKILL = (
     PLUGIN_ROOT / "assets" / "stable-skill" / "workflow-manager" / "SKILL.md"
 )
@@ -419,21 +420,29 @@ class OrchestratorHookTests(unittest.TestCase):
         duplicates = sorted({name for name in names if names.count(name) > 1})
         self.assertEqual(duplicates, [], duplicates)
 
-    def test_declared_hook_commands_recover_removed_version_and_fail_open_without_candidate(self) -> None:
-        hooks = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]
+    def test_declared_hook_commands_bind_exact_root_and_fail_open_without_runner(self) -> None:
+        document = json.loads(HOOKS.read_text(encoding="utf-8"))
+        hooks = document["hooks"]
         declared = [
             hook
             for matchers in hooks.values()
             for matcher in matchers
             for hook in matcher["hooks"]
         ]
+        spec = importlib.util.spec_from_file_location("hook_command_generator_test", HOOK_COMMAND_GENERATOR)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec else None)
+        generator = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(generator)
+        expected_posix, expected_windows = generator.expected_commands()
         posix_commands = [hook["command"] for hook in declared]
         windows_commands = [hook["commandWindows"] for hook in declared]
         self.assertEqual(len(posix_commands), 9)
-        self.assertEqual(len(set(posix_commands)), 1)
-        self.assertEqual(len(set(windows_commands)), 1)
-        self.assertIn('parent="$(dirname "$root")"', posix_commands[0])
-        self.assertIn('"$parent"/*/scripts/run_orchestrator_hook.sh', posix_commands[0])
+        self.assertEqual(set(posix_commands), {expected_posix})
+        self.assertEqual(set(windows_commands), {expected_windows})
+        self.assertNotIn("dirname", posix_commands[0])
+        self.assertNotIn('"$root"/../', posix_commands[0])
         self.assertIn("powershell.exe", windows_commands[0])
         self.assertIn("-EncodedCommand", windows_commands[0])
         self.assertIn("if defined TOKEN_FRUGAL_DEBUG", windows_commands[0])
@@ -442,12 +451,43 @@ class OrchestratorHookTests(unittest.TestCase):
         decoded = base64.b64decode(encoded).decode("utf-16le")
         expected_resolver = WINDOWS_RESOLVER.read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertEqual(decoded, expected_resolver)
-        self.assertIn("[IO.Directory]::EnumerateDirectories", decoded)
-        self.assertIn("$env:PLUGIN_ROOT = $selectedRoot", decoded)
+        for forbidden in ("EnumerateDirectories", "GetLastWriteTime", "selectedRoot", "Split-Path -Parent"):
+            self.assertNotIn(forbidden, decoded)
+
+        exact_data = Path(self.temporary.name) / "exact-data"
+        exact_env = os.environ.copy()
+        exact_env.update(
+            {
+                "PLUGIN_ROOT": str(PLUGIN_ROOT),
+                "PLUGIN_DATA": str(exact_data),
+                "CODEX_HOME": str(self.codex_home),
+            }
+        )
+        result = subprocess.run(
+            ["sh", "-c", posix_commands[0]],
+            input=json.dumps(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "exact-root",
+                    "source": "startup",
+                }
+            ),
+            text=True,
+            capture_output=True,
+            env=exact_env,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+        exact_states = list((exact_data / "sessions").glob("*.json"))
+        self.assertEqual(len(exact_states), 1)
+        exact_state = json.loads(exact_states[0].read_text(encoding="utf-8"))
+        self.assertEqual(exact_state["writer_version"], HOOK.WRITER_VERSION)
 
         missing_root = Path(self.temporary.name) / "removed-plugin-cache"
         env = os.environ.copy()
         env["PLUGIN_ROOT"] = str(missing_root)
+        env.pop("TOKEN_FRUGAL_DEBUG", None)
         result = subprocess.run(
             ["sh", "-c", posix_commands[0]],
             input="{}",
@@ -485,11 +525,74 @@ class OrchestratorHookTests(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("hookSpecificOutput", json.loads(result.stdout))
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
         state_files = list((recovered_data / "sessions").glob("*.json"))
-        self.assertEqual(len(state_files), 1)
-        state = json.loads(state_files[0].read_text(encoding="utf-8"))
-        self.assertEqual(state["writer_version"], HOOK.WRITER_VERSION)
+        self.assertEqual(state_files, [])
+
+        env["TOKEN_FRUGAL_DEBUG"] = "1"
+        debug = subprocess.run(
+            ["sh", "-c", posix_commands[0]],
+            input="{}",
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(debug.returncode, 0)
+        self.assertEqual(debug.stdout, "")
+        self.assertEqual(debug.stderr, "workflow_manager_hook: runner_missing\n")
+        self.assertNotIn(str(removed_root), debug.stderr)
+        self.assertNotIn(str(latest_root), debug.stderr)
+        self.assertEqual(list((recovered_data / "sessions").glob("*.json")), [])
+
+    def test_hook_command_generator_is_deterministic_and_check_only(self) -> None:
+        spec = importlib.util.spec_from_file_location("hook_command_generator_determinism", HOOK_COMMAND_GENERATOR)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec else None)
+        generator = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(generator)
+
+        source = json.loads(HOOKS.read_text(encoding="utf-8"))
+        before = json.dumps(source, sort_keys=True)
+        first = generator.generated_document(source)
+        second = generator.generated_document(source)
+        self.assertEqual(first, second)
+        self.assertEqual(json.dumps(source, sort_keys=True), before)
+        self.assertEqual(generator.canonical_text(first), generator.canonical_text(second))
+
+        _, windows = generator.expected_commands()
+        self.assertTrue(windows.isascii())
+        encoded = windows.split(" -EncodedCommand ", 1)[1].split(" ", 1)[0].rstrip(")")
+        decoded = base64.b64decode(encoded).decode("utf-16le")
+        self.assertEqual(decoded, generator.resolver_text())
+        self.assertEqual(base64.b64encode(decoded.encode("utf-16le")).decode("ascii"), encoded)
+
+        hooks_bytes = HOOKS.read_bytes()
+        hooks_mtime = HOOKS.stat().st_mtime_ns
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        checked = subprocess.run(
+            [sys.executable, str(HOOK_COMMAND_GENERATOR), "--check"],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(HOOKS.read_bytes(), hooks_bytes)
+        self.assertEqual(HOOKS.stat().st_mtime_ns, hooks_mtime)
+
+        drifted = json.loads(json.dumps(source))
+        drifted_entry = generator.command_hooks(drifted)[0]
+        drifted_entry["command"] = "drifted"
+        repaired = generator.generated_document(drifted)
+        expected_posix, expected_windows = generator.expected_commands()
+        self.assertEqual(
+            {(entry["command"], entry["commandWindows"]) for entry in generator.command_hooks(repaired)},
+            {(expected_posix, expected_windows)},
+        )
+        self.assertEqual(drifted_entry["command"], "drifted")
 
     def test_manifest_uses_plain_semver_and_supported_default_prompt_limit(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -3655,6 +3758,53 @@ class OrchestratorHookTests(unittest.TestCase):
         for path in old_paths:
             state = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(state["updated_at"], migrated_updated_at[path])
+
+    def test_writer_1027_state_migrates_without_inventing_contracts(self) -> None:
+        data = Path(self.temporary.name) / "writer-1027-data"
+        session = "writer-1027"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 设置模块崩溃并验证",
+            },
+            data=data,
+        )
+        state = self.load_only_state(data)
+        state["writer_version"] = "1.0.27"
+        preserved_keys = (
+            "objective",
+            "assessor_binding_id",
+            "assessor_generation",
+            "assessor_state",
+            "assessor_input_fingerprint",
+            "plan_state",
+            "execution_contract_id",
+            "executor_state",
+            "model_profile",
+        )
+        preserved = {key: state.get(key) for key in preserved_keys}
+        path = self.state_files(data)[0]
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "hook_run_id": "resume-1028",
+                "source": "resume",
+            },
+            data=data,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        migrated = self.load_only_state(data)
+        self.assertEqual(migrated["schema_version"], 14)
+        self.assertEqual(migrated["writer_version"], "1.0.28")
+        self.assertEqual(
+            {key: migrated.get(key) for key in preserved_keys},
+            preserved,
+        )
 
     def test_control_followup_preserves_substantive_objective(self) -> None:
         session = "followup"
