@@ -11,8 +11,7 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = ROOT / "plugins" / "workflow-manager"
+PLUGIN = Path(__file__).resolve().parents[1]
 HOOKS_PATH = PLUGIN / "hooks" / "hooks.json"
 WINDOWS_RESOLVER = PLUGIN / "scripts" / "resolve_orchestrator_hook.ps1"
 EXPECTED_HOOK_COUNT = 9

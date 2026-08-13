@@ -24,7 +24,7 @@ WRAPPER = PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.sh"
 WINDOWS_RESOLVER = PLUGIN_ROOT / "scripts" / "resolve_orchestrator_hook.ps1"
 MANIFEST = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 HOOKS = PLUGIN_ROOT / "hooks" / "hooks.json"
-HOOK_COMMAND_GENERATOR = PLUGIN_ROOT.parents[1] / "scripts" / "generate_hook_commands.py"
+HOOK_COMMAND_GENERATOR = PLUGIN_ROOT / "scripts" / "generate_hook_commands.py"
 ORCHESTRATOR_SKILL = (
     PLUGIN_ROOT / "assets" / "stable-skill" / "workflow-manager" / "SKILL.md"
 )
@@ -593,6 +593,38 @@ class OrchestratorHookTests(unittest.TestCase):
             {(expected_posix, expected_windows)},
         )
         self.assertEqual(drifted_entry["command"], "drifted")
+
+    def test_plugin_cache_tree_is_self_contained_for_hook_generation(self) -> None:
+        isolated_root = (
+            Path(self.temporary.name)
+            / "plugins"
+            / "cache"
+            / "workflow-manager"
+            / "workflow-manager"
+            / HOOK.WRITER_VERSION
+        )
+        shutil.copytree(PLUGIN_ROOT, isolated_root)
+        isolated_generator = isolated_root / "scripts" / "generate_hook_commands.py"
+        isolated_hooks = isolated_root / "hooks" / "hooks.json"
+        self.assertTrue(isolated_generator.is_file())
+        self.assertFalse(
+            (isolated_root.parents[1] / "scripts" / "generate_hook_commands.py").exists()
+        )
+        hooks_bytes = isolated_hooks.read_bytes()
+        hooks_mtime = isolated_hooks.stat().st_mtime_ns
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        checked = subprocess.run(
+            [sys.executable, str(isolated_generator), "--check"],
+            cwd=isolated_root,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(isolated_hooks.read_bytes(), hooks_bytes)
+        self.assertEqual(isolated_hooks.stat().st_mtime_ns, hooks_mtime)
 
     def test_manifest_uses_plain_semver_and_supported_default_prompt_limit(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -3800,7 +3832,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         migrated = self.load_only_state(data)
         self.assertEqual(migrated["schema_version"], 14)
-        self.assertEqual(migrated["writer_version"], "1.0.28")
+        self.assertEqual(migrated["writer_version"], HOOK.WRITER_VERSION)
         self.assertEqual(
             {key: migrated.get(key) for key in preserved_keys},
             preserved,

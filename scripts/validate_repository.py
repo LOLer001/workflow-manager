@@ -21,7 +21,7 @@ def read_json(path: Path) -> dict:
 
 
 def load_command_generator():
-    path = ROOT / "scripts" / "generate_hook_commands.py"
+    path = PLUGIN / "scripts" / "generate_hook_commands.py"
     spec = importlib.util.spec_from_file_location("workflow_manager_hook_commands", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -70,7 +70,8 @@ def main() -> int:
     assert '--verify-tag' in release_workflow
     assert (ROOT / "scripts" / "extract_release_notes.py").is_file()
     generator = load_command_generator()
-    assert (ROOT / "scripts" / "generate_hook_commands.py").is_file()
+    assert (PLUGIN / "scripts" / "generate_hook_commands.py").is_file()
+    assert not (ROOT / "scripts" / "generate_hook_commands.py").exists()
     declared = generator.command_hooks(hooks_document)
     expected_posix, expected_windows = generator.expected_commands()
     posix_commands = {hook["command"] for hook in declared}

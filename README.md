@@ -35,14 +35,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.28\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.29\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.28/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.29/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -85,7 +85,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.28 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.29 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -119,7 +119,6 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```text
 .agents/plugins/marketplace.json       GitHub 插件市场
-scripts/generate_hook_commands.py      九个 Hook 事件的命令单一生成源
 plugins/workflow-manager/              插件源码
   .codex-plugin/plugin.json            插件清单
   assets/stable-skill/workflow-manager/  唯一可调用 Skill 的安装源
@@ -127,6 +126,7 @@ plugins/workflow-manager/              插件源码
     references/confirmed-execution.md   合同执行、模型证据、失败恢复与迁移
     references/regression-continuity.md 验收回归、因果复核、重规划与压缩续接
   hooks/hooks.json                     生命周期钩子
+  scripts/generate_hook_commands.py    九个 Hook 事件的命令单一生成源
   scripts/install_stable_skill.py      用户级稳定路径安装器
   scripts/                             其他跨平台运行脚本
   tests/                               策略与 Windows 原生测试
@@ -137,7 +137,7 @@ plugins/workflow-manager/              插件源码
 仓库一致性检查：
 
 ```bash
-python scripts/generate_hook_commands.py --check
+python plugins/workflow-manager/scripts/generate_hook_commands.py --check
 python scripts/validate_repository.py
 ```
 
