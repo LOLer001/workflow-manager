@@ -155,6 +155,36 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertNotEqual(changed["reference_acceptance"]["contract_digest"], old_digest)
         self.assertEqual(changed["plan_state"], "analyzing")
 
+    def test_reference_negative_feedback_replans_or_opens_causal_review_and_resumes_bounded_state(self) -> None:
+        session = "reference-negative"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "start", "prompt": "AndroidNativeDemo 对齐 Unity 主题0"})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "negative", "prompt": "动画方向不对"})
+        state = self.load_only_state()
+        self.assertEqual(state["reference_acceptance"]["state"], "failed")
+        self.assertEqual(state["plan_state"], "analyzing")
+        reference_digest = state["reference_acceptance"]["contract_digest"]
+
+        causal_data = Path(self.temporary.name) / "reference-causal-data"
+        state = self.create_completed_execution_baseline("reference-causal", causal_data)
+        state["reference_acceptance"] = {**state["reference_acceptance"], "enabled": True, "contract_digest": "a" * 32, "state": "candidate"}
+        state["execution_contract_id"] = HOOK.execution_contract_id(state)
+        state["last_execution_baseline"]["execution_contract_id"] = state["execution_contract_id"]
+        path = self.state_files(causal_data)[0]
+        path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "reference-causal", "hook_run_id": "negative", "prompt": "动画方向不对"}, data=causal_data)
+        causal = self.load_only_state(causal_data)
+        self.assertEqual(causal["causal_review"]["state"], "triage_required")
+
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
+        compacted = self.load_only_state()
+        self.assertEqual(compacted["compactions"][-1]["reference_acceptance"]["contract_digest"], reference_digest)
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"})
+        output = json.loads(resumed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(reference_digest, output)
+        self.assertIn('"state":"failed"', output)
+        self.assertNotIn("AndroidNativeDemo", output)
+        self.assertNotIn("动画方向不对", output)
+
     def test_spawn_json_arguments_shape_preserves_confirmed_executor_binding(self) -> None:
         state = self.create_confirmed_executor_state("json-spawn")
         raw = self.executor_spawn_payload(state, session="json-spawn", hook_run_id="json-spawn-request")

@@ -3704,6 +3704,7 @@ def session_start(payload: dict[str, Any]) -> None:
                 state.get("last_execution_baseline")
             ),
             "causal_review": _safe_causal_review(state.get("causal_review")),
+            "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
@@ -3898,10 +3899,14 @@ def successful_acceptance_feedback(prompt: str) -> bool:
     contrast_signal = bool(
         re.search(r"(?:但是|但|不过|然而|却|同时|另外|可是|but|however|yet)", normalized)
     )
-    fidelity_negative = any(marker in normalized for marker in ("不一致", "不对", "不像", "方向错误", "方向不对"))
+    fidelity_negative = fidelity_negative_feedback(normalized)
     return any(marker in normalized for marker in SUCCESS_FEEDBACK_MARKERS) and not fidelity_negative and not (
         regression_signal and contrast_signal
     )
+
+
+def fidelity_negative_feedback(prompt: str) -> bool:
+    return any(marker in prompt.lower() for marker in ("不一致", "不对", "不像", "方向错误", "方向不对", "动画方向不对"))
 
 
 def regression_feedback(
@@ -3920,7 +3925,10 @@ def regression_feedback(
         and not new_objective
         and not is_control_followup(prompt)
         and not successful_acceptance_feedback(prompt)
-        and any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
+        and (
+            any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
+            or (_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and fidelity_negative_feedback(prompt))
+        )
     )
 
 
@@ -4048,7 +4056,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
     previous = snapshot_state(payload)
     requested_reference = reference_requested(prompt)
-    reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and reference_contract_changed(prompt))
+    reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
     active_plan = pending_plan or previous.get("plan_state") == "confirmed"
     explicit_new = explicit_new_objective(prompt)
@@ -4068,7 +4076,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     reference_rejection = bool(
         _safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"]
         and not acceptance_success
-        and any(marker in prompt.lower() for marker in REGRESSION_REPORT_MARKERS)
+        and (any(marker in prompt.lower() for marker in REGRESSION_REPORT_MARKERS) or fidelity_negative_feedback(prompt))
     )
     causal_report = regression_feedback(prompt, previous, new_objective=new_objective)
     acceptance_miss = unmet_acceptance_without_recorded_change(
@@ -4197,6 +4205,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
                 reset_executor_binding(state)
+        elif reference["enabled"] and (causal_report or reference_failure or reference_rejection):
+            reference.update({"state": "failed", "fidelity_candidate": "failed", "user_final_acceptance": "failed"})
+            state["reference_acceptance"] = reference
         elif reference["enabled"] and reference_changed:
             reference.update({"contract_digest": stable_hash(f"{reference['contract_digest']}\0{prompt_meta['fingerprint']}", 32), "version_fingerprint": prompt_meta["fingerprint"], "phase": "planned", "state": "planned", "fidelity_candidate": "unknown", "user_final_acceptance": "unknown", "evidence_digest": None})
             state["reference_acceptance"] = reference
@@ -4205,9 +4216,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["plan_digest"] = state["plan_objective_fingerprint"] = state["plan_difficulty_decision_id"] = None
             state["confirmed_plan_digest"] = state["confirmed_at"] = None
             reset_executor_binding(state)
-        elif reference["enabled"] and (causal_report or reference_failure or reference_rejection):
-            reference.update({"state": "failed", "fidelity_candidate": "failed", "user_final_acceptance": "failed"})
-            state["reference_acceptance"] = reference
         elif reference["enabled"] and acceptance_success:
             # Only an explicit user acceptance may finalise reference fidelity.
             reference.update({"state": "accepted", "user_final_acceptance": "accepted"})
@@ -4932,12 +4940,12 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
                 "telemetry": telemetry,
                 "objective_meta": state.get("objective", {}),
-            "current_stage": current_execution_stage(state),
-            "work_difficulty": state.get("work_difficulty", "unknown"),
-            "difficulty_decision_id": state.get("difficulty_decision_id"),
-            "plan_state": state.get("plan_state", "none"),
-            "plan_generation": safe_int(state.get("plan_generation")),
-            "plan_digest": state.get("plan_digest"),
+                "current_stage": current_execution_stage(state),
+                "work_difficulty": state.get("work_difficulty", "unknown"),
+                "difficulty_decision_id": state.get("difficulty_decision_id"),
+                "plan_state": state.get("plan_state", "none"),
+                "plan_generation": safe_int(state.get("plan_generation")),
+                "plan_digest": state.get("plan_digest"),
                 "confirmed_plan_digest": state.get("confirmed_plan_digest"),
                 "execution_profile_version": state.get("execution_profile_version"),
                 "executor_state": state.get("executor_state", "none"),
@@ -4948,9 +4956,8 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "last_execution_baseline": _safe_execution_baseline(
                     state.get("last_execution_baseline")
                 ),
-            "causal_review": _safe_causal_review(state.get("causal_review")),
-            "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
-            "continuity": quality_continuity(state),
+                "causal_review": _safe_causal_review(state.get("causal_review")),
+                "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
                     op.get("fingerprint")
