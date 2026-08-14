@@ -3557,7 +3557,12 @@ class OrchestratorHookTests(unittest.TestCase):
                 }
             )
             linked_reason = json.loads(linked.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
-            self.assertIn("WSL/DrvFS/CIFS/UNC", linked_reason)
+            expected_link_reason = (
+                "WSL/DrvFS/CIFS/UNC"
+                if Path("/mnt/c").is_dir()
+                else "real existing /tmp directory"
+            )
+            self.assertIn(expected_link_reason, linked_reason)
 
     def test_exec_command_rejects_structured_workdir_outside_command_leaf(self) -> None:
         native_workdir = Path(self.temporary.name) / "split-native"
@@ -3594,7 +3599,13 @@ class OrchestratorHookTests(unittest.TestCase):
         cases = (
             (str(native_base), ".", None),
             (str(native_base), "child", None),
-            ("/mnt/c", ".", "WSL/DrvFS/CIFS/UNC"),
+            (
+                "/mnt/c",
+                ".",
+                "WSL/DrvFS/CIFS/UNC"
+                if Path("/mnt/c").is_dir()
+                else "cannot be resolved from payload cwd",
+            ),
             (str(missing_base), ".", "cannot be resolved from payload cwd"),
         )
         for index, (payload_cwd, workdir, expected_reason) in enumerate(cases):
