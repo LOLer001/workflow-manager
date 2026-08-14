@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 17
-WRITER_VERSION = "1.0.33"
+WRITER_VERSION = "1.0.34"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -45,6 +45,7 @@ STATE_EVENTS = frozenset(
 MAX_PROMPTS = 8
 MAX_OPERATIONS = 48
 MAX_SUBAGENTS = 24
+MAX_TERMINAL_SUBAGENT_LIFECYCLES = 10
 MAX_COMPACTIONS = 16
 MAX_GUARDS = 32
 MAX_PROCESSED_RUNS = 128
@@ -1580,8 +1581,8 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         "at": item.get("at"),
         "event": item.get("event") if item.get("event") in {"request", "start", "stop"} else "unknown",
         "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
-        "agent_id": safe_label(item.get("agent_id"), 120),
-        "agent_type": safe_label(item.get("agent_type"), 80),
+        "agent_id": safe_label(item.get("agent_id"), 120) if item.get("agent_id") else None,
+        "agent_type": safe_label(item.get("agent_type"), 80) if item.get("agent_type") else None,
         "task_name": safe_label(item.get("task_name"), 120) if item.get("task_name") else None,
         "status": safe_label(item.get("status"), 32).lower() if item.get("status") else None,
         "scope_fingerprint": safe_label(item.get("scope_fingerprint"), 64) if item.get("scope_fingerprint") else None,
@@ -1610,6 +1611,165 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
             "length": max(safe_int(result_meta.get("length")), 0),
         }
     return value
+
+
+def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
+    records = value.get("subagents", []) if isinstance(value, dict) else as_list(value)
+    groups: list[dict[str, Any]] = []
+    live_by_agent: dict[str, dict[str, Any]] = {}
+    terminal_by_agent: dict[str, dict[str, Any]] = {}
+
+    def new_group(index: int, item: dict[str, Any], state_value: str) -> dict[str, Any]:
+        group = {
+            "state": state_value,
+            "agent_id": str(item.get("agent_id") or "") or None,
+            "request": item if item.get("event") == "request" else None,
+            "start": item if item.get("event") == "start" else None,
+            "stop": item if item.get("event") == "stop" else None,
+            "records": [(index, item)],
+            "first_index": index,
+            "last_index": index,
+        }
+        groups.append(group)
+        return group
+
+    for index, item in enumerate(records):
+        if not isinstance(item, dict):
+            continue
+        event = item.get("event")
+        if event == "request":
+            if not safe_fingerprint(item.get("request_fingerprint")):
+                continue
+            group = new_group(index, item, "result_pending" if item.get("agent_id") else "pending")
+            if group["state"] == "result_pending":
+                group["agent_id"] = str(item.get("agent_id"))
+            continue
+        agent_id = str(item.get("agent_id") or "")
+        if not agent_id:
+            continue
+        if event == "start":
+            if agent_id in live_by_agent:
+                continue
+            request_fingerprint = safe_fingerprint(item.get("request_fingerprint"))
+            request_group = next(
+                (
+                    group
+                    for group in groups
+                    if group.get("state") == "pending"
+                    and request_fingerprint
+                    and safe_fingerprint((group.get("request") or {}).get("request_fingerprint"))
+                    == request_fingerprint
+                ),
+                None,
+            )
+            prior_terminal = terminal_by_agent.get(agent_id)
+            if prior_terminal and (
+                not request_group
+                or safe_int(request_group.get("first_index")) <= safe_int(prior_terminal.get("last_index"))
+            ):
+                continue
+            group = request_group or new_group(index, item, "live")
+            if request_group:
+                group["records"].append((index, item))
+                group["start"] = item
+                group["last_index"] = index
+                group["state"] = "live"
+            group["agent_id"] = agent_id
+            live_by_agent[agent_id] = group
+            continue
+        if event == "stop":
+            group = live_by_agent.pop(agent_id, None)
+            if group is None:
+                group = next(
+                    (
+                        candidate
+                        for candidate in reversed(groups)
+                        if candidate.get("state") == "result_pending"
+                        and candidate.get("agent_id") == agent_id
+                    ),
+                    None,
+                )
+            if group is None:
+                if agent_id in terminal_by_agent:
+                    continue
+                group = new_group(index, item, "terminal")
+            else:
+                group["records"].append((index, item))
+                group["stop"] = item
+                group["last_index"] = index
+                group["state"] = "terminal"
+            group["agent_id"] = agent_id
+            terminal_by_agent[agent_id] = group
+    return groups
+
+
+def subagent_lifecycle_is_bound(state: dict[str, Any], group: dict[str, Any]) -> bool:
+    records = [item for _, item in group.get("records", [])]
+    role = next((item.get("role") for item in reversed(records) if item.get("role")), "lane")
+    contract_id = next((item.get("contract_id") for item in reversed(records) if item.get("contract_id")), None)
+    agent_id = group.get("agent_id")
+    return bool(
+        role == "high_assessor"
+        and (
+            (agent_id and agent_id == state.get("assessor_agent_id"))
+            or (contract_id and contract_id == state.get("assessor_binding_id"))
+        )
+    ) or bool(
+        role == "confirmed_executor"
+        and (
+            (agent_id and agent_id == state.get("executor_agent_id"))
+            or (contract_id and contract_id == state.get("execution_contract_id"))
+        )
+    )
+
+
+def retained_subagent_records(state: dict[str, Any], records: Any = None) -> list[dict[str, Any]]:
+    groups = subagent_lifecycle_groups(state if records is None else records)
+    protected = [
+        group
+        for group in groups
+        if group.get("state") in {"pending", "result_pending", "live"} or subagent_lifecycle_is_bound(state, group)
+    ]
+    terminal = [group for group in groups if group.get("state") == "terminal" and group not in protected]
+    kept_ids = {id(group) for group in protected + terminal[-MAX_TERMINAL_SUBAGENT_LIFECYCLES:]}
+    kept = [pair for group in groups if id(group) in kept_ids for pair in group.get("records", [])]
+    return [item for _, item in sorted(kept, key=lambda pair: pair[0])]
+
+
+def protected_subagent_lifecycle_count(state: dict[str, Any]) -> int:
+    return sum(
+        group.get("state") in {"pending", "result_pending", "live"} or subagent_lifecycle_is_bound(state, group)
+        for group in subagent_lifecycle_groups(state)
+    )
+
+
+def append_result_pending_subagent(
+    state: dict[str, Any], *, agent_id: Any, request_fingerprint: Any
+) -> bool:
+    agent = safe_label(agent_id, 120) if agent_id else ""
+    request_fp = safe_fingerprint(request_fingerprint)
+    if not agent or not request_fp:
+        return False
+    if any(
+        group.get("state") == "result_pending" and group.get("agent_id") == agent
+        for group in subagent_lifecycle_groups(state)
+    ):
+        return False
+    state.setdefault("subagents", []).append(
+        {
+            "at": utc_now(),
+            "event": "request",
+            "agent_id": agent,
+            "task_name": "high_assessor_followup",
+            "status": "pending",
+            "request_fingerprint": request_fp,
+            "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+            "role": "high_assessor",
+            "contract_id": state.get("assessor_binding_id"),
+            "attempt": state.get("assessor_attempt"),
+        }
+    )
+    return True
 
 
 def _safe_active_agent_scope(item: Any) -> dict[str, Any] | None:
@@ -2060,7 +2220,11 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
 
     base["prompts"] = [item for raw in as_list(value.get("prompts")) if (item := _safe_prompt(raw)) is not None][-MAX_PROMPTS:]
     base["operations"] = [item for raw in as_list(value.get("operations")) if (item := _safe_operation(raw)) is not None][-MAX_OPERATIONS:]
-    base["subagents"] = [item for raw in as_list(value.get("subagents")) if (item := _safe_subagent(raw)) is not None][-MAX_SUBAGENTS:]
+    safe_subagents = [
+        item for raw in as_list(value.get("subagents"))
+        if (item := _safe_subagent(raw)) is not None
+    ]
+    base["subagents"] = retained_subagent_records(base, safe_subagents)
     base["compactions"] = [item for raw in as_list(value.get("compactions")) if (item := _safe_compaction(raw)) is not None][-MAX_COMPACTIONS:]
     base["guards"] = [item for raw in as_list(value.get("guards")) if (item := _safe_guard(raw)) is not None][
         -MAX_GUARDS:
@@ -2150,7 +2314,7 @@ def hook_run_key(payload: dict[str, Any]) -> str | None:
 def trim_state(state: dict[str, Any]) -> None:
     state["prompts"] = list(state.get("prompts", []))[-MAX_PROMPTS:]
     state["operations"] = list(state.get("operations", []))[-MAX_OPERATIONS:]
-    state["subagents"] = list(state.get("subagents", []))[-MAX_SUBAGENTS:]
+    state["subagents"] = retained_subagent_records(state)
     state["compactions"] = list(state.get("compactions", []))[-MAX_COMPACTIONS:]
     state["guards"] = list(state.get("guards", []))[-MAX_GUARDS:]
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
@@ -4633,22 +4797,18 @@ def pressure_text(telemetry: dict[str, Any]) -> str:
 
 
 def active_agent_count(state: dict[str, Any]) -> int:
-    active: set[str] = set()
-    for item in state.get("subagents", []):
-        agent_id = str(item.get("agent_id") or "")
-        if not agent_id:
-            continue
-        if item.get("event") == "start":
-            active.add(agent_id)
-        elif item.get("event") == "stop":
-            active.discard(agent_id)
-    return len(active)
+    return sum(group.get("state") == "live" for group in subagent_lifecycle_groups(state))
 
 
 def agent_activity_counts(state: dict[str, Any]) -> dict[str, int]:
-    started = {str(item.get("agent_id")) for item in state.get("subagents", []) if item.get("event") == "start"}
-    completed = {str(item.get("agent_id")) for item in state.get("subagents", []) if item.get("event") == "stop"}
-    return {"started": len(started), "completed": len(completed), "active": active_agent_count(state)}
+    groups = subagent_lifecycle_groups(state)
+    return {
+        "started": sum(group.get("start") is not None for group in groups),
+        "completed": sum(group.get("state") == "terminal" for group in groups),
+        "active": sum(group.get("state") == "live" for group in groups),
+        "pending": sum(group.get("state") in {"pending", "result_pending"} for group in groups),
+        "result_pending": sum(group.get("state") == "result_pending" for group in groups),
+    }
 
 
 def current_execution_stage(state: dict[str, Any]) -> str:
@@ -6254,11 +6414,19 @@ def handle_stall_diagnosis_pretool(
                 {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "stall_diagnosis", "action": "deny", "fingerprint": fingerprint}
             )
             return
+        request_fingerprint = stable_hash(f"stall-diagnosis-request-v1\0{fingerprint}", 32)
+        if not append_result_pending_subagent(
+            current,
+            agent_id=current.get("assessor_agent_id"),
+            request_fingerprint=request_fingerprint,
+        ):
+            current.setdefault("guards", []).append(
+                {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "stall_diagnosis", "action": "deny", "fingerprint": fingerprint}
+            )
+            return
         current_stall["state"] = "diagnosis_pending"
         current_stall["diagnosis_attempt"] = safe_int(current_stall.get("diagnosis_attempt")) + 1
-        current_stall["diagnosis_request_fingerprint"] = stable_hash(
-            f"stall-diagnosis-request-v1\0{fingerprint}", 32
-        )
+        current_stall["diagnosis_request_fingerprint"] = request_fingerprint
         current_stall["at"] = utc_now()
         current["stall"] = current_stall
         decision["owned"] = True
@@ -6285,6 +6453,24 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             "high assessor and complete before recovery; exhausted stalls require replan."
         )
         return
+    if is_subagent_spawn_tool(payload) and protected_subagent_lifecycle_count(state) >= MAX_SUBAGENTS:
+        def record_lifecycle_overflow(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+                    "kind": "subagent_lifecycle_overflow",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+
+        mutate_state(payload, record_lifecycle_overflow)
+        emit_pretool_deny(
+            "Subagent spawn denied: the protected lifecycle limit is reached; preserve pending, live, and current "
+            "bound assessor/executor records instead of dropping them."
+        )
+        return
     if normalized_key(payload.get("tool_name")).endswith("followuptask") and state.get("assessor_state") in {"simple_execution_required", "recovery_required"}:
         request = subagent_request_text(payload)
         target = next((str(candidate.get("target") or "") for candidate in subagent_request_candidates(payload) if candidate.get("target")), "")
@@ -6297,12 +6483,24 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             and safe_int(state.get("assessor_attempt")) < 2
         )
         if target == str(state.get("assessor_agent_id") or "") and binding and f"assessor_binding_id={binding}" in request and solve and verify and recovery_ok:
+            followup_decision = {"accepted": False}
+
             def start_simple_execution(current: dict[str, Any]) -> None:
+                if current.get("assessor_state") not in {"simple_execution_required", "recovery_required"} or not append_result_pending_subagent(
+                    current, agent_id=target, request_fingerprint=fingerprint
+                ):
+                    current.setdefault("guards", []).append(
+                        {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "subagent_lifecycle", "action": "deny", "fingerprint": fingerprint}
+                    )
+                    return
                 current["assessor_state"] = "simple_running"
                 if current.get("assessor_failure_kind") == "simple_execution_invalid":
                     current["assessor_attempt"] = safe_int(current.get("assessor_attempt")) + 1
                 current["assessor_failure_kind"] = None
+                followup_decision["accepted"] = True
             mutate_state(payload, start_simple_execution)
+            if not followup_decision["accepted"]:
+                emit_pretool_deny("Workflow Manager blocked duplicate or stale Simple assessor follow-up lifecycle.")
             return
         emit_pretool_deny("Workflow Manager blocked Simple assessor follow-up: target, binding, and solve/verify contract must match the original assessor.")
         return
@@ -6694,6 +6892,20 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 and stall.get("diagnosis_request_fingerprint") == stall_followup_fingerprint
             ):
                 if status_value.startswith("error") or status_value in ERROR_STATUSES:
+                    state.setdefault("subagents", []).append(
+                        {
+                            "at": utc_now(),
+                            "event": "stop",
+                            "agent_id": state.get("assessor_agent_id"),
+                            "task_name": "high_assessor_followup",
+                            "status": "failed",
+                            "request_fingerprint": stall_followup_fingerprint,
+                            "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+                            "role": "high_assessor",
+                            "contract_id": state.get("assessor_binding_id"),
+                            "attempt": state.get("assessor_attempt"),
+                        }
+                    )
                     if safe_int(stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS:
                         stall["state"] = "exhausted"
                         state["executor_state"] = "exhausted"
@@ -6880,21 +7092,11 @@ def task_name_from_payload(payload: dict[str, Any]) -> str | None:
 
 
 def active_agent_records(state: dict[str, Any]) -> list[dict[str, Any]]:
-    active: dict[str, dict[str, Any]] = {}
-    for item in state.get("subagents", []):
-        agent_id = str(item.get("agent_id") or "")
-        if not agent_id:
-            continue
-        if item.get("event") == "start":
-            role = item.get("role") or "lane"
-            if role == "confirmed_executor":
-                for active_id, active_item in list(active.items()):
-                    if active_item.get("role") == "confirmed_executor":
-                        active.pop(active_id, None)
-            active[agent_id] = item
-        elif item.get("event") == "stop":
-            active.pop(agent_id, None)
-    return list(active.values())
+    return [
+        group["start"]
+        for group in subagent_lifecycle_groups(state)
+        if group.get("state") == "live" and isinstance(group.get("start"), dict)
+    ]
 
 
 def active_agent_scope_summary(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6981,22 +7183,11 @@ def record_explicit_executor_stall(
 
 
 def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
-    used_counts: dict[str, int] = {}
-    for item in state.get("subagents", []):
-        if item.get("event") != "start" or not item.get("request_fingerprint"):
-            continue
-        fingerprint = str(item.get("request_fingerprint"))
-        used_counts[fingerprint] = used_counts.get(fingerprint, 0) + 1
-    seen_counts: dict[str, int] = {}
-    candidates: list[dict[str, Any]] = []
-    for item in state.get("subagents", []):
-        if item.get("event") != "request" or not item.get("request_fingerprint"):
-            continue
-        fingerprint = str(item.get("request_fingerprint"))
-        occurrence = seen_counts.get(fingerprint, 0)
-        seen_counts[fingerprint] = occurrence + 1
-        if occurrence >= used_counts.get(fingerprint, 0):
-            candidates.append(item)
+    candidates = [
+        group["request"]
+        for group in subagent_lifecycle_groups(state)
+        if group.get("state") == "pending" and isinstance(group.get("request"), dict)
+    ]
     if not candidates:
         return None
     turn_id = safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None
@@ -7022,9 +7213,33 @@ def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> 
     return (executor_pending or assessor_pending or candidates)[-1]
 
 
+def subagent_start_conflict_reason(
+    state: dict[str, Any], agent_id: str, request: dict[str, Any]
+) -> str | None:
+    if not agent_id:
+        return "SubagentStart lacks a concrete agent_id"
+    groups = subagent_lifecycle_groups(state)
+    if any(group.get("state") == "live" and group.get("agent_id") == agent_id for group in groups):
+        return "duplicate SubagentStart for an already-live agent"
+    terminal = [
+        group for group in groups
+        if group.get("state") == "terminal" and group.get("agent_id") == agent_id
+    ]
+    if not terminal:
+        return None
+    request_group = next(
+        (group for group in groups if group.get("state") == "pending" and group.get("request") is request),
+        None,
+    )
+    if not request_group or safe_int(request_group.get("first_index")) <= safe_int(terminal[-1].get("last_index")):
+        return "late SubagentStart cannot revive a terminal agent without a newer bound request"
+    return None
+
+
 def subagent_start(payload: dict[str, Any]) -> None:
     previous = snapshot_state(payload)
     request = pending_subagent_request(previous, payload) or {}
+    expected_request_fingerprint = safe_fingerprint(request.get("request_fingerprint"))
     scope_value = payload.get("prompt") or payload.get("task") or payload.get("message")
     scope_fingerprint = (stable_hash(scope_value) if scope_value else None) or request.get("scope_fingerprint")
     task_name = task_name_from_payload(payload) or request.get("task_name")
@@ -7042,10 +7257,32 @@ def subagent_start(payload: dict[str, Any]) -> None:
         for item in active
     )
     over_cap = len(active) >= cap
+    decision: dict[str, Any] = {"accepted": False}
 
     def update(state: dict[str, Any]) -> None:
         agent_id = safe_label(payload.get("agent_id"), 120)
-        request_contract = request.get("contract_id")
+        bound_request = pending_subagent_request(state, payload) or {}
+        bound_request_fingerprint = safe_fingerprint(bound_request.get("request_fingerprint"))
+        conflict = (
+            "persisted SubagentStart request was already consumed or no longer matches"
+            if expected_request_fingerprint
+            and bound_request_fingerprint != expected_request_fingerprint
+            else subagent_start_conflict_reason(state, agent_id, bound_request)
+        )
+        if conflict:
+            state.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+                    "kind": "subagent_lifecycle",
+                    "action": "deny",
+                    "fingerprint": stable_hash(f"subagent-start\0{agent_id}\0{conflict}"),
+                }
+            )
+            decision["reason"] = conflict
+            return
+        decision["accepted"] = True
+        request_contract = bound_request.get("contract_id")
         highest = safe_session_execution_preference(
             state.get("session_execution_preference")
         ) == "highest_throughout"
@@ -7059,13 +7296,13 @@ def subagent_start(payload: dict[str, Any]) -> None:
             and request_contract
             and request_contract == state.get("execution_contract_id")
             and request_contract == execution_contract_id(state)
-            and request.get("model") == state.get("executor_model")
-            and request.get("reasoning_effort") == expected_effort
-            and (not highest or request.get("model") == expected_model)
-            and (echoed_model is None or echoed_model == request.get("model"))
-            and (echoed_effort is None or echoed_effort == request.get("reasoning_effort"))
-            and request.get("fork_turns") == state.get("executor_fork_turns")
-            and safe_int(request.get("attempt")) == safe_int(state.get("executor_attempt"))
+            and bound_request.get("model") == state.get("executor_model")
+            and bound_request.get("reasoning_effort") == expected_effort
+            and (not highest or bound_request.get("model") == expected_model)
+            and (echoed_model is None or echoed_model == bound_request.get("model"))
+            and (echoed_effort is None or echoed_effort == bound_request.get("reasoning_effort"))
+            and bound_request.get("fork_turns") == state.get("executor_fork_turns")
+            and safe_int(bound_request.get("attempt")) == safe_int(state.get("executor_attempt"))
         )
         state.setdefault("subagents", []).append(
             {
@@ -7080,12 +7317,12 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 "objective_fingerprint": objective_fingerprint,
                 "stale": False,
                 "status": "running",
-                "role": request.get("role") or "lane",
+                "role": bound_request.get("role") or "lane",
                 "contract_id": request_contract,
-                "model": request.get("model"),
-                "reasoning_effort": request.get("reasoning_effort"),
-                "fork_turns": request.get("fork_turns"),
-                "attempt": request.get("attempt"),
+                "model": bound_request.get("model"),
+                "reasoning_effort": bound_request.get("reasoning_effort"),
+                "fork_turns": bound_request.get("fork_turns"),
+                "attempt": bound_request.get("attempt"),
             }
         )
         if executor_request:
@@ -7103,7 +7340,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
         if assessor_request:
             echoed_model = safe_label(payload.get("model"), 80) if payload.get("model") else None
             echoed_effort = safe_label(payload.get("reasoning_effort"), 24) if payload.get("reasoning_effort") else None
-            bound = bool(state.get("assessor_state") == "spawn_pending" and request.get("contract_id") == state.get("assessor_binding_id") and objective_fingerprint == state.get("objective", {}).get("fingerprint") and safe_int(request.get("attempt")) == safe_int(state.get("assessor_attempt")))
+            bound = bool(state.get("assessor_state") == "spawn_pending" and bound_request.get("contract_id") == state.get("assessor_binding_id") and objective_fingerprint == state.get("objective", {}).get("fingerprint") and safe_int(bound_request.get("attempt")) == safe_int(state.get("assessor_attempt")))
             model_matches = echoed_model is None or echoed_model == state.get("assessor_model")
             effort_matches = echoed_effort is None or echoed_effort == state.get("assessor_reasoning_effort")
             matched = bound and model_matches and effort_matches
@@ -7115,6 +7352,13 @@ def subagent_start(payload: dict[str, Any]) -> None:
             state["assessor_failure_kind"] = None if matched else ("retry_exhausted" if state["assessor_state"] == "failed" else "start_mismatch")
 
     _, changed = mutate_state(payload, update)
+    if not decision["accepted"]:
+        emit_context(
+            "SubagentStart",
+            f"Workflow Manager ignored an invalid lifecycle transition: {decision.get('reason') or 'state update unavailable'}. "
+            "A terminal agent stays terminal unless a newer persisted request explicitly binds a new generation.",
+        )
+        return
     warnings: list[str] = []
     if executor_request:
         refreshed = snapshot_state(payload)
@@ -7159,6 +7403,16 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         (item for item in reversed(active_agent_records(previous)) if item.get("agent_id") == agent_id),
         None,
     )
+    if started is None:
+        result_group = next(
+            (
+                group
+                for group in reversed(subagent_lifecycle_groups(previous))
+                if group.get("state") == "result_pending" and group.get("agent_id") == agent_id
+            ),
+            None,
+        )
+        started = (result_group or {}).get("request")
     started_objective = str((started or {}).get("objective_fingerprint") or "")
     current_objective = str(previous.get("objective", {}).get("fingerprint") or "")
     stale = bool(started_objective and current_objective and started_objective != current_objective)
@@ -7180,32 +7434,101 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     diagnosis_lines = [line for line in str(result or "").splitlines() if line.startswith("STALL_DIAGNOSIS")]
     diagnosis_matches = [match for line in diagnosis_lines if (match := STALL_DIAGNOSIS_RE.fullmatch(line))]
     stall_diagnosis = diagnosis_matches[0] if len(diagnosis_lines) == len(diagnosis_matches) == 1 else None
+    decision: dict[str, Any] = {"recorded": False}
 
     def update(state: dict[str, Any]) -> None:
+        current_result_group = None
+        current_started = next(
+            (item for item in reversed(active_agent_records(state)) if item.get("agent_id") == agent_id),
+            None,
+        )
+        if current_started is None:
+            current_result_group = next(
+                (
+                    group
+                    for group in reversed(subagent_lifecycle_groups(state))
+                    if group.get("state") == "result_pending" and group.get("agent_id") == agent_id
+                ),
+                None,
+            )
+            current_started = (current_result_group or {}).get("request")
+        already_terminal = any(
+            group.get("state") == "terminal" and group.get("agent_id") == agent_id
+            for group in subagent_lifecycle_groups(state)
+        )
+        if not agent_id or (current_started is None and already_terminal):
+            reason = "SubagentStop lacks a concrete agent_id" if not agent_id else "duplicate or late SubagentStop for a terminal agent"
+            state.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+                    "kind": "subagent_lifecycle",
+                    "action": "deny",
+                    "fingerprint": stable_hash(f"subagent-stop\0{agent_id}\0{reason}"),
+                }
+            )
+            decision["reason"] = reason
+            return
+        if already_terminal and current_started is not None:
+            payload_request = safe_fingerprint(payload.get("request_fingerprint"))
+            current_request = safe_fingerprint(current_started.get("request_fingerprint"))
+            payload_turn = safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None
+            current_turn = current_started.get("turn_id")
+            exact_request = bool(payload_request and current_request and payload_request == current_request)
+            exact_turn = bool(payload_turn and current_turn and payload_turn == current_turn)
+            bound_simple = bool(
+                current_result_group
+                and state.get("assessor_state") == "simple_running"
+                and agent_id == state.get("assessor_agent_id")
+                and simple_execution
+                and simple_execution.group(1) == state.get("assessor_binding_id")
+            )
+            bound_stall = bool(
+                current_result_group
+                and _safe_stall(state.get("stall")).get("state") == "diagnosing"
+                and agent_id == state.get("assessor_agent_id")
+                and diagnosis_lines
+            )
+            if not (exact_request or exact_turn or bound_simple or bound_stall):
+                reason = "SubagentStop is ambiguous after agent_id reuse and requires generation reconciliation"
+                state.setdefault("guards", []).append(
+                    {
+                        "at": utc_now(),
+                        "turn_id": payload_turn,
+                        "kind": "subagent_lifecycle_ambiguous",
+                        "action": "deny",
+                        "fingerprint": stable_hash(f"subagent-stop\0{agent_id}\0ambiguous"),
+                    }
+                )
+                decision["reason"] = reason
+                return
+        effective_started = current_started
         state.setdefault("subagents", []).append(
             {
                 "at": utc_now(),
                 "event": "stop",
                 "agent_id": agent_id,
                 "agent_type": safe_label(payload.get("agent_type"), 80),
-                "task_name": task_name_from_payload(payload) or (started or {}).get("task_name"),
-                "scope_fingerprint": (started or {}).get("scope_fingerprint"),
+                "task_name": task_name_from_payload(payload) or (effective_started or {}).get("task_name"),
+                "scope_fingerprint": (effective_started or {}).get("scope_fingerprint"),
+                "request_fingerprint": (effective_started or {}).get("request_fingerprint"),
                 "objective_fingerprint": started_objective or None,
                 "stale": stale,
                 "status": status_value,
                 "result_meta": text_metadata(result),
-                "role": (started or {}).get("role") or "lane",
-                "contract_id": (started or {}).get("contract_id"),
-                "model": (started or {}).get("model"),
-                "reasoning_effort": (started or {}).get("reasoning_effort"),
-                "fork_turns": (started or {}).get("fork_turns"),
-                "attempt": (started or {}).get("attempt"),
+                "role": (effective_started or {}).get("role") or "lane",
+                "contract_id": (effective_started or {}).get("contract_id"),
+                "model": (effective_started or {}).get("model"),
+                "reasoning_effort": (effective_started or {}).get("reasoning_effort"),
+                "fork_turns": (effective_started or {}).get("fork_turns"),
+                "attempt": (effective_started or {}).get("attempt"),
             }
         )
+        decision["recorded"] = True
         if executor_agent and state.get("executor_agent_id") == agent_id:
             contract_current = bool(
                 not stale
-                and (started or {}).get("contract_id") == state.get("execution_contract_id")
+                and (effective_started or {}).get("contract_id") == state.get("execution_contract_id")
                 and state.get("execution_contract_id") == execution_contract_id(state)
             )
             successful = status_value in {"completed", "ok"}
@@ -7340,6 +7663,12 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
     mutate_state(payload, update)
+    if not decision["recorded"]:
+        emit_context(
+            "SubagentStop",
+            f"Workflow Manager treated this as a no-op terminal lifecycle event: {decision.get('reason') or 'state update unavailable'}.",
+        )
+        return
     if stale:
         emit_context(
             "SubagentStop",

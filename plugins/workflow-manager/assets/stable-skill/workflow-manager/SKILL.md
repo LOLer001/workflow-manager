@@ -38,7 +38,7 @@ Optimize critical-path time; launch ready positive-utility lanes only when net t
 - Cross-task notices require fresh active same-host source+peer and a same-resource conflict; read [live coordination](references/live-coordination.md). Serialize only those shared stages. Pending Hard plans permit only read-only children.
 - A stalled bound Hard executor stops with exact evidence. Reuse its high assessor once read-only; resume the bound profile for an in-plan remedy, else replan. Read [stall recovery](references/stall-recovery.md).
 - Confirmed Hard has one executor; only read-only side lanes continue. Stay local when tiny, unready, overlapping, slower, or opted out.
-- Give each child a concise Chinese purpose summary, safe ASCII `task_name`, scope, ownership, and result shape. Reuse a live agent for one bounded follow-up.
+- Give each child a concise Chinese purpose summary, ASCII `task_name`, scope/owner/result contract. Reuse it once. After its result, confirm terminal; interrupt only if still running. Keep live/pending; prune only terminal excess above 10. Read [agent lifecycle](references/agent-lifecycle.md).
 
 ## Continuity
 

@@ -384,7 +384,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 17)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.33")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.34")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -4626,6 +4626,113 @@ class OrchestratorHookTests(unittest.TestCase):
         state = self.load_only_state()
         stops = [item for item in state["subagents"] if item["event"] == "stop"]
         self.assertEqual(stops[-1]["status"], "unknown")
+
+    def test_subagent_terminal_events_are_idempotent_and_id_reuse_needs_a_new_request(self) -> None:
+        session = "agent-terminal"
+        start = {"hook_event_name": "SubagentStart", "session_id": session, "agent_id": "reused-agent", "task_name": "first_lane"}
+        self.run_hook({**start, "hook_run_id": "start"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "reused-agent", "last_assistant_message": "done"})
+        stopped = self.load_only_state()
+        self.assertEqual((HOOK.agent_activity_counts(stopped)["active"], stopped["subagents"][-1]["status"]), (0, "unknown"))
+        self.run_hook({**start, "hook_run_id": "late-start"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "duplicate-stop", "agent_id": "reused-agent"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "missing-id"})
+        closed = self.load_only_state()
+        self.assertEqual(HOOK.agent_activity_counts(closed)["active"], 0)
+        self.assertEqual(sum(item["event"] == "start" for item in closed["subagents"]), 1)
+        self.assertEqual(sum(item["event"] == "stop" and item.get("agent_id") == "reused-agent" for item in closed["subagents"]), 1)
+        self.assertFalse(any(item["event"] in {"start", "stop"} and not item.get("agent_id") for item in closed["subagents"]))
+
+        closed["last_route"] = HOOK.classify_prompt("Inspect two independent modules in parallel and verify both")
+        self.state_files()[0].write_text(json.dumps(closed), encoding="utf-8")
+        spawn = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "new-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "second_lane", "message": "Read-only inspect the second independent module"}}
+        self.assertNotIn("permissionDecision", json.loads(self.run_hook(spawn).stdout or "{}").get("hookSpecificOutput", {}))
+        requested = self.load_only_state()
+        new_request = [item for item in requested["subagents"] if item["event"] == "request"][-1]
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "new-start", "agent_id": "reused-agent"})
+        restarted = self.load_only_state()
+        self.assertEqual(HOOK.agent_activity_counts(restarted)["active"], 1)
+        self.assertEqual(HOOK.active_agent_records(restarted)[0]["request_fingerprint"], new_request["request_fingerprint"])
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "delayed-old-stop", "agent_id": "reused-agent", "status": "completed"})
+        ambiguous = self.load_only_state()
+        self.assertEqual(HOOK.agent_activity_counts(ambiguous)["active"], 1)
+        self.assertEqual(ambiguous["guards"][-1]["kind"], "subagent_lifecycle_ambiguous")
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "current-stop", "agent_id": "reused-agent", "request_fingerprint": new_request["request_fingerprint"], "status": "completed"})
+        self.assertEqual(HOOK.agent_activity_counts(self.load_only_state())["active"], 0)
+
+    def test_lifecycle_retention_preserves_protected_groups_and_trims_old_terminal_groups(self) -> None:
+        session = "agent-retention"
+        state = self.create_confirmed_executor_state(session)
+        state["executor_state"] = "running"
+        state["executor_agent_id"] = "bound-executor"
+        records = []
+        for index in range(HOOK.MAX_SUBAGENTS + 1):
+            records.append({"event": "request", "status": "pending", "request_fingerprint": f"{index + 1:032x}", "task_name": f"pending-{index}", "role": "lane"})
+        records.append({"event": "start", "status": "running", "agent_id": "live-agent", "task_name": "live", "role": "lane"})
+        for agent_id, role, contract in (
+            (state["assessor_agent_id"], "high_assessor", state["assessor_binding_id"]),
+            (state["executor_agent_id"], "confirmed_executor", state["execution_contract_id"]),
+        ):
+            request_fp = HOOK.stable_hash(f"bound-{agent_id}", 32)
+            records.extend((
+                {"event": "request", "status": "pending", "request_fingerprint": request_fp, "role": role, "contract_id": contract},
+                {"event": "start", "status": "running", "agent_id": agent_id, "request_fingerprint": request_fp, "role": role, "contract_id": contract},
+                {"event": "stop", "status": "completed", "agent_id": agent_id, "request_fingerprint": request_fp, "role": role, "contract_id": contract},
+            ))
+        for index in range(12):
+            request_fp = HOOK.stable_hash(f"terminal-{index}", 32)
+            records.extend((
+                {"event": "request", "status": "pending", "request_fingerprint": request_fp, "task_name": f"terminal-{index}", "role": "lane"},
+                {"event": "start", "status": "running", "agent_id": f"terminal-{index}", "request_fingerprint": request_fp, "task_name": f"terminal-{index}", "role": "lane"},
+                {"event": "stop", "status": "completed", "agent_id": f"terminal-{index}", "request_fingerprint": request_fp, "task_name": f"terminal-{index}", "role": "lane"},
+            ))
+        state["subagents"] = records
+        self.state_files()[0].write_text(json.dumps(state), encoding="utf-8")
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
+        compacted = self.load_only_state()
+        self.assertEqual(HOOK.agent_activity_counts(compacted)["active"], 1)
+        self.assertEqual(len([item for item in compacted["subagents"] if item["event"] == "request" and str(item.get("task_name", "")).startswith("pending-")]), HOOK.MAX_SUBAGENTS + 1)
+        self.assertTrue(all(any(item.get("agent_id") == agent_id for item in compacted["subagents"]) for agent_id in (state["assessor_agent_id"], state["executor_agent_id"])))
+        self.assertFalse(any(item.get("agent_id") in {"terminal-0", "terminal-1"} for item in compacted["subagents"]))
+        for index in range(2, 12):
+            self.assertEqual(sum(item.get("agent_id") == f"terminal-{index}" for item in compacted["subagents"]), 2)
+        self.assertEqual(len(compacted["compactions"][-1]["active_agent_scopes"]), 1)
+        overflow = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "overflow", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "overflow_lane", "message": "Read-only inspect another independent module"}})
+        self.assertIn("lifecycle", json.loads(overflow.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"})
+        resume_context = json.loads(resumed.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"active_agent_count":1', resume_context)
+
+    def test_concurrent_subagent_starts_consume_one_pending_request_once(self) -> None:
+        for round_index in range(4):
+            with self.subTest(round=round_index):
+                session = f"agent-start-race-{round_index}"
+                data = Path(self.temporary.name) / session
+                self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "init"}, data=data)
+                state = self.load_only_state(data)
+                state["last_route"] = HOOK.classify_prompt("Inspect two independent modules in parallel and verify both")
+                self.state_files(data)[0].write_text(json.dumps(state), encoding="utf-8")
+                spawn = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "race_lane", "message": "Read-only inspect one independent module"}}
+                self.run_hook(spawn, data=data)
+                request = [item for item in self.load_only_state(data)["subagents"] if item["event"] == "request"][-1]
+                payloads = [{"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"start-{index}", "agent_id": f"race-agent-{index}"} for index in range(2)]
+                barrier, contexts = threading.Barrier(2), []
+                real_snapshot = HOOK.snapshot_state
+
+                def synchronized_snapshot(payload: dict) -> dict:
+                    snapshot = real_snapshot(payload)
+                    barrier.wait()
+                    return snapshot
+
+                with patch.dict(os.environ, {"PLUGIN_DATA": str(data), "CODEX_HOME": str(self.codex_home)}), patch.object(HOOK, "snapshot_state", side_effect=synchronized_snapshot), patch.object(HOOK, "emit_context", side_effect=lambda _event, text: contexts.append(text)):
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        list(pool.map(HOOK.subagent_start, payloads))
+                final = self.load_only_state(data)
+                starts = [item for item in final["subagents"] if item["event"] == "start"]
+                self.assertEqual((len(starts), HOOK.agent_activity_counts(final)["active"]), (1, 1))
+                self.assertEqual(starts[0]["request_fingerprint"], request["request_fingerprint"])
+                self.assertEqual(sum("invalid lifecycle transition" in text for text in contexts), 1)
+                self.assertEqual(sum(item.get("kind") == "subagent_lifecycle" for item in final["guards"]), 1)
 
 
     def test_compaction_tracks_active_scope_and_late_result_is_stale(self) -> None:

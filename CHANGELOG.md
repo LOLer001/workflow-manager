@@ -1,5 +1,14 @@
 # 更新记录
 
+## 1.0.34
+
+- 子智能体记录改为按完整生命周期折叠，不再机械保留最后 24 条事件：pending 请求、live Start、无第二次 Start 的同代理 follow-up，以及 terminal Stop 作为代次整体参与计数、门禁、压缩和恢复。
+- Stop 缺少 status 时仍以 `terminal/unknown` 幂等关闭；重复、孤立、缺 ID、晚到 Start/Stop 不会复活或误停代理。同一 ID 新代次必须有更新请求，复用后 Stop 还需匹配当前 request fingerprint/turn，绑定 Simple/stall marker 保留无第二次 Start 的安全收敛。
+- pending 请求与 Start 在同一状态锁内单次消费；并发 Start 或两个 confirmed executor 只能有一个生效，输家明确记录生命周期拒绝，不能降级成无绑定普通 lane 或静默驱逐既有执行证据。
+- 永久保留 pending、result-pending、live 及当前绑定 assessor/executor；完整终态历史只保留最新 10 组。保护集达到安全上限时拒绝新委派，不通过丢弃活动证据腾空间。Schema 保持 17，writer 升至 1.0.34，仍只保存有界指纹、枚举、长度和时间。
+- 主 Skill 明确宿主边界：结果返回后仅当宿主仍显示该精确代理 running 才停止；不碰 live/待回收/诊断/合同执行代理。Hook 不能调用宿主状态 API、终止代理、删除任务或清理侧边栏历史，也不会虚报这些动作。
+- 新增终态幂等、ID 复用、延迟 Stop、并发 pending、双 executor、25 pending、完整终态裁剪、compact/resume 和隐私回归，并复跑实时协调、卡顿诊断与严格困难计划合同。
+
 ## 1.0.33
 
 - 已确认困难计划的绑定执行者只有在当前类型化失败后停止变更并提交精确 `EXECUTION_STALL` 行时，才进入卡顿升级；普通首个实现、编译、部署或验证失败继续使用既有原档修正，不会把日常错误机械升级为高成本流程。
