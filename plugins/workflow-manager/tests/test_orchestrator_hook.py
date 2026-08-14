@@ -12,8 +12,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,6 +93,279 @@ class OrchestratorHookTests(unittest.TestCase):
         path.write_text(json.dumps(event) + "\n", encoding="utf-8")
         return path
 
+    def coordination_envelope(
+        self,
+        *,
+        session: str,
+        target_thread: str,
+        target_host: str,
+        source_thread: str | None = None,
+        source_host: str | None = None,
+        sender_resource: str = "a" * 32,
+        target_resource: str | None = None,
+        resource_kind: str = "adb_device",
+        sender_stage: str = "deploy",
+        target_stage: str = "device_verify",
+        generation: int = 1,
+        transition: str = "blocked",
+    ) -> str:
+        source_host = source_host or target_host
+        source_thread = source_thread or session
+        return "\n".join(
+            (
+                "WORKFLOW_COORDINATION_V1",
+                f"source_task_fingerprint={HOOK.coordination_task_fingerprint(source_thread, source_host)}",
+                f"source_host_fingerprint={HOOK.coordination_host_fingerprint(source_host)}",
+                f"target_task_fingerprint={HOOK.coordination_task_fingerprint(target_thread, target_host)}",
+                f"target_host_fingerprint={HOOK.coordination_host_fingerprint(target_host)}",
+                f"sender_resource_identity={sender_resource}",
+                f"target_resource_identity={target_resource or sender_resource}",
+                f"resource_kind={resource_kind}",
+                f"sender_stage={sender_stage}",
+                f"target_stage={target_stage}",
+                f"lease_generation={generation}",
+                f"transition={transition}",
+                "END_WORKFLOW_COORDINATION",
+            )
+        )
+
+    def record_thread_activity(
+        self,
+        session: str,
+        threads: list[dict],
+        *,
+        data: Path | None = None,
+        run_id: str = "list-threads",
+    ) -> None:
+        if threads and not any(item.get("id", item.get("threadId")) == session for item in threads):
+            host = threads[0].get("hostId")
+            threads = [*threads, {"id": session, "hostId": host, "status": "active"}]
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": run_id,
+                "tool_name": "codex_app__list_threads",
+                "tool_input": {},
+                "tool_response": {"status": "ok", "schemaVersion": 1, "threads": threads},
+            },
+            data=data,
+        )
+
+    def coordination_send_payload(
+        self,
+        session: str,
+        target_thread: str,
+        target_host: str,
+        message: str,
+        *,
+        run_id: str,
+        event: str = "PreToolUse",
+        response: dict | None = None,
+    ) -> dict:
+        payload = {
+            "hook_event_name": event,
+            "session_id": session,
+            "hook_run_id": run_id,
+            "tool_name": "codex_app__send_message_to_thread",
+            "tool_input": {
+                "threadId": target_thread,
+                "hostId": target_host,
+                "prompt": message,
+            },
+        }
+        if response is not None:
+            payload["tool_response"] = response
+        return payload
+
+    def test_live_coordination_active_conflict_is_once_only_and_private(self) -> None:
+        session, peer, host = "coord-active", "peer-active", "host-active"
+        self.record_thread_activity(
+            session,
+            [{"id": peer, "hostId": host, "status": "active", "title": "private title", "summary": "private summary"}],
+        )
+        state = self.load_only_state()
+        serialized = json.dumps(state, ensure_ascii=False)
+        self.assertEqual(state["coordination_activity"][0]["status"], "active")
+        for raw in (peer, host, "private title", "private summary"):
+            self.assertNotIn(raw, serialized)
+
+        message = self.coordination_envelope(session=session, target_thread=peer, target_host=host)
+        pre = self.coordination_send_payload(session, peer, host, message, run_id="send-pre")
+        accepted = self.run_hook(pre)
+        self.assertNotIn("permissionDecision", json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}))
+        self.assertEqual(self.load_only_state()["coordination_notices"][-1]["state"], "pending")
+        self.run_hook(self.coordination_send_payload(session, peer, host, message, run_id="send-post", event="PostToolUse", response={"status": "ok"}))
+        self.assertEqual(self.load_only_state()["coordination_notices"][-1]["state"], "sent")
+        duplicate = self.run_hook(self.coordination_send_payload(session, peer, host, message, run_id="send-duplicate"))
+        self.assertIn("already sent", json.loads(duplicate.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertNotIn(message, json.dumps(self.load_only_state(), ensure_ascii=False))
+
+    def test_live_coordination_requires_fresh_active_same_resource_conflict(self) -> None:
+        cases = (
+            ("idle", None, None, "not active"),
+            ("notLoaded", None, None, "not active"),
+            ("completed", None, None, "not active"),
+            ("active", "b" * 32, None, "resource identities"),
+            ("active", None, ("build", "deploy"), "stages are compatible"),
+        )
+        for index, (status, target_resource, stages, reason_text) in enumerate(cases):
+            with self.subTest(status=status, target_resource=target_resource, stages=stages):
+                data = Path(self.temporary.name) / f"coord-case-{index}"
+                session, peer, host = f"coord-case-{index}", f"peer-{index}", f"host-{index}"
+                self.record_thread_activity(session, [{"id": peer, "hostId": host, "status": status}], data=data)
+                sender_stage, target_stage = stages or ("deploy", "device_verify")
+                message = self.coordination_envelope(
+                    session=session,
+                    target_thread=peer,
+                    target_host=host,
+                    target_resource=target_resource,
+                    resource_kind="build_account" if stages else "adb_device",
+                    sender_stage=sender_stage,
+                    target_stage=target_stage,
+                )
+                denied = self.run_hook(self.coordination_send_payload(session, peer, host, message, run_id="send"), data=data)
+                self.assertIn(reason_text, json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+                self.assertEqual(self.load_only_state(data)["coordination_notices"], [])
+
+        stale_data = Path(self.temporary.name) / "coord-stale"
+        self.record_thread_activity(
+            "coord-stale",
+            [{"id": "peer-stale", "hostId": "host-stale", "status": "active"}],
+            data=stale_data,
+        )
+        stale = self.load_only_state(stale_data)
+        stale["coordination_activity"][0]["observed_at"] = "2000-01-01T00:00:00+00:00"
+        self.state_files(stale_data)[0].write_text(json.dumps(stale), encoding="utf-8")
+        message = self.coordination_envelope(session="coord-stale", target_thread="peer-stale", target_host="host-stale")
+        expired = self.run_hook(self.coordination_send_payload("coord-stale", "peer-stale", "host-stale", message, run_id="expired"), data=stale_data)
+        self.assertIn("fresh list_threads", json.loads(expired.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_live_coordination_retries_once_and_keys_generation_transition(self) -> None:
+        session, peer, host = "coord-retry", "peer-retry", "host-retry"
+        self.record_thread_activity(session, [{"id": peer, "hostId": host, "status": "active"}])
+        blocked = self.coordination_envelope(session=session, target_thread=peer, target_host=host)
+        self.run_hook(self.coordination_send_payload(session, peer, host, blocked, run_id="pre-1"))
+        self.run_hook(self.coordination_send_payload(session, peer, host, blocked, run_id="post-1", event="PostToolUse", response={"status": "error"}))
+        self.assertEqual((self.load_only_state()["coordination_notices"][-1]["state"], self.load_only_state()["coordination_notices"][-1]["attempt"]), ("failed", 1))
+        stale_retry = self.run_hook(self.coordination_send_payload(session, peer, host, blocked, run_id="pre-stale"))
+        self.assertIn("after the failed send", json.loads(stale_retry.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        self.record_thread_activity(session, [{"id": peer, "hostId": host, "status": "active"}], run_id="refresh")
+        retry = self.run_hook(self.coordination_send_payload(session, peer, host, blocked, run_id="pre-2"))
+        self.assertNotIn("permissionDecision", json.loads(retry.stdout or "{}").get("hookSpecificOutput", {}))
+        self.run_hook(self.coordination_send_payload(session, peer, host, blocked, run_id="post-2", event="PostToolUse", response={"status": "error"}))
+        self.assertEqual(self.load_only_state()["coordination_notices"][-1]["state"], "exhausted")
+
+        blocked2 = self.coordination_envelope(session=session, target_thread=peer, target_host=host, generation=2)
+        self.run_hook(self.coordination_send_payload(session, peer, host, blocked2, run_id="blocked-2"))
+        self.run_hook(self.coordination_send_payload(session, peer, host, blocked2, run_id="blocked-2-post", event="PostToolUse", response={}))
+        self.assertEqual(self.load_only_state()["coordination_notices"][-1]["state"], "unconfirmed")
+        terminal = self.run_hook(self.coordination_send_payload(session, peer, host, blocked2, run_id="blocked-2-duplicate"))
+        self.assertIn("terminal", json.loads(terminal.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        invalid_releases = (
+            self.coordination_envelope(session=session, target_thread=peer, target_host=host, generation=1, transition="released"),
+            self.coordination_envelope(session=session, target_thread=peer, target_host=host, generation=2, transition="released", sender_resource="b" * 32),
+            self.coordination_envelope(session=session, target_thread=peer, target_host=host, generation=2, transition="released", sender_stage="device_verify", target_stage="deploy"),
+        )
+        for index, message in enumerate(invalid_releases):
+            denied = self.run_hook(self.coordination_send_payload(session, peer, host, message, run_id=f"bad-release-{index}"))
+            self.assertIn("current blocked", json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        released2 = self.coordination_envelope(session=session, target_thread=peer, target_host=host, generation=2, transition="released")
+        allowed = self.run_hook(self.coordination_send_payload(session, peer, host, released2, run_id="released-2"))
+        self.assertNotIn("permissionDecision", json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}))
+        self.assertEqual(len(self.load_only_state()["coordination_notices"]), 3)
+
+    def test_live_coordination_desktop_schema_and_topology_fail_closed(self) -> None:
+        session, peer, host = "coord-schema", "peer-schema", "host-schema"
+        active = {"id": peer, "hostId": host, "status": "active"}
+        bad_responses = (
+            {"status": "error", "schemaVersion": 1, "threads": [active]},
+            {"status": "ok", "threads": [active]},
+            "{bad-json",
+            {"status": "ok", "schemaVersion": 1, "threads": [{**active, "threadId": "other"}]},
+            {"status": "ok", "schemaVersion": 1, "threads": [active, {**active, "status": "idle"}]},
+            {"status": "ok", "schemaVersion": 1, "threads": [active] * 33},
+            {"status": "ok", "schemaVersion": 1, "threads": [active], "structuredContent": {"schemaVersion": 1, "threads": [active]}},
+        )
+        for index, response in enumerate(bad_responses):
+            self.record_thread_activity(session, [active], run_id=f"restore-{index}")
+            self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": f"bad-list-{index}", "tool_name": "codex_app__list_threads", "tool_input": {}, "tool_response": response})
+            self.assertEqual(self.load_only_state()["coordination_activity"], [], index)
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "structured", "tool_name": "list_threads", "tool_input": {}, "tool_response": {"status": "ok", "structuredContent": {"schemaVersion": 1, "threads": [active]}}})
+        self.assertEqual(self.load_only_state()["coordination_activity"][0]["status"], "active")
+
+        controls = (
+            self.coordination_envelope(session=session, target_thread=peer, target_host=host, source_host="other-host"),
+            self.coordination_envelope(session=session, source_thread=peer, target_thread=peer, target_host=host),
+        )
+        for index, message in enumerate(controls):
+            denied = self.run_hook(self.coordination_send_payload(session, peer, host, message, run_id=f"topology-{index}"))
+            self.assertIn("source", json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        missing_host = self.coordination_send_payload(session, peer, host, self.coordination_envelope(session=session, target_thread=peer, target_host=host), run_id="missing-host")
+        missing_host["tool_input"].pop("hostId")
+        self.assertIn("lacks host_id", json.loads(self.run_hook(missing_host).stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        conflicting = self.coordination_send_payload(session, peer, host, self.coordination_envelope(session=session, target_thread=peer, target_host=host), run_id="conflicting-prompt")
+        conflicting["tool_input"]["message"] = "different"
+        self.assertIn("conflicting message", json.loads(self.run_hook(conflicting).stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+        source_cases = (
+            [active],
+            [active, {"id": session, "hostId": host, "status": "idle"}],
+            [active, {"id": session, "hostId": "other-host", "status": "active"}],
+        )
+        for index, threads in enumerate(source_cases):
+            data = Path(self.temporary.name) / f"source-case-{index}"
+            self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "list", "tool_name": "list_threads", "tool_input": {}, "tool_response": {"schemaVersion": 1, "threads": threads}}, data=data)
+            denied = self.run_hook(self.coordination_send_payload(session, peer, host, self.coordination_envelope(session=session, target_thread=peer, target_host=host), run_id="send"), data=data)
+            self.assertIn("current session", json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+            self.assertEqual(self.load_only_state(data)["coordination_notices"], [])
+
+    def test_live_coordination_concurrent_pre_reserves_once(self) -> None:
+        session, peer, host = "coord-race", "peer-race", "host-race"
+        self.record_thread_activity(session, [{"id": peer, "hostId": host, "status": "active"}])
+        message = self.coordination_envelope(session=session, target_thread=peer, target_host=host)
+        payloads = [self.coordination_send_payload(session, peer, host, message, run_id=f"race-{index}") for index in range(2)]
+        barrier, denied = threading.Barrier(2), []
+        def attempt(payload: dict) -> bool:
+            state = HOOK.snapshot_state(payload)
+            barrier.wait()
+            return HOOK.handle_coordination_pretool(payload, state, HOOK.tool_fingerprint(payload)[0])
+        with patch.dict(os.environ, {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)}), patch.object(HOOK, "emit_pretool_deny", side_effect=denied.append):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                self.assertEqual(list(pool.map(attempt, payloads)), [True, True])
+        self.assertEqual(len(self.load_only_state()["coordination_notices"]), 1)
+        self.assertEqual(len(denied), 1)
+        self.assertIn("pending", denied[0])
+
+    def test_live_coordination_legacy_sentinel_and_control_prompts_are_bounded(self) -> None:
+        ordinary = self.run_hook(self.coordination_send_payload("coord-language", "peer", "host", "Please review the parser result.", run_id="ordinary"))
+        self.assertEqual(ordinary.stdout, "")
+        resource_words = self.run_hook(self.coordination_send_payload("coord-language", "peer", "host", "Device lock: wait until I release adb.", run_id="resource-words"))
+        self.assertEqual(resource_words.stdout, "")
+        legacy = self.run_hook(self.coordination_send_payload("coord-language", "peer", "host", "<codex_delegation> Device lock: wait until release.", run_id="legacy"))
+        self.assertIn("list_threads", json.loads(legacy.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+        session, peer, host = "coord-inbound", "coord-sender", "host-inbound"
+        inbound_data = Path(self.temporary.name) / "coord-inbound"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "objective", "prompt": "修复 Android 崩溃并验证"}, data=inbound_data)
+        before = self.load_only_state(inbound_data)
+        message = self.coordination_envelope(session=session, source_thread=peer, target_thread=session, target_host=host)
+        controls = (message, message.removesuffix("END_WORKFLOW_COORDINATION"), message + "\nextra user request", "prefix\n" + message, "<codex_delegation> legacy")
+        for index, prompt in enumerate(controls):
+            self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": f"control-{index}", "prompt": prompt}, data=inbound_data)
+            after = self.load_only_state(inbound_data)
+            for key in ("objective", "assessor_binding_id", "assessor_state", "plan_state", "executor_state", "last_route", "reference_acceptance", "causal_review"):
+                self.assertEqual(after[key], before[key], (index, key))
+        final = self.load_only_state(inbound_data)
+        self.assertEqual(len(final["coordination_inbound"]), 1)
+        self.assertNotIn("WORKFLOW_COORDINATION_V1", json.dumps(final, ensure_ascii=False))
+
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"}, data=inbound_data)
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"}, data=inbound_data)
+        checkpoint = self.load_only_state(inbound_data)["compactions"][-1]
+        self.assertTrue(checkpoint["coordination_inbound"])
+        self.assertNotIn(message, resumed.stdout)
+
     def test_python_syntax_and_declared_events(self) -> None:
         self.assertEqual(
             set(HOOK.HANDLERS),
@@ -108,8 +383,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 15)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.31")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 16)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.32")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -4433,7 +4708,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         migrated = self.load_only_state(data)
-        self.assertEqual(migrated["schema_version"], 15)
+        self.assertEqual(migrated["schema_version"], 16)
         self.assertEqual(migrated["session_execution_preference"], "default")
         self.assertEqual(migrated["writer_version"], HOOK.WRITER_VERSION)
         self.assertEqual(

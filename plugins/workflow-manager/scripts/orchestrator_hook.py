@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 15
-WRITER_VERSION = "1.0.31"
+SCHEMA_VERSION = 16
+WRITER_VERSION = "1.0.32"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -49,6 +49,11 @@ MAX_COMPACTIONS = 16
 MAX_GUARDS = 32
 MAX_PROCESSED_RUNS = 128
 MAX_DUPLICATE_NOTICES = 64
+MAX_COORDINATION_ACTIVITY = 32
+MAX_COORDINATION_NOTICES = 32
+MAX_COORDINATION_INBOUND = 32
+COORDINATION_SNAPSHOT_TTL_SECONDS = 60
+COORDINATION_ID_MAX_BYTES = 4096
 MAX_STATE_BYTES = 1024 * 1024
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
 LOCK_TIMEOUT_SECONDS = 0.75
@@ -147,6 +152,295 @@ def stable_hash(value: Any, length: int = 16) -> str:
     else:
         raw = str(value or "").encode("utf-8", errors="replace")
     return hashlib.sha256(raw).hexdigest()[:length]
+
+
+COORDINATION_ENVELOPE_START = "WORKFLOW_COORDINATION_V1"
+COORDINATION_ENVELOPE_END = "END_WORKFLOW_COORDINATION"
+COORDINATION_RESOURCE_STAGES = {
+    "build_account": {"build", "compile", "package"},
+    "adb_device": {"adb", "deploy", "device_verify", "flash", "install", "reboot"},
+}
+COORDINATION_TRANSITIONS = {"blocked", "released"}
+COORDINATION_NOTICE_STATES = {"pending", "sent", "failed", "exhausted", "unconfirmed"}
+COORDINATION_THREAD_STATUSES = {"active", "idle", "notLoaded", "completed", "missing", "unknown"}
+COORDINATION_ENVELOPE_FIELDS = (
+    "source_task_fingerprint",
+    "source_host_fingerprint",
+    "target_task_fingerprint",
+    "target_host_fingerprint",
+    "sender_resource_identity",
+    "target_resource_identity",
+    "resource_kind",
+    "sender_stage",
+    "target_stage",
+    "lease_generation",
+    "transition",
+)
+
+
+def coordination_host_fingerprint(host_id: Any) -> str:
+    return stable_hash(f"workflow-coordination-host-v1\0{str(host_id or '')}", 32)
+
+
+def coordination_task_fingerprint_for_host(thread_id: Any, host_fingerprint: Any) -> str:
+    return stable_hash(
+        f"workflow-coordination-task-v1\0{str(host_fingerprint or '')}\0{str(thread_id or '')}",
+        32,
+    )
+
+
+def coordination_task_fingerprint(thread_id: Any, host_id: Any) -> str:
+    return coordination_task_fingerprint_for_host(
+        thread_id, coordination_host_fingerprint(host_id)
+    )
+
+
+def is_list_threads_tool(payload: dict[str, Any]) -> bool:
+    return str(payload.get("tool_name") or "") in {"list_threads", "codex_app__list_threads"}
+
+
+def is_send_message_to_thread_tool(payload: dict[str, Any]) -> bool:
+    return str(payload.get("tool_name") or "") in {
+        "send_message_to_thread",
+        "codex_app__send_message_to_thread",
+    }
+
+
+def coordination_send_fields(payload: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
+    value = payload.get("tool_input")
+    if not isinstance(value, dict):
+        return None, "send_message_to_thread requires one structured tool_input object"
+    aliases = {
+        "thread_id": ("threadId",),
+        "host_id": ("hostId",),
+        "message": ("prompt", "message"),
+    }
+    result: dict[str, str] = {}
+    for field, names in aliases.items():
+        raw_values = [value.get(name) for name in names if value.get(name) not in (None, "")]
+        if any(not isinstance(raw, str) for raw in raw_values):
+            return None, f"send_message_to_thread {field} must be a string"
+        observed = [raw for raw in raw_values if isinstance(raw, str)]
+        if len(set(observed)) > 1:
+            return None, f"send_message_to_thread has conflicting {field} aliases"
+        if not observed:
+            return None, f"send_message_to_thread lacks {field}"
+        if len(observed[0].encode("utf-8", errors="replace")) > COORDINATION_ID_MAX_BYTES:
+            return None, f"send_message_to_thread {field} exceeds the bounded input limit"
+        result[field] = observed[0]
+    return result, None
+
+
+def coordination_control_text(payload: dict[str, Any]) -> str | None:
+    value = payload.get("tool_input")
+    if not isinstance(value, dict):
+        return None
+    messages = [value.get(key) for key in ("prompt", "message")]
+    return next(
+        (
+            message
+            for message in messages
+            if isinstance(message, str)
+            and (
+                message.startswith(COORDINATION_ENVELOPE_START)
+                or message.startswith("<codex_delegation>")
+            )
+        ),
+        None,
+    )
+
+
+def parse_coordination_envelope(text: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(text, str) or not text.startswith(COORDINATION_ENVELOPE_START):
+        return None, "missing WORKFLOW_COORDINATION_V1 marker"
+    if len(text.encode("utf-8", errors="replace")) > 8192:
+        return None, "coordination envelope exceeds the bounded byte limit"
+    lines = text.splitlines()
+    if len(lines) != len(COORDINATION_ENVELOPE_FIELDS) + 2:
+        return None, "coordination envelope has extra, missing, or mixed content"
+    if lines[0] != COORDINATION_ENVELOPE_START or lines[-1] != COORDINATION_ENVELOPE_END:
+        return None, "coordination envelope markers must be exact and complete"
+    result: dict[str, Any] = {}
+    for line, expected in zip(lines[1:-1], COORDINATION_ENVELOPE_FIELDS):
+        if "=" not in line:
+            return None, f"coordination envelope lacks {expected}"
+        key, value = line.split("=", 1)
+        if key != expected or not value or value != value.strip():
+            return None, f"coordination envelope field order/value is invalid at {expected}"
+        result[key] = value
+    for key in (
+        "source_task_fingerprint",
+        "source_host_fingerprint",
+        "target_task_fingerprint",
+        "target_host_fingerprint",
+        "sender_resource_identity",
+        "target_resource_identity",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{32}", str(result.get(key) or "")):
+            return None, f"coordination envelope {key} must be 32hex"
+    kind = str(result.get("resource_kind") or "")
+    if kind not in COORDINATION_RESOURCE_STAGES:
+        return None, "coordination resource_kind must be build_account or adb_device"
+    if result.get("transition") not in COORDINATION_TRANSITIONS:
+        return None, "coordination transition must be blocked or released"
+    generation = str(result.get("lease_generation") or "")
+    if not re.fullmatch(r"[1-9]\d{0,8}", generation):
+        return None, "coordination lease_generation must be positive"
+    result["lease_generation"] = int(generation)
+    return result, None
+
+
+def coordination_conflict_class(envelope: dict[str, Any]) -> str | None:
+    kind = str(envelope.get("resource_kind") or "")
+    allowed = COORDINATION_RESOURCE_STAGES.get(kind, set())
+    sender = str(envelope.get("sender_stage") or "")
+    target = str(envelope.get("target_stage") or "")
+    if sender not in allowed or target not in allowed:
+        return None
+    stages = sorted((sender, target))
+    return stable_hash(f"workflow-coordination-conflict-v1\0{kind}\0{stages[0]}\0{stages[1]}", 32)
+
+
+def coordination_notice_identity(envelope: dict[str, Any]) -> dict[str, str]:
+    peers = sorted(
+        (
+            f"{envelope['source_host_fingerprint']}:{envelope['source_task_fingerprint']}",
+            f"{envelope['target_host_fingerprint']}:{envelope['target_task_fingerprint']}",
+        )
+    )
+    peer_pair = stable_hash(f"workflow-coordination-peers-v1\0{peers[0]}\0{peers[1]}", 32)
+    conflict = coordination_conflict_class(envelope) or ""
+    owner = stable_hash(
+        f"workflow-coordination-owner-v1\0{envelope['source_host_fingerprint']}\0{envelope['source_task_fingerprint']}",
+        32,
+    )
+    scope = stable_hash(
+        "\0".join(
+            (
+                "workflow-coordination-scope-v1",
+                peer_pair,
+                str(envelope.get("sender_resource_identity") or ""),
+                str(envelope.get("resource_kind") or ""),
+                conflict,
+            )
+        ),
+        32,
+    )
+    phase = stable_hash(
+        "\0".join(
+            (
+                "workflow-coordination-phase-v1",
+                owner,
+                str(envelope.get("sender_stage") or ""),
+                str(envelope.get("target_stage") or ""),
+            )
+        ),
+        32,
+    )
+    notice = stable_hash(
+        "\0".join(
+            (
+                "workflow-coordination-notice-v1",
+                peer_pair,
+                str(envelope.get("sender_resource_identity") or ""),
+                conflict,
+                str(envelope.get("lease_generation") or ""),
+                str(envelope.get("transition") or ""),
+            )
+        ),
+        32,
+    )
+    return {
+        "peer_pair_fingerprint": peer_pair,
+        "conflict_class_fingerprint": conflict,
+        "notice_fingerprint": notice,
+        "owner_fingerprint": owner,
+        "scope_fingerprint": scope,
+        "phase_fingerprint": phase,
+    }
+
+
+def coordination_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def coordination_activity_from_response(response: Any) -> list[dict[str, Any]]:
+    if not isinstance(response, dict) or response_status(response) == "error":
+        return []
+    direct = "schemaVersion" in response or "threads" in response
+    structured = "structuredContent" in response
+    if direct == structured:
+        return []
+    leaf = response if direct else response.get("structuredContent")
+    if not isinstance(leaf, dict) or set(("schemaVersion", "threads")) - set(leaf):
+        return []
+    schema = leaf.get("schemaVersion")
+    if isinstance(schema, bool) or not re.fullmatch(r"[1-9]\d{0,2}", str(schema or "")):
+        return []
+    threads = leaf.get("threads")
+    if not isinstance(threads, list) or len(threads) > MAX_COORDINATION_ACTIVITY:
+        return []
+    observed_at = coordination_now()
+    result: list[dict[str, Any]] = []
+    seen: dict[str, str] = {}
+    total_bytes = 0
+    for item in threads:
+        if not isinstance(item, dict):
+            return []
+        ids = [
+            str(item.get(key)).strip()
+            for key in ("id", "threadId")
+            if item.get(key) not in (None, "")
+        ]
+        if not ids or len(set(ids)) > 1:
+            return []
+        thread_id = ids[0]
+        host_id = item.get("hostId")
+        if not isinstance(thread_id, str) or not isinstance(host_id, str) or not thread_id or not host_id:
+            return []
+        total_bytes += len(thread_id.encode("utf-8", errors="replace")) + len(
+            host_id.encode("utf-8", errors="replace")
+        )
+        if (
+            max(
+                len(thread_id.encode("utf-8", errors="replace")),
+                len(host_id.encode("utf-8", errors="replace")),
+            )
+            > COORDINATION_ID_MAX_BYTES
+            or total_bytes > COORDINATION_ID_MAX_BYTES * MAX_COORDINATION_ACTIVITY
+        ):
+            return []
+        raw_status = item.get("status")
+        status = raw_status if raw_status in COORDINATION_THREAD_STATUSES else "missing" if raw_status is None else "unknown"
+        task_fp = coordination_task_fingerprint(thread_id, host_id)
+        host_fp = coordination_host_fingerprint(host_id)
+        if task_fp in seen:
+            if seen[task_fp] != status:
+                return []
+            continue
+        seen[task_fp] = status
+        result.append(
+            {
+                "task_fingerprint": task_fp,
+                "host_fingerprint": host_fp,
+                "status": status,
+                "snapshot_fingerprint": stable_hash(
+                    f"workflow-coordination-snapshot-v1\0{task_fp}\0{host_fp}\0{status}\0{observed_at}",
+                    32,
+                ),
+                "observed_at": observed_at,
+            }
+        )
+    return result
+
+
+def coordination_snapshot_fresh(item: dict[str, Any]) -> bool:
+    try:
+        observed = datetime.fromisoformat(str(item.get("observed_at") or "")).timestamp()
+        age = time.time() - observed
+        return -5 <= age <= COORDINATION_SNAPSHOT_TTL_SECONDS
+    except (TypeError, ValueError):
+        return False
 
 
 def execution_contract_id(state: dict[str, Any]) -> str | None:
@@ -918,6 +1212,83 @@ def sync_stable_skill(
         }
 
 
+def _coordination_fp32(value: Any) -> str | None:
+    text = str(value or "")
+    return text if re.fullmatch(r"[0-9a-f]{32}", text) else None
+
+
+def _safe_coordination_activity(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    task = _coordination_fp32(item.get("task_fingerprint"))
+    host = _coordination_fp32(item.get("host_fingerprint"))
+    snapshot = _coordination_fp32(item.get("snapshot_fingerprint"))
+    if not task or not host or not snapshot:
+        return None
+    return {
+        "task_fingerprint": task,
+        "host_fingerprint": host,
+        "status": item.get("status") if item.get("status") in COORDINATION_THREAD_STATUSES else "unknown",
+        "snapshot_fingerprint": snapshot,
+        "observed_at": str(item.get("observed_at") or "")[:40],
+    }
+
+
+def _safe_coordination_notice(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    fingerprints = {
+        key: _coordination_fp32(item.get(key))
+        for key in (
+            "notice_fingerprint",
+            "peer_pair_fingerprint",
+            "resource_identity",
+            "conflict_class_fingerprint",
+            "owner_fingerprint",
+            "scope_fingerprint",
+            "phase_fingerprint",
+            "request_fingerprint",
+        )
+    }
+    if not all(fingerprints.values()):
+        return None
+    return {
+        **fingerprints,
+        "resource_kind": item.get("resource_kind") if item.get("resource_kind") in COORDINATION_RESOURCE_STAGES else None,
+        "lease_generation": min(max(safe_int(item.get("lease_generation")), 1), 999_999_999),
+        "transition": item.get("transition") if item.get("transition") in COORDINATION_TRANSITIONS else None,
+        "state": item.get("state") if item.get("state") in COORDINATION_NOTICE_STATES else "failed",
+        "attempt": min(max(safe_int(item.get("attempt")), 1), 2),
+        "at": str(item.get("at") or "")[:40],
+    }
+
+
+def _safe_coordination_inbound(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    fingerprints = {
+        key: _coordination_fp32(item.get(key))
+        for key in (
+            "notice_fingerprint",
+            "peer_pair_fingerprint",
+            "resource_identity",
+            "conflict_class_fingerprint",
+            "owner_fingerprint",
+            "scope_fingerprint",
+            "phase_fingerprint",
+        )
+    }
+    if not all(fingerprints.values()):
+        return None
+    return {
+        **fingerprints,
+        "resource_kind": item.get("resource_kind") if item.get("resource_kind") in COORDINATION_RESOURCE_STAGES else None,
+        "lease_generation": min(max(safe_int(item.get("lease_generation")), 1), 999_999_999),
+        "transition": item.get("transition") if item.get("transition") in COORDINATION_TRANSITIONS else None,
+        "received_at": str(item.get("received_at") or "")[:40],
+    }
+
+
 def new_state(payload: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     return {
@@ -996,6 +1367,9 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "guards": [],
         "processed_hook_runs": [],
         "duplicate_notices": [],
+        "coordination_activity": [],
+        "coordination_notices": [],
+        "coordination_inbound": [],
     }
 
 
@@ -1318,6 +1692,18 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             item.get("last_execution_baseline")
         ),
         "causal_review": _safe_causal_review(item.get("causal_review")),
+        "coordination_activity": [
+            safe for raw in as_list(item.get("coordination_activity"))
+            if (safe := _safe_coordination_activity(raw)) is not None
+        ][:MAX_COORDINATION_ACTIVITY],
+        "coordination_notices": [
+            safe for raw in as_list(item.get("coordination_notices"))
+            if (safe := _safe_coordination_notice(raw)) is not None
+        ][-MAX_COORDINATION_NOTICES:],
+        "coordination_inbound": [
+            safe for raw in as_list(item.get("coordination_inbound"))
+            if (safe := _safe_coordination_inbound(raw)) is not None
+        ][-MAX_COORDINATION_INBOUND:],
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
             if (scope := _safe_active_agent_scope(raw)) is not None
@@ -1511,6 +1897,19 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         value.get("last_execution_baseline")
     )
     base["causal_review"] = _safe_causal_review(value.get("causal_review"))
+    if safe_int(value.get("schema_version")) >= 16:
+        base["coordination_activity"] = [
+            safe for raw in as_list(value.get("coordination_activity"))
+            if (safe := _safe_coordination_activity(raw)) is not None
+        ][:MAX_COORDINATION_ACTIVITY]
+        base["coordination_notices"] = [
+            safe for raw in as_list(value.get("coordination_notices"))
+            if (safe := _safe_coordination_notice(raw)) is not None
+        ][-MAX_COORDINATION_NOTICES:]
+        base["coordination_inbound"] = [
+            safe for raw in as_list(value.get("coordination_inbound"))
+            if (safe := _safe_coordination_inbound(raw)) is not None
+        ][-MAX_COORDINATION_INBOUND:]
 
     base["objective"] = safe_metadata(value.get("objective"))
     if not base["objective"] and value.get("last_objective"):
@@ -1686,6 +2085,9 @@ def trim_state(state: dict[str, Any]) -> None:
     state["guards"] = list(state.get("guards", []))[-MAX_GUARDS:]
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
     state["duplicate_notices"] = list(state.get("duplicate_notices", []))[-MAX_DUPLICATE_NOTICES:]
+    state["coordination_activity"] = list(state.get("coordination_activity", []))[:MAX_COORDINATION_ACTIVITY]
+    state["coordination_notices"] = list(state.get("coordination_notices", []))[-MAX_COORDINATION_NOTICES:]
+    state["coordination_inbound"] = list(state.get("coordination_inbound", []))[-MAX_COORDINATION_INBOUND:]
 
 
 def increment_event_count(state: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -4315,6 +4717,21 @@ def session_start(payload: dict[str, Any]) -> None:
             ),
             "causal_review": _safe_causal_review(state.get("causal_review")),
             "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
+            "coordination_activity": [
+                safe
+                for raw in state.get("coordination_activity", [])
+                if (safe := _safe_coordination_activity(raw)) is not None
+            ][:MAX_COORDINATION_ACTIVITY],
+            "coordination_notices": [
+                safe
+                for raw in state.get("coordination_notices", [])
+                if (safe := _safe_coordination_notice(raw)) is not None
+            ][-MAX_COORDINATION_NOTICES:],
+            "coordination_inbound": [
+                safe
+                for raw in state.get("coordination_inbound", [])
+                if (safe := _safe_coordination_inbound(raw)) is not None
+            ][-MAX_COORDINATION_INBOUND:],
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
@@ -4710,8 +5127,110 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
     )
 
 
+def handle_coordination_user_prompt(payload: dict[str, Any], prompt: str) -> bool:
+    has_marker = COORDINATION_ENVELOPE_START in prompt
+    has_legacy = "<codex_delegation>" in prompt
+    if not has_marker and not has_legacy:
+        return False
+    envelope, error = (
+        parse_coordination_envelope(prompt)
+        if prompt.startswith(COORDINATION_ENVELOPE_START)
+        else (None, "coordination marker is mixed with prefixed content")
+    )
+    conflict = coordination_conflict_class(envelope) if envelope else None
+    session_id = str(payload.get("session_id") or "")
+    target_for_session = (
+        coordination_task_fingerprint_for_host(
+            session_id, envelope["target_host_fingerprint"]
+        )
+        if envelope and session_id
+        else None
+    )
+    valid = bool(
+        not has_legacy
+        and envelope
+        and not error
+        and target_for_session == envelope["target_task_fingerprint"]
+        and envelope["source_host_fingerprint"] == envelope["target_host_fingerprint"]
+        and envelope["source_task_fingerprint"] != envelope["target_task_fingerprint"]
+        and envelope["sender_resource_identity"] == envelope["target_resource_identity"]
+        and conflict
+    )
+    if valid and envelope:
+        current = snapshot_state(payload)
+        identity = coordination_notice_identity(envelope)
+        existing = next(
+            (
+                item
+                for item in current.get("coordination_inbound", [])
+                if item.get("notice_fingerprint") == identity["notice_fingerprint"]
+            ),
+            None,
+        )
+        blocks = [
+            item
+            for item in current.get("coordination_inbound", [])
+            if item.get("scope_fingerprint") == identity["scope_fingerprint"]
+            and item.get("transition") == "blocked"
+        ]
+        generation = safe_int(envelope.get("lease_generation"))
+        if envelope.get("transition") == "blocked" and not existing and blocks:
+            valid = generation > max(safe_int(item.get("lease_generation")) for item in blocks)
+        elif envelope.get("transition") == "released":
+            latest = max(blocks, key=lambda item: safe_int(item.get("lease_generation"))) if blocks else None
+            valid = bool(
+                latest
+                and generation == safe_int(latest.get("lease_generation"))
+                and latest.get("owner_fingerprint") == identity["owner_fingerprint"]
+                and latest.get("phase_fingerprint") == identity["phase_fingerprint"]
+            )
+
+    def update(state: dict[str, Any]) -> None:
+        if valid and envelope and conflict:
+            identity = coordination_notice_identity(envelope)
+            if not any(
+                item.get("notice_fingerprint") == identity["notice_fingerprint"]
+                for item in state.get("coordination_inbound", [])
+            ):
+                state.setdefault("coordination_inbound", []).append(
+                    {
+                        **identity,
+                        "resource_identity": envelope["sender_resource_identity"],
+                        "resource_kind": envelope["resource_kind"],
+                        "lease_generation": envelope["lease_generation"],
+                        "transition": envelope["transition"],
+                        "received_at": coordination_now(),
+                    }
+                )
+        else:
+            state.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "live_coordination_control",
+                    "action": "deny",
+                    "fingerprint": stable_hash(prompt),
+                }
+            )
+
+    mutate_state(payload, update)
+    emit_context(
+        "UserPromptSubmit",
+        (
+            "Workflow Manager recorded a bounded coordination fingerprint and left the task contract unchanged."
+            if valid
+            else "Workflow Manager ignored an invalid or mixed coordination control envelope and left the task contract unchanged."
+        ),
+    )
+    return True
+
+
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
+    if handle_coordination_user_prompt(payload, prompt):
+        return
     previous = snapshot_state(payload)
     same_assessor_objective_retry = bool(
         previous.get("task_domain") == "work"
@@ -5338,9 +5857,250 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     return True
 
 
+def _record_coordination_guard(
+    payload: dict[str, Any], fingerprint: str, kind: str = "live_coordination"
+) -> None:
+    def update(state: dict[str, Any]) -> None:
+        state.setdefault("guards", []).append(
+            {
+                "at": utc_now(),
+                "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+                "kind": kind,
+                "action": "deny",
+                "fingerprint": fingerprint,
+            }
+        )
+
+    mutate_state(payload, update)
+
+
+def handle_coordination_pretool(
+    payload: dict[str, Any], state: dict[str, Any], fingerprint: str
+) -> bool:
+    if not is_send_message_to_thread_tool(payload):
+        return False
+    message = coordination_control_text(payload)
+    if message is None:
+        return False
+    if message.startswith("<codex_delegation>"):
+        _record_coordination_guard(payload, fingerprint, "legacy_coordination")
+        emit_pretool_deny(
+            "Workflow Manager blocked legacy <codex_delegation> coordination. Call list_threads first, then send "
+            "one complete WORKFLOW_COORDINATION_V1 envelope only to a fresh active target."
+        )
+        return True
+    if not message.startswith(COORDINATION_ENVELOPE_START):
+        return False
+
+    fields, fields_error = coordination_send_fields(payload)
+    envelope, envelope_error = parse_coordination_envelope(message)
+    if fields_error or envelope_error or not fields or not envelope:
+        _record_coordination_guard(payload, fingerprint)
+        emit_pretool_deny(
+            f"Workflow Manager blocked invalid coordination envelope: {fields_error or envelope_error}. "
+            "Call list_threads and send only the exact bounded WORKFLOW_COORDINATION_V1 contract."
+        )
+        return True
+    actual_task = coordination_task_fingerprint(fields["thread_id"], fields["host_id"])
+    actual_host = coordination_host_fingerprint(fields["host_id"])
+    session_id = payload.get("session_id")
+    source_task = coordination_task_fingerprint(session_id, fields["host_id"])
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or len(session_id.encode("utf-8", errors="replace")) > COORDINATION_ID_MAX_BYTES
+        or envelope["source_host_fingerprint"] != actual_host
+        or envelope["source_task_fingerprint"] != source_task
+        or envelope["source_task_fingerprint"] == envelope["target_task_fingerprint"]
+    ):
+        _record_coordination_guard(payload, fingerprint)
+        emit_pretool_deny(
+            "Workflow Manager blocked coordination because source must bind the current session on the target host, "
+            "and source/target must be different tasks on that same host."
+        )
+        return True
+    if envelope["target_task_fingerprint"] != actual_task or envelope["target_host_fingerprint"] != actual_host:
+        _record_coordination_guard(payload, fingerprint)
+        emit_pretool_deny(
+            "Workflow Manager blocked coordination because the envelope target fingerprints do not bind the actual "
+            "threadId/hostId. Call list_threads again and rebuild the envelope from the exact active peer."
+        )
+        return True
+    if envelope["sender_resource_identity"] != envelope["target_resource_identity"]:
+        _record_coordination_guard(payload, fingerprint)
+        emit_pretool_deny(
+            "Workflow Manager blocked coordination because sender/target resource identities differ; unrelated "
+            "resources do not justify a cross-task notification."
+        )
+        return True
+    conflict = coordination_conflict_class(envelope)
+    if not conflict:
+        _record_coordination_guard(payload, fingerprint)
+        emit_pretool_deny(
+            "Workflow Manager blocked coordination because the declared stages are compatible with the resource kind; "
+            "do not notify a peer without a real conflicting stage."
+        )
+        return True
+    identity = coordination_notice_identity(envelope)
+    request_fingerprint = stable_hash(f"workflow-coordination-request-v1\0{fingerprint}", 32)
+    decision: dict[str, Any] = {}
+
+    def reserve_pending(current: dict[str, Any]) -> None:
+        def deny(reason: str) -> None:
+            decision.update({"allowed": False, "reason": reason})
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "live_coordination",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+
+        activities = current.get("coordination_activity", [])
+        source_snapshot = next(
+            (
+                item
+                for item in activities
+                if item.get("task_fingerprint") == source_task
+                and item.get("host_fingerprint") == actual_host
+            ),
+            None,
+        )
+        target_snapshot = next(
+            (
+                item
+                for item in activities
+                if item.get("task_fingerprint") == actual_task
+                and item.get("host_fingerprint") == actual_host
+            ),
+            None,
+        )
+        if not source_snapshot or not coordination_snapshot_fresh(source_snapshot):
+            deny(
+                "Workflow Manager blocked coordination because the current session lacks a fresh list_threads "
+                "snapshot on the target's exact host. Call list_threads; the Hook cannot query host activity itself."
+            )
+            return
+        if source_snapshot.get("status") != "active":
+            deny(
+                f"Workflow Manager blocked coordination because the current session is not active "
+                f"(status={source_snapshot.get('status')}) on the target's exact host."
+            )
+            return
+        if not target_snapshot or not coordination_snapshot_fresh(target_snapshot):
+            deny(
+                "Workflow Manager blocked coordination without a fresh list_threads snapshot for this exact peer. "
+                "Call list_threads; the Hook cannot query host activity itself."
+            )
+            return
+        if target_snapshot.get("status") != "active":
+            deny(
+                f"Workflow Manager blocked coordination because the target is not active "
+                f"(status={target_snapshot.get('status')}); idle, notLoaded, completed, or missing peers must not be notified."
+            )
+            return
+
+        notices = current.setdefault("coordination_notices", [])
+        existing = next(
+            (item for item in reversed(notices) if item.get("notice_fingerprint") == identity["notice_fingerprint"]),
+            None,
+        )
+        if existing and any(
+            existing.get(key) != identity[key]
+            for key in ("owner_fingerprint", "scope_fingerprint", "phase_fingerprint")
+        ):
+            deny("Workflow Manager blocked coordination because the existing lease owner or phase does not match.")
+            return
+        scope_blocks = [
+            item
+            for item in notices
+            if item.get("scope_fingerprint") == identity["scope_fingerprint"]
+            and item.get("transition") == "blocked"
+        ]
+        generation = safe_int(envelope.get("lease_generation"))
+        if envelope.get("transition") == "blocked" and not existing and scope_blocks:
+            if generation <= max(safe_int(item.get("lease_generation")) for item in scope_blocks):
+                deny("Workflow Manager blocked coordination because a new blocked lease generation must increase monotonically.")
+                return
+        if envelope.get("transition") == "released":
+            latest = max(scope_blocks, key=lambda item: safe_int(item.get("lease_generation"))) if scope_blocks else None
+            if (
+                not latest
+                or latest.get("state") not in {"sent", "unconfirmed"}
+                or generation != safe_int(latest.get("lease_generation"))
+                or latest.get("owner_fingerprint") != identity["owner_fingerprint"]
+                or latest.get("phase_fingerprint") != identity["phase_fingerprint"]
+            ):
+                deny(
+                    "Workflow Manager blocked released coordination because it does not match the current blocked "
+                    "generation, owner, resource, and phase."
+                )
+                return
+        if existing and existing.get("state") in {"sent", "unconfirmed"}:
+            deny("Workflow Manager blocked coordination because this peer/resource/generation/transition notice was already sent or is otherwise terminal.")
+            return
+        if existing and existing.get("state") == "pending":
+            deny("Workflow Manager blocked coordination because the identical notice is already pending.")
+            return
+        if existing and (existing.get("state") == "exhausted" or safe_int(existing.get("attempt")) >= 2):
+            deny("Workflow Manager blocked coordination because the one normal retry is exhausted.")
+            return
+        if existing and existing.get("state") == "failed":
+            try:
+                failure_time = datetime.fromisoformat(str(existing.get("at") or ""))
+                source_time = datetime.fromisoformat(str(source_snapshot.get("observed_at") or ""))
+                target_time = datetime.fromisoformat(str(target_snapshot.get("observed_at") or ""))
+            except ValueError:
+                failure_time = source_time = target_time = datetime.min.replace(tzinfo=timezone.utc)
+            if min(source_time, target_time) <= failure_time:
+                deny(
+                    "Workflow Manager blocked the retry until a fresh successful list_threads snapshot is observed "
+                    "after the failed send."
+                )
+                return
+
+        attempt = 2 if existing and existing.get("state") == "failed" else 1
+        if existing:
+            notices.remove(existing)
+        notices.append(
+            {
+                **identity,
+                "resource_identity": envelope["sender_resource_identity"],
+                "resource_kind": envelope["resource_kind"],
+                "lease_generation": envelope["lease_generation"],
+                "transition": envelope["transition"],
+                "state": "pending",
+                "attempt": attempt,
+                "request_fingerprint": request_fingerprint,
+                "at": coordination_now(),
+            }
+        )
+        decision["allowed"] = True
+
+    if state_path(payload) is None:
+        emit_pretool_deny(
+            "Workflow Manager blocked coordination because an atomic session ledger is unavailable."
+        )
+        return True
+    _, changed = mutate_state(payload, reserve_pending)
+    if not changed or "allowed" not in decision:
+        emit_pretool_deny(
+            "Workflow Manager blocked coordination because the atomic session reservation was unavailable or already processed."
+        )
+    elif not decision["allowed"]:
+        emit_pretool_deny(str(decision.get("reason") or "Workflow Manager blocked coordination."))
+    return True
+
+
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
+    if handle_coordination_pretool(payload, state, fingerprint):
+        return
     if normalized_key(payload.get("tool_name")).endswith("followuptask") and state.get("assessor_state") in {"simple_execution_required", "recovery_required"}:
         request = subagent_request_text(payload)
         target = next((str(candidate.get("target") or "") for candidate in subagent_request_candidates(payload) if candidate.get("target")), "")
@@ -5677,6 +6437,27 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     response = payload.get("tool_response")
     status_value = response_status(response)
+    coordination_activity = (
+        coordination_activity_from_response(response)
+        if is_list_threads_tool(payload)
+        else None
+    )
+    coordination_post: dict[str, str] | None = None
+    if is_send_message_to_thread_tool(payload):
+        fields, _ = coordination_send_fields(payload)
+        envelope, _ = parse_coordination_envelope(fields.get("message") if fields else None)
+        if fields and envelope:
+            coordination_post = coordination_notice_identity(envelope)
+            coordination_post["request_fingerprint"] = stable_hash(
+                f"workflow-coordination-request-v1\0{fingerprint}", 32
+            )
+    coordination_send_state = "unconfirmed"
+    if status_value.startswith("error") or status_value in ERROR_STATUSES:
+        coordination_send_state = "failed"
+    elif isinstance(response, dict):
+        explicit = str(response.get("status") or response.get("state") or "").strip().lower()
+        if explicit in {"ok", "accepted", "success"} or response.get("ok") is True or response.get("success") is True:
+            coordination_send_state = "sent"
     command = extract_command(payload)
     category = command_category(payload, command)
     risk_kind = command_risk_kind(payload, command)
@@ -5696,6 +6477,27 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     )
 
     def update(state: dict[str, Any]) -> None:
+        if coordination_activity is not None:
+            state["coordination_activity"] = coordination_activity
+        if coordination_post:
+            notice = next(
+                (
+                    item
+                    for item in reversed(state.get("coordination_notices", []))
+                    if item.get("notice_fingerprint") == coordination_post["notice_fingerprint"]
+                    and item.get("request_fingerprint") == coordination_post["request_fingerprint"]
+                    and item.get("state") == "pending"
+                ),
+                None,
+            )
+            if notice:
+                if coordination_send_state == "sent":
+                    notice["state"] = "sent"
+                elif coordination_send_state == "unconfirmed":
+                    notice["state"] = "unconfirmed"
+                else:
+                    notice["state"] = "exhausted" if safe_int(notice.get("attempt")) >= 2 else "failed"
+                notice["at"] = coordination_now()
         active_plan_digest = (
             state.get("plan_digest")
             if state.get("plan_state") == "confirmed"
@@ -5813,6 +6615,21 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                     state.get("last_execution_baseline")
                 ),
                 "causal_review": _safe_causal_review(state.get("causal_review")),
+                "coordination_activity": [
+                    safe
+                    for raw in state.get("coordination_activity", [])
+                    if (safe := _safe_coordination_activity(raw)) is not None
+                ][:MAX_COORDINATION_ACTIVITY],
+                "coordination_notices": [
+                    safe
+                    for raw in state.get("coordination_notices", [])
+                    if (safe := _safe_coordination_notice(raw)) is not None
+                ][-MAX_COORDINATION_NOTICES:],
+                "coordination_inbound": [
+                    safe
+                    for raw in state.get("coordination_inbound", [])
+                    if (safe := _safe_coordination_inbound(raw)) is not None
+                ][-MAX_COORDINATION_INBOUND:],
                 "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [

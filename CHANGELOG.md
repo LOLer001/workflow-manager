@@ -1,5 +1,13 @@
 # 更新记录
 
+## 1.0.32
+
+- 跨任务共享资源协调改为即时证据门禁：只有 fresh `list_threads` 同时证明当前任务和目标任务处于同一宿主、不同任务且均为 `active`，并且当前任务证据确认双方处于同一资源的冲突阶段时，才允许发送一次结构化通知；`idle`、`notLoaded`、已完成、缺失、未知、异资源、兼容阶段或过期快照全部拒绝。
+- 新的 `WORKFLOW_COORDINATION_V1` 控制协议绑定 source/target、资源、冲突阶段、owner、lease generation 与 `blocked|released` transition；旧 generation 不能释放新 claim，发送失败后必须重新取得 fresh 活跃快照才可进行唯一一次修正重试，未知宿主回执保持终态 `unconfirmed`，不会机械重复发送。
+- fresh source/target 校验、notice 去重、ABA/retry 校验与 pending 占位现在位于同一个会话状态锁事务中；并发相同请求严格只有一条获准，另一条以 pending 重复原因拒绝，避免检查与写入之间的竞态。
+- 普通 `send_message_to_thread` 即使含 build、lock、device 或 release 等词也完全不受协调协议拦截；完整入站控制消息只更新有界协调账本，legacy `<codex_delegation>`、混合或畸形控制不会再刷新目标、评估者、计划、执行者、参考或因果合同。
+- 状态 Schema 升至 16；活动快照、通知和入站账本只保存域分离指纹、枚举、代次、尝试与时间，不持久化 task/host ID、标题、摘要、资源名或消息原文。新增真实 Desktop `id`/`prompt`/`schemaVersion`、拓扑、歧义清旧、fresh retry、ABA、并发 one-shot、压缩隐私与旧 R06/严格合同回归。
+
 ## 1.0.31
 
 - 修复合法高档评估者创建请求被通用 assessor gate 误判为非评估者、进而重复拒绝的问题；任何已识别的 assessor 意图都会先返回具体的绑定、目标、档位、fork、合同或恢复校验原因。Hook 仍只校验和记录请求及宿主回显，不宣称已经切换父会话或子智能体模型。

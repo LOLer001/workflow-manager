@@ -35,7 +35,7 @@ Optimize critical-path time. Launch ready positive-utility lanes only when time 
 
 - Before spawning note `deliverable | ready | owner | resource | time saved`. Read-only investigation is only one option; owned write/test/research/review lanes qualify.
 - Parent owns integration/shared state. Treat caps as ceilings, never quotas: Direct/Focused 0; Complex up to 2 subagents; Extensive up to 3.
-- Serialize only overlapping edits or shared delivery/device stages; unrelated lanes may run. Pending Hard plans permit only read-only children.
+- Serialize overlapping edits/shared stages only. Cross-task notices require a fresh active same-host peer plus the same resource/conflict; read [live coordination](references/live-coordination.md). Pending Hard plans permit only read-only children.
 - Confirmed Hard has one executor; only read-only side lanes continue. Stay local when tiny, unready, overlapping, slower, or opted out.
 - Give each child a concise Chinese purpose summary and safe ASCII `task_name`; state scope, ownership, and result shape. Reuse a live agent for one bounded follow-up.
 
