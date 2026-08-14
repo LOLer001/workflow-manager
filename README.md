@@ -9,6 +9,7 @@
 - 每个 Work 新目标显式创建一个最高可用模型/推理的绑定评估子智能体；PreTool 仅接受完整证明请求。Start 的 active model 匹配可证明模型，推理强度只有宿主明确回显才可观测，缺失不算失败。
 - 简单工作问题由评估档直接解决和验证，不额外增加计划确认轮次。
 - 困难工作问题先只读取证据，再给出包含模块、文件、方法、改动、构建部署、验收、风险和回退的详细计划；只有用户严格确认当前计划后才开始写入、构建或部署。
+- 详细困难计划进入待确认状态时会在插件私有数据目录生成经过清理、与目标/难度/代次/摘要绑定的 Markdown 审阅镜像；镜像只便于审阅，不能确认计划或授权执行，状态中的 `plan_digest` 始终是权威绑定。
 - 严格确认后，父会话继续以高推理负责协调和复核；从宿主当时实际暴露的选项中选择最新的较低档 Codex 模型，创建唯一合同执行子智能体并固定 `reasoning_effort=medium`，不硬编码具体模型名。
 - Hook 不能切换父会话模型；只有宿主接受带显式 `model` 覆盖且 `fork_turns=none` 或正整数的创建请求，才算子智能体切换证据。
 - `execution_contract_id` 同时绑定目标、难度决策、计划代次和计划摘要；失败按类型记录，初次失败后最多允许一次有实质修正的恢复，禁止原样重试。
@@ -40,14 +41,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.34\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.35\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.34/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.35/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -68,14 +69,14 @@ Workflow Manager 不会仅因新版 Hook 已接管就删除旧版本缓存：旧
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.34\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.35\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.34/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.35/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
 ```
 
 `hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
@@ -116,7 +117,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.34 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.35 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -133,6 +134,8 @@ codex plugin add workflow-manager@workflow-manager --json
 处理顺序是“日常/工作 → Work 的高档评估者判简单/困难 → 独立判断 Direct/Focused/Complex/Extensive”。困难不等于增加执行者数量；除高评估者和已确认的唯一执行者外，子智能体数量也不能反向决定问题难度。任务仍只按需经过 `Contract → Evidence → Change → Verify → Report`。
 
 困难计划等待确认期间，目标读取、搜索、静态检查、计划更新、澄清问题和明确只读的子智能体调查可以继续；明确文件写入、变更型子智能体或 Git、构建打包、部署安装和设备变更会被拦截。确认只绑定当前计划、目标和难度判断；任何新增约束或重规划请求都会使原确认失效。
+
+私有 Markdown 镜像只复制经过清理和大小限制的详细计划正文。镜像写入失败、正文漂移或路径身份异常不会改变权威 `plan_digest`，也不会自行锁定或开放确认；修正真实原因后，同一计划可以安全重试写入。每个会话只保留当前镜像和最新 5 个受管旧镜像；保留清理以最多 16 项的有界事务执行，路径绑定或删除前后校验失败时逐字节回滚，符号链接、硬链接、同名竞态和目录替换均以 `unsafe_path` 关闭镜像 I/O。
 
 插件会读取 Codex 生命周期事件来判断路由、输出规模和续接状态；持久化数据只保留摘要、指纹、验收待办状态和计数，不保存原始提示词、命令或子智能体结果。大工具结果会保留给模型正常推理，插件只提示后续查询如何收窄，不会仅因为输出较大而替换必要证据。钩子属于工作流护栏，不是安全边界。子智能体可能减少主会话噪声，但不保证降低总 token 消耗。
 
@@ -186,9 +189,10 @@ Windows 原生测试：
 ```powershell
 Set-Location plugins/workflow-manager
 py -3 -m unittest -v tests.test_windows_hook
+py -3 -m unittest -v tests.test_plan_artifact
 ```
 
-提交前应同时通过仓库校验、完整 Python 测试和 Windows 13 项原生测试。GitHub Actions 会自动执行这些检查。
+提交前应同时通过仓库校验、完整 Python 测试、Windows 14 项 Hook 测试和 30 项计划镜像测试；无符号链接权限时仅允许对应夹具精确跳过。GitHub Actions 会自动执行这些检查。
 
 ## 贡献与发布
 

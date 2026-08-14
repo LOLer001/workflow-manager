@@ -383,8 +383,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 17)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.34")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 18)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.35")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -5041,7 +5041,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         migrated = self.load_only_state(data)
-        self.assertEqual(migrated["schema_version"], 17)
+        self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
         self.assertEqual(migrated["session_execution_preference"], "default")
         self.assertEqual(migrated["writer_version"], HOOK.WRITER_VERSION)
         self.assertEqual(

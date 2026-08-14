@@ -93,6 +93,19 @@ class WindowsHookTests(unittest.TestCase):
             timeout=45,
         )
 
+    def test_plan_directory_guard_blocks_rename_until_handles_close(self) -> None:
+        root = self.data
+        session = HOOK.plan_artifact_session_id("windows-handle-guard")
+        directory = root / "plans" / session
+        renamed = self.root / "renamed-plan-session"
+        with HOOK.plan_session_directory_guard(root, session) as guard:
+            guard["verify"]()
+            with self.assertRaises(OSError):
+                directory.rename(renamed)
+            self.assertTrue(directory.is_dir())
+        directory.rename(renamed)
+        self.assertTrue(renamed.is_dir())
+
     def test_all_declared_events_use_same_windows_command(self) -> None:
         hooks = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]
         commands = [

@@ -27,6 +27,12 @@ Spawn with all of these settings:
 
 Host acceptance of this exact spawn is handoff-request evidence. Subagent start must match the pending request before mutation; report only the model/effort fields the host accepted or echoed, never assumed fields.
 
+## Private plan review mirror
+
+When a detailed Hard plan reaches `awaiting_confirmation`, the Hook may write a sanitized, size-bounded Markdown mirror under its private data root. The artifact binds its relative path, objective and difficulty fingerprints, positive generation, authoritative `plan_digest`, and body digest. It is review-only: creating or editing it never confirms the plan, changes the bound plan, or authorizes execution. The state `plan_digest` remains authoritative.
+
+Verify the artifact on later state events and after compaction/resume. Body mismatch is `content_drift`; unsafe roots, replaced directories, links, unexpected link counts, identity races, or write failures close only artifact I/O and must not self-lock confirmation. Retry the same plan mirror only after correcting the recorded cause. Retention keeps the current artifact plus the five newest owned old artifacts in deterministic order. Each deletion transaction is capped at 16, snapshots bytes and mode before quarantine, verifies the directory binding before and immediately after every unlink, and restores the whole transaction byte-for-byte without overwriting a path that appeared during the race.
+
 ## Execution contract
 
 Compute `execution_contract_id` from the execution-profile version, normalized resolved policy/profile, and all four bindings:

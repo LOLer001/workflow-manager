@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -20,8 +22,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 17
-WRITER_VERSION = "1.0.34"
+SCHEMA_VERSION = 18
+WRITER_VERSION = "1.0.35"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -56,6 +58,9 @@ MAX_COORDINATION_INBOUND = 32
 COORDINATION_SNAPSHOT_TTL_SECONDS = 60
 COORDINATION_ID_MAX_BYTES = 4096
 MAX_STATE_BYTES = 1024 * 1024
+MAX_PLAN_ARTIFACT_BODY_BYTES = 96 * 1024
+MAX_OLD_PLAN_ARTIFACTS = 5
+MAX_RETENTION_TRANSACTION_ITEMS = 16
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
 LOCK_TIMEOUT_SECONDS = 0.75
 DUPLICATE_TTL_SECONDS = 15 * 60
@@ -117,6 +122,34 @@ CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
 CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
 REFERENCE_ACCEPTANCE_STATES = {"disabled", "planned", "candidate", "accepted", "failed"}
+PLAN_ARTIFACT_LIFECYCLE_STATUSES = {
+    "none",
+    "ready",
+    "confirmed",
+    "executing",
+    "succeeded",
+    "invalidated",
+}
+PLAN_ARTIFACT_WRITE_STATUSES = {
+    "none",
+    "written",
+    "write_failed",
+    "content_drift",
+    "legacy_unavailable",
+}
+PLAN_ARTIFACT_WARNING_CODES = {
+    "none",
+    "unsafe_data_root",
+    "unsafe_path",
+    "write_error",
+    "content_drift",
+    "legacy_unavailable",
+}
+PLAN_ARTIFACT_OWNER = "<!-- workflow-manager-plan-artifact:v1"
+PLAN_ARTIFACT_BODY_MARKER = "<!-- workflow-manager-plan-body -->"
+PLAN_ARTIFACT_NAME_RE = re.compile(
+    r"^hard-plan-g([0-9]{4,})-([0-9a-f]{32})\.md$"
+)
 
 SUCCESS_STATUSES = {"ok"}
 ERROR_STATUSES = {
@@ -153,7 +186,7 @@ SENSITIVE_KEYS = {
 }
 
 SENSITIVE_TEXT_KEY_PATTERN = (
-    r"(?:api[_-]?key|(?:[a-z][a-z0-9]*[_-])*token|client[_-]?secret|secret|password|passwd|"
+    r"(?:api[_-]?key|(?:token|[a-z][a-z0-9_-]{0,63}token)|client[_-]?secret|secret|password|passwd|"
     r"authorization|cookie)"
 )
 
@@ -927,6 +960,12 @@ def safe_id(value: Any) -> str:
     return f"{readable}-{stable_hash(raw)}"
 
 
+def plan_artifact_session_id(value: Any) -> str:
+    """Keep private plan paths unlinkable to readable host session labels."""
+    raw = str(value or "")
+    return f"session-{stable_hash('plan-artifact-session' + chr(0) + raw)}"
+
+
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
         return min(max(int(os.environ.get(name, default)), minimum), maximum)
@@ -1379,6 +1418,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_difficulty_decision_id": None,
         "confirmed_plan_digest": None,
         "confirmed_at": None,
+        "plan_artifact": empty_plan_artifact(),
         "execution_profile_version": EXECUTION_PROFILE_VERSION,
         "executor_state": "none",
         "execution_contract_id": None,
@@ -1843,6 +1883,1222 @@ def _safe_causal_review(item: Any) -> dict[str, Any]:
     }
 
 
+def empty_plan_artifact() -> dict[str, Any]:
+    return {
+        "relative_path": None,
+        "objective_fingerprint": None,
+        "difficulty_decision_id": None,
+        "plan_digest": None,
+        "content_digest": None,
+        "generation": 0,
+        "lifecycle_status": "none",
+        "write_status": "none",
+        "warning_code": "none",
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+def _safe_plan_artifact(item: Any) -> dict[str, Any]:
+    result = empty_plan_artifact()
+    if not isinstance(item, dict):
+        return result
+    relative = str(item.get("relative_path") or "")
+    relative_match = re.fullmatch(
+        r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan-g[0-9]{4,}-[0-9a-f]{32}\.md",
+        relative,
+    )
+    result.update(
+        {
+            "relative_path": relative if relative_match else None,
+            "objective_fingerprint": safe_fingerprint(item.get("objective_fingerprint")) or None,
+            "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
+            "plan_digest": safe_fingerprint(item.get("plan_digest")) or None,
+            "content_digest": safe_fingerprint(item.get("content_digest")) or None,
+            "generation": max(safe_int(item.get("generation")), 0),
+            "lifecycle_status": item.get("lifecycle_status") if item.get("lifecycle_status") in PLAN_ARTIFACT_LIFECYCLE_STATUSES else "none",
+            "write_status": item.get("write_status") if item.get("write_status") in PLAN_ARTIFACT_WRITE_STATUSES else "none",
+            "warning_code": item.get("warning_code") if item.get("warning_code") in PLAN_ARTIFACT_WARNING_CODES else "none",
+            "created_at": str(item.get("created_at"))[:40] if item.get("created_at") else None,
+            "updated_at": str(item.get("updated_at"))[:40] if item.get("updated_at") else None,
+        }
+    )
+    if result["relative_path"] and result["plan_digest"] not in result["relative_path"]:
+        result["relative_path"] = None
+    return result
+
+
+def _plan_artifact_lifecycle(state: dict[str, Any], artifact_digest: str | None) -> str:
+    if not artifact_digest:
+        return "none"
+    if state.get("plan_digest") != artifact_digest or state.get("plan_state") in {"none", "analyzing", "invalidated"}:
+        return "invalidated"
+    if state.get("executor_state") == "succeeded":
+        return "succeeded"
+    if state.get("plan_state") == "confirmed":
+        if state.get("executor_state") in {"spawn_pending", "running", "local_running", "recovery_required", "exhausted"}:
+            return "executing"
+        return "confirmed"
+    return "ready"
+
+
+def _legacy_plan_artifact(state: dict[str, Any]) -> dict[str, Any]:
+    artifact = empty_plan_artifact()
+    plan_digest = safe_fingerprint(state.get("plan_digest")) or None
+    if not plan_digest:
+        return artifact
+    artifact.update(
+        {
+            "objective_fingerprint": safe_fingerprint(state.get("plan_objective_fingerprint")) or None,
+            "difficulty_decision_id": safe_fingerprint(state.get("plan_difficulty_decision_id")) or None,
+            "plan_digest": plan_digest,
+            "generation": max(safe_int(state.get("plan_generation")), 0),
+            "lifecycle_status": _plan_artifact_lifecycle(state, plan_digest),
+            "write_status": "legacy_unavailable",
+            "warning_code": "legacy_unavailable",
+            "updated_at": utc_now(),
+        }
+    )
+    return artifact
+
+
+def sync_plan_artifact_lifecycle(state: dict[str, Any]) -> None:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    lifecycle = _plan_artifact_lifecycle(state, artifact.get("plan_digest"))
+    if artifact["lifecycle_status"] != lifecycle:
+        artifact["lifecycle_status"] = lifecycle
+        artifact["updated_at"] = utc_now()
+    state["plan_artifact"] = artifact
+
+def sanitize_plan_artifact_body(value: Any) -> str:
+    source = str(value or "")
+    suffix = "\n\n> Workflow Manager: plan mirror truncated at the private artifact byte limit.\n"
+    allowance = MAX_PLAN_ARTIFACT_BODY_BYTES - len(suffix.encode("utf-8"))
+    bidi_controls = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
+    characters: list[str] = []
+    used_bytes = 0
+    source_truncated = False
+    for character in source:
+        codepoint = ord(character)
+        if codepoint in bidi_controls:
+            continue
+        if character == "\r":
+            character = "\n"
+            codepoint = ord(character)
+        if character not in {"\n", "\t"} and (codepoint < 32 or codepoint == 127):
+            continue
+        encoded_character = character.encode("utf-8")
+        if used_bytes + len(encoded_character) > allowance:
+            source_truncated = True
+            break
+        characters.append(character)
+        used_bytes += len(encoded_character)
+    text = "".join(characters)
+    protocol = re.compile(
+        r"^\s*(?:WORK_ASSESSMENT|SIMPLE_EXECUTION|LOCAL_EXECUTION|EXECUTION_STALL|"
+        r"STALL_DIAGNOSIS|CAUSAL_REVIEW|WORKFLOW_COORDINATION_V1|END_WORKFLOW_COORDINATION)\b",
+        re.I,
+    )
+    lines = [
+        line
+        for line in text.splitlines()
+        if not protocol.match(line)
+        and not re.fullmatch(
+            r"\s*计划已就绪，等待确认后执行[。.!！\s]*",
+            line,
+        )
+    ]
+    body = redact_text("\n".join(lines))
+    body = body.replace("<redacted-token>", "[REDACTED]").replace(
+        "<redacted>", "[REDACTED]"
+    )
+    body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
+    if source_truncated:
+        body = body.rstrip() + suffix
+    encoded = body.encode("utf-8")
+    if len(encoded) > MAX_PLAN_ARTIFACT_BODY_BYTES:
+        suffix = "\n\n> Workflow Manager: plan mirror truncated at the private artifact byte limit.\n"
+        allowance = MAX_PLAN_ARTIFACT_BODY_BYTES - len(suffix.encode("utf-8"))
+        body = encoded[:allowance].decode("utf-8", errors="ignore").rstrip() + suffix
+    return body.rstrip() + "\n"
+
+
+def _plan_artifact_body(document: str) -> str | None:
+    marker = PLAN_ARTIFACT_BODY_MARKER + "\n"
+    return document.split(marker, 1)[1] if marker in document else None
+
+
+def plan_artifact_body_digest(document: str) -> str | None:
+    body = _plan_artifact_body(str(document or ""))
+    return stable_hash(body, 32) if body is not None else None
+
+
+class PlanArtifactError(OSError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code if code in PLAN_ARTIFACT_WARNING_CODES else "write_error"
+
+
+def _canonical_plan_data_root(payload: dict[str, Any]) -> Path:
+    configured = os.environ.get("PLUGIN_DATA") or os.environ.get("CLAUDE_PLUGIN_DATA")
+    root = Path(configured) if configured else Path.home() / ".codex" / "workflow-manager"
+    if not root.is_absolute() or Path(os.path.abspath(str(root))) != root:
+        raise PlanArtifactError("unsafe_data_root")
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise PlanArtifactError("unsafe_data_root")
+    resolved = root.resolve(strict=False)
+    cwd_value = payload.get("cwd")
+    if cwd_value:
+        cwd = Path(str(cwd_value))
+        if cwd.is_absolute():
+            try:
+                resolved.relative_to(cwd.resolve(strict=False))
+            except ValueError:
+                pass
+            else:
+                raise PlanArtifactError("unsafe_data_root")
+    return resolved
+
+
+def _ensure_private_real_dir(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(mode=0o700)
+    else:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise PlanArtifactError("unsafe_path")
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _directory_identity(info: os.stat_result) -> tuple[int, int]:
+    return (int(info.st_dev), int(info.st_ino))
+
+
+def _require_directory_identity(info: os.stat_result, expected: tuple[int, int]) -> None:
+    if not stat.S_ISDIR(info.st_mode) or _directory_identity(info) != expected:
+        raise PlanArtifactError("unsafe_path")
+
+
+def _windows_api_directory_path(path: Path) -> str:
+    value = os.path.abspath(str(path))
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _windows_open_directory_guard(path: Path) -> tuple[Any, tuple[int, int]]:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation)]
+    get_information.restype = wintypes.BOOL
+    handle = create_file(
+        _windows_api_directory_path(path),
+        0x80000000,
+        0x0001 | 0x0002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise PlanArtifactError("unsafe_path")
+    information = ByHandleFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        _windows_close_handle(handle)
+        raise PlanArtifactError("unsafe_path")
+    attributes = int(information.dwFileAttributes)
+    if not attributes & 0x0010 or attributes & 0x0400:
+        _windows_close_handle(handle)
+        raise PlanArtifactError("unsafe_path")
+    identity = (
+        int(information.dwVolumeSerialNumber),
+        (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow),
+    )
+    return handle, identity
+
+
+def _windows_close_handle(handle: Any) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(handle):
+        raise PlanArtifactError("unsafe_path")
+
+
+@contextmanager
+def plan_session_directory_guard(
+    root: Path, session: str, *, create: bool = True
+) -> Iterator[dict[str, Any]]:
+    if not re.fullmatch(r"session-[0-9a-f]{16}", session):
+        raise PlanArtifactError("unsafe_path")
+    if create:
+        _ensure_private_real_dir(root)
+    if os.name == "nt":
+        handles: list[Any] = []
+        guarded: list[tuple[Path, tuple[int, int]]] = []
+        try:
+            for path in (root, root / "plans", root / "plans" / session):
+                if create:
+                    _ensure_private_real_dir(path)
+                handle, identity = _windows_open_directory_guard(path)
+                handles.append(handle)
+                guarded.append((path, identity))
+
+            def verify() -> None:
+                for path, expected in guarded:
+                    handle, observed = _windows_open_directory_guard(path)
+                    try:
+                        if observed != expected:
+                            raise PlanArtifactError("unsafe_path")
+                    finally:
+                        _windows_close_handle(handle)
+
+            yield {"directory_fd": None, "verify": verify}
+        finally:
+            for handle in reversed(handles):
+                _windows_close_handle(handle)
+        return
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise PlanArtifactError("unsafe_path")
+    flags = os.O_RDONLY | nofollow | directory
+    descriptors: list[int] = []
+    try:
+        root_fd = os.open(str(root), flags)
+        descriptors.append(root_fd)
+        if create:
+            os.fchmod(root_fd, 0o700)
+        root_identity = _directory_identity(os.fstat(root_fd))
+        for name in ("plans", session):
+            parent_fd = descriptors[-1]
+            if create:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+            child_fd = os.open(name, flags, dir_fd=parent_fd)
+            descriptors.append(child_fd)
+            if create:
+                os.fchmod(child_fd, 0o700)
+        plans_fd, session_fd = descriptors[1], descriptors[2]
+        plans_identity = _directory_identity(os.fstat(plans_fd))
+        session_identity = _directory_identity(os.fstat(session_fd))
+
+        def verify() -> None:
+            _require_directory_identity(root.lstat(), root_identity)
+            _require_directory_identity(
+                os.stat("plans", dir_fd=root_fd, follow_symlinks=False), plans_identity
+            )
+            _require_directory_identity(
+                os.stat(session, dir_fd=plans_fd, follow_symlinks=False), session_identity
+            )
+
+        verify()
+        yield {"directory_fd": session_fd, "verify": verify}
+    except OSError as error:
+        if isinstance(error, PlanArtifactError):
+            raise
+        raise PlanArtifactError("unsafe_path") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _atomic_write_plan_file(
+    path: Path,
+    payload: bytes,
+    *,
+    directory_fd: int | None = None,
+    verify_binding: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if not PLAN_ARTIFACT_NAME_RE.fullmatch(path.name):
+        raise PlanArtifactError("unsafe_path")
+    transaction: dict[str, Any] = {
+        "path": path,
+        "directory_fd": directory_fd,
+        "old_identity": None,
+        "backup_name": None,
+        "new_identity": None,
+    }
+    try:
+        existing = _plan_lstat(path, directory_fd)
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            stat.S_ISLNK(existing.st_mode)
+            or not stat.S_ISREG(existing.st_mode)
+            or existing.st_nlink != 1
+        ):
+            raise PlanArtifactError("unsafe_path")
+        transaction["old_identity"] = _plan_file_identity(existing)
+    descriptor = -1
+    temporary_name: str | None = None
+    temporary_path: Path | None = None
+    try:
+        if directory_fd is not None:
+            for _ in range(64):
+                candidate = f".{path.name}.{secrets.token_hex(12)}.tmp"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                except FileExistsError:
+                    continue
+                temporary_name = candidate
+                break
+        else:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+            )
+            temporary_path = Path(temporary)
+            temporary_name = temporary_path.name
+        if descriptor < 0 or temporary_name is None:
+            raise PlanArtifactError("write_error")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if verify_binding is not None:
+            verify_binding()
+        if transaction["old_identity"] is not None:
+            backup_name = _transaction_name(path, "backup", directory_fd)
+            _plan_rename(path, backup_name, directory_fd)
+            transaction["backup_name"] = backup_name
+            backup_info = _plan_lstat(path.parent / backup_name, directory_fd)
+            if _plan_file_identity(backup_info) != transaction["old_identity"]:
+                raise PlanArtifactError("unsafe_path")
+        if directory_fd is not None:
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        else:
+            if temporary_path is None:
+                raise PlanArtifactError("write_error")
+            os.replace(temporary_path, path)
+        temporary_name = None
+        temporary_path = None
+        installed = _plan_lstat(path, directory_fd)
+        transaction["new_identity"] = _plan_file_identity(installed)
+        if (
+            stat.S_ISLNK(installed.st_mode)
+            or not stat.S_ISREG(installed.st_mode)
+            or installed.st_nlink != 1
+        ):
+            raise PlanArtifactError("unsafe_path")
+        try:
+            if directory_fd is not None:
+                os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+                os.fsync(directory_fd)
+            else:
+                path.chmod(0o600)
+        except (NotImplementedError, OSError):
+            pass
+        if verify_binding is not None:
+            verify_binding()
+        return transaction
+    except Exception as error:
+        if transaction["backup_name"] is not None or transaction["new_identity"] is not None:
+            try:
+                _rollback_plan_write(transaction)
+            except PlanArtifactError as rollback_error:
+                raise rollback_error from error
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name is not None:
+            try:
+                if directory_fd is not None:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                elif temporary_path is not None:
+                    temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _plan_file_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (int(info.st_dev), int(info.st_ino), int(info.st_nlink))
+
+
+def _plan_lstat(path: Path, directory_fd: int | None) -> os.stat_result:
+    return (
+        os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if directory_fd is not None
+        else path.lstat()
+    )
+
+
+def _plan_rename(path: Path, target_name: str, directory_fd: int | None) -> None:
+    if directory_fd is not None:
+        os.rename(
+            path.name,
+            target_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    else:
+        path.rename(path.parent / target_name)
+
+
+def _plan_rename_if_absent(
+    path: Path, target_name: str, directory_fd: int | None
+) -> None:
+    if os.name == "nt":
+        if directory_fd is not None:
+            raise PlanArtifactError("unsafe_path")
+        try:
+            path.rename(path.parent / target_name)
+        except FileExistsError as error:
+            raise PlanArtifactError("unsafe_path") from error
+        return
+
+    import ctypes
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise PlanArtifactError("unsafe_path") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    source_fd = directory_fd if directory_fd is not None else at_fdcwd
+    target_fd = directory_fd if directory_fd is not None else at_fdcwd
+    source = os.fsencode(path.name if directory_fd is not None else path)
+    target = os.fsencode(
+        target_name if directory_fd is not None else path.parent / target_name
+    )
+    if renameat2(source_fd, source, target_fd, target, 1) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise PlanArtifactError("unsafe_path")
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _transaction_name(path: Path, purpose: str, directory_fd: int | None) -> str:
+    for _ in range(64):
+        name = f".{path.name}.{purpose}.{secrets.token_hex(12)}"
+        try:
+            _plan_lstat(path.parent / name, directory_fd)
+        except FileNotFoundError:
+            return name
+    raise PlanArtifactError("write_error")
+
+
+def _unlink_plan_file_if_identity(
+    path: Path,
+    expected: tuple[int, int, int],
+    directory_fd: int | None,
+) -> bool:
+    try:
+        observed = _plan_lstat(path, directory_fd)
+    except FileNotFoundError:
+        return True
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or _plan_file_identity(observed) != expected
+    ):
+        return False
+    if directory_fd is not None:
+        os.unlink(path.name, dir_fd=directory_fd)
+    else:
+        path.unlink()
+    try:
+        remaining = _plan_lstat(path, directory_fd)
+    except FileNotFoundError:
+        return True
+    return _plan_file_identity(remaining) != expected
+
+
+def _rollback_plan_write(transaction: dict[str, Any]) -> None:
+    path = transaction["path"]
+    directory_fd = transaction.get("directory_fd")
+    new_identity = transaction.get("new_identity")
+    if new_identity and not _unlink_plan_file_if_identity(path, new_identity, directory_fd):
+        raise PlanArtifactError("unsafe_path")
+    backup_name = transaction.get("backup_name")
+    old_identity = transaction.get("old_identity")
+    if not backup_name:
+        return
+    backup = path.parent / backup_name
+    try:
+        target = _plan_lstat(path, directory_fd)
+    except FileNotFoundError:
+        pass
+    else:
+        if not old_identity or _plan_file_identity(target) != old_identity:
+            raise PlanArtifactError("unsafe_path")
+        transaction["backup_name"] = None
+        return
+    backup_info = _plan_lstat(backup, directory_fd)
+    if (
+        not old_identity
+        or stat.S_ISLNK(backup_info.st_mode)
+        or not stat.S_ISREG(backup_info.st_mode)
+        or backup_info.st_nlink != 1
+        or _plan_file_identity(backup_info) != old_identity
+    ):
+        raise PlanArtifactError("unsafe_path")
+    _plan_rename(backup, path.name, directory_fd)
+    restored = _plan_lstat(path, directory_fd)
+    if _plan_file_identity(restored) != old_identity:
+        raise PlanArtifactError("unsafe_path")
+    transaction["backup_name"] = None
+
+
+def _commit_plan_write(
+    transaction: dict[str, Any], verify_binding: Callable[[], None] | None
+) -> None:
+    backup_name = transaction.get("backup_name")
+    if not backup_name:
+        return
+    if verify_binding is not None:
+        verify_binding()
+    backup = transaction["path"].parent / backup_name
+    if not _unlink_plan_file_if_identity(
+        backup, transaction["old_identity"], transaction.get("directory_fd")
+    ):
+        raise PlanArtifactError("unsafe_path")
+    transaction["backup_name"] = None
+
+
+def _owned_plan_artifact_record(
+    path: Path, *, directory_fd: int | None = None
+) -> tuple[int, str, tuple[int, int, int]] | None:
+    descriptor = -1
+    try:
+        match = PLAN_ARTIFACT_NAME_RE.fullmatch(path.name)
+        if not match:
+            return None
+        if directory_fd is not None:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            info = os.fstat(descriptor)
+            header_bytes = os.read(descriptor, 4097)
+        else:
+            info = path.lstat()
+            with path.open("rb") as stream:
+                header_bytes = stream.read(4097)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None
+        if len(header_bytes) > 4096:
+            header_bytes = header_bytes[:4096]
+        header = header_bytes.decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not header.startswith(PLAN_ARTIFACT_OWNER + "\n"):
+        return None
+    generation = re.search(r"(?m)^generation: ([0-9]+)$", header)
+    digest = re.search(r"(?m)^plan_digest: ([0-9a-f]{32})$", header)
+    if not generation or not digest:
+        return None
+    parsed = (safe_int(generation.group(1)), digest.group(1))
+    if parsed != (safe_int(match.group(1)), match.group(2)):
+        return None
+    return (parsed[0], parsed[1], _plan_file_identity(info))
+
+
+def _owned_plan_artifact(
+    path: Path, *, directory_fd: int | None = None
+) -> tuple[int, str] | None:
+    record = _owned_plan_artifact_record(path, directory_fd=directory_fd)
+    return (record[0], record[1]) if record is not None else None
+
+
+def _read_exact_plan_bytes(
+    path: Path,
+    expected: tuple[int, int, int],
+    directory_fd: int | None,
+) -> bytes:
+    limit = MAX_PLAN_ARTIFACT_BODY_BYTES + 16 * 1024
+    descriptor = -1
+    try:
+        if directory_fd is not None:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            before = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or _plan_file_identity(before) != expected
+                or before.st_size > limit
+            ):
+                raise PlanArtifactError("unsafe_path")
+            chunks: list[bytes] = []
+            observed_size = 0
+            while observed_size <= limit:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - observed_size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                observed_size += len(chunk)
+            document = b"".join(chunks)
+            after = os.fstat(descriptor)
+            after_path = _plan_lstat(path, directory_fd)
+            if (
+                stat.S_ISLNK(after_path.st_mode)
+                or not stat.S_ISREG(after_path.st_mode)
+                or after_path.st_nlink != 1
+                or _plan_file_identity(after) != expected
+                or _plan_file_identity(after_path) != expected
+            ):
+                raise PlanArtifactError("unsafe_path")
+        else:
+            before = path.lstat()
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or _plan_file_identity(before) != expected
+                or before.st_size > limit
+            ):
+                raise PlanArtifactError("unsafe_path")
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if _plan_file_identity(opened) != expected:
+                    raise PlanArtifactError("unsafe_path")
+                document = stream.read(limit + 1)
+                after_handle = os.fstat(stream.fileno())
+                after_path = path.lstat()
+            if (
+                stat.S_ISLNK(after_path.st_mode)
+                or not stat.S_ISREG(after_path.st_mode)
+                or after_path.st_nlink != 1
+                or _plan_file_identity(after_handle) != expected
+                or _plan_file_identity(after_path) != expected
+            ):
+                raise PlanArtifactError("unsafe_path")
+        if len(document) > limit:
+            raise PlanArtifactError("unsafe_path")
+        return document
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _retention_snapshot(
+    path: Path,
+    identity: tuple[int, int, int],
+    directory_fd: int | None,
+) -> dict[str, Any] | None:
+    try:
+        info = _plan_lstat(path, directory_fd)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or _plan_file_identity(info) != identity
+        ):
+            return None
+        document = _read_exact_plan_bytes(path, identity, directory_fd)
+        after = _plan_lstat(path, directory_fd)
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or _plan_file_identity(after) != identity
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(info.st_mode)
+        ):
+            return None
+    except (OSError, PlanArtifactError):
+        return None
+    return {
+        "document": document,
+        "identity": identity,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def _install_retention_snapshot(
+    path: Path, snapshot: dict[str, Any], directory_fd: int | None
+) -> None:
+    descriptor = -1
+    temporary_name: str | None = None
+    temporary_path: Path | None = None
+    try:
+        if directory_fd is not None:
+            for _ in range(64):
+                candidate = f".{path.name}.restore.{secrets.token_hex(12)}"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                except FileExistsError:
+                    continue
+                temporary_name = candidate
+                break
+        else:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.restore.", dir=str(path.parent)
+            )
+            temporary_path = Path(temporary)
+            temporary_name = temporary_path.name
+        if descriptor < 0 or temporary_name is None:
+            raise PlanArtifactError("unsafe_path")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(snapshot["document"])
+            stream.flush()
+            os.fsync(stream.fileno())
+            try:
+                os.fchmod(stream.fileno(), int(snapshot["mode"]))
+            except (AttributeError, NotImplementedError, OSError):
+                pass
+        temporary = path.parent / temporary_name
+        _plan_rename_if_absent(temporary, path.name, directory_fd)
+        temporary_name = None
+        temporary_path = None
+    except PlanArtifactError:
+        raise
+    except OSError as error:
+        raise PlanArtifactError("unsafe_path") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name is not None:
+            try:
+                if directory_fd is not None:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                elif temporary_path is not None:
+                    temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _restore_retention_snapshot(
+    path: Path, snapshot: dict[str, Any], directory_fd: int | None
+) -> None:
+    expected_document = snapshot["document"]
+    installed = False
+    try:
+        existing = _plan_lstat(path, directory_fd)
+    except FileNotFoundError:
+        _install_retention_snapshot(path, snapshot, directory_fd)
+        existing = _plan_lstat(path, directory_fd)
+        installed = True
+    if (
+        stat.S_ISLNK(existing.st_mode)
+        or not stat.S_ISREG(existing.st_mode)
+        or existing.st_nlink != 1
+        or (
+            not installed
+            and _plan_file_identity(existing) != snapshot["identity"]
+        )
+        or stat.S_IMODE(existing.st_mode) != int(snapshot["mode"])
+    ):
+        raise PlanArtifactError("unsafe_path")
+    identity = _plan_file_identity(existing)
+    observed = _read_exact_plan_bytes(path, identity, directory_fd)
+    if observed != expected_document:
+        raise PlanArtifactError("unsafe_path")
+
+
+def _retain_plan_artifacts(
+    directory: Path,
+    current: Path,
+    *,
+    directory_fd: int | None = None,
+    verify_binding: Callable[[], None] | None = None,
+) -> None:
+    def restore(staged: list[dict[str, Any]]) -> None:
+        try:
+            for entry in reversed(staged):
+                original = entry["original"]
+                quarantine = entry["quarantine"]
+                identity = entry["identity"]
+                snapshot = entry["snapshot"]
+                try:
+                    existing = _plan_lstat(original, directory_fd)
+                except FileNotFoundError:
+                    try:
+                        quarantined = _plan_lstat(quarantine, directory_fd)
+                    except FileNotFoundError:
+                        _restore_retention_snapshot(original, snapshot, directory_fd)
+                    else:
+                        if (
+                            stat.S_ISLNK(quarantined.st_mode)
+                            or not stat.S_ISREG(quarantined.st_mode)
+                            or quarantined.st_nlink != 1
+                            or _plan_file_identity(quarantined) != identity
+                            or stat.S_IMODE(quarantined.st_mode) != snapshot["mode"]
+                            or _read_exact_plan_bytes(
+                                quarantine, identity, directory_fd
+                            )
+                            != snapshot["document"]
+                        ):
+                            raise PlanArtifactError("unsafe_path")
+                        _plan_rename_if_absent(
+                            quarantine, original.name, directory_fd
+                        )
+                        _restore_retention_snapshot(
+                            original, snapshot, directory_fd
+                        )
+                else:
+                    if (
+                        stat.S_ISLNK(existing.st_mode)
+                        or not stat.S_ISREG(existing.st_mode)
+                        or existing.st_nlink != 1
+                        or _plan_file_identity(existing) != identity
+                    ):
+                        raise PlanArtifactError("unsafe_path")
+                    _restore_retention_snapshot(original, snapshot, directory_fd)
+                try:
+                    _plan_lstat(quarantine, directory_fd)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise PlanArtifactError("unsafe_path")
+        except PlanArtifactError:
+            raise
+        except Exception as error:
+            raise PlanArtifactError("unsafe_path") from error
+
+    def retain_transaction(
+        candidates: list[
+            tuple[tuple[int, str, tuple[int, int, int]], Path]
+        ],
+    ) -> None:
+        staged: list[dict[str, Any]] = []
+        try:
+            for record, candidate in candidates:
+                if verify_binding is not None:
+                    verify_binding()
+                snapshot = _retention_snapshot(
+                    candidate, record[2], directory_fd
+                )
+                if snapshot is None:
+                    continue
+                observed = _plan_lstat(candidate, directory_fd)
+                if (
+                    stat.S_ISLNK(observed.st_mode)
+                    or not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or _plan_file_identity(observed) != record[2]
+                    or stat.S_IMODE(observed.st_mode) != snapshot["mode"]
+                ):
+                    raise PlanArtifactError("unsafe_path")
+                quarantine_name = _transaction_name(
+                    candidate, "quarantine", directory_fd
+                )
+                quarantine = directory / quarantine_name
+                _plan_rename_if_absent(
+                    candidate, quarantine_name, directory_fd
+                )
+                entry = {
+                    "original": candidate,
+                    "quarantine": quarantine,
+                    "identity": record[2],
+                    "snapshot": snapshot,
+                    "unlinked": False,
+                }
+                staged.append(entry)
+                quarantined = _plan_lstat(quarantine, directory_fd)
+                if (
+                    stat.S_ISLNK(quarantined.st_mode)
+                    or not stat.S_ISREG(quarantined.st_mode)
+                    or quarantined.st_nlink != 1
+                    or _plan_file_identity(quarantined) != record[2]
+                    or stat.S_IMODE(quarantined.st_mode) != snapshot["mode"]
+                    or _read_exact_plan_bytes(
+                        quarantine, record[2], directory_fd
+                    )
+                    != snapshot["document"]
+                ):
+                    raise PlanArtifactError("unsafe_path")
+            if verify_binding is not None:
+                verify_binding()
+            for entry in staged:
+                if verify_binding is not None:
+                    verify_binding()
+                quarantine = entry["quarantine"]
+                identity = entry["identity"]
+                snapshot = entry["snapshot"]
+                observed = _plan_lstat(quarantine, directory_fd)
+                if (
+                    stat.S_ISLNK(observed.st_mode)
+                    or not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or _plan_file_identity(observed) != identity
+                    or stat.S_IMODE(observed.st_mode) != snapshot["mode"]
+                    or _read_exact_plan_bytes(
+                        quarantine, identity, directory_fd
+                    )
+                    != snapshot["document"]
+                ):
+                    raise PlanArtifactError("unsafe_path")
+                if not _unlink_plan_file_if_identity(
+                    quarantine, identity, directory_fd
+                ):
+                    raise PlanArtifactError("unsafe_path")
+                entry["unlinked"] = True
+                if verify_binding is not None:
+                    verify_binding()
+        except Exception as error:
+            try:
+                restore(staged)
+            except Exception as restore_error:
+                raise PlanArtifactError("unsafe_path") from restore_error
+            raise PlanArtifactError("unsafe_path") from error
+
+    if verify_binding is not None:
+        verify_binding()
+    try:
+        names = os.listdir(directory_fd) if directory_fd is not None else [item.name for item in directory.iterdir()]
+    except PlanArtifactError:
+        raise
+    except OSError:
+        return
+    owned = []
+    for name in names:
+        candidate = directory / name
+        record = _owned_plan_artifact_record(candidate, directory_fd=directory_fd)
+        if record is not None:
+            owned.append((record, candidate))
+    old = sorted(
+        (item for item in owned if item[1].name != current.name),
+        key=lambda item: (item[0][0], item[0][1], item[1].name),
+        reverse=True,
+    )
+    stale = old[MAX_OLD_PLAN_ARTIFACTS:]
+    for offset in range(0, len(stale), MAX_RETENTION_TRANSACTION_ITEMS):
+        retain_transaction(
+            stale[offset : offset + MAX_RETENTION_TRANSACTION_ITEMS]
+        )
+
+
+
+def _read_plan_artifact_document(
+    path: Path, *, directory_fd: int | None = None
+) -> str:
+    limit = MAX_PLAN_ARTIFACT_BODY_BYTES + 16 * 1024
+    descriptor = -1
+    try:
+        if directory_fd is not None:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            before = os.fstat(descriptor)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise PlanArtifactError("unsafe_path")
+            chunks: list[bytes] = []
+            observed_size = 0
+            while observed_size <= limit:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - observed_size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                observed_size += len(chunk)
+            document = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if _plan_file_identity(after) != _plan_file_identity(before):
+                raise PlanArtifactError("unsafe_path")
+        else:
+            before = path.lstat()
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise PlanArtifactError("unsafe_path")
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if _plan_file_identity(opened) != _plan_file_identity(before):
+                    raise PlanArtifactError("unsafe_path")
+                document = stream.read(limit + 1)
+                after_handle = os.fstat(stream.fileno())
+                after_path = path.lstat()
+            if (
+                _plan_file_identity(after_handle) != _plan_file_identity(opened)
+                or _plan_file_identity(after_path) != _plan_file_identity(opened)
+                or stat.S_ISLNK(after_path.st_mode)
+                or not stat.S_ISREG(after_path.st_mode)
+                or after_path.st_nlink != 1
+            ):
+                raise PlanArtifactError("unsafe_path")
+        if len(document) > limit:
+            raise PlanArtifactError("content_drift")
+        return document.decode("utf-8")
+    except UnicodeError as error:
+        raise PlanArtifactError("content_drift") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+def write_plan_artifact(state: dict[str, Any], payload: dict[str, Any], message: str) -> None:
+    body = sanitize_plan_artifact_body(message)
+    content_digest = stable_hash(body, 32)
+    plan_digest = safe_fingerprint(state.get("plan_digest")) or None
+    generation = max(safe_int(state.get("plan_generation")), 0)
+    session = plan_artifact_session_id(payload.get("session_id"))
+    filename = f"hard-plan-g{generation:04d}-{plan_digest}.md" if plan_digest else ""
+    relative = f"plans/{session}/{filename}" if filename else None
+    previous = _safe_plan_artifact(state.get("plan_artifact"))
+    now = utc_now()
+    artifact = empty_plan_artifact()
+    artifact.update(
+        {
+            "relative_path": relative,
+            "objective_fingerprint": safe_fingerprint(state.get("plan_objective_fingerprint")) or None,
+            "difficulty_decision_id": safe_fingerprint(state.get("plan_difficulty_decision_id")) or None,
+            "plan_digest": plan_digest,
+            "content_digest": content_digest,
+            "generation": generation,
+            "lifecycle_status": _plan_artifact_lifecycle(state, plan_digest),
+            "created_at": previous.get("created_at") if previous.get("plan_digest") == plan_digest else now,
+            "updated_at": now,
+        }
+    )
+    try:
+        if not plan_digest or not relative:
+            raise PlanArtifactError("write_error")
+        root = _canonical_plan_data_root(payload)
+        plans = root / "plans"
+        directory = plans / session
+        target = directory / filename
+        with plan_session_directory_guard(root, session) as guard:
+            guard["verify"]()
+            document = (
+                f"{PLAN_ARTIFACT_OWNER}\n"
+                f"generation: {generation}\n"
+                f"plan_digest: {plan_digest}\n"
+                f"content_digest: {content_digest}\n"
+                f"objective_fingerprint: {artifact['objective_fingerprint'] or 'none'}\n"
+                f"difficulty_decision_id: {artifact['difficulty_decision_id'] or 'none'}\n"
+                "-->\n# Workflow Manager Hard Plan\n\n"
+                "> This Markdown file is a private review mirror. The bound state plan_digest remains authoritative.\n\n"
+                f"{PLAN_ARTIFACT_BODY_MARKER}\n{body}"
+            )
+            directory_fd = guard["directory_fd"]
+            transaction: dict[str, Any] | None = None
+            try:
+                transaction = _atomic_write_plan_file(
+                    target,
+                    document.encode("utf-8"),
+                    directory_fd=directory_fd,
+                    verify_binding=guard["verify"],
+                )
+                guard["verify"]()
+                _retain_plan_artifacts(
+                    directory,
+                    target,
+                    directory_fd=directory_fd,
+                    verify_binding=guard["verify"],
+                )
+                guard["verify"]()
+                _commit_plan_write(transaction, guard["verify"])
+            except Exception as error:
+                if transaction is not None:
+                    try:
+                        _rollback_plan_write(transaction)
+                    except PlanArtifactError as rollback_error:
+                        raise rollback_error from error
+                raise
+        artifact["write_status"] = "written"
+        artifact["warning_code"] = "none"
+    except PlanArtifactError as error:
+        artifact["write_status"] = "write_failed"
+        artifact["warning_code"] = error.code
+    except OSError:
+        artifact["write_status"] = "write_failed"
+        artifact["warning_code"] = "write_error"
+    state["plan_artifact"] = artifact
+
+
+def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> None:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    if artifact.get("write_status") not in {"written", "content_drift"} or not artifact.get("relative_path"):
+        state["plan_artifact"] = artifact
+        return
+    try:
+        parts = artifact["relative_path"].split("/")
+        if len(parts) != 3 or parts[0] != "plans":
+            raise PlanArtifactError("unsafe_path")
+        _, session, filename = parts
+        root = _canonical_plan_data_root(payload)
+        target = root / "plans" / session / filename
+        with plan_session_directory_guard(root, session, create=False) as guard:
+            guard["verify"]()
+            document = _read_plan_artifact_document(
+                target, directory_fd=guard["directory_fd"]
+            )
+            guard["verify"]()
+        observed = plan_artifact_body_digest(document)
+        if observed != artifact.get("content_digest"):
+            raise PlanArtifactError("content_drift")
+        artifact["write_status"] = "written"
+        artifact["warning_code"] = "none"
+    except PlanArtifactError as error:
+        artifact["write_status"] = "content_drift"
+        artifact["warning_code"] = (
+            error.code if error.code in {"unsafe_path", "content_drift"} else "content_drift"
+        )
+    except OSError:
+        artifact["write_status"] = "content_drift"
+        artifact["warning_code"] = "content_drift"
+    artifact["updated_at"] = utc_now()
+    state["plan_artifact"] = artifact
+
+
 def _safe_compaction(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -1877,6 +3133,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         "plan_generation": max(safe_int(item.get("plan_generation")), 0),
         "plan_digest": plan_digest,
         "confirmed_plan_digest": confirmed_plan_digest,
+        "plan_artifact": _safe_plan_artifact(item.get("plan_artifact")),
         "session_execution_preference": safe_session_execution_preference(
             item.get("session_execution_preference")
         ),
@@ -2041,6 +3298,11 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         safe_fingerprint(value.get("confirmed_plan_digest")) or None
     )
     base["confirmed_at"] = str(value.get("confirmed_at"))[:40] if value.get("confirmed_at") else None
+    base["plan_artifact"] = (
+        _safe_plan_artifact(value.get("plan_artifact"))
+        if safe_int(value.get("schema_version")) >= 18
+        else _legacy_plan_artifact(base)
+    )
     base["execution_profile_version"] = safe_label(
         value.get("execution_profile_version") or EXECUTION_PROFILE_VERSION, 16
     )
@@ -2250,6 +3512,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if migrated_baseline:
             migrated_baseline["acceptance_status"] = "incomplete"
             base["last_execution_baseline"] = migrated_baseline
+    sync_plan_artifact_lifecycle(base)
     base["schema_version"] = SCHEMA_VERSION
     base["writer_version"] = WRITER_VERSION
     return base
@@ -2391,6 +3654,7 @@ def mutate_state(
         state = new_state(payload)
         increment_event_count(state, payload)
         change(state)
+        sync_plan_artifact_lifecycle(state)
         outcome = "disabled" if not persistence_enabled() else "missing_session_id"
         set_persistence_metadata(state, payload, attempted=False, ok=False, outcome=outcome)
         trim_state(state)
@@ -2407,8 +3671,10 @@ def mutate_state(
             if run_key and run_key in state.get("processed_hook_runs", []):
                 debug_persistence(payload, path_resolved=True, outcome="duplicate")
                 return state, False
+            verify_plan_artifact(state, payload)
             increment_event_count(state, payload)
             change(state)
+            sync_plan_artifact_lifecycle(state)
             if run_key:
                 state.setdefault("processed_hook_runs", []).append(run_key)
             trim_state(state)
@@ -4941,6 +6207,7 @@ def session_start(payload: dict[str, Any]) -> None:
             "plan_generation": safe_int(state.get("plan_generation")),
             "plan_digest": state.get("plan_digest"),
             "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+            "plan_artifact": _safe_plan_artifact(state.get("plan_artifact")),
             "execution_profile_version": state.get("execution_profile_version"),
             "executor_state": state.get("executor_state", "none"),
             "execution_contract_id": state.get("execution_contract_id"),
@@ -7033,6 +8300,7 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "plan_generation": safe_int(state.get("plan_generation")),
                 "plan_digest": state.get("plan_digest"),
                 "confirmed_plan_digest": state.get("confirmed_plan_digest"),
+                "plan_artifact": _safe_plan_artifact(state.get("plan_artifact")),
                 "session_execution_preference": safe_session_execution_preference(
                     state.get("session_execution_preference")
                 ),
@@ -7426,6 +8694,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         previous.get("assessor_state") == "simple_running" and agent_id == previous.get("assessor_agent_id")
     ) or stall_assessor
     assessment = re.search(r"(?im)^\s*WORK_ASSESSMENT\s+binding_id=([0-9a-f]{32})\s+outcome=(simple|hard)\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
+    hard_plan_detailed = bool(len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", str(result or ""))) >= 2 and re.search(r"(?:验收|验证|test|verify|acceptance)", str(result or ""), re.I) and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", str(result or "")))
     simple_execution = re.search(r"(?im)^\s*SIMPLE_EXECUTION\s+binding_id=([0-9a-f]{32})\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
     stall_lines = [line for line in str(result or "").splitlines() if line.startswith("EXECUTION_STALL")]
     stall_matches = [match for line in stall_lines if (match := EXECUTION_STALL_RE.fullmatch(line))]
@@ -7456,6 +8725,10 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             group.get("state") == "terminal" and group.get("agent_id") == agent_id
             for group in subagent_lifecycle_groups(state)
         )
+        artifact = _safe_plan_artifact(state.get("plan_artifact"))
+        if (status_value in {"completed", "ok"} and assessment and assessment.group(1) == state.get("assessor_binding_id") and assessment.group(2).lower() == "hard" and hard_plan_detailed and state.get("plan_digest") == stable_hash(str(result or ""), 32) and artifact.get("write_status") == "write_failed"):
+            write_plan_artifact(state, payload, str(result or ""))
+            decision["artifact_retry"] = True
         if not agent_id or (current_started is None and already_terminal):
             reason = "SubagentStop lacks a concrete agent_id" if not agent_id else "duplicate or late SubagentStop for a terminal agent"
             state.setdefault("guards", []).append(
@@ -7660,9 +8933,17 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["plan_difficulty_decision_id"] = state.get("difficulty_decision_id")
                 state["plan_state"] = "awaiting_confirmation"
                 state["model_profile"] = confirmed_executor_model_profile(state)
+                write_plan_artifact(state, payload, str(result or ""))
             state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
-    mutate_state(payload, update)
+    updated_state, _ = mutate_state(payload, update)
+    artifact = _safe_plan_artifact(updated_state.get("plan_artifact"))
+    if artifact.get("write_status") in {"write_failed", "content_drift"}:
+        emit_context(
+            "SubagentStop",
+            f"Workflow Manager plan_artifact {artifact['write_status']} warning_code={artifact['warning_code']}; the plan_digest contract remains authoritative and confirmation is not self-locked.",
+        )
+        return
     if not decision["recorded"]:
         emit_context(
             "SubagentStop",
@@ -7708,6 +8989,9 @@ def stop(payload: dict[str, Any]) -> None:
     def update(state: dict[str, Any]) -> None:
         state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
+        artifact = _safe_plan_artifact(state.get("plan_artifact"))
+        if plan_ready and state.get("plan_digest") == stable_hash(assistant_message, 32) and artifact.get("write_status") == "write_failed":
+            write_plan_artifact(state, payload, assistant_message)
         if state.get("plan_state") == "confirmed" and state.get("executor_state") == "local_running":
             if local_execution and local_execution.group(1) == state.get("execution_contract_id"):
                 if local_execution.group(2) == "succeeded":
@@ -7845,10 +9129,18 @@ def stop(payload: dict[str, Any]) -> None:
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
                 state["plan_state"] = "awaiting_confirmation"
+                write_plan_artifact(state, payload, assistant_message)
             else:
                 state["plan_state"] = "analyzing"
 
-    mutate_state(payload, update)
+    updated_state, _ = mutate_state(payload, update)
+    artifact = _safe_plan_artifact(updated_state.get("plan_artifact"))
+    if artifact.get("write_status") in {"write_failed", "content_drift"}:
+        emit_context(
+            "Stop",
+            f"Workflow Manager plan_artifact {artifact['write_status']} warning_code={artifact['warning_code']}; the plan_digest contract remains authoritative and confirmation is not self-locked.",
+        )
+        return
     emit_continue()
 
 
