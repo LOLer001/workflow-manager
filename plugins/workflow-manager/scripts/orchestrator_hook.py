@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 18
-WRITER_VERSION = "1.0.35"
+SCHEMA_VERSION = 19
+WRITER_VERSION = "1.0.36"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -1631,6 +1631,9 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         "stale": bool(item.get("stale")),
         "request_gate": item.get("request_gate")
         if item.get("request_gate") in {"audit", "open"}
+        else None,
+        "request_visibility": item.get("request_visibility")
+        if item.get("request_visibility") in {"plaintext", "opaque_v2"}
         else None,
         "request_cap": min(max(safe_int(item.get("request_cap")), 0), 3),
         "reaudited": bool(item.get("reaudited")),
@@ -3486,6 +3489,9 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         item for raw in as_list(value.get("subagents"))
         if (item := _safe_subagent(raw)) is not None
     ]
+    if safe_int(value.get("schema_version")) < 19:
+        for item in safe_subagents:
+            item["request_visibility"] = None
     base["subagents"] = retained_subagent_records(base, safe_subagents)
     base["compactions"] = [item for raw in as_list(value.get("compactions")) if (item := _safe_compaction(raw)) is not None][-MAX_COMPACTIONS:]
     base["guards"] = [item for raw in as_list(value.get("guards")) if (item := _safe_guard(raw)) is not None][
@@ -4808,6 +4814,7 @@ SUBAGENT_REQUEST_MAX_NODES = 48
 SUBAGENT_REQUEST_MAX_LIST_ITEMS = 16
 SUBAGENT_REQUEST_MAX_BYTES = 64 * 1024
 SUBAGENT_REQUEST_WRAPPERS = ("args", "arguments", "input", "tool_input", "content")
+OPAQUE_V2_MESSAGE_RE = re.compile(r"gAAAAA[A-Za-z0-9_-]{80,65520}={0,2}")
 SUBAGENT_REQUEST_ALIASES = {
     "task_name": ("task_name", "taskName", "name", "description"),
     "message": ("message", "prompt", "task"),
@@ -4816,6 +4823,13 @@ SUBAGENT_REQUEST_ALIASES = {
     "fork_turns": ("fork_turns", "forkTurns"),
     "target": ("target",),
 }
+
+
+def assessor_task_name_has_intent(value: Any) -> bool:
+    normalized = normalized_key(value)
+    return normalized == "highassessor" or bool(
+        re.fullmatch(r"highassessor[0-9a-f]{48}v1", normalized)
+    )
 
 
 def _json_container_text(value: str) -> bool:
@@ -4942,7 +4956,7 @@ def _bounded_assessor_intent(payload: dict[str, Any]) -> bool:
         if not isinstance(value, dict):
             continue
         for key, child in list(value.items())[:SUBAGENT_REQUEST_MAX_LIST_ITEMS]:
-            if normalized_key(key) in {"taskname", "name", "description"} and normalized_key(child) == "highassessor":
+            if normalized_key(key) in {"taskname", "name", "description"} and assessor_task_name_has_intent(child):
                 return True
             pending.append((child, depth + 1))
     return False
@@ -5039,6 +5053,46 @@ def subagent_request_fields(payload: dict[str, Any]) -> tuple[str | None, str | 
     return task_name, stable_hash(scope_value) if scope_value else None
 
 
+def subagent_request_visibility(payload: dict[str, Any]) -> str:
+    candidates = subagent_request_candidates(payload)
+    value = candidates[0].get("message") if candidates else None
+    if isinstance(value, str) and OPAQUE_V2_MESSAGE_RE.fullmatch(value.strip()):
+        return "opaque_v2"
+    return "plaintext"
+
+
+def bound_assessor_task_name(state: dict[str, Any]) -> str | None:
+    binding = safe_fingerprint(state.get("assessor_binding_id"))
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    if not binding or len(binding) != 32 or not objective or len(objective) != 16:
+        return None
+    return f"high_assessor_{binding}_{objective}_v1"
+
+
+def bound_executor_task_name(state: dict[str, Any]) -> str | None:
+    contract = safe_fingerprint(state.get("execution_contract_id"))
+    return f"confirmed_executor_{contract}_v1" if contract and len(contract) == 32 else None
+
+
+def opaque_v2_bound_assessor_target(payload: dict[str, Any], state: dict[str, Any]) -> bool:
+    if subagent_request_visibility(payload) != "opaque_v2":
+        return False
+    candidates = subagent_request_candidates(payload)
+    target = str(candidates[0].get("target") or "").strip() if candidates else ""
+    expected = bound_assessor_task_name(state)
+    if not expected or not target or target.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] != expected:
+        return False
+    return any(
+        item.get("event") == "request"
+        and item.get("role") == "high_assessor"
+        and item.get("contract_id") == state.get("assessor_binding_id")
+        and item.get("task_name") == expected
+        and item.get("request_visibility") == "opaque_v2"
+        for item in state.get("subagents", [])
+        if isinstance(item, dict)
+    )
+
+
 def subagent_request_options(payload: dict[str, Any]) -> dict[str, str | None]:
     candidates = subagent_request_candidates(payload)
     candidate = candidates[0] if candidates else {}
@@ -5062,32 +5116,39 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
     if not contract_id or not request:
         return False, "missing execution contract"
     options = subagent_request_options(payload)
+    task_name, _ = subagent_request_fields(payload)
+    visibility = subagent_request_visibility(payload)
+    opaque_v2 = visibility == "opaque_v2"
+    if opaque_v2 and task_name != bound_executor_task_name(state):
+        return False, "opaque V2 executor requires the exact visible task_name binding"
+    if opaque_v2 and state.get("executor_state") == "recovery_required":
+        return False, "opaque V2 executor recovery requires a fresh contract-bound plan"
     model = str(options.get("model") or "").strip()
     effort = str(options.get("reasoning_effort") or "").strip().lower()
     fork_turns = str(options.get("fork_turns") or "").strip().lower()
     preference = safe_session_execution_preference(
         state.get("session_execution_preference")
     )
-    contract_marker = bool(
+    contract_marker = opaque_v2 or bool(
         re.search(
             rf"(?:execution_contract_id|execution-contract-id|执行合同)\s*[:=：]\s*{re.escape(contract_id)}\b",
             request,
             re.I,
         )
     )
-    plan_marker = str(state.get("plan_digest") or "") in request
-    generation_marker = bool(
+    plan_marker = opaque_v2 or str(state.get("plan_digest") or "") in request
+    generation_marker = opaque_v2 or bool(
         re.search(
             rf"(?:plan_generation|plan-generation|计划代次)\s*[:=：]\s*{safe_int(state.get('plan_generation'))}\b",
             request,
             re.I,
         )
     )
-    exclusive_scope = bool(
+    exclusive_scope = opaque_v2 or bool(
         re.search(r"\b(?:exclusive (?:owner|executor)|only executor)\b", request, re.I)
         or any(term in request for term in ("唯一执行者", "独占执行", "独占修改"))
     )
-    acceptance = bool(
+    acceptance = opaque_v2 or bool(
         re.search(r"\b(?:acceptance|verification|verify|test)\b", request, re.I)
         or any(term in request for term in ("验收", "验证", "测试"))
     )
@@ -5128,7 +5189,7 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
     if preference == "highest_throughout":
         expected_model = highest_execution_model(state)
         expected_effort = highest_execution_effort(state)
-        if "profile_resolution=highest_available" not in request:
+        if not opaque_v2 and "profile_resolution=highest_available" not in request:
             return False, "highest executor requires profile_resolution=highest_available"
         if not expected_model or not expected_effort:
             return False, "model_unavailable"
@@ -5144,6 +5205,8 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
             return False, "reasoning_effort must be medium"
     if fork_turns != "none" and not re.fullmatch(r"[1-9]\d*", fork_turns):
         return False, "fork_turns must be none or a positive integer when overriding model"
+    if opaque_v2 and not re.fullmatch(r"[1-9]\d*", fork_turns):
+        return False, "opaque V2 executor requires positive fork_turns for bound context redundancy"
     if not contract_marker or not plan_marker or not generation_marker:
         return False, "executor request is not bound to the exact confirmed plan"
     if not exclusive_scope or not acceptance:
@@ -5158,17 +5221,28 @@ def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -
     binding = str(state.get("assessor_binding_id") or "")
     request = subagent_request_text(payload)
     options = subagent_request_options(payload)
+    task_name, _ = subagent_request_fields(payload)
+    visibility = subagent_request_visibility(payload)
+    opaque_v2 = visibility == "opaque_v2"
     if not binding or not request:
         return False, "missing assessor binding"
     if safe_int(state.get("assessor_attempt")) >= 2:
         return False, "assessor retry exhausted"
     if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
         return False, "duplicate assessor"
-    if not re.search(rf"assessor_binding_id\s*[:=]\s*{re.escape(binding)}\b", request) or "profile_resolution=highest_available" not in request:
-        return False, "assessor binding mismatch"
     objective = str(state.get("objective", {}).get("fingerprint") or "")
-    if not objective or not re.search(rf"objective_fingerprint\s*[:=]\s*{re.escape(objective)}\b", request):
-        return False, "assessor objective mismatch"
+    if opaque_v2:
+        if task_name != bound_assessor_task_name(state):
+            return False, "opaque V2 assessor requires the exact visible task_name binding"
+        if state.get("assessor_state") == "recovery_required":
+            return False, "opaque V2 assessor recovery requires a fresh objective binding"
+    else:
+        if not re.search(rf"assessor_binding_id\s*[:=]\s*{re.escape(binding)}\b", request):
+            return False, "assessor binding mismatch"
+        if "profile_resolution=highest_available" not in request:
+            return False, "assessor profile resolution mismatch"
+        if not objective or not re.search(rf"objective_fingerprint\s*[:=]\s*{re.escape(objective)}\b", request):
+            return False, "assessor objective mismatch"
     raw_model = str(options.get("model") or "").strip()
     model = safe_label(raw_model, 80)
     if not raw_model or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
@@ -5178,8 +5252,10 @@ def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -
     fork = str(options.get("fork_turns") or "").lower()
     if fork != "none" and not re.fullmatch(r"[1-9]\d*", fork):
         return False, "assessor fork_turns invalid"
-    simple_contract = bool(re.search(r"(?:simple.{0,32}(?:direct|solve|execute|解决|直接).{0,40}(?:verify|验证|测试)|(?:直接|解决).{0,40}simple)", request, re.I))
-    hard_contract = bool(re.search(r"(?:hard.{0,48}(?:read[- ]only|plan|confirmation|只读|计划|确认)|hard.{0,48}(?:plan|只读|计划).{0,48}(?:read[- ]only|confirmation|只读|确认))", request, re.I))
+    if opaque_v2 and not re.fullmatch(r"[1-9]\d*", fork):
+        return False, "opaque V2 assessor requires positive fork_turns for bound context redundancy"
+    simple_contract = opaque_v2 or bool(re.search(r"(?:simple.{0,32}(?:direct|solve|execute|解决|直接).{0,40}(?:verify|验证|测试)|(?:直接|解决).{0,40}simple)", request, re.I))
+    hard_contract = opaque_v2 or bool(re.search(r"(?:hard.{0,48}(?:read[- ]only|plan|confirmation|只读|计划|确认)|hard.{0,48}(?:plan|只读|计划).{0,48}(?:read[- ]only|confirmation|只读|确认))", request, re.I))
     if not simple_contract or not hard_contract:
         return False, "assessor request lacks the Simple/Hard assessment contract"
     if state.get("assessor_state") == "recovery_required":
@@ -5653,6 +5729,37 @@ def _git_invocation(command: str) -> tuple[str, re.Match[str]] | None:
     return None
 
 
+def git_invocation_count(command: str) -> int:
+    return max(
+        (
+            sum(1 for _ in GIT_INVOCATION_RE.finditer(shell_syntax_view(candidate)))
+            for candidate in command_views(command)
+        ),
+        default=0,
+    )
+
+
+def explicit_git_cwd(command: str, payload_cwd: Any) -> tuple[str | None, str | None]:
+    """Resolve visible `git -C` options without trusting an unavailable tool workdir."""
+    invocation = _git_invocation(command)
+    if not invocation:
+        return None, None
+    candidate, match = invocation
+    prefix = candidate[match.start() : match.start(1)]
+    raw_paths = re.findall(r"(?:^|\s)-C\s+('[^']*'|\"[^\"]*\"|[^\s;&|]+)", prefix)
+    if not raw_paths:
+        return None, None
+    effective = str(payload_cwd or "").strip() or None
+    for raw_path in raw_paths:
+        path = raw_path[1:-1] if len(raw_path) >= 2 and raw_path[0] == raw_path[-1] and raw_path[0] in "'\"" else raw_path
+        if not path or any(marker in path for marker in ("$", "`", "\x00")):
+            return None, "git -C path must be literal scalar text"
+        effective, error = _normalize_structured_command_cwd(path, effective)
+        if error:
+            return None, f"git -C {error}"
+    return effective, None
+
+
 def git_subcommand(command: str) -> str | None:
     invocation = _git_invocation(command)
     return invocation[1].group(1).lower() if invocation else None
@@ -5790,18 +5897,32 @@ def command_guard(payload: dict[str, Any]) -> tuple[str, str] | None:
     if not command:
         return None
     subcommand = git_subcommand(command)
+    if subcommand and git_invocation_count(command) != 1:
+        return (
+            "ambiguous_git_input",
+            "Workflow Manager guard blocked multiple Git invocations in one command. Run one bounded Git "
+            "operation per tool call so each execution directory and subcommand is checked independently.",
+        )
     if subcommand and resolution.get("error"):
         return (
             "ambiguous_git_input",
             f"Workflow Manager guard blocked Git because {resolution['error']}; keep cmd and cwd/workdir in one "
             "structured tool_input leaf and remove conflicting aliases.",
         )
-    effective_cwd = resolution.get("cwd")
+    explicit_cwd, explicit_cwd_error = explicit_git_cwd(command, resolution.get("cwd"))
+    if subcommand and explicit_cwd_error:
+        return (
+            "ambiguous_git_input",
+            f"Workflow Manager guard blocked Git because {explicit_cwd_error}; use one literal existing native "
+            "Linux git -C directory.",
+        )
+    effective_cwd = explicit_cwd or resolution.get("cwd")
     if subcommand and cwd_is_wsl_or_network_mount(effective_cwd):
         return (
             "mounted_local_git",
-            "Workflow Manager guard blocked Git in a WSL/DrvFS/CIFS/UNC working tree. Use android-remote-git or the "
-            "authoritative remote Linux source tree; do not retry another local Git variant.",
+            "Workflow Manager guard blocked Git in a WSL/DrvFS/CIFS/UNC working tree. Use android-remote-git, the "
+            "authoritative remote Linux source tree, or encode an already verified native Linux cwd as an absolute "
+            "git -C path when the Hook only exposes the mounted session cwd.",
         )
     if subcommand and not real_tmp_git_directory(effective_cwd):
         return (
@@ -7070,14 +7191,17 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "state only and does not prove that the host changed the parent model or reasoning settings."
         )
     if classification.get("task_domain") == "work" and refreshed_for_assessor.get("assessor_state") == "spawn_required":
+        assessor_task = bound_assessor_task_name(refreshed_for_assessor)
         context += (
             " Work requires one high-tier assessor before execution. Spawn exactly one child with the host's highest "
-            "available Codex model and reasoning (high/xhigh/max/ultra), explicit model/effort and fork_turns=none "
-            f"or positive integer; include assessor_binding_id={refreshed_for_assessor.get('assessor_binding_id')} "
+            "available Codex model and reasoning (high/xhigh/max/ultra), explicit model/effort, positive "
+            f"fork_turns, and visible task_name={assessor_task}; include "
+            f"assessor_binding_id={refreshed_for_assessor.get('assessor_binding_id')} "
             f"objective_fingerprint={refreshed_for_assessor.get('objective', {}).get('fingerprint')} and profile_resolution=highest_available. The self-contained child "
             "contract is: assess Simple and directly solve+verify before WORK_ASSESSMENT; for Hard remain read-only, "
             "return a detailed executable plan plus WORK_ASSESSMENT, and end exactly 计划已就绪，等待确认后执行. "
-            "Record requested versus observed profile separately."
+            "The visible task name preserves state binding when V2 encrypts message before PreToolUse; record "
+            "requested versus observed profile separately."
         )
     if causal_report:
         refreshed = snapshot_state(payload)
@@ -7109,11 +7233,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             f"review_id={review.get('review_id')}."
         )
     elif confirmed_plan:
+        executor_task = bound_executor_task_name(refreshed_for_assessor)
         if refreshed_for_assessor.get("session_execution_preference") == "highest_throughout":
             context += (
                 " Confirmed plan binding is valid. Before mutation, spawn exactly one exclusive executor with "
                 "profile_resolution=highest_available, the bound assessor/current highest-tier model, the same "
-                "requested reasoning_effort as the bound assessor, and a non-full-history fork. Bind the exact "
+                f"requested reasoning_effort as the bound assessor, positive fork_turns, and visible task_name={executor_task}. Bind the exact "
                 "execution contract, full plan, ownership, and acceptance. This is a request contract, not proof "
                 "that the host applied the override; wait for matching SubagentStart metadata."
             )
@@ -7121,7 +7246,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             context += (
                 " Confirmed plan binding is valid. The parent remains the high-reasoning coordinator; before any "
                 "mutation, spawn exactly one exclusive confirmed-plan executor using the newest actually available "
-                "lower-tier Codex model, reasoning_effort=medium, and fork_turns=none or a positive integer. Bind its "
+                f"lower-tier Codex model, reasoning_effort=medium, positive fork_turns, and visible task_name={executor_task}. Bind its "
                 "request to execution_contract_id, plan_digest, plan_generation, full actionable plan, scope, and "
                 "acceptance. Do not claim a model switch until the host accepts that explicit spawn override."
             )
@@ -7306,6 +7431,7 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
                 "stale": False,
                 "status": "pending",
                 "request_gate": gate,
+                "request_visibility": subagent_request_visibility(payload),
                 "request_cap": cap,
                 "reaudited": reaudited,
                 "role": "confirmed_executor" if executor_request else "lane",
@@ -7641,7 +7767,12 @@ def handle_stall_diagnosis_pretool(
     matches = [match for line in marker_lines if (match := STALL_DIAGNOSIS_REQUEST_RE.fullmatch(line))]
     marker = matches[0] if len(marker_lines) == len(matches) == 1 else None
     reason = resolution.get("error")
-    if stall.get("state") != "diagnosis_required":
+    if subagent_request_visibility(payload) == "opaque_v2":
+        reason = reason or (
+            "opaque V2 followup does not expose stall_id and execution_contract_id for pre-dispatch binding; "
+            "fail closed and replan instead of weakening diagnosis authorization"
+        )
+    elif stall.get("state") != "diagnosis_required":
         reason = reason or "stall diagnosis is not awaiting delivery"
     elif safe_int(stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS:
         reason = reason or "stall diagnosis delivery retry is exhausted"
@@ -7742,19 +7873,24 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         request = subagent_request_text(payload)
         target = next((str(candidate.get("target") or "") for candidate in subagent_request_candidates(payload) if candidate.get("target")), "")
         binding = str(state.get("assessor_binding_id") or "")
-        solve = bool(re.search(r"(?:solve|解决)", request, re.I))
-        verify = bool(re.search(r"(?:verify|验证|测试)", request, re.I))
+        opaque_bound_target = opaque_v2_bound_assessor_target(payload, state)
+        solve = opaque_bound_target or bool(re.search(r"(?:solve|解决)", request, re.I))
+        verify = opaque_bound_target or bool(re.search(r"(?:verify|验证|测试)", request, re.I))
+        binding_marker = opaque_bound_target or f"assessor_binding_id={binding}" in request
+        target_matches = opaque_bound_target or target == str(state.get("assessor_agent_id") or "")
         recovery_ok = state.get("assessor_state") != "recovery_required" or (
             f"recovery_from={state.get('assessor_failure_kind')}" in request
             and bool(re.search(r"material_correction\s*[:=]\s*\S.{7,}", request))
             and safe_int(state.get("assessor_attempt")) < 2
         )
-        if target == str(state.get("assessor_agent_id") or "") and binding and f"assessor_binding_id={binding}" in request and solve and verify and recovery_ok:
+        if target_matches and binding and binding_marker and solve and verify and recovery_ok:
             followup_decision = {"accepted": False}
 
             def start_simple_execution(current: dict[str, Any]) -> None:
                 if current.get("assessor_state") not in {"simple_execution_required", "recovery_required"} or not append_result_pending_subagent(
-                    current, agent_id=target, request_fingerprint=fingerprint
+                    current,
+                    agent_id=(current.get("assessor_agent_id") if opaque_bound_target else target),
+                    request_fingerprint=fingerprint,
                 ):
                     current.setdefault("guards", []).append(
                         {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "subagent_lifecycle", "action": "deny", "fingerprint": fingerprint}
@@ -7784,7 +7920,7 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 current["assessor_model"] = safe_label(options.get("model"), 80)
                 current["assessor_reasoning_effort"] = safe_label(options.get("reasoning_effort"), 24)
                 current["assessor_fork_turns"] = options.get("fork_turns")
-                current.setdefault("subagents", []).append({"at": utc_now(), "event": "request", "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "task_name": task_name, "scope_fingerprint": scope_fingerprint, "status": "pending", "request_gate": "open", "request_cap": 1, "role": "high_assessor", "contract_id": current.get("assessor_binding_id"), "request_fingerprint": fingerprint, "objective_fingerprint": current.get("objective", {}).get("fingerprint"), "model": current["assessor_model"], "reasoning_effort": current["assessor_reasoning_effort"], "fork_turns": current["assessor_fork_turns"], "attempt": current["assessor_attempt"]})
+                current.setdefault("subagents", []).append({"at": utc_now(), "event": "request", "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "task_name": task_name, "scope_fingerprint": scope_fingerprint, "status": "pending", "request_gate": "open", "request_visibility": subagent_request_visibility(payload), "request_cap": 1, "role": "high_assessor", "contract_id": current.get("assessor_binding_id"), "request_fingerprint": fingerprint, "objective_fingerprint": current.get("objective", {}).get("fingerprint"), "model": current["assessor_model"], "reasoning_effort": current["assessor_reasoning_effort"], "fork_turns": current["assessor_fork_turns"], "attempt": current["assessor_attempt"]})
             mutate_state(payload, record_assessor)
             return
         request_text = subagent_request_text(payload)
@@ -7878,7 +8014,8 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             )
         emit_pretool_deny(
             f"Workflow Manager blocked {executor_block}: this confirmed hard-work plan requires exactly one "
-            f"contract-bound executor. {profile_instruction} with fork_turns=none or a positive integer, and "
+            f"contract-bound executor. {profile_instruction} with visible task_name={bound_executor_task_name(state)}, "
+            "positive fork_turns, and "
             "include the exact execution_contract_id, plan_digest, plan_generation, exclusive scope, full "
             "actionable plan, and acceptance. The Hook did not switch the parent and cannot prove host support."
         )

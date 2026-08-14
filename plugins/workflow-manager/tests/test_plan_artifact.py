@@ -259,7 +259,7 @@ class PlanArtifactTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "m05"})
-        self.assertEqual(migrated["schema_version"], 18)
+        self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
         self.assertEqual(migrated["plan_artifact"]["write_status"], "legacy_unavailable")
         self.assertEqual(migrated["plan_artifact"]["plan_digest"], "a" * 32)
         self.assertNotIn("must-not-survive", json.dumps(migrated))

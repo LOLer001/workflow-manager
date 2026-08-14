@@ -22,8 +22,8 @@ Spawn with all of these settings:
 
 - the resolved explicit `model` override;
 - the resolved effort: `medium` by default, or host-max for `highest_throughout`;
-- because a model override is explicit, `fork_turns=none` or a positive integer, never an omitted/invalid override contract;
-- one schema-safe ASCII `task_name` plus the normal concise Chinese purpose summary.
+- positive `fork_turns` for redundant bound context when V2 hides message from local `PreToolUse`;
+- visible `task_name=confirmed_executor_<execution_contract_id>_v1` plus the normal concise Chinese purpose summary.
 
 Host acceptance of this exact spawn is handoff-request evidence. Subagent start must match the pending request before mutation; report only the model/effort fields the host accepted or echoed, never assumed fields.
 
@@ -44,7 +44,7 @@ Compute `execution_contract_id` from the execution-profile version, normalized r
 
 Do not store or reconstruct the ID from raw prompt text. Any policy/profile, objective, difficulty decision, generation, or digest change makes the contract stale and requires a new executor request; changed plan bindings also require new confirmation.
 
-The spawn request must include the exact `execution_contract_id`, `plan_digest`, and `plan_generation`; declare the child the only executor/exclusive owner; provide the full actionable confirmed plan, owned paths/modules, forbidden scope, dependencies and shared resources, expected artifacts, acceptance checks, rollback/stop conditions, and a compact result contract. This full handoff is required even with `fork_turns=none`; do not rely on implicit parent context.
+The spawn request must include the exact `execution_contract_id`, `plan_digest`, and `plan_generation`; declare the child the only executor/exclusive owner; provide the full actionable confirmed plan, owned paths/modules, forbidden scope, dependencies and shared resources, expected artifacts, acceptance checks, rollback/stop conditions, and a compact result contract. The visible task name authorizes only the current state binding; it does not prove V2 ciphertext contains that handoff, so retain positive fork context and verify runtime identity, ownership, result, and acceptance independently.
 
 The executor must return decisive changes, paths/identifiers, verification evidence, unresolved risk, and typed failure if any. Raw logs stay in files or bounded excerpts. The parent independently checks contract match and acceptance evidence before reporting success.
 

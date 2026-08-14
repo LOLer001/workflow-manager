@@ -383,8 +383,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 18)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.35")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 19)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.36")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -519,6 +519,26 @@ class OrchestratorHookTests(unittest.TestCase):
         allowed = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "second-write", "agent_id": "two-turn", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
         self.assertNotIn("permissionDecision", json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}))
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "done", "agent_id": "two-turn", "status": "completed", "last_assistant_message": f"SIMPLE_EXECUTION binding_id={binding} evidence_digest={'f' * 32}"})
+        self.assertEqual(self.load_only_state()["assessor_state"], "simple_complete")
+
+    def test_v2_encrypted_simple_followup_reuses_only_bound_assessor(self) -> None:
+        session = "v2-simple-followup"
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并验证"})
+        state = self.load_only_state()
+        binding = state["assessor_binding_id"]
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        task_name = f"high_assessor_{binding}_{state['objective']['fingerprint']}_v1"
+        target = f"/root/{task_name}"
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaborationspawn_agent", "tool_input": {"task_name": task_name, "message": encrypted_message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": target, "model": "gpt-5.6-sol"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "assess", "agent_id": target, "status": "completed", "last_assistant_message": f"WORK_ASSESSMENT binding_id={binding} outcome=simple evidence_digest={'a' * 32}"})
+
+        wrong_target = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "wrong", "tool_name": "collaboration.followup_task", "tool_input": {"target": "other-agent", "message": encrypted_message}})
+        self.assertEqual(json.loads(wrong_target.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        accepted = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "follow", "tool_name": "collaboration.followup_task", "tool_input": {"target": target, "message": encrypted_message}})
+        self.assertNotIn("permissionDecision", json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}))
+        self.assertEqual(self.load_only_state()["assessor_state"], "simple_running")
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "done", "agent_id": target, "status": "completed", "last_assistant_message": f"SIMPLE_EXECUTION binding_id={binding} evidence_digest={'b' * 32}"})
         self.assertEqual(self.load_only_state()["assessor_state"], "simple_complete")
 
     def test_assessor_spawn_failure_and_late_start_never_revive(self) -> None:
@@ -722,6 +742,109 @@ class OrchestratorHookTests(unittest.TestCase):
             data=content_data,
         )
         self.assertNotIn("permissionDecision", json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}))
+
+    def test_v2_encrypted_assessor_uses_visible_state_bound_task_name(self) -> None:
+        session = "v2-encrypted-assessor"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 崩溃并验证",
+            }
+        )
+        state = self.load_only_state()
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        task_name = (
+            f"high_assessor_{state['assessor_binding_id']}_"
+            f"{state['objective']['fingerprint']}_v1"
+        )
+        accepted = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "spawn",
+                "tool_name": "collaborationspawn_agent",
+                "tool_input": {
+                    "task_name": task_name,
+                    "message": encrypted_message,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "ultra",
+                    "fork_turns": "1",
+                },
+            }
+        )
+        self.assertEqual(accepted.stdout, "", accepted.stdout)
+        pending = self.load_only_state()
+        self.assertEqual((pending["assessor_state"], pending["assessor_attempt"]), ("spawn_pending", 1))
+        self.assertEqual(pending["subagents"][-1]["task_name"], task_name)
+        self.assertEqual(pending["subagents"][-1]["request_visibility"], "opaque_v2")
+
+    def test_v2_encrypted_assessor_fails_closed_without_exact_visible_binding(self) -> None:
+        session = "v2-encrypted-assessor-stale"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 崩溃并验证",
+            }
+        )
+        state = self.load_only_state()
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        correct = (
+            f"high_assessor_{state['assessor_binding_id']}_"
+            f"{state['objective']['fingerprint']}_v1"
+        )
+        cases = {
+            "legacy-unbound": "high_assessor",
+            "stale-binding": correct.replace(state["assessor_binding_id"], "f" * 32),
+            "stale-objective": correct.replace(state["objective"]["fingerprint"], "e" * 16),
+        }
+        for label, task_name in cases.items():
+            with self.subTest(label=label):
+                denied = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": session,
+                        "hook_run_id": label,
+                        "tool_name": "collaborationspawn_agent",
+                        "tool_input": {
+                            "task_name": task_name,
+                            "message": encrypted_message,
+                            "model": "gpt-5.6-sol",
+                            "reasoning_effort": "ultra",
+                            "fork_turns": "1",
+                        },
+                    }
+                )
+                output = json.loads(denied.stdout)["hookSpecificOutput"]
+                self.assertEqual(output["permissionDecision"], "deny")
+                self.assertIn("visible task_name binding", output["permissionDecisionReason"])
+        self.assertEqual(self.load_only_state()["assessor_attempt"], 0)
+
+    def test_schema18_migration_never_invents_v2_visibility_authorization(self) -> None:
+        legacy = HOOK.new_state({"session_id": "schema18-v2"})
+        legacy["schema_version"] = 18
+        legacy["objective"] = {"fingerprint": "a" * 16, "length": 8}
+        legacy["assessor_generation"] = 1
+        legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
+        legacy["assessor_state"] = "spawn_pending"
+        legacy["subagents"] = [
+            {
+                "event": "request",
+                "status": "pending",
+                "role": "high_assessor",
+                "contract_id": legacy["assessor_binding_id"],
+                "objective_fingerprint": "a" * 16,
+                "request_fingerprint": "b" * 32,
+                "task_name": f"high_assessor_{legacy['assessor_binding_id']}_{'a' * 16}_v1",
+                "request_visibility": "opaque_v2",
+            }
+        ]
+        migrated = HOOK.normalize_state(legacy, {"session_id": "schema18-v2"})
+        self.assertEqual(migrated["schema_version"], 19)
+        self.assertIsNone(migrated["subagents"][0]["request_visibility"])
 
     def test_assessor_spawn_bridge_ignores_function_wrapper_name(self) -> None:
         session = "assessor-function-wrapper"
@@ -2221,6 +2344,143 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(pending["executor_reasoning_effort"], "medium")
         self.assertEqual(pending["executor_fork_turns"], "none")
 
+    def test_v2_encrypted_executor_uses_visible_contract_task_name(self) -> None:
+        session = "v2-encrypted-executor"
+        state = self.create_confirmed_executor_state(session)
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        task_name = f"confirmed_executor_{state['execution_contract_id']}_v1"
+        accepted = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "executor-request",
+                "tool_name": "collaborationspawn_agent",
+                "tool_input": {
+                    "task_name": task_name,
+                    "message": encrypted_message,
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "medium",
+                    "fork_turns": "2",
+                },
+            }
+        )
+        output = json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {})
+        self.assertNotIn("permissionDecision", output, accepted.stdout)
+        pending = self.load_only_state()
+        self.assertEqual((pending["executor_state"], pending["executor_attempt"]), ("spawn_pending", 1))
+        request = pending["subagents"][-1]
+        self.assertEqual(request["task_name"], task_name)
+        self.assertEqual(request["request_visibility"], "opaque_v2")
+
+    def test_v2_encrypted_executor_rejects_none_fork_and_stale_contract_name(self) -> None:
+        session = "v2-encrypted-executor-stale"
+        state = self.create_confirmed_executor_state(session)
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        correct = f"confirmed_executor_{state['execution_contract_id']}_v1"
+        cases = {
+            "none-fork": (correct, "none", "positive fork_turns"),
+            "stale-contract": (
+                correct.replace(state["execution_contract_id"], "f" * 32),
+                "2",
+                "visible task_name binding",
+            ),
+        }
+        for label, (task_name, fork_turns, reason_fragment) in cases.items():
+            with self.subTest(label=label):
+                denied = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": session,
+                        "hook_run_id": label,
+                        "tool_name": "collaborationspawn_agent",
+                        "tool_input": {
+                            "task_name": task_name,
+                            "message": encrypted_message,
+                            "model": "gpt-5.6-terra",
+                            "reasoning_effort": "medium",
+                            "fork_turns": fork_turns,
+                        },
+                    }
+                )
+                output = json.loads(denied.stdout)["hookSpecificOutput"]
+                self.assertEqual(output["permissionDecision"], "deny")
+                self.assertIn(reason_fragment, output["permissionDecisionReason"])
+        self.assertEqual(self.load_only_state()["executor_attempt"], 0)
+
+    def test_v2_encrypted_hard_workflow_roundtrip_survives_compaction(self) -> None:
+        session = "v2-hard-roundtrip"
+        started = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "model": "gpt-5.6-sol",
+                "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
+            }
+        )
+        context = json.loads(started.stdout)["hookSpecificOutput"]["additionalContext"]
+        assessor_task = re.search(r"task_name=(high_assessor_[0-9a-f]{32}_[0-9a-f]{16}_v1)", context).group(1)
+        binding = re.search(r"assessor_binding_id=([0-9a-f]{32})", context).group(1)
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "assessor-request",
+                "tool_name": "collaborationspawn_agent",
+                "tool_input": {"task_name": assessor_task, "message": encrypted_message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "1"},
+            }
+        )
+        assessor = f"/root/{assessor_task}"
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "assessor-start", "agent_id": assessor, "model": "gpt-5.6-sol", "reasoning_effort": "ultra"})
+        early_write = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "early-write", "agent_id": assessor, "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+        self.assertEqual(json.loads(early_write.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        plan = (
+            "1. 收集崩溃与重启日志并定位根因\n"
+            "2. 修改唯一责任模块并构建可回滚产物\n"
+            "3. 串行部署、复现、稳定性与回归验证\n"
+            "验收：原重启消失、相邻场景通过且保留回滚证据。\n"
+            f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n"
+            "计划已就绪，等待确认后执行"
+        )
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "assessor-stop", "agent_id": assessor, "status": "completed", "last_assistant_message": plan})
+        planned = self.load_only_state()
+        self.assertEqual((planned["assessor_state"], planned["plan_state"]), ("hard_plan_ready", "awaiting_confirmation"))
+        self.assertEqual(planned["plan_artifact"]["write_status"], "written")
+
+        confirmed_output = self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "confirm", "prompt": "确认按这个计划执行"})
+        confirmed_context = json.loads(confirmed_output.stdout)["hookSpecificOutput"]["additionalContext"]
+        confirmed = self.load_only_state()
+        executor_task = f"confirmed_executor_{confirmed['execution_contract_id']}_v1"
+        self.assertIn(f"task_name={executor_task}", confirmed_context)
+        parent_write = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "parent-write", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+        self.assertEqual(json.loads(parent_write.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "executor-request",
+                "tool_name": "collaborationspawn_agent",
+                "tool_input": {"task_name": executor_task, "message": encrypted_message, "model": "gpt-5.6-terra", "reasoning_effort": "medium", "fork_turns": "2"},
+            }
+        )
+        executor = f"/root/{executor_task}"
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-start", "agent_id": executor, "model": "gpt-5.6-terra", "reasoning_effort": "medium"})
+        allowed = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "executor-write", "agent_id": executor, "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+        self.assertNotIn("permissionDecision", json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}))
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "change", "agent_id": executor, "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}, "tool_response": {"status": "completed"}})
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "verify", "agent_id": executor, "tool_name": "Bash", "tool_input": {"command": "python3 -m unittest tests.test_reboot"}, "tool_response": {"exit_code": 0, "output": "OK"}})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "executor-stop", "agent_id": executor, "status": "completed", "last_assistant_message": "Bound implementation and acceptance verification complete."})
+        completed = self.load_only_state()
+        self.assertEqual(completed["executor_state"], "succeeded")
+        self.assertTrue(completed["last_execution_baseline"])
+
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"})
+        after_resume = self.load_only_state()
+        self.assertEqual((after_resume["plan_state"], after_resume["executor_state"]), ("confirmed", "succeeded"))
+        self.assertNotIn(plan, resumed.stdout)
+
     def test_confirmed_executor_start_records_contract_and_allows_only_bound_caller(self) -> None:
         session = "executor-start"
         state = self.create_confirmed_executor_state(session)
@@ -2362,6 +2622,17 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "resume-stop", "agent_id": "resumed-executor", "status": "completed", "last_assistant_message": "bounded remediation completed and verified"})
         resolved = self.load_only_state()
         self.assertEqual((resolved["executor_state"], resolved["stall"]["state"]), ("succeeded", "resolved"))
+
+    def test_v2_encrypted_stall_diagnosis_fails_closed_without_visible_stall_binding(self) -> None:
+        session = "v2-stall-diagnosis"
+        state = self.create_explicit_stall_state(session)
+        encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
+        wrong = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "wrong", "tool_name": "collaboration.followup_task", "tool_input": {"target": "other-agent", "message": encrypted_message}})
+        self.assertEqual(json.loads(wrong.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        denied = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "diagnose", "tool_name": "collaboration.followup_task", "tool_input": {"target": state["assessor_agent_id"], "message": encrypted_message}})
+        reason = json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("does not expose stall_id and execution_contract_id", reason)
+        self.assertEqual(self.load_only_state()["stall"]["state"], "diagnosis_required")
 
     def test_stall_diagnosis_delivery_retry_is_bounded_and_late_safe(self) -> None:
         session = "stall-delivery"
@@ -4064,6 +4335,62 @@ class OrchestratorHookTests(unittest.TestCase):
                 else "real existing /tmp directory"
             )
             self.assertIn(expected_link_reason, linked_reason)
+
+    def test_official_bash_shape_honors_explicit_native_git_dash_c(self) -> None:
+        native_workdir = Path(self.temporary.name) / "explicit-git-c"
+        native_workdir.mkdir()
+        explicit = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "official-bash-explicit-c",
+                "hook_run_id": "native",
+                "cwd": "/mnt/c/work/repo",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        f"git -C {native_workdir} status --short "
+                        "--untracked-files=no -- src/parser.py"
+                    )
+                },
+            }
+        )
+        self.assertEqual(explicit.stdout, "", explicit.stdout)
+
+        mounted = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "official-bash-mounted-c",
+                "hook_run_id": "mounted",
+                "cwd": str(native_workdir),
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "git -C /mnt/c/work/repo status --short "
+                        "--untracked-files=no -- src/parser.py"
+                    )
+                },
+            }
+        )
+        reason = json.loads(mounted.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("WSL/DrvFS/CIFS/UNC", reason)
+
+        chained = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "official-bash-chained-git",
+                "hook_run_id": "chained",
+                "cwd": "/mnt/c/work/repo",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        f"git -C {native_workdir} status --short --untracked-files=no -- src/parser.py; "
+                        "git clean -fd"
+                    )
+                },
+            }
+        )
+        chained_reason = json.loads(chained.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("multiple Git invocations", chained_reason)
 
     def test_exec_command_rejects_structured_workdir_outside_command_leaf(self) -> None:
         native_workdir = Path(self.temporary.name) / "split-native"

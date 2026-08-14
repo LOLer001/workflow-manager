@@ -12,6 +12,8 @@ The Hook observes request, Start, and Stop events; it cannot call `list_agents`,
 
 ## Lifecycle and race rules
 
+- Multi-Agent V2 may encrypt `message` before local `PreToolUse`. For a new assessor use visible `task_name=high_assessor_<assessor_binding_id>_<objective_fingerprint>_v1` and positive `fork_turns`; the Hook records only `opaque_v2`, never the ciphertext. Plaintext hosts still require the complete message markers and Simple/Hard contract.
+- An opaque Simple follow-up is valid only when its visible canonical target ends in that exact task name and the retained request proves the same binding. Wrong/stale targets fail closed, and the result must still return the exact `SIMPLE_EXECUTION` binding. Opaque recovery or stall diagnosis without a visible recovery/stall contract must replan rather than weaken authorization.
 - Fold records into complete generations: pending request, live Start, result-pending follow-up, and terminal Stop. A Stop without status is still terminal with `unknown` status. Duplicate, orphan, or late events are bounded no-ops.
 - A pending request is consumed atomically. Concurrent Starts for one request yield one live generation; a loser cannot downgrade into an unbound lane. A second confirmed executor cannot silently displace the first.
 - Reusing an agent ID requires a newer persisted request. After reuse, a Stop must correlate to the current request fingerprint or turn; otherwise it is ambiguous and must not close the new generation. Exact bound Simple or stall-result markers may correlate a result-pending follow-up that has no second Start.

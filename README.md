@@ -41,14 +41,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.35\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.36\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.35/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.36/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -69,14 +69,14 @@ Workflow Manager 不会仅因新版 Hook 已接管就删除旧版本缓存：旧
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.35\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.36\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.35/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.36/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
 ```
 
 `hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
@@ -117,7 +117,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.35 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.36 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -134,6 +134,10 @@ codex plugin add workflow-manager@workflow-manager --json
 处理顺序是“日常/工作 → Work 的高档评估者判简单/困难 → 独立判断 Direct/Focused/Complex/Extensive”。困难不等于增加执行者数量；除高评估者和已确认的唯一执行者外，子智能体数量也不能反向决定问题难度。任务仍只按需经过 `Contract → Evidence → Change → Verify → Report`。
 
 困难计划等待确认期间，目标读取、搜索、静态检查、计划更新、澄清问题和明确只读的子智能体调查可以继续；明确文件写入、变更型子智能体或 Git、构建打包、部署安装和设备变更会被拦截。确认只绑定当前计划、目标和难度判断；任何新增约束或重规划请求都会使原确认失效。
+
+Codex Multi-Agent V2 可能在本地 `PreToolUse` 前加密 collaboration `message`。此时 assessor 与 confirmed executor 使用当前状态派生的可见 ASCII `task_name` 和正数 `fork_turns` 绑定请求；Simple follow-up 还必须命中此前已接受的 canonical assessor target。错目标或旧合同会拒绝，结果仍须回显精确 binding。加密 stall/recovery 无法暴露所需合同字段时会明确 fail-closed 并重规划，不会把宿主可见性限制当成放宽授权的理由。
+
+当官方 `Bash` Hook 只暴露挂载的 session `cwd` 时，原生 Linux Git 目录必须在命令中以字面量绝对 `git -C` 明示；每个工具调用只允许一个 Git 操作。挂载路径、虚假 `/tmp` 和链式第二个 Git 仍会被拒绝。
 
 私有 Markdown 镜像只复制经过清理和大小限制的详细计划正文。镜像写入失败、正文漂移或路径身份异常不会改变权威 `plan_digest`，也不会自行锁定或开放确认；修正真实原因后，同一计划可以安全重试写入。每个会话只保留当前镜像和最新 5 个受管旧镜像；保留清理以最多 16 项的有界事务执行，路径绑定或删除前后校验失败时逐字节回滚，符号链接、硬链接、同名竞态和目录替换均以 `unsafe_path` 关闭镜像 I/O。
 

@@ -7,14 +7,13 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 
 ## Quality invariant
 
-- Correctness and required reasoning, evidence, safety, and acceptance outrank savings.
-- Remove redundancy, never required stages, evidence, correction, or checks.
+- Correctness and required reasoning, evidence, safety, and acceptance outrank savings; remove only redundancy.
 - Pressure may change order/checkpoints, never the depth needed to solve the task.
 
 ## Route and run
 
 1. Classify **Daily** (chat/weather/reports/personal/cleanup) versus **Work** (device/App/code/engineering). Daily keeps current settings/safety.
-2. Work creates one objective/generation-bound high assessor using highest available model/effort and a non-full-history fork. Record requested versus observed only.
+2. Work creates one objective-bound high assessor using highest available model/effort, a positive fork, and a state-bound ASCII task name. Record requested versus observed only.
 3. First assessor turn is read-only. **Simple** returns `WORK_ASSESSMENT`, then the same child solves+verifies and returns `SIMPLE_EXECUTION`. **Hard** returns the detailed plan+marker.
 4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan scope/paths, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
 5. Before confirmation allow reads; block write/agent/Git/build/deploy/device mutation. A private Markdown mirror is review-only, not authorization. Changes invalidate it. Read [work routing](references/work-routing.md).
@@ -27,13 +26,13 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 ## Context gates
 
 - Below 55% work normally; at 55-70% trim presentation; at 70% checkpoint and narrow exploration.
-- After compaction resume native summary/gates and profile preference, never raw prompt. Reclassify on new phases, repeated failures, long builds, or large output.
+- After compaction resume native summary/gates, never raw prompt. Reclassify on changed inputs, repeated failures, long builds, or large output.
 
 ## Delegation
 
-Optimize critical-path time; launch ready positive-utility lanes only when net time saved exceeds coordination/collision cost.
+Launch ready positive-utility lanes only when critical-path time saved exceeds coordination/collision cost.
 
-- Before spawning note `deliverable | ready | owner | resource | time saved`. Read-only investigation is only one option; any owned write/test/research/review lane qualifies.
+- Read-only investigation is only one option; owned write/test/research/review lanes qualify.
 - Parent owns integration/shared state; treat caps as ceilings, never quotas: Direct/Focused 0; Complex up to 2 subagents; Extensive up to 3.
 - Cross-task notices require fresh active same-host source+peer and a same-resource conflict; read [live coordination](references/live-coordination.md). Serialize only those shared stages. Pending Hard plans permit only read-only children.
 - A stalled bound Hard executor stops with exact evidence. Reuse its high assessor once read-only; resume the bound profile for an in-plan remedy, else replan. Read [stall recovery](references/stall-recovery.md).
@@ -60,7 +59,7 @@ Optimize critical-path time; launch ready positive-utility lanes only when net t
 
 ## Mounted-source safety
 
-Never run Git from CIFS, Samba, UNC, DrvFS, or other WSL mounts. Use `android-remote-git`, an authoritative Linux tree, or a safe non-mounted terminal.
+Never run Git from CIFS, Samba, UNC, DrvFS, or other WSL mounts. Use remote Git or an authoritative Linux tree. If a Bash Hook exposes only mounted session `cwd`, put one verified native directory visibly in the command as absolute `git -C`; never chain Git calls.
 
 ## Truthfulness and boundaries
 

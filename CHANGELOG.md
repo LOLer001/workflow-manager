@@ -1,5 +1,13 @@
 # 更新记录
 
+## 1.0.36
+
+- 兼容 Codex Multi-Agent V2 在本地 `PreToolUse` 前将 collaboration `message` 加密的真实载荷：assessor 与 confirmed executor 改用可见、目标/合同绑定的 ASCII `task_name` 加正数 `fork_turns` 作为预派发状态绑定，明文宿主继续执行原有完整 message 合同校验。
+- V2 Simple 二阶段只允许 follow-up 的可见 canonical target 命中此前已接受的 bound assessor task；错 target、旧 binding、旧目标、无正数 fork 和旧合同全部 fail-closed。结果端仍要求 `WORK_ASSESSMENT` / `SIMPLE_EXECUTION` binding，Hard assessor 提前变更仍失败，executor 仍受单一所有权与验收门禁。
+- 加密 follow-up 无法暴露 `stall_id` 与 `execution_contract_id` 时，stall recovery 明确拒绝并要求重规划，不把宿主可见性缺口变成授权降级；同理 opaque assessor/executor recovery 不复用旧合同。
+- Git 挂载守卫适配官方 `Bash` Hook 只保证 session `cwd` 的形态：可从命令本身安全解析一个或多个字面量 `git -C`，仍拒绝 DrvFS/CIFS/UNC、虚假 `/tmp`、无法安全解析的相对/动态路径和单次命令中的多个 Git 调用，避免“安全首条 + 挂载区第二条”的链式绕过。
+- Schema 升至 19，writer/manifest 升至 1.0.36；只新增 `plaintext|opaque_v2` 枚举，不保存 collaboration 明文或密文。Schema18 迁移不会凭旧字段生成 V2 授权证据。
+
 ## 1.0.35
 
 - Hard 详细计划进入待确认状态时，自动在插件私有数据目录生成经过清理和大小限制的 Markdown 审阅镜像，并将相对路径、目标/难度/代次、`plan_digest` 与正文摘要作为有界状态保存。镜像只用于审阅，不能确认计划或授权执行；状态中的 `plan_digest` 始终权威，正文修改只会标记 `content_drift`。
