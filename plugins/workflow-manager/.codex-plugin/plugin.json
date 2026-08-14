@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.30",
+  "version": "1.0.31",
   "description": "Quality-first, context-efficient workflow management with daily/work and simple/hard routing, confirmed plans, compaction recovery, and dynamic subagent orchestration.",
   "author": {
     "name": "Cong"

@@ -1,5 +1,13 @@
 # 更新记录
 
+## 1.0.31
+
+- 修复合法高档评估者创建请求被通用 assessor gate 误判为非评估者、进而重复拒绝的问题；任何已识别的 assessor 意图都会先返回具体的绑定、目标、档位、fork、合同或恢复校验原因。Hook 仍只校验和记录请求及宿主回显，不宣称已经切换父会话或子智能体模型。
+- 将宿主创建参数归一为一个有界 canonical leaf：兼容直接 `tool_input`、`args`/`arguments`/`input`/`tool_input` 包装、JSON 字符串、有限 list/content block、function/tool 调用包装及宿主工具别名；多 leaf、同字段别名冲突、跨层拼装、超深/超节点/超列表/超 64 KiB 均 fail-closed。
+- 同一目标与 assessor binding 的失败重试保持幂等，不刷新 generation、binding、attempt 或类型化失败；重复创建和最多一次实质修正的恢复继续受既有两次尝试上限约束，避免同一矛盾循环。
+- Git 挂载保护改用 `exec_command` 实际结构化 command leaf 中的 `workdir`/`cwd`，优先于父 payload cwd；跨 leaf 或冲突路径拒绝，相对路径只按真实 payload cwd 解析，`/tmp` 仅在真实存在目录下放行，并继续阻止 DrvFS/CIFS/UNC。
+- 新增 canonical 参数桥接、assessor 具体拒绝/幂等、function wrapper、64 KiB 边界、effective workdir 正反向、跨 leaf 路径、相对路径与挂载路径的 Linux 回归测试；Schema 保持 15，严格计划确认、assessor 首轮只读、唯一执行者、参考验收、因果复核与压缩恢复语义不变。
+
 ## 1.0.30
 
 - 新增持久会话偏好 `default|highest_throughout`。只有明确限定本/整个会话、全程或始终，并同时要求最高可用模型和最高推理强度时才启用最高档；同样明确要求恢复默认才退出，偏好跨目标和压缩恢复保留。

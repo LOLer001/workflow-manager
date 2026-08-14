@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 15
-WRITER_VERSION = "1.0.30"
+WRITER_VERSION = "1.0.31"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -2751,87 +2751,410 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
     }
     route.update(classify_work_difficulty(normalized, domain, route))
     return decorate_route(route)
-def extract_command(payload: dict[str, Any]) -> str:
+COMMAND_REQUEST_WRAPPERS = ("args", "arguments", "input", "tool_input")
+COMMAND_REQUEST_MAX_DEPTH = 4
+COMMAND_REQUEST_MAX_NODES = 24
+COMMAND_REQUEST_MAX_LIST_ITEMS = 8
+
+
+def _normalize_structured_command_cwd(value: str, payload_cwd: Any) -> tuple[str | None, str | None]:
+    candidate = value.strip()
+    if not candidate:
+        return None, "command cwd/workdir must be non-empty"
+    normalized = candidate.replace("\\", "/")
+    if (
+        normalized.startswith("/")
+        or normalized.startswith("//")
+        or re.match(r"(?i)^[a-z]:/", normalized)
+    ):
+        return candidate, None
+
+    base = str(payload_cwd or "").strip()
+    if not base:
+        return None, "relative command cwd/workdir has no payload cwd base"
+    try:
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            return None, "relative command cwd/workdir has an ambiguous payload cwd base"
+        resolved_base = base_path.resolve(strict=True)
+        if not resolved_base.is_dir():
+            return None, "relative command cwd/workdir base is not a real directory"
+        resolved = (resolved_base / candidate).resolve(strict=True)
+        if not resolved.is_dir():
+            return None, "relative command cwd/workdir is not a real directory"
+        return str(resolved), None
+    except OSError:
+        return None, "relative command cwd/workdir cannot be resolved from payload cwd"
+
+
+def command_request_resolution(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bind command and workdir/cwd from one structured tool-input leaf."""
     tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        for key in ("command", "cmd"):
-            value = tool_input.get(key)
-            if isinstance(value, str):
-                return value
-        for key in ("args", "arguments", "input"):
-            nested = tool_input.get(key)
-            if isinstance(nested, dict):
-                for command_key in ("command", "cmd"):
-                    value = nested.get(command_key)
-                    if isinstance(value, str):
-                        return value
-    tool = str(payload.get("tool_name") or "").lower()
-    if isinstance(tool_input, str) and tool in {"bash", "shell", "exec_command"}:
-        return tool_input
-    return ""
+    tool = normalized_key(payload.get("tool_name"))
+    if isinstance(tool_input, str):
+        raw_command_tool = tool in {"bash", "shell", "execcommand"} or tool.endswith("execcommand")
+        return {
+            "command": tool_input if raw_command_tool else "",
+            "cwd": payload.get("cwd"),
+            "error": None,
+        }
+
+    pending: list[tuple[Any, int]] = [(tool_input, 0)]
+    seen: set[int] = set()
+    leaves: list[tuple[str, Any]] = []
+    errors: list[str] = []
+    observed_commands: list[str] = []
+    nodes = 0
+    while pending:
+        value, depth = pending.pop(0)
+        nodes += 1
+        if nodes > COMMAND_REQUEST_MAX_NODES:
+            errors.append("command arguments exceed bounded node limit")
+            break
+        if depth > COMMAND_REQUEST_MAX_DEPTH:
+            errors.append("command arguments exceed bounded depth limit")
+            break
+        if isinstance(value, list):
+            if len(value) > COMMAND_REQUEST_MAX_LIST_ITEMS:
+                errors.append("command arguments exceed bounded list limit")
+                continue
+            pending.extend((item, depth + 1) for item in value)
+            continue
+        if not isinstance(value, dict):
+            continue
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        command_values = [
+            candidate.strip()
+            for key in ("command", "cmd")
+            for candidate in (value.get(key),)
+            if isinstance(candidate, str) and candidate.strip()
+        ]
+        observed_commands.extend(command_values)
+        structured_cwd_keys = [key for key in ("workdir", "cwd") if key in value]
+        if structured_cwd_keys and not command_values:
+            errors.append("structured cwd/workdir is outside the command leaf")
+        if len(set(command_values)) > 1:
+            errors.append("command leaf contains conflicting command/cmd aliases")
+        elif command_values:
+            cwd_values: list[str] = []
+            invalid_cwd = False
+            for key in ("workdir", "cwd"):
+                if key not in value:
+                    continue
+                candidate = value.get(key)
+                if not isinstance(candidate, str):
+                    invalid_cwd = True
+                    continue
+                cwd_values.append(candidate.strip())
+            if invalid_cwd:
+                errors.append("command cwd/workdir must be scalar text")
+            elif len(set(cwd_values)) > 1:
+                errors.append("command leaf contains conflicting cwd/workdir aliases")
+            else:
+                cwd = payload.get("cwd")
+                if cwd_values:
+                    cwd, cwd_error = _normalize_structured_command_cwd(
+                        cwd_values[0], payload.get("cwd")
+                    )
+                    if cwd_error:
+                        errors.append(cwd_error)
+                leaves.append(
+                    (
+                        command_values[0],
+                        cwd,
+                    )
+                )
+        for key in COMMAND_REQUEST_WRAPPERS:
+            child = value.get(key)
+            # Workdir/cwd embedded in JSON or another scalar is data, not executable structure.
+            if isinstance(child, (dict, list)):
+                pending.append((child, depth + 1))
+
+    if not errors and len(leaves) > 1:
+        errors.append("command arguments contain multiple command leaves")
+    if len(leaves) == 1 and not errors:
+        command, cwd = leaves[0]
+    else:
+        command = "\n".join(dict.fromkeys(observed_commands))
+        cwd = payload.get("cwd")
+    return {"command": command, "cwd": cwd, "error": errors[0] if errors else None}
+
+
+def extract_command(payload: dict[str, Any]) -> str:
+    return str(command_request_resolution(payload).get("command") or "")
+
+
+def effective_tool_cwd(payload: dict[str, Any]) -> Any:
+    return command_request_resolution(payload).get("cwd")
 
 
 def is_subagent_spawn_tool(payload: dict[str, Any]) -> bool:
     name = normalized_key(payload.get("tool_name"))
-    return name == "agent" or name.endswith("spawnagent")
+    return (
+        name == "agent"
+        or name.endswith("spawnagent")
+        or name in {"subagentspawn", "createsubagent", "spawnsubagent"}
+    )
+
+
+SUBAGENT_REQUEST_MAX_DEPTH = 6
+SUBAGENT_REQUEST_MAX_NODES = 48
+SUBAGENT_REQUEST_MAX_LIST_ITEMS = 16
+SUBAGENT_REQUEST_MAX_BYTES = 64 * 1024
+SUBAGENT_REQUEST_WRAPPERS = ("args", "arguments", "input", "tool_input", "content")
+SUBAGENT_REQUEST_ALIASES = {
+    "task_name": ("task_name", "taskName", "name", "description"),
+    "message": ("message", "prompt", "task"),
+    "model": ("model",),
+    "reasoning_effort": ("reasoning_effort", "reasoningEffort"),
+    "fork_turns": ("fork_turns", "forkTurns"),
+    "target": ("target",),
+}
+
+
+def _json_container_text(value: str) -> bool:
+    stripped = value.strip()
+    return bool(stripped and stripped[0] in "{[")
+
+
+def _content_block_text(value: Any) -> tuple[str | None, str | None]:
+    """Read a finite text/content representation without following arbitrary keys."""
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    texts: list[str] = []
+    nodes = 0
+    byte_count = 0
+    while pending:
+        current, depth = pending.pop(0)
+        nodes += 1
+        if nodes > SUBAGENT_REQUEST_MAX_NODES or depth > SUBAGENT_REQUEST_MAX_DEPTH:
+            return None, "content blocks exceed bounded depth/node limits"
+        if isinstance(current, str):
+            encoded = current.encode("utf-8", errors="replace")
+            byte_count += len(encoded)
+            if byte_count > SUBAGENT_REQUEST_MAX_BYTES:
+                return None, "content blocks exceed bounded byte limit"
+            if current.strip():
+                texts.append(current.strip())
+            continue
+        if isinstance(current, list):
+            if len(current) > SUBAGENT_REQUEST_MAX_LIST_ITEMS:
+                return None, "content blocks exceed bounded list limit"
+            pending.extend((item, depth + 1) for item in current)
+            continue
+        if not isinstance(current, dict):
+            return None, "content blocks must contain text objects"
+        block_type = normalized_key(current.get("type"))
+        if block_type and block_type not in {"text", "inputtext", "outputtext"}:
+            return None, "content block type is not textual"
+        if "text" in current:
+            pending.append((current.get("text"), depth + 1))
+        elif "content" in current:
+            pending.append((current.get("content"), depth + 1))
+        else:
+            return None, "content block lacks text"
+    return ("\n".join(texts) if texts else None), None
+
+
+def _request_alias_value(field: str, value: Any) -> tuple[str | None, str | None]:
+    if field == "message" and isinstance(value, (list, dict)):
+        return _content_block_text(value)
+    if value in (None, ""):
+        return None, None
+    if not isinstance(value, (str, int)):
+        return None, f"{field} must be scalar text"
+    normalized = str(value).strip()
+    return (normalized or None), None
+
+
+def _function_tool_request_wrapper(candidate: dict[str, Any]) -> bool:
+    return bool(
+        normalized_key(candidate.get("type"))
+        in {"function", "tool", "functioncall", "toolcall"}
+        and "arguments" in candidate
+    )
+
+
+def _canonical_request_leaf(
+    candidate: dict[str, Any],
+) -> tuple[dict[str, str], str | None, int]:
+    leaf: dict[str, str] = {}
+    consumed_bytes = 0
+    for field, aliases in SUBAGENT_REQUEST_ALIASES.items():
+        observed: list[str] = []
+        for alias in aliases:
+            if alias not in candidate:
+                continue
+            normalized, error = _request_alias_value(field, candidate.get(alias))
+            if error:
+                return {}, error, consumed_bytes
+            if normalized is not None:
+                observed.append(normalized)
+                consumed_bytes += len(normalized.encode("utf-8", errors="replace"))
+        if len(set(observed)) > 1:
+            return {}, f"conflicting {field} aliases", consumed_bytes
+        if observed:
+            leaf[field] = observed[0]
+
+    # Some hosts represent the message itself as a content block beside the scalar
+    # model/fork fields. JSON content is a wrapper, not message text, and is parsed below.
+    if "message" not in leaf and "content" in candidate:
+        content_text, error = _content_block_text(candidate.get("content"))
+        if error:
+            return {}, error, consumed_bytes
+        if content_text and not _json_container_text(content_text):
+            leaf["message"] = content_text
+            consumed_bytes += len(content_text.encode("utf-8", errors="replace"))
+    return leaf, None, consumed_bytes
+
+
+def _bounded_assessor_intent(payload: dict[str, Any]) -> bool:
+    """Notice assessor markers even when the request wrapper itself is malformed."""
+    root = payload.get("tool_input") if "tool_input" in payload else payload
+    pending: list[tuple[Any, int]] = [(root, 0)]
+    nodes = 0
+    byte_count = 0
+    while pending:
+        value, depth = pending.pop(0)
+        nodes += 1
+        if nodes > SUBAGENT_REQUEST_MAX_NODES or depth > SUBAGENT_REQUEST_MAX_DEPTH:
+            return False
+        if isinstance(value, str):
+            encoded = value.encode("utf-8", errors="replace")
+            byte_count += len(encoded)
+            if byte_count > SUBAGENT_REQUEST_MAX_BYTES:
+                return False
+            lower = value.lower()
+            if "assessor_binding_id" in lower:
+                return True
+            continue
+        if isinstance(value, list):
+            pending.extend(
+                (item, depth + 1)
+                for item in value[:SUBAGENT_REQUEST_MAX_LIST_ITEMS]
+            )
+            continue
+        if not isinstance(value, dict):
+            continue
+        for key, child in list(value.items())[:SUBAGENT_REQUEST_MAX_LIST_ITEMS]:
+            if normalized_key(key) in {"taskname", "name", "description"} and normalized_key(child) == "highassessor":
+                return True
+            pending.append((child, depth + 1))
+    return False
+
+
+def subagent_request_resolution(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve exactly one bounded canonical request leaf; never splice sibling layers."""
+    root = payload.get("tool_input") if "tool_input" in payload else payload
+    pending: list[tuple[Any, int]] = [(root, 0)]
+    leaves: list[dict[str, str]] = []
+    errors: list[str] = []
+    seen: set[int] = set()
+    nodes = 0
+    byte_count = 0
+    while pending:
+        value, depth = pending.pop(0)
+        nodes += 1
+        if nodes > SUBAGENT_REQUEST_MAX_NODES:
+            errors.append("request arguments exceed bounded node limit")
+            break
+        if depth > SUBAGENT_REQUEST_MAX_DEPTH:
+            errors.append("request arguments exceed bounded depth limit")
+            break
+        if isinstance(value, str):
+            encoded = value.encode("utf-8", errors="replace")
+            byte_count += len(encoded)
+            if byte_count > SUBAGENT_REQUEST_MAX_BYTES:
+                errors.append("request arguments exceed bounded byte limit")
+                break
+            if not _json_container_text(value):
+                continue
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError):
+                errors.append("request arguments contain invalid JSON")
+                continue
+            pending.append((decoded, depth + 1))
+            continue
+        if isinstance(value, list):
+            if len(value) > SUBAGENT_REQUEST_MAX_LIST_ITEMS:
+                errors.append("request arguments exceed bounded list limit")
+                continue
+            pending.extend((item, depth + 1) for item in value)
+            continue
+        if not isinstance(value, dict):
+            continue
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        function_tool_wrapper = _function_tool_request_wrapper(value)
+        if function_tool_wrapper:
+            leaf, leaf_error, leaf_bytes = {}, None, 0
+        else:
+            leaf, leaf_error, leaf_bytes = _canonical_request_leaf(value)
+        byte_count += leaf_bytes
+        if byte_count > SUBAGENT_REQUEST_MAX_BYTES:
+            errors.append("request arguments exceed bounded byte limit")
+            break
+        if leaf_error:
+            errors.append(leaf_error)
+        elif leaf:
+            leaves.append(leaf)
+        wrapper_keys = ("arguments",) if function_tool_wrapper else SUBAGENT_REQUEST_WRAPPERS
+        for key in wrapper_keys:
+            if key in value:
+                pending.append((value.get(key), depth + 1))
+        if normalized_key(value.get("type")) in {"text", "inputtext", "outputtext"}:
+            text_value = value.get("text")
+            if isinstance(text_value, str) and _json_container_text(text_value):
+                pending.append((text_value, depth + 1))
+
+    error = errors[0] if errors else None
+    if not error and len(leaves) > 1:
+        error = "request arguments contain multiple request leaves"
+    return {
+        "leaf": leaves[0] if len(leaves) == 1 and not error else {},
+        "error": error,
+        "assessor_intent": _bounded_assessor_intent(payload),
+    }
 
 
 def subagent_request_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Accept raw and host-normalized collaboration spawn shapes without inventing bindings."""
-    candidates: list[dict[str, Any]] = []
-    pending: list[Any] = [payload.get("tool_input"), payload]
-    seen: set[int] = set()
-    while pending:
-        value = pending.pop(0)
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (TypeError, ValueError):
-                continue
-        if not isinstance(value, dict) or id(value) in seen:
-            continue
-        seen.add(id(value))
-        candidates.append(value)
-        pending.extend(value.get(key) for key in ("args", "arguments", "input", "tool_input"))
-    return candidates
+    resolution = subagent_request_resolution(payload)
+    leaf = resolution.get("leaf")
+    return [leaf] if isinstance(leaf, dict) and leaf else []
 
 
 def subagent_request_fields(payload: dict[str, Any]) -> tuple[str | None, str | None]:
     candidates = subagent_request_candidates(payload)
-
-    task_name = None
-    scope_value = None
-    for candidate in candidates:
-        if task_name is None:
-            for key in ("task_name", "name", "description"):
-                value = candidate.get(key)
-                if value:
-                    task_name = safe_label(value, 120)
-                    break
-        if scope_value is None:
-            for key in ("message", "prompt", "task"):
-                value = candidate.get(key)
-                if value:
-                    scope_value = value
-                    break
+    candidate = candidates[0] if candidates else {}
+    task_name = safe_label(candidate.get("task_name"), 120) if candidate.get("task_name") else None
+    scope_value = candidate.get("message")
     return task_name, stable_hash(scope_value) if scope_value else None
 
 
 def subagent_request_options(payload: dict[str, Any]) -> dict[str, str | None]:
     candidates = subagent_request_candidates(payload)
+    candidate = candidates[0] if candidates else {}
     result: dict[str, str | None] = {
         "model": None,
         "reasoning_effort": None,
         "fork_turns": None,
     }
-    for candidate in candidates:
-        for key in tuple(result):
-            if result[key] is None and candidate.get(key) not in (None, ""):
-                result[key] = str(candidate.get(key)).strip()
+    for key in tuple(result):
+        if candidate.get(key) not in (None, ""):
+            result[key] = str(candidate.get(key)).strip()
     return result
 
 
 def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
+    resolution = subagent_request_resolution(payload)
+    if resolution.get("error"):
+        return False, f"executor {resolution['error']}"
     contract_id = str(state.get("execution_contract_id") or "")
     request = subagent_request_text(payload)
     if not contract_id or not request:
@@ -2916,11 +3239,16 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
 
 
 def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
+    resolution = subagent_request_resolution(payload)
+    if resolution.get("error"):
+        return False, f"assessor {resolution['error']}"
     binding = str(state.get("assessor_binding_id") or "")
     request = subagent_request_text(payload)
     options = subagent_request_options(payload)
     if not binding or not request:
         return False, "missing assessor binding"
+    if safe_int(state.get("assessor_attempt")) >= 2:
+        return False, "assessor retry exhausted"
     if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
         return False, "duplicate assessor"
     if not re.search(rf"assessor_binding_id\s*[:=]\s*{re.escape(binding)}\b", request) or "profile_resolution=highest_available" not in request:
@@ -2941,8 +3269,6 @@ def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -
     hard_contract = bool(re.search(r"(?:hard.{0,48}(?:read[- ]only|plan|confirmation|只读|计划|确认)|hard.{0,48}(?:plan|只读|计划).{0,48}(?:read[- ]only|confirmation|只读|确认))", request, re.I))
     if not simple_contract or not hard_contract:
         return False, "assessor request lacks the Simple/Hard assessment contract"
-    if safe_int(state.get("assessor_attempt")) >= 2:
-        return False, "assessor retry exhausted"
     if state.get("assessor_state") == "recovery_required":
         failure = safe_label(state.get("assessor_failure_kind"), 48)
         if (
@@ -2955,12 +3281,13 @@ def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -
 
 
 def subagent_request_text(payload: dict[str, Any]) -> str:
-    for candidate in subagent_request_candidates(payload):
-        for key in ("message", "prompt", "task"):
-            value = candidate.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-    return ""
+    candidates = subagent_request_candidates(payload)
+    value = candidates[0].get("message") if candidates else None
+    return value if isinstance(value, str) else ""
+
+
+def subagent_request_has_assessor_intent(payload: dict[str, Any]) -> bool:
+    return bool(subagent_request_resolution(payload).get("assessor_intent"))
 
 
 def request_supports_delegation_reaudit(payload: dict[str, Any], route: dict[str, Any]) -> bool:
@@ -3425,6 +3752,8 @@ def cwd_is_wsl_or_network_mount(cwd: Any) -> bool:
     normalized = value.replace("\\", "/")
     if value.startswith("\\\\") or normalized.startswith("//"):
         return True
+    if re.match(r"(?i)^[a-z]:/", normalized):
+        return True
     if re.match(r"(?i)^/mnt/[a-z](?:/|$)", normalized):
         return True
     if os.name == "nt" or not normalized.startswith("/"):
@@ -3444,6 +3773,17 @@ def cwd_is_wsl_or_network_mount(cwd: Any) -> bool:
                         best_length = len(mountpoint)
                         best_type = fields[2].lower()
         return best_type in {"9p", "cifs", "drvfs", "fuse.sshfs", "smbfs"}
+    except OSError:
+        return False
+
+
+def real_tmp_git_directory(cwd: Any) -> bool:
+    value = str(cwd or "").strip().replace("\\", "/")
+    if not (value == "/tmp" or value.startswith("/tmp/")):
+        return True
+    try:
+        path = Path(value)
+        return path.is_absolute() and path.resolve(strict=True).is_dir()
     except OSError:
         return False
 
@@ -3532,15 +3872,29 @@ def command_output_budget(payload: dict[str, Any], command: str, risk_kind: str)
 
 
 def command_guard(payload: dict[str, Any]) -> tuple[str, str] | None:
-    command = extract_command(payload)
+    resolution = command_request_resolution(payload)
+    command = str(resolution.get("command") or "")
     if not command:
         return None
     subcommand = git_subcommand(command)
-    if subcommand and cwd_is_wsl_or_network_mount(payload.get("cwd")):
+    if subcommand and resolution.get("error"):
+        return (
+            "ambiguous_git_input",
+            f"Workflow Manager guard blocked Git because {resolution['error']}; keep cmd and cwd/workdir in one "
+            "structured tool_input leaf and remove conflicting aliases.",
+        )
+    effective_cwd = resolution.get("cwd")
+    if subcommand and cwd_is_wsl_or_network_mount(effective_cwd):
         return (
             "mounted_local_git",
             "Workflow Manager guard blocked Git in a WSL/DrvFS/CIFS/UNC working tree. Use android-remote-git or the "
             "authoritative remote Linux source tree; do not retry another local Git variant.",
+        )
+    if subcommand and not real_tmp_git_directory(effective_cwd):
+        return (
+            "invalid_tmp_git_cwd",
+            "Workflow Manager guard blocked Git because a /tmp workdir is not a real existing /tmp directory. "
+            "Use an existing native Linux directory and keep cmd plus workdir/cwd in the same structured tool_input leaf.",
         )
     if subcommand == "status" and not bounded_git_status(command):
         return (
@@ -3724,8 +4078,14 @@ def emit_posttool_advisory(status_value: str, meta: dict[str, Any]) -> None:
 
 def tool_fingerprint(payload: dict[str, Any]) -> tuple[str, str]:
     tool = safe_label(payload.get("tool_name"), 120)
+    command_resolution = command_request_resolution(payload)
+    fingerprint_cwd = (
+        command_resolution.get("cwd")
+        if command_resolution.get("command")
+        else payload.get("cwd")
+    )
     canonical_payload = {
-        "cwd": str(payload.get("cwd") or ""),
+        "cwd": str(fingerprint_cwd or ""),
         "session_id": str(payload.get("session_id") or ""),
         "tool": str(payload.get("tool_name") or "unknown"),
         "tool_input": payload.get("tool_input"),
@@ -4353,6 +4713,12 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
     previous = snapshot_state(payload)
+    same_assessor_objective_retry = bool(
+        previous.get("task_domain") == "work"
+        and previous.get("objective", {}).get("fingerprint") == stable_hash(prompt)
+        and previous.get("assessor_state")
+        in {"spawn_required", "spawn_pending", "running", "recovery_required", "failed"}
+    )
     preference_directive = session_execution_preference_directive(prompt)
     preference_changed = preference_directive not in {None, previous.get("session_execution_preference", "default")}
     requested_reference = reference_requested(prompt)
@@ -4396,7 +4762,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and not confirmed_plan
     )
     continuation = not new_objective and (
-        preference_directive is not None or is_control_followup(prompt) or is_progress_followup(prompt) or active_plan or reference_changed
+        preference_directive is not None
+        or is_control_followup(prompt)
+        or is_progress_followup(prompt)
+        or active_plan
+        or reference_changed
+        or same_assessor_objective_retry
     )
     classification = classify_prompt(prompt)
     if requested_reference:
@@ -4992,6 +5363,8 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         emit_pretool_deny("Workflow Manager blocked Simple assessor follow-up: target, binding, and solve/verify contract must match the original assessor.")
         return
     if is_subagent_spawn_tool(payload):
+        request_resolution = subagent_request_resolution(payload)
+        assessor_intent = subagent_request_has_assessor_intent(payload)
         assessor_ok, assessor_reason = confirmed_assessor_request(payload, state)
         if assessor_ok:
             def record_assessor(current: dict[str, Any]) -> None:
@@ -5006,14 +5379,21 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             mutate_state(payload, record_assessor)
             return
         request_text = subagent_request_text(payload)
-        assessor_intent = "assessor_binding_id" in request_text or subagent_request_fields(payload)[0] == "high_assessor"
-        if state.get("assessor_state") in {"spawn_required", "spawn_pending", "running", "recovery_required"} and assessor_intent:
+        if assessor_intent:
             if assessor_reason == "assessor retry exhausted":
                 def exhaust_assessor(current: dict[str, Any]) -> None:
                     current["assessor_state"] = "failed"
                     current["assessor_failure_kind"] = "retry_exhausted"
                 mutate_state(payload, exhaust_assessor)
-            emit_pretool_deny(f"Workflow Manager blocked assessor spawn: {assessor_reason}.")
+            emit_pretool_deny(
+                f"Workflow Manager blocked assessor spawn: {assessor_reason or 'invalid assessor request'}."
+            )
+            return
+        if request_resolution.get("error"):
+            emit_pretool_deny(
+                f"Workflow Manager blocked subagent spawn: {request_resolution['error']}; provide exactly one "
+                "bounded request leaf and do not split fields across wrappers."
+            )
             return
         route = safe_route(state.get("last_route"))
         request_is_shared = request_touches_shared_resource(request_text)

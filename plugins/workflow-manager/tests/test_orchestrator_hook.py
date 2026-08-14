@@ -109,7 +109,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 15)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.30")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.31")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -342,6 +342,346 @@ class OrchestratorHookTests(unittest.TestCase):
         legacy = {**HOOK.new_state({"session_id": "legacy"}), "schema_version": 13, "writer_version": "1.0.26", "task_domain": "work", "objective": {"fingerprint": "a" * 16, "length": 12}, "work_difficulty": "hard", "assessor_state": "none", "plan_state": "none"}
         migrated = HOOK.normalize_state(legacy, {"session_id": "legacy"})
         self.assertEqual((migrated["assessor_state"], migrated["assessor_input_fingerprint"]), ("spawn_required", "a" * 16))
+
+    def test_assessor_spawn_bridge_accepts_one_bounded_canonical_leaf(self) -> None:
+        tool_names = (
+            "collaboration.spawn_agent",
+            "spawn_agent",
+            "Agent",
+            "functions.collaboration.spawn_agent",
+            "mcp__collaboration__spawn_agent",
+            "collaboration.spawnAgent",
+            "subagent_spawn",
+            "create_subagent",
+        )
+        for index, tool_name in enumerate(tool_names):
+            with self.subTest(tool_name=tool_name):
+                data = Path(self.temporary.name) / f"assessor-bridge-{index}"
+                session = f"assessor-bridge-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session,
+                        "hook_run_id": "work",
+                        "prompt": "修复 Android 崩溃并验证",
+                    },
+                    data=data,
+                )
+                state = self.load_only_state(data)
+                message = (
+                    f"assessor_binding_id={state['assessor_binding_id']} "
+                    f"objective_fingerprint={state['objective']['fingerprint']} "
+                    "profile_resolution=highest_available assess Simple directly solve and verify; "
+                    "Hard read-only plan then confirmation"
+                )
+                leaf = {
+                    "task_name": "high_assessor",
+                    "message": message,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "ultra",
+                    "fork_turns": "none",
+                }
+                shapes = (
+                    leaf,
+                    {"args": leaf},
+                    {"arguments": leaf},
+                    {"input": leaf},
+                    {"tool_input": leaf},
+                    json.dumps({"arguments": leaf}),
+                    [leaf],
+                    {"content": [{"type": "text", "text": json.dumps(leaf)}]},
+                )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": session,
+                        "hook_run_id": "spawn",
+                        "tool_name": tool_name,
+                        "tool_input": shapes[index],
+                    },
+                    data=data,
+                )
+                output = json.loads(result.stdout or "{}")
+                self.assertNotIn(
+                    "permissionDecision",
+                    output.get("hookSpecificOutput", {}),
+                    (tool_name, result.stdout, result.stderr),
+                )
+                pending = self.load_only_state(data)
+                self.assertEqual((pending["assessor_state"], pending["assessor_attempt"]), ("spawn_pending", 1))
+                self.assertEqual(pending["subagents"][-1]["role"], "high_assessor")
+
+        content_data = Path(self.temporary.name) / "assessor-content-message"
+        session = "assessor-content-message"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 崩溃并验证",
+            },
+            data=content_data,
+        )
+        state = self.load_only_state(content_data)
+        message = (
+            f"assessor_binding_id={state['assessor_binding_id']} "
+            f"objective_fingerprint={state['objective']['fingerprint']} "
+            "profile_resolution=highest_available assess Simple directly solve and verify; "
+            "Hard read-only plan then confirmation"
+        )
+        content_leaf = {
+            "taskName": "high_assessor",
+            "message": [{"type": "input_text", "text": message}],
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "ultra",
+            "forkTurns": "none",
+        }
+        accepted = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "spawn",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": content_leaf,
+            },
+            data=content_data,
+        )
+        self.assertNotIn("permissionDecision", json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}))
+
+    def test_assessor_spawn_bridge_ignores_function_wrapper_name(self) -> None:
+        session = "assessor-function-wrapper"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 崩溃并验证",
+            }
+        )
+        state = self.load_only_state()
+        leaf = {
+            "task_name": "high_assessor",
+            "message": (
+                f"assessor_binding_id={state['assessor_binding_id']} "
+                f"objective_fingerprint={state['objective']['fingerprint']} "
+                "profile_resolution=highest_available assess Simple directly solve and verify; "
+                "Hard read-only plan then confirmation"
+            ),
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "ultra",
+            "fork_turns": "none",
+        }
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "spawn",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "type": "function",
+                    "name": "collaboration.spawn_agent",
+                    "arguments": leaf,
+                },
+            }
+        )
+        self.assertNotIn("permissionDecision", json.loads(result.stdout or "{}").get("hookSpecificOutput", {}))
+        self.assertEqual(self.load_only_state()["assessor_state"], "spawn_pending")
+
+    def test_assessor_spawn_bridge_bounds_direct_canonical_field_bytes(self) -> None:
+        session = "assessor-direct-byte-limit"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 崩溃并验证",
+            }
+        )
+        state = self.load_only_state()
+        message = (
+            f"assessor_binding_id={state['assessor_binding_id']} "
+            f"objective_fingerprint={state['objective']['fingerprint']} "
+            "profile_resolution=highest_available assess Simple directly solve and verify; "
+            "Hard read-only plan then confirmation "
+            + ("x" * (70 * 1024))
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "oversized",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "high_assessor",
+                    "message": message,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "ultra",
+                    "fork_turns": "none",
+                },
+            }
+        )
+        reason = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("bounded byte limit", reason)
+        self.assertNotIn("non-assessor subagent", reason)
+        self.assertEqual(self.load_only_state()["assessor_state"], "spawn_required")
+
+    def test_assessor_intent_conflicts_fail_closed_before_generic_gate(self) -> None:
+        session = "assessor-conflicting-leaves"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": "修复 Android 崩溃并验证",
+            }
+        )
+        state = self.load_only_state()
+        binding = state["assessor_binding_id"]
+        objective = state["objective"]["fingerprint"]
+        message = (
+            f"assessor_binding_id={binding} objective_fingerprint={objective} "
+            "profile_resolution=highest_available assess Simple directly solve and verify; "
+            "Hard read-only plan then confirmation"
+        )
+        conflicting = {
+            "message": message,
+            "args": {
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "ultra",
+                "fork_turns": "none",
+            },
+        }
+        first = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "conflict-1",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": conflicting,
+            }
+        )
+        reason = json.loads(first.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("multiple request leaves", reason)
+        self.assertNotIn("non-assessor subagent", reason)
+        unchanged = self.load_only_state()
+        self.assertEqual((unchanged["assessor_binding_id"], unchanged["assessor_attempt"]), (binding, 0))
+
+        repeated = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "conflict-2",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": conflicting,
+            }
+        )
+        repeated_reason = json.loads(repeated.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("multiple request leaves", repeated_reason)
+        self.assertEqual(self.load_only_state()["assessor_binding_id"], binding)
+
+        field_conflict = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "field-conflict",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "high_assessor",
+                    "message": message,
+                    "prompt": "different assessor prompt",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "ultra",
+                    "fork_turns": "none",
+                },
+            }
+        )
+        field_reason = json.loads(field_conflict.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("conflicting message aliases", field_reason)
+        self.assertNotIn("non-assessor subagent", field_reason)
+
+        malformed = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "malformed-json",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": '{"message":"assessor_binding_id=' + binding + '",',
+            }
+        )
+        malformed_reason = json.loads(malformed.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("invalid JSON", malformed_reason)
+        self.assertNotIn("non-assessor subagent", malformed_reason)
+
+    def test_same_objective_assessor_retry_is_idempotent(self) -> None:
+        session = "assessor-idempotent-objective"
+        prompt = "修复 Android 崩溃并验证"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "work",
+                "prompt": prompt,
+            }
+        )
+        state = self.load_only_state()
+        binding = state["assessor_binding_id"]
+        generation = state["assessor_generation"]
+        message = (
+            f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
+            "profile_resolution=highest_available assess Simple directly solve and verify; "
+            "Hard read-only plan then confirmation"
+        )
+        spawn = {
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "hook_run_id": "spawn",
+            "tool_name": "collaboration.spawn_agent",
+            "tool_input": {
+                "task_name": "high_assessor",
+                "message": message,
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "ultra",
+                "fork_turns": "none",
+            },
+        }
+        self.run_hook(spawn)
+        duplicate = self.run_hook({**spawn, "hook_run_id": "duplicate"})
+        duplicate_reason = json.loads(duplicate.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("duplicate assessor", duplicate_reason)
+        self.assertNotIn("non-assessor subagent", duplicate_reason)
+        pending = self.load_only_state()
+        self.assertEqual((pending["assessor_binding_id"], pending["assessor_generation"], pending["assessor_attempt"]), (binding, generation, 1))
+
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "bad-start",
+                "agent_id": "wrong-profile",
+                "model": "wrong",
+                "reasoning_effort": "ultra",
+            }
+        )
+        failed = self.load_only_state()
+        self.assertEqual((failed["assessor_state"], failed["assessor_failure_kind"]), ("recovery_required", "start_mismatch"))
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "same-objective",
+                "prompt": prompt,
+            }
+        )
+        retried = self.load_only_state()
+        self.assertEqual(
+            (
+                retried["assessor_binding_id"],
+                retried["assessor_generation"],
+                retried["assessor_attempt"],
+                retried["assessor_failure_kind"],
+            ),
+            (binding, generation, 1, "start_mismatch"),
+        )
 
     def test_assessor_hard_plan_compacts_and_resumes_without_raw_prompt(self) -> None:
         session = "assessor-resume"
@@ -3120,6 +3460,177 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         self.assertEqual(bounded.stdout, "")
+
+    def test_exec_command_uses_same_leaf_workdir_for_git_mount_safety(self) -> None:
+        native_workdir = Path(self.temporary.name) / "native-git-workdir"
+        native_workdir.mkdir()
+        command = "git status --short --untracked-files=no -- src/parser.py"
+
+        mounted_actual = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "actual-mounted-git",
+                "hook_run_id": "mounted",
+                "cwd": str(native_workdir),
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": command, "workdir": "/mnt/c/work/repo"},
+            }
+        )
+        mounted_reason = json.loads(mounted_actual.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("WSL/DrvFS/CIFS/UNC", mounted_reason)
+
+        native_actual = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "actual-native-git",
+                "hook_run_id": "native",
+                "cwd": "/mnt/c/work/repo",
+                "tool_name": "functions.exec_command",
+                "tool_input": {"cmd": command, "workdir": str(native_workdir)},
+            }
+        )
+        self.assertEqual(native_actual.stdout, "")
+
+        nonexistent = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "missing-native-git",
+                "hook_run_id": "missing",
+                "cwd": "/srv/repo",
+                "tool_name": "exec_command",
+                "tool_input": {
+                    "cmd": command,
+                    "workdir": str(Path(self.temporary.name) / "does-not-exist"),
+                },
+            }
+        )
+        missing_reason = json.loads(nonexistent.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("real existing /tmp directory", missing_reason)
+
+        string_spoof = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "string-workdir-spoof",
+                "hook_run_id": "spoof",
+                "cwd": "/mnt/c/work/repo",
+                "tool_name": "exec_command",
+                "tool_input": {
+                    "cmd": command,
+                    "input": json.dumps({"workdir": str(native_workdir)}),
+                },
+            }
+        )
+        spoof_reason = json.loads(string_spoof.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("WSL/DrvFS/CIFS/UNC", spoof_reason)
+
+        conflicting_cwd = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "conflicting-command-workdir",
+                "hook_run_id": "conflicting",
+                "cwd": str(native_workdir),
+                "tool_name": "exec_command",
+                "tool_input": {
+                    "cmd": command,
+                    "cwd": str(native_workdir),
+                    "workdir": "/mnt/c/work/repo",
+                },
+            }
+        )
+        conflicting_reason = json.loads(conflicting_cwd.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("conflicting cwd/workdir", conflicting_reason)
+
+        symlink = Path(self.temporary.name) / "mounted-link"
+        try:
+            symlink.symlink_to("/mnt/c", target_is_directory=True)
+        except OSError:
+            symlink = None
+        if symlink is not None:
+            linked = self.run_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "linked-mounted-git",
+                    "hook_run_id": "linked",
+                    "cwd": str(native_workdir),
+                    "tool_name": "exec_command",
+                    "tool_input": {"cmd": command, "workdir": str(symlink)},
+                }
+            )
+            linked_reason = json.loads(linked.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+            self.assertIn("WSL/DrvFS/CIFS/UNC", linked_reason)
+
+    def test_exec_command_rejects_structured_workdir_outside_command_leaf(self) -> None:
+        native_workdir = Path(self.temporary.name) / "split-native"
+        native_workdir.mkdir()
+        command = "git status --short --untracked-files=no -- src/parser.py"
+        cases = (
+            (str(native_workdir), "/mnt/c/work/repo"),
+            ("/mnt/c/work/repo", str(native_workdir)),
+        )
+        for index, (payload_cwd, nested_workdir) in enumerate(cases):
+            with self.subTest(payload_cwd=payload_cwd, nested_workdir=nested_workdir):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": f"split-command-workdir-{index}",
+                        "hook_run_id": "split",
+                        "cwd": payload_cwd,
+                        "tool_name": "exec_command",
+                        "tool_input": {
+                            "cmd": command,
+                            "args": {"workdir": nested_workdir},
+                        },
+                    }
+                )
+                reason = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertIn("outside the command leaf", reason)
+
+    def test_exec_command_resolves_relative_workdir_from_payload_cwd(self) -> None:
+        native_base = Path(self.temporary.name) / "relative-base"
+        native_base.mkdir()
+        (native_base / "child").mkdir()
+        missing_base = Path(self.temporary.name) / "missing-relative-base"
+        command = "git status --short --untracked-files=no -- src/parser.py"
+        cases = (
+            (str(native_base), ".", None),
+            (str(native_base), "child", None),
+            ("/mnt/c", ".", "WSL/DrvFS/CIFS/UNC"),
+            (str(missing_base), ".", "cannot be resolved from payload cwd"),
+        )
+        for index, (payload_cwd, workdir, expected_reason) in enumerate(cases):
+            with self.subTest(payload_cwd=payload_cwd, workdir=workdir):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": f"relative-command-workdir-{index}",
+                        "hook_run_id": "relative",
+                        "cwd": payload_cwd,
+                        "tool_name": "exec_command",
+                        "tool_input": {"cmd": command, "workdir": workdir},
+                    }
+                )
+                if expected_reason is None:
+                    self.assertEqual(result.stdout, "")
+                else:
+                    reason = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+                    self.assertIn(expected_reason, reason)
+
+    def test_exec_command_workdir_changes_tool_fingerprint(self) -> None:
+        first, _ = HOOK.tool_fingerprint(
+            {
+                "tool_name": "exec_command",
+                "cwd": "/mnt/c/work/repo",
+                "tool_input": {"cmd": "pwd", "workdir": "/tmp/a"},
+            }
+        )
+        second, _ = HOOK.tool_fingerprint(
+            {
+                "tool_name": "exec_command",
+                "cwd": "/mnt/c/work/repo",
+                "tool_input": {"cmd": "pwd", "workdir": "/tmp/b"},
+            }
+        )
+        self.assertNotEqual(first, second)
 
     def test_pretool_allows_remote_git_and_quoted_search_text(self) -> None:
         commands = (
