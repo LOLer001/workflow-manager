@@ -383,8 +383,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 16)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.32")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 17)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.33")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -2023,6 +2023,8 @@ class OrchestratorHookTests(unittest.TestCase):
         contract_id: str | None = None,
         recovery_from: str | None = None,
         material_correction: str | None = None,
+        stall_id: str | None = None,
+        remediation_digest: str | None = None,
     ) -> dict:
         tool_input = {
             "task_name": "execute_confirmed_plan",
@@ -2042,6 +2044,11 @@ class OrchestratorHookTests(unittest.TestCase):
                     if recovery_from and material_correction
                     else ""
                 )
+                + (
+                    f" stall_id={stall_id} remediation_digest={remediation_digest}"
+                    if stall_id and remediation_digest
+                    else ""
+                )
             ),
             "model": model,
             "reasoning_effort": effort,
@@ -2055,6 +2062,37 @@ class OrchestratorHookTests(unittest.TestCase):
             "tool_name": "collaboration.spawn_agent",
             "tool_input": tool_input,
         }
+
+    def create_explicit_stall_state(self, session: str, data: Path | None = None, *, highest: bool = False) -> dict:
+        state = self.create_confirmed_executor_state(session, data, highest=highest)
+        model, effort = (("gpt-5.6-sol", "ultra") if highest else ("gpt-5.6-terra", "medium"))
+        self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id=f"{session}-request", model=model, effort=effort), data=data)
+        agent = f"{session}-executor"
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-start", "agent_id": agent}, data=data)
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": f"{session}-fail", "agent_id": agent, "tool_name": "Bash", "tool_input": {"command": "make module"}, "tool_response": {"exit_code": 2}}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": f"{session}-stall", "agent_id": agent, "status": "failed", "last_assistant_message": f"EXECUTION_STALL contract_id={state['execution_contract_id']} failure_kind=build_failed evidence_digest={'d' * 32}"}, data=data)
+        return self.load_only_state(data)
+
+    def stall_followup_payload(self, state: dict, session: str, run_id: str, *, target: str | None = None, message: str | None = None) -> dict:
+        request = message or (
+            f"STALL_DIAGNOSIS_REQUEST stall_id={state['stall']['stall_id']} assessor_binding_id={state['assessor_binding_id']} "
+            f"objective_fingerprint={state['objective']['fingerprint']} execution_contract_id={state['execution_contract_id']} mode=read_only\n"
+            "Read-only diagnosis only without modifying files. Do not build or deploy; do not execute the plan."
+        )
+        return {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": run_id, "tool_name": "collaboration.followup_task", "tool_input": {"target": target or state["assessor_agent_id"], "message": request}}
+
+    def complete_stall_diagnosis(self, state: dict, session: str, *, outcome: str, data: Path | None = None) -> dict:
+        request = self.stall_followup_payload(state, session, f"{session}-diagnosis")
+        self.run_hook(request, data=data)
+        self.run_hook({**request, "hook_event_name": "PostToolUse", "hook_run_id": f"{session}-diagnosis-post", "tool_response": {"status": "ok"}}, data=data)
+        diagnosing = self.load_only_state(data)
+        result = (
+            f"STALL_DIAGNOSIS stall_id={diagnosing['stall']['stall_id']} assessor_binding_id={diagnosing['assessor_binding_id']} "
+            f"outcome={outcome} plan_digest={diagnosing['plan_digest']} execution_contract_id={diagnosing['execution_contract_id']} "
+            f"remediation_digest={'e' * 32}"
+        )
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": f"{session}-diagnosis-stop", "agent_id": diagnosing["assessor_agent_id"], "status": "completed", "last_assistant_message": result}, data=data)
+        return self.load_only_state(data)
 
     def create_completed_execution_baseline(
         self,
@@ -2277,6 +2315,194 @@ class OrchestratorHookTests(unittest.TestCase):
             json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"],
             "deny",
         )
+
+    def test_explicit_executor_stall_requires_bound_high_diagnosis_before_resume(self) -> None:
+        session = "executor-stall"
+        state = self.create_confirmed_executor_state(session)
+        self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="request-1"))
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-1", "agent_id": "stall-executor"})
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "failed-build", "agent_id": "stall-executor", "tool_name": "Bash", "tool_input": {"command": "make module"}, "tool_response": {"exit_code": 2}})
+        ordinary_failure = self.load_only_state()
+        self.assertEqual((ordinary_failure["executor_state"], ordinary_failure["executor_failure_kind"]), ("recovery_required", "build_failed"))
+        self.assertEqual(ordinary_failure.get("stall", {}).get("state", "none"), "none")
+
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "explicit-stall", "agent_id": "stall-executor", "status": "failed", "last_assistant_message": f"EXECUTION_STALL contract_id={state['execution_contract_id']} failure_kind=build_failed evidence_digest={'d' * 32}"})
+        stalled = self.load_only_state()
+        self.assertEqual(stalled.get("stall", {}).get("state"), "diagnosis_required")
+        self.assertRegex(stalled["stall"]["stall_id"], r"^[0-9a-f]{32}$")
+        direct = self.run_hook(self.executor_spawn_payload(stalled, session=session, hook_run_id="direct-recovery", recovery_from=stalled["executor_failure_kind"], material_correction="changed the build configuration after the first error"))
+        self.assertIn("diagnosis", json.loads(direct.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+        request = (
+            f"STALL_DIAGNOSIS_REQUEST stall_id={stalled['stall']['stall_id']} "
+            f"assessor_binding_id={stalled['assessor_binding_id']} objective_fingerprint={stalled['objective']['fingerprint']} "
+            f"execution_contract_id={stalled['execution_contract_id']} mode=read_only\n"
+            "Read-only diagnosis only without modifying files. Do not build or deploy; do not execute the plan."
+        )
+        followup_input = {"target": stalled["assessor_agent_id"], "message": request}
+        followup = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "diagnose", "tool_name": "collaboration.followup_task", "tool_input": followup_input})
+        self.assertNotIn("permissionDecision", json.loads(followup.stdout or "{}").get("hookSpecificOutput", {}))
+        self.assertEqual(self.load_only_state()["stall"]["state"], "diagnosis_pending")
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "diagnose-post", "tool_name": "collaboration.followup_task", "tool_input": followup_input, "tool_response": {"status": "ok"}})
+        diagnosing = self.load_only_state()
+        self.assertEqual(diagnosing["stall"]["state"], "diagnosing")
+        remediation = "e" * 32
+        result = (
+            f"STALL_DIAGNOSIS stall_id={diagnosing['stall']['stall_id']} assessor_binding_id={diagnosing['assessor_binding_id']} "
+            f"outcome=resume plan_digest={diagnosing['plan_digest']} execution_contract_id={diagnosing['execution_contract_id']} "
+            f"remediation_digest={remediation}"
+        )
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "diagnose-stop", "agent_id": diagnosing["assessor_agent_id"], "status": "completed", "last_assistant_message": result})
+        diagnosed = self.load_only_state()
+        self.assertEqual((diagnosed["stall"]["state"], diagnosed["stall"]["remediation_digest"]), ("resume_required", remediation))
+        resumed = self.run_hook(self.executor_spawn_payload(diagnosed, session=session, hook_run_id="resume-request", recovery_from=diagnosed["executor_failure_kind"], material_correction="applied the bounded diagnostic remediation to build inputs", stall_id=diagnosed["stall"]["stall_id"], remediation_digest=remediation))
+        self.assertNotIn("permissionDecision", json.loads(resumed.stdout or "{}").get("hookSpecificOutput", {}))
+        self.assertEqual(self.load_only_state()["stall"]["state"], "resuming")
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "resume-start", "agent_id": "resumed-executor"})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "resume-stop", "agent_id": "resumed-executor", "status": "completed", "last_assistant_message": "bounded remediation completed and verified"})
+        resolved = self.load_only_state()
+        self.assertEqual((resolved["executor_state"], resolved["stall"]["state"]), ("succeeded", "resolved"))
+
+    def test_stall_diagnosis_delivery_retry_is_bounded_and_late_safe(self) -> None:
+        session = "stall-delivery"
+        state = self.create_explicit_stall_state(session)
+        valid = self.stall_followup_payload(state, session, "diagnose-1")
+        bad_messages = (
+            ("other-agent", valid["tool_input"]["message"]),
+            (None, valid["tool_input"]["message"].replace(state["stall"]["stall_id"], "f" * 32)),
+            (None, valid["tool_input"]["message"].replace(state["assessor_binding_id"], "e" * 32)),
+            (None, "Read-only diagnosis without the required marker. Do not build."),
+        )
+        for index, (target, message) in enumerate(bad_messages):
+            denied = self.run_hook(self.stall_followup_payload(state, session, f"bad-{index}", target=target, message=message))
+            self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(self.load_only_state()["stall"]["state"], "diagnosis_required")
+        self.run_hook(valid)
+        pending = self.load_only_state()
+        wrong_post = self.stall_followup_payload(state, session, "wrong-post", target="other-agent")
+        wrong_post.update({"hook_event_name": "PostToolUse", "tool_response": {"status": "ok"}})
+        self.run_hook(wrong_post)
+        self.assertEqual(self.load_only_state()["stall"]["state"], "diagnosis_pending")
+        first_post = {**valid, "hook_event_name": "PostToolUse", "hook_run_id": "post-1", "tool_response": {"status": "error"}}
+        self.run_hook(first_post)
+        self.assertEqual((self.load_only_state()["stall"]["state"], self.load_only_state()["stall"]["diagnosis_attempt"]), ("diagnosis_required", 1))
+        retry = self.stall_followup_payload(self.load_only_state(), session, "diagnose-2")
+        self.run_hook(retry)
+        self.run_hook({**retry, "hook_event_name": "PostToolUse", "hook_run_id": "post-2", "tool_response": {"status": "error"}})
+        self.assertEqual((self.load_only_state()["stall"]["state"], self.load_only_state()["executor_state"]), ("exhausted", "exhausted"))
+        self.run_hook({**retry, "hook_event_name": "PostToolUse", "hook_run_id": "late-ok", "tool_response": {"status": "ok"}})
+        self.assertEqual(self.load_only_state()["stall"]["state"], "exhausted")
+
+    def test_stall_unknown_delivery_is_diagnosing_and_accepts_late_bound_result(self) -> None:
+        session = "stall-unconfirmed"
+        state = self.create_explicit_stall_state(session)
+        request = self.stall_followup_payload(state, session, "diagnose")
+        self.run_hook(request)
+        pending = self.load_only_state()["stall"]
+        self.run_hook({**request, "hook_event_name": "PostToolUse", "hook_run_id": "post-unknown", "tool_response": {}})
+        unconfirmed = self.load_only_state()
+        self.assertEqual((unconfirmed["stall"]["state"], unconfirmed["stall"]["diagnosis_attempt"]), ("diagnosing", 1))
+        self.assertEqual(unconfirmed["stall"]["diagnosis_request_fingerprint"], pending["diagnosis_request_fingerprint"])
+        duplicate = self.stall_followup_payload(unconfirmed, session, "duplicate")
+        self.assertEqual(json.loads(self.run_hook(duplicate).stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        result = f"STALL_DIAGNOSIS stall_id={unconfirmed['stall']['stall_id']} assessor_binding_id={unconfirmed['assessor_binding_id']} outcome=resume plan_digest={unconfirmed['plan_digest']} execution_contract_id={unconfirmed['execution_contract_id']} remediation_digest={'e' * 32}"
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "late-result", "agent_id": unconfirmed["assessor_agent_id"], "status": "completed", "last_assistant_message": result})
+        self.assertEqual(self.load_only_state()["stall"]["state"], "resume_required")
+
+    def test_stall_diagnosis_concurrent_pretool_has_exactly_one_owner(self) -> None:
+        for round_index in range(4):
+            with self.subTest(round=round_index):
+                session = f"stall-race-{round_index}"
+                data = Path(self.temporary.name) / session
+                state = self.create_explicit_stall_state(session, data)
+                base = self.stall_followup_payload(state, session, "race-0")
+                payloads = [{**base, "hook_run_id": f"race-{index}"} for index in range(2)]
+                barrier, denied = threading.Barrier(2), []
+
+                def attempt(payload: dict) -> bool:
+                    snapshot = HOOK.snapshot_state(payload)
+                    barrier.wait()
+                    return HOOK.handle_stall_diagnosis_pretool(payload, snapshot, HOOK.tool_fingerprint(payload)[0])
+
+                with patch.dict(os.environ, {"PLUGIN_DATA": str(data), "CODEX_HOME": str(self.codex_home)}), patch.object(HOOK, "emit_pretool_deny", side_effect=denied.append):
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        self.assertEqual(list(pool.map(attempt, payloads)), [True, True])
+                final = self.load_only_state(data)
+                self.assertEqual((len(denied), final["stall"]["state"], final["stall"]["diagnosis_attempt"]), (1, "diagnosis_pending", 1))
+                self.assertIn("duplicate", denied[0])
+                self.assertEqual(final["stall"]["diagnosis_request_fingerprint"], HOOK.stable_hash(f"stall-diagnosis-request-v1\0{HOOK.tool_fingerprint(base)[0]}", 32))
+                self.assertEqual(sum(item.get("kind") == "stall_diagnosis" and item.get("action") == "deny" for item in final["guards"]), 1)
+
+    def test_resolved_stall_bypasses_ordinary_followup_but_rejects_stale_marker(self) -> None:
+        session = "stall-resolved-followup"
+        state = self.create_explicit_stall_state(session)
+        state["stall"]["state"] = "resolved"
+        self.state_files()[0].write_text(json.dumps(state), encoding="utf-8")
+        ordinary = self.stall_followup_payload(state, session, "ordinary", message="Ordinary bounded status follow-up without any control marker.")
+        self.assertNotIn("permissionDecision", json.loads(self.run_hook(ordinary).stdout or "{}").get("hookSpecificOutput", {}))
+        stale = self.stall_followup_payload(state, session, "stale")
+        stale_output = json.loads(self.run_hook(stale).stdout)["hookSpecificOutput"]
+        self.assertEqual(stale_output["permissionDecision"], "deny")
+        self.assertIn("not awaiting delivery", stale_output["permissionDecisionReason"])
+
+    def test_stall_diagnosis_invalid_result_exhausts_and_replan_invalidates_contract(self) -> None:
+        invalid_data = Path(self.temporary.name) / "stall-invalid"
+        invalid = self.create_explicit_stall_state("stall-invalid", invalid_data)
+        request = self.stall_followup_payload(invalid, "stall-invalid", "diagnose-invalid")
+        self.run_hook(request, data=invalid_data)
+        self.run_hook({**request, "hook_event_name": "PostToolUse", "tool_response": {"status": "ok"}}, data=invalid_data)
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": "stall-invalid", "hook_run_id": "invalid-result", "agent_id": invalid["assessor_agent_id"], "status": "completed", "last_assistant_message": "STALL_DIAGNOSIS malformed"}, data=invalid_data)
+        invalid_result = self.load_only_state(invalid_data)
+        self.assertEqual((invalid_result["stall"]["state"], invalid_result["executor_state"]), ("exhausted", "exhausted"))
+
+        replan_data = Path(self.temporary.name) / "stall-replan"
+        stalled = self.create_explicit_stall_state("stall-replan", replan_data)
+        old_contract = stalled["execution_contract_id"]
+        replanned = self.complete_stall_diagnosis(stalled, "stall-replan", outcome="replan", data=replan_data)
+        self.assertEqual((replanned["stall"]["state"], replanned["plan_state"], replanned["execution_contract_id"]), ("resolved", "analyzing", None))
+        self.assertGreater(replanned["plan_generation"], stalled["plan_generation"])
+        denied = self.run_hook(self.executor_spawn_payload(stalled, session="stall-replan", hook_run_id="old-contract", contract_id=old_contract, recovery_from="build_failed", material_correction="bounded correction after replan"), data=replan_data)
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_stall_resume_restores_bound_profile_and_failure_is_terminal(self) -> None:
+        for highest, expected_model, expected_effort, expected_profile in (
+            (False, "gpt-5.6-terra", "medium", "work_executor_low_latest"),
+            (True, "gpt-5.6-sol", "ultra", "work_executor_highest_available"),
+        ):
+            with self.subTest(highest=highest):
+                session = f"stall-profile-{highest}"
+                data = Path(self.temporary.name) / session
+                stalled = self.create_explicit_stall_state(session, data, highest=highest)
+                diagnosed = self.complete_stall_diagnosis(stalled, session, outcome="resume", data=data)
+                self.assertEqual((diagnosed["stall"]["resume_profile"], diagnosed["model_profile"]), (expected_profile, expected_profile))
+                wrong = self.run_hook(self.executor_spawn_payload(diagnosed, session=session, hook_run_id="wrong-profile", model=("gpt-5.6-terra" if highest else "gpt-5.6-sol"), effort=("medium" if highest else "ultra"), recovery_from="build_failed", material_correction="applied bounded diagnostic correction", stall_id=diagnosed["stall"]["stall_id"], remediation_digest=diagnosed["stall"]["remediation_digest"]), data=data)
+                self.assertEqual(json.loads(wrong.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+                resumed = self.run_hook(self.executor_spawn_payload(diagnosed, session=session, hook_run_id="resume", model=expected_model, effort=expected_effort, recovery_from="build_failed", material_correction="applied bounded diagnostic correction", stall_id=diagnosed["stall"]["stall_id"], remediation_digest=diagnosed["stall"]["remediation_digest"]), data=data)
+                self.assertNotIn("permissionDecision", json.loads(resumed.stdout or "{}").get("hookSpecificOutput", {}))
+                self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "resume-start", "agent_id": "resumed-executor", "model": expected_model, "reasoning_effort": expected_effort}, data=data)
+                self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "resume-fail", "agent_id": "resumed-executor", "status": "failed", "last_assistant_message": "bounded remediation did not resolve the failure"}, data=data)
+                exhausted = self.load_only_state(data)
+                self.assertEqual((exhausted["stall"]["state"], exhausted["executor_state"]), ("exhausted", "exhausted"))
+                denied_again = self.run_hook(self.stall_followup_payload(exhausted, session, "second-diagnosis"), data=data)
+                self.assertEqual(json.loads(denied_again.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_stall_compaction_resume_and_schema16_migration_are_private(self) -> None:
+        session = "stall-compact"
+        state = self.create_explicit_stall_state(session)
+        secret = "RAW_STALL_CONTROL_MUST_NOT_PERSIST"
+        path = self.state_files()[0]
+        state["stall"]["raw_control_message"] = secret
+        path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
+        compacted = self.load_only_state()
+        self.assertEqual(compacted["compactions"][-1]["stall"]["stall_id"], compacted["stall"]["stall_id"])
+        self.assertNotIn(secret, path.read_text(encoding="utf-8"))
+        resumed = self.run_hook({"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume"})
+        self.assertIn(compacted["stall"]["stall_id"], resumed.stdout)
+        self.assertNotIn(secret, resumed.stdout)
+        legacy = {**compacted, "schema_version": 16, "writer_version": "1.0.32"}
+        migrated = HOOK.normalize_state(legacy, {"session_id": session})
+        self.assertEqual(migrated["stall"]["state"], "none")
 
     def test_executor_failures_are_typed_and_recovery_is_bounded(self) -> None:
         session = "executor-recovery"
@@ -4708,7 +4934,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         migrated = self.load_only_state(data)
-        self.assertEqual(migrated["schema_version"], 16)
+        self.assertEqual(migrated["schema_version"], 17)
         self.assertEqual(migrated["session_execution_preference"], "default")
         self.assertEqual(migrated["writer_version"], HOOK.WRITER_VERSION)
         self.assertEqual(

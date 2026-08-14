@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 16
-WRITER_VERSION = "1.0.32"
+SCHEMA_VERSION = 17
+WRITER_VERSION = "1.0.33"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -96,6 +96,21 @@ EXECUTOR_FAILURE_KINDS = {
     "verification_failed",
 }
 MAX_EXECUTOR_ATTEMPTS = 2
+STALL_STATES = {
+    "none",
+    "diagnosis_required",
+    "diagnosis_pending",
+    "diagnosing",
+    "resume_required",
+    "resuming",
+    "resolved",
+    "exhausted",
+}
+STALL_RESUME_PROFILES = {
+    "work_executor_low_latest",
+    "work_executor_highest_available",
+}
+MAX_STALL_DIAGNOSIS_ATTEMPTS = 2
 ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "simple_execution_required", "simple_running", "simple_complete", "hard_plan_ready", "recovery_required", "failed"}
 CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
 CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
@@ -592,6 +607,7 @@ def reset_executor_binding(state: dict[str, Any], *, preserve_failure: bool = Fa
     state["executor_observed_effective"] = False
     state["executor_observed_model"] = None
     state["executor_observed_reasoning_effort"] = None
+    state["stall"] = _safe_stall(None)
 
 
 def safe_session_execution_preference(value: Any) -> str:
@@ -1289,6 +1305,39 @@ def _safe_coordination_inbound(item: Any) -> dict[str, Any] | None:
     }
 
 
+def _safe_stall(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        item = {}
+    state_value = item.get("state") if item.get("state") in STALL_STATES else "none"
+    result = {
+        "state": state_value,
+        "stall_id": _coordination_fp32(item.get("stall_id")),
+        "objective_fingerprint": safe_fingerprint(item.get("objective_fingerprint")) or None,
+        "plan_digest": _coordination_fp32(item.get("plan_digest")),
+        "execution_contract_id": _coordination_fp32(item.get("execution_contract_id")),
+        "evidence_digest": _coordination_fp32(item.get("evidence_digest")),
+        "diagnosis_request_fingerprint": _coordination_fp32(item.get("diagnosis_request_fingerprint")),
+        "remediation_digest": _coordination_fp32(item.get("remediation_digest")),
+        "correction_digest": _coordination_fp32(item.get("correction_digest")),
+        "failure_kind": item.get("failure_kind") if item.get("failure_kind") in EXECUTOR_FAILURE_KINDS else None,
+        "resume_profile": item.get("resume_profile") if item.get("resume_profile") in STALL_RESUME_PROFILES else None,
+        "executor_attempt": min(max(safe_int(item.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS),
+        "diagnosis_attempt": min(max(safe_int(item.get("diagnosis_attempt")), 0), MAX_STALL_DIAGNOSIS_ATTEMPTS),
+        "at": str(item.get("at") or "")[:40] or None,
+    }
+    required = (
+        result["stall_id"],
+        result["objective_fingerprint"],
+        result["plan_digest"],
+        result["execution_contract_id"],
+        result["failure_kind"],
+        result["resume_profile"],
+    )
+    if state_value != "none" and not all(required):
+        result["state"] = "exhausted"
+    return result
+
+
 def new_state(payload: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     return {
@@ -1351,6 +1400,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
             "outcome": None,
             "evidence_digest": None,
         },
+        "stall": _safe_stall(None),
         "created_at": now,
         "updated_at": now,
         "objective": {},
@@ -1692,6 +1742,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             item.get("last_execution_baseline")
         ),
         "causal_review": _safe_causal_review(item.get("causal_review")),
+        "stall": _safe_stall(item.get("stall")),
         "coordination_activity": [
             safe for raw in as_list(item.get("coordination_activity"))
             if (safe := _safe_coordination_activity(raw)) is not None
@@ -1897,6 +1948,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         value.get("last_execution_baseline")
     )
     base["causal_review"] = _safe_causal_review(value.get("causal_review"))
+    if safe_int(value.get("schema_version")) >= 17:
+        base["stall"] = _safe_stall(value.get("stall"))
     if safe_int(value.get("schema_version")) >= 16:
         base["coordination_activity"] = [
             safe for raw in as_list(value.get("coordination_activity"))
@@ -1985,6 +2038,23 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_model"] = None
         base["executor_reasoning_effort"] = None
         base["executor_fork_turns"] = None
+    stall = _safe_stall(base.get("stall"))
+    if stall.get("state") not in {"none", "resolved"}:
+        bound = bool(
+            stall.get("objective_fingerprint") == base.get("objective", {}).get("fingerprint")
+            and stall.get("plan_digest") == base.get("plan_digest")
+            and stall.get("execution_contract_id") == base.get("execution_contract_id")
+        )
+        if not bound:
+            stall["state"] = "exhausted"
+            if base.get("plan_state") == "confirmed":
+                base["executor_state"] = "exhausted"
+        base["model_profile"] = (
+            stall.get("resume_profile")
+            if stall.get("state") in {"resume_required", "resuming"}
+            else "work_assessment"
+        )
+        base["stall"] = stall
     if base["causal_review"].get("state") in {"triage_required", "triaging"}:
         base["model_profile"] = "work_assessment"
 
@@ -3592,6 +3662,17 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
         or any(term in request for term in ("验收", "验证", "测试"))
     )
     if state.get("executor_state") == "recovery_required":
+        stall = _safe_stall(state.get("stall"))
+        if stall.get("state") not in {"none", "resume_required"}:
+            return False, "stall diagnosis must complete before executor recovery"
+        if stall.get("state") == "resume_required":
+            if (
+                f"stall_id={stall.get('stall_id')}" not in request
+                or f"remediation_digest={stall.get('remediation_digest')}" not in request
+            ):
+                return False, "stall recovery lacks the bound stall_id and remediation_digest"
+            if stall.get("resume_profile") != confirmed_executor_model_profile(state):
+                return False, "stall recovery profile no longer matches the bound session policy"
         failure_kind = str(state.get("executor_failure_kind") or "")
         recovery_marker = bool(
             failure_kind
@@ -4716,6 +4797,7 @@ def session_start(payload: dict[str, Any]) -> None:
                 state.get("last_execution_baseline")
             ),
             "causal_review": _safe_causal_review(state.get("causal_review")),
+            "stall": _safe_stall(state.get("stall")),
             "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
             "coordination_activity": [
                 safe
@@ -5821,6 +5903,17 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
             )
             current["executor_fork_turns"] = str(options.get("fork_turns"))
             current["model_profile"] = confirmed_executor_model_profile(current)
+            stall = _safe_stall(current.get("stall"))
+            if stall.get("state") == "resume_required":
+                correction = re.search(
+                    r"material_correction\s*[:=]\s*(.{8,}?)(?=\s+stall_id=|$)",
+                    subagent_request_text(payload),
+                    re.I,
+                )
+                stall["state"] = "resuming"
+                stall["correction_digest"] = stable_hash(correction.group(1), 32) if correction else None
+                stall["at"] = utc_now()
+                current["stall"] = stall
 
     mutate_state(payload, record_request)
     if executor_request:
@@ -6096,10 +6189,101 @@ def handle_coordination_pretool(
     return True
 
 
+STALL_DIAGNOSIS_REQUEST_RE = re.compile(
+    r"^STALL_DIAGNOSIS_REQUEST stall_id=([0-9a-f]{32}) "
+    r"assessor_binding_id=([0-9a-f]{32}) objective_fingerprint=([0-9a-f]{8,64}) "
+    r"execution_contract_id=([0-9a-f]{32}) mode=read_only$"
+)
+
+
+def handle_stall_diagnosis_pretool(
+    payload: dict[str, Any], state: dict[str, Any], fingerprint: str
+) -> bool:
+    if not normalized_key(payload.get("tool_name")).endswith("followuptask"):
+        return False
+    stall = _safe_stall(state.get("stall"))
+    if stall.get("state") == "none":
+        return False
+    resolution = subagent_request_resolution(payload)
+    leaf = resolution.get("leaf") if isinstance(resolution.get("leaf"), dict) else {}
+    request = str(leaf.get("message") or "")
+    target = str(leaf.get("target") or "")
+    marker_lines = [line for line in request.splitlines() if line.startswith("STALL_DIAGNOSIS_REQUEST")]
+    if stall.get("state") == "resolved" and not marker_lines:
+        return False
+    matches = [match for line in marker_lines if (match := STALL_DIAGNOSIS_REQUEST_RE.fullmatch(line))]
+    marker = matches[0] if len(marker_lines) == len(matches) == 1 else None
+    reason = resolution.get("error")
+    if stall.get("state") != "diagnosis_required":
+        reason = reason or "stall diagnosis is not awaiting delivery"
+    elif safe_int(stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS:
+        reason = reason or "stall diagnosis delivery retry is exhausted"
+    elif not marker:
+        reason = reason or "stall diagnosis marker is missing or malformed"
+    elif target != str(state.get("assessor_agent_id") or ""):
+        reason = reason or "stall diagnosis target does not match the original assessor"
+    elif marker.group(1) != stall.get("stall_id"):
+        reason = reason or "stall_id mismatch"
+    elif marker.group(2) != state.get("assessor_binding_id"):
+        reason = reason or "assessor binding mismatch"
+    elif marker.group(3) != state.get("objective", {}).get("fingerprint"):
+        reason = reason or "stall objective mismatch"
+    elif marker.group(4) != state.get("execution_contract_id"):
+        reason = reason or "stall execution contract mismatch"
+    elif not subagent_request_is_read_only(payload):
+        reason = reason or "stall diagnosis first round must be strictly read-only"
+    if reason:
+        def reject(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "stall_diagnosis", "action": "deny", "fingerprint": fingerprint}
+            )
+        mutate_state(payload, reject)
+        emit_pretool_deny(f"Workflow Manager blocked stall diagnosis follow-up: {reason}.")
+        return True
+
+    decision = {"owned": False}
+
+    def reserve(current: dict[str, Any]) -> None:
+        current_stall = _safe_stall(current.get("stall"))
+        if (
+            current_stall.get("state") != "diagnosis_required"
+            or current_stall.get("stall_id") != stall.get("stall_id")
+            or safe_int(current_stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS
+        ):
+            current.setdefault("guards", []).append(
+                {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "stall_diagnosis", "action": "deny", "fingerprint": fingerprint}
+            )
+            return
+        current_stall["state"] = "diagnosis_pending"
+        current_stall["diagnosis_attempt"] = safe_int(current_stall.get("diagnosis_attempt")) + 1
+        current_stall["diagnosis_request_fingerprint"] = stable_hash(
+            f"stall-diagnosis-request-v1\0{fingerprint}", 32
+        )
+        current_stall["at"] = utc_now()
+        current["stall"] = current_stall
+        decision["owned"] = True
+
+    _, changed = mutate_state(payload, reserve)
+    if not changed or not decision["owned"]:
+        emit_pretool_deny("Workflow Manager blocked duplicate or stale stall diagnosis follow-up.")
+    return True
+
+
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
     if handle_coordination_pretool(payload, state, fingerprint):
+        return
+    if handle_stall_diagnosis_pretool(payload, state, fingerprint):
+        return
+    stall_state = _safe_stall(state.get("stall")).get("state")
+    if is_subagent_spawn_tool(payload) and stall_state in {
+        "diagnosis_required", "diagnosis_pending", "diagnosing", "exhausted"
+    }:
+        emit_pretool_deny(
+            "Workflow Manager blocked a new executor or assessor: stall diagnosis must reuse the original bound "
+            "high assessor and complete before recovery; exhausted stalls require replan."
+        )
         return
     if normalized_key(payload.get("tool_name")).endswith("followuptask") and state.get("assessor_state") in {"simple_execution_required", "recovery_required"}:
         request = subagent_request_text(payload)
@@ -6458,6 +6642,11 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         explicit = str(response.get("status") or response.get("state") or "").strip().lower()
         if explicit in {"ok", "accepted", "success"} or response.get("ok") is True or response.get("success") is True:
             coordination_send_state = "sent"
+    stall_followup_fingerprint = (
+        stable_hash(f"stall-diagnosis-request-v1\0{fingerprint}", 32)
+        if normalized_key(payload.get("tool_name")).endswith("followuptask")
+        else None
+    )
     command = extract_command(payload)
     category = command_category(payload, command)
     risk_kind = command_risk_kind(payload, command)
@@ -6498,6 +6687,22 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 else:
                     notice["state"] = "exhausted" if safe_int(notice.get("attempt")) >= 2 else "failed"
                 notice["at"] = coordination_now()
+        if stall_followup_fingerprint:
+            stall = _safe_stall(state.get("stall"))
+            if (
+                stall.get("state") == "diagnosis_pending"
+                and stall.get("diagnosis_request_fingerprint") == stall_followup_fingerprint
+            ):
+                if status_value.startswith("error") or status_value in ERROR_STATUSES:
+                    if safe_int(stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS:
+                        stall["state"] = "exhausted"
+                        state["executor_state"] = "exhausted"
+                    else:
+                        stall["state"] = "diagnosis_required"
+                else:
+                    stall["state"] = "diagnosing"
+                stall["at"] = utc_now()
+                state["stall"] = stall
         active_plan_digest = (
             state.get("plan_digest")
             if state.get("plan_state") == "confirmed"
@@ -6565,6 +6770,26 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 else "exhausted"
             )
             state["model_profile"] = "work_assessment"
+        stall = _safe_stall(state.get("stall"))
+        resumed_failure = bool(
+            failed
+            and stall.get("state") == "resuming"
+            and stall.get("execution_contract_id") == state.get("execution_contract_id")
+            and (
+                executor_operation
+                or (
+                    pending_spawn
+                    and pending_spawn.get("role") == "confirmed_executor"
+                    and pending_spawn.get("contract_id") == state.get("execution_contract_id")
+                )
+            )
+        )
+        if resumed_failure:
+            stall["state"] = "exhausted"
+            stall["at"] = utc_now()
+            state["stall"] = stall
+            state["executor_state"] = "exhausted"
+            state["model_profile"] = "work_assessment"
         if telemetry:
             state["telemetry"] = telemetry
 
@@ -6615,6 +6840,7 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                     state.get("last_execution_baseline")
                 ),
                 "causal_review": _safe_causal_review(state.get("causal_review")),
+                "stall": _safe_stall(state.get("stall")),
                 "coordination_activity": [
                     safe
                     for raw in state.get("coordination_activity", [])
@@ -6684,6 +6910,74 @@ def active_agent_scope_summary(state: dict[str, Any]) -> list[dict[str, Any]]:
         if safe_summary:
             summaries.append(safe_summary)
     return summaries[:8]
+
+
+EXECUTION_STALL_RE = re.compile(
+    r"^EXECUTION_STALL contract_id=([0-9a-f]{32}) "
+    r"failure_kind=([a-z_]+) evidence_digest=([0-9a-f]{32})$"
+)
+STALL_DIAGNOSIS_RE = re.compile(
+    r"^STALL_DIAGNOSIS stall_id=([0-9a-f]{32}) assessor_binding_id=([0-9a-f]{32}) "
+    r"outcome=(resume|replan) plan_digest=([0-9a-f]{32}) "
+    r"execution_contract_id=([0-9a-f]{32}) remediation_digest=([0-9a-f]{32})$"
+)
+
+
+def executor_stall_id(state: dict[str, Any], failure_kind: str) -> str | None:
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    plan = _coordination_fp32(state.get("plan_digest"))
+    contract = _coordination_fp32(state.get("execution_contract_id"))
+    attempt = min(max(safe_int(state.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS)
+    if not objective or not plan or not contract or not attempt or failure_kind not in EXECUTOR_FAILURE_KINDS:
+        return None
+    return stable_hash(
+        f"execution-stall-v1\0{objective}\0{plan}\0{contract}\0{attempt}\0{failure_kind}",
+        32,
+    )
+
+
+def record_explicit_executor_stall(
+    state: dict[str, Any], contract_id: str, failure_kind: str, evidence_digest: str
+) -> bool:
+    stall_id = executor_stall_id(state, failure_kind)
+    contract_current = bool(
+        contract_id == state.get("execution_contract_id")
+        and contract_id == execution_contract_id(state)
+        and failure_kind == state.get("executor_failure_kind")
+        and state.get("plan_state") == "confirmed"
+    )
+    prior = _safe_stall(state.get("stall"))
+    repeated = bool(
+        prior.get("state") != "none"
+        and prior.get("execution_contract_id") == contract_id
+    )
+    if not stall_id or not contract_current or repeated:
+        if repeated:
+            prior["state"] = "exhausted"
+            prior["at"] = utc_now()
+            state["stall"] = prior
+        state["executor_state"] = "exhausted"
+        state["model_profile"] = "work_assessment"
+        return False
+    state["stall"] = _safe_stall(
+        {
+            "state": "diagnosis_required",
+            "stall_id": stall_id,
+            "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+            "plan_digest": state.get("plan_digest"),
+            "execution_contract_id": contract_id,
+            "evidence_digest": evidence_digest,
+            "failure_kind": failure_kind,
+            "resume_profile": confirmed_executor_model_profile(state),
+            "executor_attempt": state.get("executor_attempt"),
+            "diagnosis_attempt": 0,
+            "at": utc_now(),
+        }
+    )
+    state["executor_state"] = "recovery_required"
+    state["executor_failure_kind"] = failure_kind
+    state["model_profile"] = "work_assessment"
+    return True
 
 
 def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -6869,11 +7163,23 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     current_objective = str(previous.get("objective", {}).get("fingerprint") or "")
     stale = bool(started_objective and current_objective and started_objective != current_objective)
     executor_agent = bool((started or {}).get("role") == "confirmed_executor")
+    previous_stall = _safe_stall(previous.get("stall"))
+    stall_assessor = bool(
+        previous_stall.get("state") == "diagnosing"
+        and agent_id == previous.get("assessor_agent_id")
+    )
     assessor_agent = bool((started or {}).get("role") == "high_assessor") or bool(
         previous.get("assessor_state") == "simple_running" and agent_id == previous.get("assessor_agent_id")
-    )
+    ) or stall_assessor
     assessment = re.search(r"(?im)^\s*WORK_ASSESSMENT\s+binding_id=([0-9a-f]{32})\s+outcome=(simple|hard)\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
     simple_execution = re.search(r"(?im)^\s*SIMPLE_EXECUTION\s+binding_id=([0-9a-f]{32})\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
+    stall_lines = [line for line in str(result or "").splitlines() if line.startswith("EXECUTION_STALL")]
+    stall_matches = [match for line in stall_lines if (match := EXECUTION_STALL_RE.fullmatch(line))]
+    execution_stall_intent = bool(stall_lines)
+    execution_stall = stall_matches[0] if len(stall_lines) == len(stall_matches) == 1 else None
+    diagnosis_lines = [line for line in str(result or "").splitlines() if line.startswith("STALL_DIAGNOSIS")]
+    diagnosis_matches = [match for line in diagnosis_lines if (match := STALL_DIAGNOSIS_RE.fullmatch(line))]
+    stall_diagnosis = diagnosis_matches[0] if len(diagnosis_lines) == len(diagnosis_matches) == 1 else None
 
     def update(state: dict[str, Any]) -> None:
         state.setdefault("subagents", []).append(
@@ -6903,6 +7209,25 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 and state.get("execution_contract_id") == execution_contract_id(state)
             )
             successful = status_value in {"completed", "ok"}
+            if execution_stall_intent:
+                valid_stall = bool(
+                    not successful
+                    and contract_current
+                    and execution_stall
+                    and execution_stall.group(1) == state.get("execution_contract_id")
+                    and execution_stall.group(2) in EXECUTOR_FAILURE_KINDS
+                )
+                if valid_stall:
+                    record_explicit_executor_stall(
+                        state,
+                        execution_stall.group(1),
+                        execution_stall.group(2),
+                        execution_stall.group(3),
+                    )
+                else:
+                    state["executor_state"] = "exhausted"
+                    state["model_profile"] = "work_assessment"
+                return
             if not contract_current:
                 state["executor_state"] = "recovery_required"
                 state["executor_failure_kind"] = "stale_contract"
@@ -6910,6 +7235,14 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             elif successful and state.get("executor_state") == "running":
                 state["executor_state"] = "succeeded"
                 state["executor_failure_kind"] = None
+                stall = _safe_stall(state.get("stall"))
+                if (
+                    stall.get("state") == "resuming"
+                    and stall.get("execution_contract_id") == state.get("execution_contract_id")
+                ):
+                    stall["state"] = "resolved"
+                    stall["at"] = utc_now()
+                    state["stall"] = stall
                 baseline = build_execution_baseline(state)
                 if baseline:
                     state["last_execution_baseline"] = baseline
@@ -6918,6 +7251,51 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["executor_state"] = "recovery_required" if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS else "exhausted"
                 state["executor_failure_kind"] = "executor_failed"
                 state["model_profile"] = "work_assessment"
+                stall = _safe_stall(state.get("stall"))
+                if (
+                    stall.get("state") == "resuming"
+                    and stall.get("execution_contract_id") == state.get("execution_contract_id")
+                ):
+                    stall["state"] = "exhausted"
+                    stall["at"] = utc_now()
+                    state["stall"] = stall
+                    state["executor_state"] = "exhausted"
+        if stall_assessor:
+            stall = _safe_stall(state.get("stall"))
+            valid = bool(
+                status_value in {"completed", "ok"}
+                and stall.get("state") == "diagnosing"
+                and stall_diagnosis
+                and stall_diagnosis.group(1) == stall.get("stall_id")
+                and stall_diagnosis.group(2) == state.get("assessor_binding_id")
+                and stall_diagnosis.group(4) == stall.get("plan_digest") == state.get("plan_digest")
+                and stall_diagnosis.group(5) == stall.get("execution_contract_id") == state.get("execution_contract_id")
+            )
+            if not valid:
+                stall["state"] = "exhausted"
+                state["executor_state"] = "exhausted"
+                state["model_profile"] = "work_assessment"
+                state["stall"] = stall
+                return
+            stall["remediation_digest"] = stall_diagnosis.group(6)
+            stall["at"] = utc_now()
+            if stall_diagnosis.group(3) == "resume":
+                stall["state"] = "resume_required"
+                state["executor_state"] = "recovery_required"
+                state["model_profile"] = stall.get("resume_profile")
+            else:
+                stall["state"] = "resolved"
+                state["plan_state"] = "analyzing"
+                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
+                state["plan_digest"] = None
+                state["plan_objective_fingerprint"] = None
+                state["plan_difficulty_decision_id"] = None
+                state["confirmed_plan_digest"] = None
+                state["confirmed_at"] = None
+                reset_executor_binding(state)
+                state["model_profile"] = "work_assessment"
+            state["stall"] = stall
+            return
         if assessor_agent and state.get("assessor_agent_id") == agent_id:
             if state.get("assessor_state") == "simple_running":
                 if status_value in {"completed", "ok"} and simple_execution and simple_execution.group(1) == state.get("assessor_binding_id"):

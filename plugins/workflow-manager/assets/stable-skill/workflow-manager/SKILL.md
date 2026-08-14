@@ -13,31 +13,32 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 
 ## Route and run
 
-1. Classify **Daily** (chat, weather, reports, personal help, cleanup) versus **Work** (device/App/code/engineering). Daily keeps current settings and safety.
-2. Work creates one objective+generation-bound high assessor, always spawned with highest available model/effort and explicit `fork_turns=none`/positive integer. Record requested versus observed profile only.
-3. First assessor turn is read-only: **Simple** returns `WORK_ASSESSMENT`, then the same bound child follow-up solves+verifies and returns `SIMPLE_EXECUTION`; **Hard** returns detailed plan+marker and ends `计划已就绪，等待确认后执行`.
-4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan modules/files, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
-5. Before strict Hard-plan confirmation, allow reads; block writes, mutating children/Git, builds, deployment, and device mutation. Changed constraints invalidate it. Read [references/work-routing.md](references/work-routing.md).
-6. Default confirmed Hard uses one lower-tier/medium executor; an explicit whole-session highest-model+effort policy instead requests the assessor tier and host-max effort. Read [references/confirmed-execution.md](references/confirmed-execution.md) for proof/reset/resume.
-7. Independently route **Direct**, **Focused**, or **Complex/Extensive** execution shape. Use only relevant `Contract > Evidence > Change > Verify > Report` stages.
-8. After confirmed execution, seal a fingerprint-only baseline. If same-task acceptance reports a symptom, read [references/regression-continuity.md](references/regression-continuity.md): compare prior objective/plan/contract/change/verification read-only. Wording is only a trigger. `introduced`/`fix_ineffective` replan and reconfirm; `unrelated` reclassifies; `uncertain` needs evidence.
-9. Only for an explicit reference-match request, read [reference acceptance](references/reference-acceptance.md); bind it to Hard execution and separate engineering, function, fidelity candidate, and user acceptance.
-10. Follow-ups inherit valid bindings; reclassify new objectives. Update `phase | done | next | blocker` only at kickoff, change, or ~60s wait.
+1. Classify **Daily** (chat/weather/reports/personal/cleanup) versus **Work** (device/App/code/engineering). Daily keeps current settings/safety.
+2. Work creates one objective/generation-bound high assessor using highest available model/effort and a non-full-history fork. Record requested versus observed only.
+3. First assessor turn is read-only. **Simple** returns `WORK_ASSESSMENT`, then the same child solves+verifies and returns `SIMPLE_EXECUTION`. **Hard** returns the detailed plan+marker.
+4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan scope/paths, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
+5. Before confirmation allow reads; block writes, mutating children/Git, builds, deployment, and device mutation. Changed constraints invalidate it. Read [work routing](references/work-routing.md).
+6. Default confirmed Hard uses lower-tier/medium; an explicit whole-session highest policy uses assessor tier+host-max. Read [confirmed execution](references/confirmed-execution.md) for proof/reset/resume.
+7. Independently route **Direct**, **Focused**, or **Complex/Extensive** shape; use only relevant `Contract > Evidence > Change > Verify > Report` stages.
+8. Seal a fingerprint-only baseline after confirmed execution. On same-task symptom feedback, read [regression continuity](references/regression-continuity.md) and compare prior objective/plan/contract/change/verification read-only. Wording only triggers review: `introduced`/`fix_ineffective` replan; `unrelated` reclassifies; `uncertain` needs evidence.
+9. For explicit reference matching, read [reference acceptance](references/reference-acceptance.md); bind Hard execution and separate engineering, function, fidelity candidate, and user acceptance.
+10. Follow-ups inherit valid bindings; reclassify new objectives. Update `phase | done | next | blocker` at kickoff, change, or ~60s wait.
 
 ## Context gates
 
 - Below 55% work normally; at 55-70% trim presentation; at 70% checkpoint and narrow exploration.
-- After compaction resume native summary/gates and normalized profile preference, never its raw prompt. Reclassify on new phases, repeated failures, long builds, or large output.
+- After compaction resume native summary/gates and profile preference, never raw prompt. Reclassify on new phases, repeated failures, long builds, or large output.
 
 ## Delegation
 
-Optimize critical-path time. Launch ready positive-utility lanes only when time saved exceeds coordination/collision cost.
+Optimize critical-path time; launch ready positive-utility lanes only when net time saved exceeds coordination/collision cost.
 
-- Before spawning note `deliverable | ready | owner | resource | time saved`. Read-only investigation is only one option; owned write/test/research/review lanes qualify.
-- Parent owns integration/shared state. Treat caps as ceilings, never quotas: Direct/Focused 0; Complex up to 2 subagents; Extensive up to 3.
-- Serialize overlapping edits/shared stages only. Cross-task notices require a fresh active same-host peer plus the same resource/conflict; read [live coordination](references/live-coordination.md). Pending Hard plans permit only read-only children.
+- Before spawning note `deliverable | ready | owner | resource | time saved`. Read-only investigation is only one option; any owned write/test/research/review lane qualifies.
+- Parent owns integration/shared state; treat caps as ceilings, never quotas: Direct/Focused 0; Complex up to 2 subagents; Extensive up to 3.
+- Cross-task notices require fresh active same-host source+peer and a same-resource conflict; read [live coordination](references/live-coordination.md). Serialize only those shared stages. Pending Hard plans permit only read-only children.
+- A stalled bound Hard executor stops with exact evidence. Reuse its high assessor once read-only; resume the bound profile for an in-plan remedy, else replan. Read [stall recovery](references/stall-recovery.md).
 - Confirmed Hard has one executor; only read-only side lanes continue. Stay local when tiny, unready, overlapping, slower, or opted out.
-- Give each child a concise Chinese purpose summary and safe ASCII `task_name`; state scope, ownership, and result shape. Reuse a live agent for one bounded follow-up.
+- Give each child a concise Chinese purpose summary, safe ASCII `task_name`, scope, ownership, and result shape. Reuse a live agent for one bounded follow-up.
 
 ## Continuity
 

@@ -22,6 +22,7 @@
 - 默认策略保持不变：Daily 使用当前策略，Work 使用最高档评估者，困难计划确认后仍由最新较低档、中等推理执行者实施。`highest_throughout` 只把已确认困难计划的执行者请求改为宿主实际可用最高档；Hook 只记录和校验请求及宿主回显，不宣称父会话或子智能体已成功切档。
 - 通过明确文件/模块所有权避免写冲突；共享构建服务器、设备或交付物只串行化实际冲突的阶段。
 - 跨任务协调只在 fresh `list_threads` 同时证明当前任务与目标任务同宿主、不同任务且均为 active，并且当前证据确认双方争用同一资源的冲突阶段时发送一次；idle、`notLoaded`、已完成、异资源或兼容阶段不通知，普通跨任务消息不受影响。
+- 已确认困难计划的绑定执行者真正卡住时，普通首个失败仍由原档修正；只有执行者停止变更并提交精确 stall 证据，才复用原最高档评估者做一次只读诊断。合同内修正恢复卡顿前的执行档，扩大范围则重新规划并严格确认，失败或再次卡顿不会循环升档。
 - 在上下文压力升高时只收窄冗余展示并提前保存检查点；必要调查继续进行。
 - 压缩后复用原生摘要、计划和已验证结果，不从头重复。
 
@@ -38,14 +39,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.32\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.33\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.32/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.33/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -66,14 +67,14 @@ Workflow Manager 不会仅因新版 Hook 已接管就删除旧版本缓存：旧
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.32\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+py -3 "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.33\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.32/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+python3 "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.33/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
 ```
 
 `hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
@@ -114,7 +115,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.32 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.33 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -155,6 +156,7 @@ plugins/workflow-manager/              插件源码
     references/confirmed-execution.md   合同执行、模型证据、失败恢复与迁移
     references/regression-continuity.md 验收回归、因果复核、重规划与压缩续接
     references/live-coordination.md      实时跨任务共享资源协调与隐私边界
+    references/stall-recovery.md         卡顿升档诊断、原档恢复与防循环边界
   hooks/hooks.json                     生命周期钩子
   scripts/generate_hook_commands.py    九个 Hook 事件的命令单一生成源
   scripts/install_stable_skill.py      用户级稳定路径安装器
