@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
@@ -90,6 +92,28 @@ class PlanArtifactTests(unittest.TestCase):
             "3. 编译、回归并按 Unity 参考验收\n"
             f"验收：{label} 功能、回归和视觉证据全部通过。{extra}\n"
         )
+
+    @staticmethod
+    def legacy_document(
+        generation: int,
+        plan_digest: str,
+        body: str,
+        *,
+        objective: str = "a" * 16,
+        difficulty: str = "b" * 24,
+    ) -> bytes:
+        content_digest = HOOK.stable_hash(body, 32)
+        return (
+            f"{HOOK.LEGACY_PLAN_ARTIFACT_OWNER}\n"
+            f"generation: {generation}\n"
+            f"plan_digest: {plan_digest}\n"
+            f"content_digest: {content_digest}\n"
+            f"objective_fingerprint: {objective}\n"
+            f"difficulty_decision_id: {difficulty}\n"
+            "-->\n# Workflow Manager Hard Plan\n\n"
+            "> This Markdown file is a private review mirror. The bound state plan_digest remains authoritative.\n\n"
+            f"{HOOK.PLAN_ARTIFACT_BODY_MARKER}\n{body}"
+        ).encode("utf-8")
 
     def begin_assessor(self, session: str, *, data: Path | None = None, suffix: str = "one") -> tuple[str, str]:
         selected = data or self.data
@@ -201,7 +225,1374 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(artifact["generation"], state["plan_generation"])
         path = self.artifact_path(state)
         self.assertTrue(path.is_file())
-        self.assertRegex(path.name, rf"^hard-plan-g0001-{state['plan_digest']}\.md$")
+        self.assertEqual(path.name, HOOK.PLAN_JOURNAL_NAME)
+
+    def test_c01_hard_plan_uses_one_bound_v2_canonical_journal(self) -> None:
+        state, _ = self.accept_assessor_plan("c01")
+        artifact = state["plan_artifact"]
+        path = self.artifact_path(state)
+
+        self.assertEqual(path.name, "hard-plan.md")
+        self.assertEqual(artifact["relative_path"], f"plans/{path.parent.name}/hard-plan.md")
+        self.assertEqual(artifact["current_revision_digest"], state["plan_digest"])
+        self.assertEqual(artifact["revision_count"], 1)
+        self.assertRegex(artifact["journal_digest"], r"^[0-9a-f]{32}$")
+        document = path.read_text(encoding="utf-8")
+        self.assertTrue(document.startswith("<!-- workflow-manager-plan-journal:v2\n"))
+        self.assertEqual(document.count("<!-- workflow-manager-plan-revision:v2\n"), 1)
+
+    def test_c02_artifact_write_failure_cannot_enter_or_confirm_pending_plan(self) -> None:
+        self.data.mkdir(parents=True)
+        (self.data / "plans").write_text("block plans directory", encoding="utf-8")
+        binding, agent_id = self.begin_assessor("c02")
+        failed_output = self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "c02",
+                "hook_run_id": "failed-plan",
+                "agent_id": agent_id,
+                "status": "completed",
+                "last_assistant_message": self.assessor_result(
+                    binding, self.hard_body("must-not-confirm")
+                ),
+            }
+        )
+        self.assertEqual(failed_output.returncode, 0, failed_output.stderr)
+        failed = self.state()
+        self.assertNotEqual(failed["plan_state"], "awaiting_confirmation")
+        self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
+
+        confirmation = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "c02",
+                "hook_run_id": "cannot-confirm",
+                "prompt": "确认按这个计划执行",
+            }
+        )
+        self.assertEqual(confirmation.returncode, 0, confirmation.stderr)
+        after = self.state()
+        self.assertNotEqual(after["plan_state"], "confirmed")
+        self.assertIsNone(after["confirmed_plan_digest"])
+        self.assertIsNone(after["execution_contract_id"])
+
+    def test_c03_replans_append_complete_revisions_to_the_same_journal(self) -> None:
+        session = "c03"
+        self.begin_parent_plan(session)
+        first = self.accept_parent_plan(session, self.hard_body("first"), run_id="first-plan")
+        path = self.artifact_path(first)
+        first_bytes = path.read_bytes()
+
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "request-replan",
+                "prompt": "修改计划：保留原验收并增加 Windows 原生事务恢复验证",
+            }
+        )
+        second = self.accept_parent_plan(
+            session, self.hard_body("second"), run_id="second-plan"
+        )
+        self.assertEqual(self.artifact_path(second), path)
+        self.assertEqual(second["plan_generation"], 2)
+        self.assertEqual(second["plan_artifact"]["revision_count"], 2)
+        document = path.read_bytes()
+        self.assertNotEqual(document, first_bytes)
+        self.assertIn(b"first", document)
+        self.assertIn(b"second", document)
+        self.assertEqual(
+            document.count(b"<!-- workflow-manager-plan-revision:v2\n"), 2
+        )
+
+    def test_c04_external_edit_invalidates_confirmed_executor_before_mutation(self) -> None:
+        session = "c04"
+        self.begin_parent_plan(session)
+        ready = self.accept_parent_plan(session, self.hard_body("bound"))
+        path = self.artifact_path(ready)
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "confirm",
+                "prompt": "确认按这个计划执行",
+            }
+        )
+        self.assertEqual(self.state()["plan_state"], "confirmed")
+        path.write_bytes(path.read_bytes() + b"\nexternal edit\n")
+
+        denied = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "mutate-after-drift",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        self.assertEqual(denied.returncode, 0, denied.stderr)
+        decision = json.loads(denied.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        drifted = self.state()
+        self.assertEqual(drifted["plan_state"], "invalidated")
+        self.assertIsNone(drifted["confirmed_plan_digest"])
+        self.assertEqual(drifted["executor_failure_kind"], "stale_contract")
+
+    def test_c05_revision_capacity_is_exact_and_never_truncates(self) -> None:
+        self.assertEqual(HOOK.MAX_PLAN_REVISION_BYTES, 960 * 1024)
+        self.assertEqual(HOOK.MAX_PLAN_JOURNAL_BYTES, 10 * 1024 * 1024)
+        exact = "x" * (HOOK.MAX_PLAN_REVISION_BYTES - 1)
+        sanitized = HOOK.sanitize_plan_artifact_body(exact)
+        self.assertEqual(len(sanitized.encode("utf-8")), HOOK.MAX_PLAN_REVISION_BYTES)
+        self.assertNotIn("truncated", sanitized)
+        with self.assertRaises(HOOK.PlanArtifactError) as raised:
+            HOOK.sanitize_plan_artifact_body(exact + "x")
+        self.assertEqual(raised.exception.code, "revision_too_large")
+
+    def test_c06_hard_update_plan_cannot_create_split_brain_plan_storage(self) -> None:
+        session = "c06"
+        self.begin_parent_plan(session)
+        self.accept_parent_plan(session, self.hard_body("canonical"))
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "split-update-plan",
+                "tool_name": "update_plan",
+                "tool_input": {
+                    "plan": [{"step": "different unbound plan", "status": "in_progress"}]
+                },
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("canonical", decision["permissionDecisionReason"])
+
+        state = self.state()
+        projection = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "bound-update-plan-projection",
+                "tool_name": "update_plan",
+                "tool_input": {
+                    "explanation": (
+                        "projection_only canonical_revision_digest="
+                        f"{state['plan_artifact']['current_revision_digest']}"
+                    ),
+                    "plan": [
+                        {
+                            "step": "收集 canonical 日志并锁定 Settings 根因",
+                            "status": "in_progress",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(projection.returncode, 0, projection.stderr)
+        self.assertEqual(projection.stdout, "")
+
+    def test_c13_plan_details_and_resume_point_to_canonical_current_revision(self) -> None:
+        session = "c13"
+        self.begin_parent_plan(session)
+        sentinel = "canonical-view-body-sentinel-42"
+        ready = self.accept_parent_plan(session, self.hard_body(sentinel))
+        artifact = ready["plan_artifact"]
+        details = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "show-details",
+                "prompt": "查看计划详情",
+            }
+        )
+        self.assertIn(artifact["relative_path"], details.stdout)
+        self.assertIn(artifact["current_revision_digest"], details.stdout)
+        self.assertIn(sentinel, details.stdout)
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        current = HOOK.read_current_plan_revision(self.state(), {"session_id": session})
+        self.assertIn(sentinel, current)
+        resumed = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "hook_run_id": "resume-details",
+                "source": "resume",
+            }
+        )
+        self.assertIn("Canonical Hard-plan semantics", resumed.stdout)
+        self.assertIn(artifact["relative_path"], resumed.stdout)
+        self.assertIn(sentinel, resumed.stdout)
+
+    def test_c14_impossible_new_state_old_journal_combination_fails_closed(self) -> None:
+        session = "c14"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        state = self.state()
+        state["plan_state"] = "analyzing"
+        state["plan_digest"] = None
+        state["plan_objective_fingerprint"] = None
+        state["plan_difficulty_decision_id"] = None
+        state["_defer_plan_transaction"] = True
+        self.assertTrue(
+            HOOK.write_plan_artifact(state, payload, self.hard_body("new"))
+        )
+        state.pop("_defer_plan_transaction", None)
+        pending = state.pop("_plan_transaction")
+        state["plan_state"] = "awaiting_confirmation"
+        HOOK.sync_plan_artifact_lifecycle(state)
+        HOOK.atomic_write(self.state_path(), state)
+        HOOK._rollback_plan_write(pending["transaction"])
+        pending["guard_context"].__exit__(None, None, None)
+
+        denied = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "impossible-combination",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        decision = json.loads(denied.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        observed = self.state()
+        self.assertEqual(observed["plan_state"], "invalidated")
+        self.assertEqual(
+            observed["plan_artifact"]["write_status"],
+            "transaction_recovery_failed",
+        )
+        self.assertIsNone(observed["execution_contract_id"])
+        self.assertTrue(
+            (self.artifact_path(stable).parent / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists()
+        )
+
+    def test_c15_state_replace_then_failure_leaves_recoverable_new_new_transaction(self) -> None:
+        session = "c15"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(stable)
+        old_bytes = journal.read_bytes()
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "replace-then-fail",
+        }
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
+        def append_revision(state: dict) -> None:
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            self.assertTrue(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("new"))
+            )
+            state["plan_state"] = "awaiting_confirmation"
+
+        real_atomic_write = HOOK.atomic_write
+
+        def committed_then_failed(path: Path, state: dict) -> None:
+            real_atomic_write(path, state)
+            raise OSError("simulated failure after state replace")
+
+        with patch.object(HOOK, "atomic_write", side_effect=committed_then_failed):
+            _, changed = HOOK.mutate_state(payload, append_revision)
+        self.assertFalse(changed)
+        persisted = self.state()
+        self.assertEqual(persisted["plan_generation"], 2)
+        self.assertNotEqual(journal.read_bytes(), old_bytes)
+        marker = journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        self.assertTrue(marker.exists())
+        self.assertEqual(len(list(journal.parent.glob(".*backup*"))), 1)
+
+        recovered = HOOK.snapshot_state(payload)
+        self.assertEqual(recovered["plan_generation"], 2)
+        self.assertEqual(recovered["plan_artifact"]["write_status"], "written")
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(journal.parent.glob(".*backup*")), [])
+
+    def test_c07_journal_capacity_exact_boundary_and_plus_one_rejection(self) -> None:
+        session = HOOK.plan_artifact_session_id("c07")
+        objective = "a" * 16
+        difficulty = "b" * 24
+        timestamp = "2026-08-20T00:00:00+00:00"
+        document: bytes | None = None
+        generation = 0
+        while document is None or (
+            HOOK.MAX_PLAN_JOURNAL_BYTES - len(document)
+            > HOOK.MAX_PLAN_REVISION_BYTES + 512
+        ):
+            generation += 1
+            body = "x" * (900 * 1024 - 1) + "\n"
+            document, _ = HOOK.append_plan_journal_revision(
+                document,
+                session=session,
+                generation=generation,
+                body=body,
+                objective_fingerprint=objective,
+                difficulty_decision_id=difficulty,
+                created_at=timestamp,
+            )
+
+        remaining = HOOK.MAX_PLAN_JOURNAL_BYTES - len(document)
+        target_body_bytes = min(HOOK.MAX_PLAN_REVISION_BYTES, remaining - 256)
+        exact_document: bytes | None = None
+        for _ in range(32):
+            body = "y" * (target_body_bytes - 1) + "\n"
+            try:
+                candidate, parsed = HOOK.append_plan_journal_revision(
+                    document,
+                    session=session,
+                    generation=generation + 1,
+                    body=body,
+                    objective_fingerprint=objective,
+                    difficulty_decision_id=difficulty,
+                    created_at=timestamp,
+                )
+            except HOOK.PlanArtifactError as error:
+                self.assertEqual(error.code, "journal_full")
+                target_body_bytes -= 1
+                continue
+            delta = HOOK.MAX_PLAN_JOURNAL_BYTES - len(candidate)
+            if delta == 0:
+                exact_document = candidate
+                break
+            target_body_bytes += delta
+        self.assertIsNotNone(exact_document)
+        assert exact_document is not None
+        self.assertEqual(len(exact_document), HOOK.MAX_PLAN_JOURNAL_BYTES)
+        self.assertEqual(
+            HOOK.parse_plan_journal(exact_document)["generation"], generation + 1
+        )
+        with self.assertRaises(HOOK.PlanArtifactError) as raised:
+            HOOK.append_plan_journal_revision(
+                exact_document,
+                session=session,
+                generation=generation + 2,
+                body="z\n",
+                objective_fingerprint=objective,
+                difficulty_decision_id=difficulty,
+                created_at=timestamp,
+            )
+        self.assertEqual(raised.exception.code, "journal_full")
+
+    def test_c08_oversized_revision_preserves_existing_journal_byte_for_byte(self) -> None:
+        session = "c08"
+        self.begin_parent_plan(session)
+        persisted = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(persisted)
+        before = journal.read_bytes()
+        generation = persisted["plan_generation"]
+        candidate = json.loads(json.dumps(persisted))
+        candidate["plan_state"] = "analyzing"
+        candidate["plan_digest"] = None
+        candidate["plan_objective_fingerprint"] = None
+        candidate["plan_difficulty_decision_id"] = None
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.assertFalse(
+            HOOK.write_plan_artifact(
+                candidate,
+                {"session_id": session},
+                "x" * HOOK.MAX_PLAN_REVISION_BYTES,
+            )
+        )
+        self.assertEqual(
+            candidate["plan_artifact"]["warning_code"], "revision_too_large"
+        )
+        self.assertEqual(candidate["plan_generation"], generation)
+        self.assertEqual(journal.read_bytes(), before)
+
+    def test_c09_state_write_failure_rolls_back_first_and_later_revision(self) -> None:
+        session = "c09"
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "first",
+        }
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
+        def first_change(state: dict) -> None:
+            state.update(
+                {
+                    "task_domain": "work",
+                    "work_difficulty": "hard",
+                    "difficulty_decision_id": "b" * 24,
+                    "objective": {"fingerprint": "a" * 16, "length": 1},
+                    "plan_state": "analyzing",
+                }
+            )
+            self.assertTrue(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("first"))
+            )
+            state["plan_state"] = "awaiting_confirmation"
+
+        with patch.object(HOOK, "atomic_write", side_effect=OSError("state fail")):
+            _, changed = HOOK.mutate_state(payload, first_change)
+        self.assertFalse(changed)
+        directory = self.data / "plans" / HOOK.plan_artifact_session_id(session)
+        self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+        self.assertEqual(list(directory.glob(".*transaction*")), [])
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+
+        payload["hook_run_id"] = "first-success"
+        stable, changed = HOOK.mutate_state(payload, first_change)
+        self.assertTrue(changed)
+        journal = self.artifact_path(stable)
+        state_path = self.state_path()
+        old_journal = journal.read_bytes()
+        old_state = state_path.read_bytes()
+
+        def second_change(state: dict) -> None:
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            self.assertTrue(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("second"))
+            )
+            state["plan_state"] = "awaiting_confirmation"
+
+        payload["hook_run_id"] = "second-fail"
+        with patch.object(HOOK, "atomic_write", side_effect=OSError("state fail")):
+            _, changed = HOOK.mutate_state(payload, second_change)
+        self.assertFalse(changed)
+        self.assertEqual(journal.read_bytes(), old_journal)
+        self.assertEqual(state_path.read_bytes(), old_state)
+        self.assertEqual(list(directory.glob(".*transaction*")), [])
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+
+    def test_c10_crash_recovery_accepts_only_old_old_or_new_new(self) -> None:
+        session = "c10"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(stable)
+        old_bytes = journal.read_bytes()
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
+        def stage(label: str) -> tuple[dict, dict]:
+            state = self.state()
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            state["_defer_plan_transaction"] = True
+            self.assertTrue(
+                HOOK.write_plan_artifact(state, payload, self.hard_body(label))
+            )
+            state.pop("_defer_plan_transaction", None)
+            pending = state.pop("_plan_transaction")
+            state["plan_state"] = "awaiting_confirmation"
+            HOOK.sync_plan_artifact_lifecycle(state)
+            return state, pending
+
+        _, pending = stage("old-new-crash")
+        pending["guard_context"].__exit__(None, None, None)
+        self.assertNotEqual(journal.read_bytes(), old_bytes)
+        recovered = HOOK.snapshot_state(payload)
+        self.assertEqual(journal.read_bytes(), old_bytes)
+        self.assertEqual(recovered["plan_generation"], stable["plan_generation"])
+        self.assertEqual(list(journal.parent.glob(".*transaction*")), [])
+        self.assertEqual(list(journal.parent.glob(".*backup*")), [])
+
+        new_state, pending = stage("new-new-crash")
+        new_bytes = journal.read_bytes()
+        HOOK.atomic_write(self.state_path(), new_state)
+        pending["guard_context"].__exit__(None, None, None)
+        recovered = HOOK.snapshot_state(payload)
+        self.assertEqual(journal.read_bytes(), new_bytes)
+        self.assertEqual(recovered["plan_generation"], 2)
+        self.assertEqual(recovered["plan_artifact"]["write_status"], "written")
+        self.assertEqual(list(journal.parent.glob(".*transaction*")), [])
+        self.assertEqual(list(journal.parent.glob(".*backup*")), [])
+
+    def test_c11_schema19_merges_up_to_six_verified_mirrors_then_cleans(self) -> None:
+        session = "c11"
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        token = HOOK.plan_artifact_session_id(session)
+        directory = self.data / "plans" / token
+        directory.mkdir(parents=True)
+        current_digest = ""
+        current_content_digest = ""
+        for generation in (2, 4, 6):
+            current_digest = f"{generation:032x}"
+            body = self.hard_body(f"legacy-{generation}")
+            current_content_digest = HOOK.stable_hash(body, 32)
+            (directory / f"hard-plan-g{generation:04d}-{current_digest}.md").write_bytes(
+                self.legacy_document(generation, current_digest, body)
+            )
+        legacy = HOOK.new_state(payload)
+        legacy.update(
+            {
+                "schema_version": 19,
+                "writer_version": "1.0.36",
+                "task_domain": "work",
+                "work_difficulty": "hard",
+                "difficulty_decision_id": "b" * 24,
+                "objective": {"fingerprint": "a" * 16, "length": 1},
+                "plan_state": "awaiting_confirmation",
+                "plan_generation": 6,
+                "plan_digest": current_digest,
+                "plan_objective_fingerprint": "a" * 16,
+                "plan_difficulty_decision_id": "b" * 24,
+                "plan_artifact": {
+                    "relative_path": f"plans/{token}/hard-plan-g0006-{current_digest}.md",
+                    "objective_fingerprint": "a" * 16,
+                    "difficulty_decision_id": "b" * 24,
+                    "plan_digest": current_digest,
+                    "content_digest": current_content_digest,
+                    "generation": 6,
+                    "lifecycle_status": "ready",
+                    "write_status": "written",
+                    "warning_code": "none",
+                },
+            }
+        )
+        HOOK.atomic_write(HOOK.state_path(payload), legacy)
+
+        migrated = HOOK.snapshot_state(payload)
+        journal = directory / HOOK.PLAN_JOURNAL_NAME
+        parsed = HOOK.parse_plan_journal(journal.read_bytes(), expected_session=token)
+        self.assertEqual(
+            [item["generation"] for item in parsed["revisions"]], [2, 4, 6]
+        )
+        self.assertEqual(migrated["schema_version"], 20)
+        self.assertEqual(migrated["plan_state"], "awaiting_confirmation")
+        self.assertEqual(migrated["plan_artifact"]["revision_count"], 3)
+        self.assertEqual(list(directory.glob("hard-plan-g*.md")), [])
+        self.assertEqual(list(directory.glob(".*transaction*")), [])
+
+    def test_c12_schema19_over_six_or_running_contract_fails_closed(self) -> None:
+        for count, executor_state, expected_status in (
+            (7, "none", "legacy_unavailable"),
+            (1, "running", "written"),
+        ):
+            with self.subTest(count=count, executor_state=executor_state):
+                selected = self.root / f"legacy-{count}-{executor_state}"
+                payload = {
+                    "hook_event_name": "SessionStart",
+                    "session_id": f"c12-{count}-{executor_state}",
+                }
+                with patch.dict(
+                    os.environ,
+                    {
+                        "PLUGIN_DATA": str(selected),
+                        "CODEX_HOME": str(self.codex_home),
+                    },
+                ):
+                    token = HOOK.plan_artifact_session_id(payload["session_id"])
+                    directory = selected / "plans" / token
+                    directory.mkdir(parents=True)
+                    for generation in range(1, count + 1):
+                        digest = f"{generation:032x}"
+                        body = self.hard_body(f"legacy-{generation}")
+                        (directory / f"hard-plan-g{generation:04d}-{digest}.md").write_bytes(
+                            self.legacy_document(generation, digest, body)
+                        )
+                    current_digest = f"{count:032x}"
+                    current_body = self.hard_body(f"legacy-{count}")
+                    legacy = HOOK.new_state(payload)
+                    legacy.update(
+                        {
+                            "schema_version": 19,
+                            "writer_version": "1.0.36",
+                            "task_domain": "work",
+                            "work_difficulty": "hard",
+                            "difficulty_decision_id": "b" * 24,
+                            "objective": {"fingerprint": "a" * 16, "length": 1},
+                            "plan_state": "confirmed" if executor_state == "running" else "awaiting_confirmation",
+                            "plan_generation": count,
+                            "plan_digest": current_digest,
+                            "plan_objective_fingerprint": "a" * 16,
+                            "plan_difficulty_decision_id": "b" * 24,
+                            "confirmed_plan_digest": current_digest if executor_state == "running" else None,
+                            "executor_state": executor_state,
+                            "execution_contract_id": "e" * 32 if executor_state == "running" else None,
+                            "plan_artifact": {
+                                "relative_path": f"plans/{token}/hard-plan-g{count:04d}-{current_digest}.md",
+                                "objective_fingerprint": "a" * 16,
+                                "difficulty_decision_id": "b" * 24,
+                                "plan_digest": current_digest,
+                                "content_digest": HOOK.stable_hash(current_body, 32),
+                                "generation": count,
+                                "lifecycle_status": "executing" if executor_state == "running" else "ready",
+                                "write_status": "written",
+                                "warning_code": "none",
+                            },
+                        }
+                    )
+                    HOOK.atomic_write(HOOK.state_path(payload), legacy)
+                    observed = HOOK.snapshot_state(payload)
+                    self.assertEqual(observed["plan_state"], "invalidated")
+                    self.assertIsNone(observed["confirmed_plan_digest"])
+                    self.assertEqual(
+                        observed["plan_artifact"]["write_status"], expected_status
+                    )
+                    if executor_state == "running":
+                        self.assertEqual(
+                            observed["executor_failure_kind"], "stale_contract"
+                        )
+                        self.assertTrue((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+                    else:
+                        self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+                        self.assertEqual(len(list(directory.glob("hard-plan-g*.md"))), 7)
+
+    def test_c16_schema19_malformed_managed_mirror_fails_closed_without_cleanup(self) -> None:
+        session = "c16"
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        token = HOOK.plan_artifact_session_id(session)
+        directory = self.data / "plans" / token
+        directory.mkdir(parents=True)
+        body = self.hard_body("legacy-current")
+        digest = "1" * 32
+        current = directory / f"hard-plan-g0001-{digest}.md"
+        current.write_bytes(self.legacy_document(1, digest, body))
+        malformed = directory / f"hard-plan-g0002-{'2' * 32}.md"
+        malformed.write_bytes(b"not a managed legacy plan document\n")
+        legacy = HOOK.new_state(payload)
+        legacy.update(
+            {
+                "schema_version": 19,
+                "writer_version": "1.0.36",
+                "task_domain": "work",
+                "work_difficulty": "hard",
+                "difficulty_decision_id": "b" * 24,
+                "objective": {"fingerprint": "a" * 16, "length": 1},
+                "plan_state": "awaiting_confirmation",
+                "plan_generation": 1,
+                "plan_digest": digest,
+                "plan_objective_fingerprint": "a" * 16,
+                "plan_difficulty_decision_id": "b" * 24,
+                "plan_artifact": {
+                    "relative_path": f"plans/{token}/{current.name}",
+                    "objective_fingerprint": "a" * 16,
+                    "difficulty_decision_id": "b" * 24,
+                    "plan_digest": digest,
+                    "content_digest": HOOK.stable_hash(body, 32),
+                    "generation": 1,
+                    "lifecycle_status": "ready",
+                    "write_status": "written",
+                    "warning_code": "none",
+                },
+            }
+        )
+        HOOK.atomic_write(HOOK.state_path(payload), legacy)
+
+        observed = HOOK.snapshot_state(payload)
+        self.assertEqual(observed["plan_state"], "invalidated")
+        self.assertEqual(
+            observed["plan_artifact"]["write_status"], "legacy_unavailable"
+        )
+        self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+        self.assertEqual(current.read_bytes(), self.legacy_document(1, digest, body))
+        self.assertEqual(malformed.read_bytes(), b"not a managed legacy plan document\n")
+
+    def test_c17_unbound_subagent_cannot_retry_a_failed_canonical_write(self) -> None:
+        self.data.mkdir(parents=True)
+        (self.data / "plans").write_text("block plans directory", encoding="utf-8")
+        binding, agent_id = self.begin_assessor("c17")
+        message = self.assessor_result(binding, self.hard_body("trusted-retry"))
+        first = self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "c17",
+                "hook_run_id": "trusted-first-stop",
+                "agent_id": agent_id,
+                "status": "completed",
+                "last_assistant_message": message,
+            }
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        failed = self.state()
+        generation = failed["plan_generation"]
+        self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
+        (self.data / "plans").unlink()
+
+        forged = self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "c17",
+                "hook_run_id": "unbound-retry",
+                "agent_id": "unbound-agent",
+                "status": "completed",
+                "last_assistant_message": message,
+            }
+        )
+        self.assertEqual(forged.returncode, 0, forged.stderr)
+        observed = self.state()
+        self.assertEqual(observed["plan_generation"], generation)
+        self.assertEqual(observed["plan_state"], "analyzing")
+        self.assertEqual(observed["plan_artifact"]["write_status"], "write_failed")
+        self.assertFalse((self.data / "plans").exists())
+
+    def test_c18_atomic_replace_rechecks_old_identity_before_backup_rename(self) -> None:
+        directory = self.root / "atomic-identity"
+        directory.mkdir()
+        target = directory / HOOK.PLAN_JOURNAL_NAME
+        target.write_bytes(b"trusted-old\n")
+        attacker = directory / "attacker.md"
+        attacker.write_bytes(b"external-race\n")
+        swapped = False
+
+        def swap_before_backup() -> None:
+            nonlocal swapped
+            if not swapped:
+                os.replace(attacker, target)
+                swapped = True
+
+        with self.assertRaises(HOOK.PlanArtifactError) as raised:
+            HOOK._atomic_write_plan_file(
+                target,
+                b"trusted-new\n",
+                expected_old_bytes=b"trusted-old\n",
+                verify_binding=swap_before_backup,
+            )
+        self.assertEqual(raised.exception.code, "unsafe_path")
+        self.assertEqual(target.read_bytes(), b"external-race\n")
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+        self.assertEqual(list(directory.glob(".*tmp")), [])
+
+    def test_c19_plan_directory_fsync_failure_stays_old_authority_and_recovers(self) -> None:
+        session = "c19"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(stable)
+        old_bytes = journal.read_bytes()
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "journal-fsync-failure",
+        }
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        calls = 0
+        real_fsync_directory = HOOK._fsync_plan_directory
+
+        def fail_journal_fsync(directory_fd: int | None) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise HOOK.PlanArtifactError("write_error")
+            real_fsync_directory(directory_fd)
+
+        def append_revision(state: dict) -> None:
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            self.assertFalse(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("new"))
+            )
+
+        with patch.object(
+            HOOK, "_fsync_plan_directory", side_effect=fail_journal_fsync
+        ):
+            _, changed = HOOK.mutate_state(payload, append_revision)
+        self.assertTrue(changed)
+        failed = self.state()
+        self.assertEqual(failed["plan_generation"], stable["plan_generation"])
+        self.assertNotEqual(failed["plan_state"], "awaiting_confirmation")
+        self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
+        self.assertNotEqual(journal.read_bytes(), old_bytes)
+        marker = journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        self.assertTrue(marker.exists())
+
+        recovered = HOOK.snapshot_state(payload)
+        self.assertEqual(recovered["plan_generation"], stable["plan_generation"])
+        self.assertEqual(journal.read_bytes(), old_bytes)
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(journal.parent.glob(".*backup*")), [])
+
+    def test_c20_schema19_cleanup_failure_is_retried_from_transaction_marker(self) -> None:
+        session = "c20"
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        token = HOOK.plan_artifact_session_id(session)
+        directory = self.data / "plans" / token
+        directory.mkdir(parents=True)
+        body = self.hard_body("legacy-cleanup")
+        digest = "3" * 32
+        legacy_path = directory / f"hard-plan-g0001-{digest}.md"
+        legacy_path.write_bytes(self.legacy_document(1, digest, body))
+        legacy = HOOK.new_state(payload)
+        legacy.update(
+            {
+                "schema_version": 19,
+                "writer_version": "1.0.36",
+                "task_domain": "work",
+                "work_difficulty": "hard",
+                "difficulty_decision_id": "b" * 24,
+                "objective": {"fingerprint": "a" * 16, "length": 1},
+                "plan_state": "awaiting_confirmation",
+                "plan_generation": 1,
+                "plan_digest": digest,
+                "plan_objective_fingerprint": "a" * 16,
+                "plan_difficulty_decision_id": "b" * 24,
+                "plan_artifact": {
+                    "relative_path": f"plans/{token}/{legacy_path.name}",
+                    "objective_fingerprint": "a" * 16,
+                    "difficulty_decision_id": "b" * 24,
+                    "plan_digest": digest,
+                    "content_digest": HOOK.stable_hash(body, 32),
+                    "generation": 1,
+                    "lifecycle_status": "ready",
+                    "write_status": "written",
+                    "warning_code": "none",
+                },
+            }
+        )
+        HOOK.atomic_write(HOOK.state_path(payload), legacy)
+
+        with patch.object(
+            HOOK,
+            "_retain_plan_artifacts",
+            side_effect=HOOK.PlanArtifactError("unsafe_path"),
+        ):
+            first = HOOK.snapshot_state(payload)
+        marker = directory / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        self.assertEqual(first["schema_version"], 20)
+        self.assertTrue((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+        self.assertTrue(legacy_path.exists())
+        self.assertTrue(marker.exists())
+
+        recovered = HOOK.snapshot_state(payload)
+        self.assertEqual(recovered["plan_state"], "awaiting_confirmation")
+        self.assertFalse(legacy_path.exists())
+        self.assertFalse(marker.exists())
+
+    def test_c21_confirmation_rereads_journal_inside_state_mutation(self) -> None:
+        session = "c21"
+        self.begin_parent_plan(session)
+        ready = self.accept_parent_plan(session, self.hard_body("confirm-race"))
+        journal = self.artifact_path(ready)
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        real_verify = HOOK.verify_plan_artifact
+        verify_calls = 0
+
+        def verify_then_drift(state: dict, payload: dict) -> bool:
+            nonlocal verify_calls
+            result = real_verify(state, payload)
+            verify_calls += 1
+            if verify_calls == 1 and result:
+                journal.write_bytes(journal.read_bytes() + b"external-confirm-race\n")
+            return result
+
+        def snapshot_without_verification(payload: dict) -> dict:
+            return HOOK.load_state(self.state_path(), payload)
+
+        with patch.object(HOOK, "snapshot_state", side_effect=snapshot_without_verification), patch.object(
+            HOOK, "verify_plan_artifact", side_effect=verify_then_drift
+        ), redirect_stdout(io.StringIO()):
+            HOOK.user_prompt_submit(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session,
+                    "hook_run_id": "confirm-race",
+                    "prompt": "确认按这个计划执行",
+                }
+            )
+        observed = self.state()
+        self.assertGreaterEqual(verify_calls, 2)
+        self.assertEqual(observed["plan_state"], "invalidated")
+        self.assertIsNone(observed["confirmed_plan_digest"])
+        self.assertIsNone(observed["execution_contract_id"])
+
+    def test_c22_confirmation_rechecks_journal_after_state_commit(self) -> None:
+        session = "c22"
+        self.begin_parent_plan(session)
+        ready = self.accept_parent_plan(session, self.hard_body("post-commit-race"))
+        journal = self.artifact_path(ready)
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        real_verify = HOOK.verify_plan_artifact
+        verify_calls = 0
+
+        def verify_then_drift(state: dict, payload: dict) -> bool:
+            nonlocal verify_calls
+            result = real_verify(state, payload)
+            verify_calls += 1
+            if verify_calls == 2 and result:
+                journal.write_bytes(journal.read_bytes() + b"external-post-commit-race\n")
+            return result
+
+        def snapshot_without_verification(payload: dict) -> dict:
+            return HOOK.load_state(self.state_path(), payload)
+
+        with patch.object(HOOK, "snapshot_state", side_effect=snapshot_without_verification), patch.object(
+            HOOK, "verify_plan_artifact", side_effect=verify_then_drift
+        ), redirect_stdout(io.StringIO()):
+            HOOK.user_prompt_submit(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session,
+                    "hook_run_id": "post-commit-confirm-race",
+                    "prompt": "确认按这个计划执行",
+                }
+            )
+        observed = self.state()
+        self.assertGreaterEqual(verify_calls, 3)
+        self.assertEqual(observed["plan_state"], "invalidated")
+        self.assertEqual(observed["executor_failure_kind"], "stale_contract")
+        self.assertIsNone(observed["confirmed_plan_digest"])
+        self.assertIsNone(observed["execution_contract_id"])
+
+    def test_c23_append_rejects_in_place_edit_after_old_journal_read(self) -> None:
+        session = "c23"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(stable)
+        old_bytes = journal.read_bytes()
+        external = b"EXTERNAL_IN_PLACE_EDIT\n"
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "append-in-place-race",
+        }
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        real_atomic_write = HOOK._atomic_write_plan_file
+        raced = False
+
+        def edit_at_atomic_entry(path: Path, document: bytes, **kwargs: object) -> dict:
+            nonlocal raced
+            if not raced:
+                path.write_bytes(path.read_bytes() + external)
+                raced = True
+            return real_atomic_write(path, document, **kwargs)
+
+        def append_revision(state: dict) -> None:
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            self.assertFalse(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("new"))
+            )
+
+        with patch.object(
+            HOOK, "_atomic_write_plan_file", side_effect=edit_at_atomic_entry
+        ):
+            _, changed = HOOK.mutate_state(payload, append_revision)
+        self.assertTrue(changed)
+        observed = self.state()
+        self.assertTrue(raced)
+        self.assertEqual(journal.read_bytes(), old_bytes + external)
+        self.assertEqual(observed["plan_generation"], stable["plan_generation"])
+        self.assertEqual(observed["plan_state"], "analyzing")
+        self.assertEqual(observed["plan_artifact"]["write_status"], "write_failed")
+        self.assertEqual(observed["plan_artifact"]["warning_code"], "content_drift")
+        self.assertFalse((journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists())
+        self.assertEqual(list(journal.parent.glob(".*backup*")), [])
+
+    def test_c24_first_write_preserves_file_created_after_absence_check(self) -> None:
+        session = "c24"
+        self.begin_parent_plan(session)
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "first-write-absence-race",
+        }
+        token = HOOK.plan_artifact_session_id(session)
+        journal = self.data / "plans" / token / HOOK.PLAN_JOURNAL_NAME
+        external = b"EXTERNAL_CREATED_AFTER_ABSENCE_CHECK\n"
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        real_atomic_write = HOOK._atomic_write_plan_file
+        raced = False
+
+        def create_at_atomic_entry(path: Path, document: bytes, **kwargs: object) -> dict:
+            nonlocal raced
+            if not raced:
+                path.write_bytes(external)
+                raced = True
+            return real_atomic_write(path, document, **kwargs)
+
+        def first_revision(state: dict) -> None:
+            self.assertFalse(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("first"))
+            )
+
+        with patch.object(
+            HOOK, "_atomic_write_plan_file", side_effect=create_at_atomic_entry
+        ):
+            _, changed = HOOK.mutate_state(payload, first_revision)
+        self.assertTrue(changed)
+        observed = self.state()
+        self.assertTrue(raced)
+        self.assertEqual(journal.read_bytes(), external)
+        self.assertEqual(observed["plan_generation"], 0)
+        self.assertNotEqual(observed["plan_state"], "awaiting_confirmation")
+        self.assertEqual(observed["plan_artifact"]["write_status"], "write_failed")
+        self.assertEqual(observed["plan_artifact"]["warning_code"], "content_drift")
+        self.assertFalse((journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists())
+        self.assertEqual(list(journal.parent.glob(".*backup*")), [])
+
+    def test_c25_schema19_migration_preserves_file_created_after_absence_check(self) -> None:
+        session = "c25"
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        token = HOOK.plan_artifact_session_id(session)
+        directory = self.data / "plans" / token
+        directory.mkdir(parents=True)
+        body = self.hard_body("legacy-race")
+        digest = "4" * 32
+        legacy_path = directory / f"hard-plan-g0001-{digest}.md"
+        legacy_bytes = self.legacy_document(1, digest, body)
+        legacy_path.write_bytes(legacy_bytes)
+        legacy = HOOK.new_state(payload)
+        legacy.update(
+            {
+                "schema_version": 19,
+                "writer_version": "1.0.36",
+                "task_domain": "work",
+                "work_difficulty": "hard",
+                "difficulty_decision_id": "b" * 24,
+                "objective": {"fingerprint": "a" * 16, "length": 1},
+                "plan_state": "awaiting_confirmation",
+                "plan_generation": 1,
+                "plan_digest": digest,
+                "plan_objective_fingerprint": "a" * 16,
+                "plan_difficulty_decision_id": "b" * 24,
+                "plan_artifact": {
+                    "relative_path": f"plans/{token}/{legacy_path.name}",
+                    "objective_fingerprint": "a" * 16,
+                    "difficulty_decision_id": "b" * 24,
+                    "plan_digest": digest,
+                    "content_digest": HOOK.stable_hash(body, 32),
+                    "generation": 1,
+                    "lifecycle_status": "ready",
+                    "write_status": "written",
+                    "warning_code": "none",
+                },
+            }
+        )
+        HOOK.atomic_write(HOOK.state_path(payload), legacy)
+        journal = directory / HOOK.PLAN_JOURNAL_NAME
+        external = b"EXTERNAL_CREATED_DURING_MIGRATION\n"
+        real_atomic_write = HOOK._atomic_write_plan_file
+        raced = False
+
+        def create_at_atomic_entry(path: Path, document: bytes, **kwargs: object) -> dict:
+            nonlocal raced
+            if not raced:
+                path.write_bytes(external)
+                raced = True
+            return real_atomic_write(path, document, **kwargs)
+
+        with patch.object(
+            HOOK, "_atomic_write_plan_file", side_effect=create_at_atomic_entry
+        ):
+            observed = HOOK.snapshot_state(payload)
+        self.assertTrue(raced)
+        self.assertEqual(observed["plan_state"], "invalidated")
+        self.assertEqual(
+            observed["plan_artifact"]["write_status"], "legacy_unavailable"
+        )
+        self.assertEqual(journal.read_bytes(), external)
+        self.assertEqual(legacy_path.read_bytes(), legacy_bytes)
+        self.assertFalse((directory / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists())
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+
+    def test_c26_atomic_replace_rechecks_bytes_after_binding_verification(self) -> None:
+        directory = self.root / "atomic-byte-race"
+        directory.mkdir()
+        target = directory / HOOK.PLAN_JOURNAL_NAME
+        old_bytes = b"trusted-old\n"
+        external = b"EXTERNAL_DURING_BINDING_VERIFY\n"
+        target.write_bytes(old_bytes)
+        raced = False
+
+        def edit_during_verification() -> None:
+            nonlocal raced
+            if not raced:
+                target.write_bytes(target.read_bytes() + external)
+                raced = True
+
+        with self.assertRaises(HOOK.PlanArtifactError) as raised:
+            HOOK._atomic_write_plan_file(
+                target,
+                b"trusted-new\n",
+                expected_old_bytes=old_bytes,
+                verify_binding=edit_during_verification,
+            )
+        self.assertEqual(raised.exception.code, "content_drift")
+        self.assertEqual(target.read_bytes(), old_bytes + external)
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+        self.assertEqual(list(directory.glob(".*tmp")), [])
+
+    def test_c27_atomic_replace_verifies_backup_bytes_before_install(self) -> None:
+        directory = self.root / "atomic-backup-byte-race"
+        directory.mkdir()
+        target = directory / HOOK.PLAN_JOURNAL_NAME
+        old_bytes = b"trusted-old\n"
+        external = b"EXTERNAL_AFTER_BACKUP_RENAME\n"
+        target.write_bytes(old_bytes)
+        real_rename = HOOK._plan_rename
+        raced = False
+
+        def rename_then_edit(path: Path, target_name: str, directory_fd: int | None) -> None:
+            nonlocal raced
+            real_rename(path, target_name, directory_fd)
+            if not raced and ".backup." in target_name:
+                backup = path.parent / target_name
+                backup.write_bytes(backup.read_bytes() + external)
+                raced = True
+
+        with patch.object(HOOK, "_plan_rename", side_effect=rename_then_edit):
+            with self.assertRaises(HOOK.PlanArtifactError) as raised:
+                HOOK._atomic_write_plan_file(
+                    target,
+                    b"trusted-new\n",
+                    expected_old_bytes=old_bytes,
+                )
+        self.assertEqual(raised.exception.code, "content_drift")
+        self.assertTrue(raced)
+        self.assertEqual(target.read_bytes(), old_bytes + external)
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+        self.assertEqual(list(directory.glob(".*tmp")), [])
+
+    def test_c28_atomic_first_write_rechecks_absence_after_binding_verification(self) -> None:
+        directory = self.root / "atomic-absence-race"
+        directory.mkdir()
+        target = directory / HOOK.PLAN_JOURNAL_NAME
+        external = b"EXTERNAL_DURING_ABSENCE_VERIFY\n"
+        raced = False
+
+        def create_during_verification() -> None:
+            nonlocal raced
+            if not raced:
+                target.write_bytes(external)
+                raced = True
+
+        with self.assertRaises(HOOK.PlanArtifactError) as raised:
+            HOOK._atomic_write_plan_file(
+                target,
+                b"trusted-first\n",
+                expected_old_bytes=None,
+                verify_binding=create_during_verification,
+            )
+        self.assertEqual(raised.exception.code, "content_drift")
+        self.assertTrue(raced)
+        self.assertEqual(target.read_bytes(), external)
+        self.assertEqual(list(directory.glob(".*backup*")), [])
+        self.assertEqual(list(directory.glob(".*tmp")), [])
+
+    def test_c29_commit_unlink_preserves_backup_changed_after_byte_recheck(self) -> None:
+        session = "c29"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(stable)
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "commit-unlink-race",
+        }
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        real_unlink = HOOK._unlink_plan_file_if_identity
+        external = b"EXTERNAL_AFTER_COMMIT_BYTE_RECHECK\n"
+        raced = False
+
+        def edit_at_unlink_entry(
+            path: Path,
+            expected: tuple[int, int, int],
+            directory_fd: int | None,
+            **kwargs: object,
+        ) -> bool:
+            nonlocal raced
+            if not raced and ".backup." in path.name:
+                path.write_bytes(path.read_bytes() + external)
+                raced = True
+            return real_unlink(path, expected, directory_fd, **kwargs)
+
+        def append_revision(state: dict) -> None:
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            self.assertTrue(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("new"))
+            )
+
+        with patch.object(
+            HOOK, "_unlink_plan_file_if_identity", side_effect=edit_at_unlink_entry
+        ):
+            state, changed = HOOK.mutate_state(payload, append_revision)
+        self.assertTrue(changed)
+        self.assertTrue(raced)
+        self.assertEqual(state["plan_state"], "invalidated")
+        self.assertEqual(state["plan_artifact"]["warning_code"], "content_drift")
+        marker = journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        backups = list(journal.parent.glob(".*backup*"))
+        self.assertTrue(marker.exists())
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].read_bytes().endswith(external))
+        persisted = self.state()
+        self.assertEqual(persisted["plan_state"], "invalidated")
+        self.assertEqual(
+            persisted["plan_artifact"]["warning_code"], "content_drift"
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX open-descriptor write race")
+    def test_c30_commit_detects_write_through_open_fd_during_unlink(self) -> None:
+        session = "c30"
+        self.begin_parent_plan(session)
+        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        journal = self.artifact_path(stable)
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": session,
+            "hook_run_id": "commit-open-fd-race",
+        }
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        real_guarded_unlink = HOOK._unlink_plan_file_if_identity
+        real_os_unlink = HOOK.os.unlink
+        external = b"EXTERNAL_THROUGH_OPEN_FD_DURING_UNLINK\n"
+        raced = False
+
+        def unlink_with_open_writer(
+            path: Path,
+            expected: tuple[int, int, int],
+            directory_fd: int | None,
+            **kwargs: object,
+        ) -> bool:
+            nonlocal raced
+            if ".backup." not in path.name:
+                return real_guarded_unlink(
+                    path, expected, directory_fd, **kwargs
+                )
+            writer = os.open(path, os.O_WRONLY | os.O_APPEND)
+
+            def write_then_unlink(
+                unlink_path: object, *args: object, **unlink_kwargs: object
+            ) -> None:
+                nonlocal raced
+                if not raced:
+                    os.write(writer, external)
+                    os.fsync(writer)
+                    raced = True
+                real_os_unlink(unlink_path, *args, **unlink_kwargs)
+
+            try:
+                with patch.object(
+                    HOOK.os, "unlink", side_effect=write_then_unlink
+                ):
+                    return real_guarded_unlink(
+                        path, expected, directory_fd, **kwargs
+                    )
+            finally:
+                os.close(writer)
+
+        def append_revision(state: dict) -> None:
+            state["plan_state"] = "analyzing"
+            state["plan_digest"] = None
+            state["plan_objective_fingerprint"] = None
+            state["plan_difficulty_decision_id"] = None
+            self.assertTrue(
+                HOOK.write_plan_artifact(state, payload, self.hard_body("new"))
+            )
+
+        with patch.object(
+            HOOK,
+            "_unlink_plan_file_if_identity",
+            side_effect=unlink_with_open_writer,
+        ):
+            state, changed = HOOK.mutate_state(payload, append_revision)
+        self.assertTrue(changed)
+        self.assertTrue(raced)
+        self.assertEqual(state["plan_state"], "invalidated")
+        marker = journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        backups = list(journal.parent.glob(".*backup*"))
+        self.assertTrue(marker.exists())
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].read_bytes().endswith(external))
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
 
     def test_m02_supported_parent_hard_plan_creates_markdown(self) -> None:
         self.begin_parent_plan("m02")
@@ -223,9 +1614,13 @@ class PlanArtifactTests(unittest.TestCase):
         for forbidden in ("hunter2", "abc.def.ghi", "sk-live-super-secret-value", secret, "WORK_ASSESSMENT", "\x00", "\x01"):
             self.assertNotIn(forbidden, text)
         self.assertIn("[REDACTED]", text)
-        self.assertEqual(state["plan_artifact"]["content_digest"], HOOK.plan_artifact_body_digest(text))
+        parsed = HOOK.parse_plan_journal(text.encode("utf-8"))
+        self.assertEqual(
+            state["plan_artifact"]["current_revision_digest"],
+            parsed["current_revision_digest"],
+        )
 
-    def test_m04_header_edits_do_not_drift_but_body_edits_do_not_authorize(self) -> None:
+    def test_m04_any_external_header_or_body_edit_invalidates_authority(self) -> None:
         state, _ = self.accept_assessor_plan("m04")
         path = self.artifact_path(state)
         original_plan = state["plan_digest"]
@@ -236,13 +1631,12 @@ class PlanArtifactTests(unittest.TestCase):
                 b"# Local display title",
             )
         )
-        self.run_hook({"hook_event_name": "SessionStart", "session_id": "m04", "hook_run_id": "header", "source": "resume"})
-        self.assertEqual(self.state()["plan_artifact"]["write_status"], "written")
-        path.write_bytes(path.read_bytes() + b"\nunauthorized body edit\n")
-        drift = self.run_hook({"hook_event_name": "SessionStart", "session_id": "m04", "hook_run_id": "body", "source": "resume"})
+        drift = self.run_hook({"hook_event_name": "SessionStart", "session_id": "m04", "hook_run_id": "header", "source": "resume"})
         observed = self.state()
         self.assertEqual(observed["plan_artifact"]["write_status"], "content_drift")
         self.assertEqual(observed["plan_digest"], original_plan)
+        self.assertEqual(observed["plan_state"], "invalidated")
+        self.assertIsNone(observed["confirmed_plan_digest"])
         self.assertIn("content_drift", drift.stdout)
 
     def test_m05_schema17_migrates_without_inventing_body(self) -> None:
@@ -279,7 +1673,7 @@ class PlanArtifactTests(unittest.TestCase):
         }
         first = self.run_hook(payload)
         failed = self.state()
-        self.assertEqual(failed["plan_state"], "awaiting_confirmation")
+        self.assertEqual(failed["plan_state"], "analyzing")
         self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
         generation = failed["plan_generation"]
         self.assertIn("write_failed", first.stdout)
@@ -289,7 +1683,8 @@ class PlanArtifactTests(unittest.TestCase):
         recovered = self.state()
         self.assertEqual(retry.returncode, 0, retry.stderr)
         self.assertEqual(recovered["plan_artifact"]["write_status"], "written")
-        self.assertEqual(recovered["plan_generation"], generation)
+        self.assertEqual(recovered["plan_generation"], generation + 1)
+        self.assertEqual(recovered["plan_state"], "awaiting_confirmation")
 
     def test_m07_plugin_data_inside_project_is_rejected_without_self_lock(self) -> None:
         project = self.root / "project"
@@ -310,7 +1705,7 @@ class PlanArtifactTests(unittest.TestCase):
         )
         state = self.state(data)
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(state["plan_state"], "awaiting_confirmation")
+        self.assertNotIn(state["plan_state"], {"awaiting_confirmation", "confirmed"})
         self.assertEqual(state["plan_artifact"]["warning_code"], "unsafe_data_root")
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
@@ -351,7 +1746,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(len(list((self.data / "plans").glob("*/*.md"))), 1)
         self.assertEqual(list((self.data / "plans").rglob("*.tmp")), [])
 
-    def test_m10_retention_keeps_current_plus_five_owned_old_files(self) -> None:
+    def test_m10_all_replans_remain_in_one_journal_and_user_file_is_preserved(self) -> None:
         session = "m10"
         self.begin_parent_plan(session)
         for generation in range(1, 8):
@@ -359,15 +1754,22 @@ class PlanArtifactTests(unittest.TestCase):
                 path = self.state_path()
                 state = json.loads(path.read_text(encoding="utf-8"))
                 state["plan_state"] = "analyzing"
+                state["plan_digest"] = None
+                state["plan_objective_fingerprint"] = None
+                state["plan_difficulty_decision_id"] = None
                 path.write_text(json.dumps(state), encoding="utf-8")
             state = self.accept_parent_plan(session, self.hard_body(f"g{generation}"), run_id=f"plan-{generation}")
             if generation == 1:
                 session_dir = self.artifact_path(state).parent
                 (session_dir / f"hard-plan-g0000-{'0' * 32}.md").write_text("user file", encoding="utf-8")
-        owned = [path for path in session_dir.glob("*.md") if path.read_text(encoding="utf-8").startswith("<!-- workflow-manager-plan-artifact:v1")]
-        self.assertEqual(len(owned), 6)
+        owned = [path for path in session_dir.glob("*.md") if path.read_text(encoding="utf-8").startswith(HOOK.PLAN_JOURNAL_OWNER)]
+        self.assertEqual(len(owned), 1)
         self.assertTrue((session_dir / f"hard-plan-g0000-{'0' * 32}.md").exists())
         self.assertTrue(self.artifact_path(state).exists())
+        self.assertEqual(
+            HOOK.parse_plan_journal(self.artifact_path(state).read_bytes())["revision_count"],
+            7,
+        )
 
     def test_m11_lifecycle_status_tracks_confirmation_execution_and_success(self) -> None:
         session = "m11"
@@ -420,11 +1822,15 @@ class PlanArtifactTests(unittest.TestCase):
             set(artifact),
             {
                 "relative_path",
+                "format_version",
                 "objective_fingerprint",
                 "difficulty_decision_id",
                 "plan_digest",
                 "content_digest",
+                "current_revision_digest",
+                "journal_digest",
                 "generation",
+                "revision_count",
                 "lifecycle_status",
                 "write_status",
                 "warning_code",
@@ -435,7 +1841,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertNotIn(body, json.dumps(state, ensure_ascii=False))
         self.assertRegex(
             artifact["relative_path"],
-            rf"^plans/[A-Za-z0-9._-]+-[0-9a-f]{{16}}/hard-plan-g0001-{state['plan_digest']}\.md$",
+            r"^plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan\.md$",
         )
 
 
@@ -466,11 +1872,15 @@ class PlanArtifactTests(unittest.TestCase):
         symbolic = directory / "symbolic.md"
         self.symlink_or_skip(symbolic, source)
         with self.assertRaises(HOOK.PlanArtifactError):
-            HOOK._atomic_write_plan_file(symbolic, b"changed")
+            HOOK._atomic_write_plan_file(
+                symbolic, b"changed", expected_old_bytes=b"original"
+            )
         hard = directory / "hard.md"
         os.link(source, hard)
         with self.assertRaises(HOOK.PlanArtifactError):
-            HOOK._atomic_write_plan_file(hard, b"changed")
+            HOOK._atomic_write_plan_file(
+                hard, b"changed", expected_old_bytes=b"original"
+            )
         self.assertEqual(source.read_text(encoding="utf-8"), "original")
         self.assertEqual(hard.read_text(encoding="utf-8"), "original")
 
@@ -485,13 +1895,16 @@ class PlanArtifactTests(unittest.TestCase):
             "WORKFLOW_COORDINATION_V1",
             "END_WORKFLOW_COORDINATION",
         )
-        raw = "1. safe plan\n" + "\n".join(markers) + "\n\u202e\u2066hidden\u2069\n" + ("x" * (HOOK.MAX_PLAN_ARTIFACT_BODY_BYTES * 2))
+        raw = "1. safe plan\n" + "\n".join(markers) + "\n\u202e\u2066hidden\u2069\n"
         body = HOOK.sanitize_plan_artifact_body(raw)
         for marker in markers:
             self.assertNotIn(marker, body)
         for control in ("\u202e", "\u2066", "\u2069"):
             self.assertNotIn(control, body)
-        self.assertLessEqual(len(body.encode("utf-8")), HOOK.MAX_PLAN_ARTIFACT_BODY_BYTES)
+        self.assertLessEqual(len(body.encode("utf-8")), HOOK.MAX_PLAN_REVISION_BYTES)
+        with self.assertRaises(HOOK.PlanArtifactError) as raised:
+            HOOK.sanitize_plan_artifact_body("x" * HOOK.MAX_PLAN_REVISION_BYTES)
+        self.assertEqual(raised.exception.code, "revision_too_large")
 
     def test_s04_replace_failure_preserves_old_file_and_removes_temporary(self) -> None:
         directory = self.root / "atomic"
@@ -500,7 +1913,9 @@ class PlanArtifactTests(unittest.TestCase):
         target.write_text("old-content", encoding="utf-8")
         with patch.object(HOOK.os, "replace", side_effect=OSError("simulated")):
             with self.assertRaises(OSError):
-                HOOK._atomic_write_plan_file(target, b"new-content")
+                HOOK._atomic_write_plan_file(
+                    target, b"new-content", expected_old_bytes=b"old-content"
+                )
         self.assertEqual(target.read_text(encoding="utf-8"), "old-content")
         self.assertEqual(list(directory.glob(".plan.md.*.tmp")), [])
 
@@ -525,7 +1940,8 @@ class PlanArtifactTests(unittest.TestCase):
         files = list((self.data / "plans").glob("*/*.md"))
         self.assertEqual(state["plan_generation"], 1)
         self.assertEqual(len(files), 1)
-        self.assertIn(state["plan_digest"], files[0].name)
+        parsed = HOOK.parse_plan_journal(files[0].read_bytes())
+        self.assertEqual(parsed["current_revision_digest"], state["plan_digest"])
 
     @unittest.skipUnless(hasattr(os, "link") and hasattr(os, "symlink"), "link support required")
     def test_s06_retention_uses_generation_and_preserves_forged_links(self) -> None:
@@ -533,27 +1949,32 @@ class PlanArtifactTests(unittest.TestCase):
         environment = patch.dict(os.environ, {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)})
         environment.start()
         self.addCleanup(environment.stop)
+        directory = self.data / "plans" / HOOK.plan_artifact_session_id("s06")
+        directory.mkdir(parents=True)
         for generation in range(1, 9):
-            state = HOOK.new_state(payload)
-            state.update(
-                {
-                    "plan_state": "awaiting_confirmation",
-                    "plan_generation": generation,
-                    "plan_digest": f"{generation:032x}",
-                    "plan_objective_fingerprint": "a" * 16,
-                    "plan_difficulty_decision_id": "b" * 24,
-                }
+            digest = f"{generation:032x}"
+            candidate = directory / f"hard-plan-g{generation:04d}-{digest}.md"
+            candidate.write_text(
+                f"{HOOK.LEGACY_PLAN_ARTIFACT_OWNER}\n"
+                f"generation: {generation}\n"
+                f"plan_digest: {digest}\n-->\n",
+                encoding="utf-8",
             )
-            HOOK.write_plan_artifact(state, payload, self.hard_body(f"g{generation}"))
             if generation == 1:
-                directory = self.data / "plans" / HOOK.plan_artifact_session_id("s06")
-                first = next(directory.glob("*.md"))
                 hard = directory / f"hard-plan-g9998-{'8' * 32}.md"
-                os.link(first, hard)
+                os.link(candidate, hard)
                 forged = directory / f"hard-plan-g9999-{'9' * 32}.md"
                 forged.write_text("forged", encoding="utf-8")
                 linked = directory / f"hard-plan-g9997-{'7' * 32}.md"
                 self.symlink_or_skip(linked, forged)
+        current = directory / f"hard-plan-g0008-{8:032x}.md"
+        with HOOK.plan_session_directory_guard(self.data, HOOK.plan_artifact_session_id("s06"), create=False) as guard:
+            HOOK._retain_plan_artifacts(
+                directory,
+                current,
+                directory_fd=guard["directory_fd"],
+                verify_binding=guard["verify"],
+            )
         self.assertTrue(forged.exists())
         self.assertTrue(hard.exists())
         self.assertTrue(linked.is_symlink())
@@ -609,7 +2030,8 @@ class PlanArtifactTests(unittest.TestCase):
         for key in ("executor_state", "execution_contract_id", "executor_failure_kind", "stall", "coordination_activity", "plan_artifact"):
             self.assertEqual(second[key], first[key])
         self.assertEqual(first["plan_artifact"]["write_status"], "legacy_unavailable")
-        self.assertEqual(first["plan_artifact"]["lifecycle_status"], "executing")
+        self.assertEqual(first["plan_artifact"]["lifecycle_status"], "invalidated")
+        self.assertEqual(first["plan_state"], "invalidated")
 
     def test_s08_compaction_resume_never_exposes_raw_session_identifier(self) -> None:
         session = "customer-secret-session-42"
@@ -626,8 +2048,10 @@ class PlanArtifactTests(unittest.TestCase):
         state.update(
             {
                 "plan_state": "awaiting_confirmation",
-                "plan_generation": 1,
+                "plan_generation": 0,
                 "plan_digest": "9" * 32,
+                "objective": {"fingerprint": "a" * 16, "length": 1},
+                "difficulty_decision_id": "b" * 24,
                 "plan_objective_fingerprint": "a" * 16,
                 "plan_difficulty_decision_id": "b" * 24,
             }
@@ -714,7 +2138,12 @@ class PlanArtifactTests(unittest.TestCase):
         quarantined_before_unlink: list[str] = []
         quarantined_after_unlink: list[str] = []
 
-        def swap_then_unlink(path: Path, identity: tuple[int, int, int], directory_fd: int | None) -> bool:
+        def swap_then_unlink(
+            path: Path,
+            identity: tuple[int, int, int],
+            directory_fd: int | None,
+            **kwargs: object,
+        ) -> bool:
             nonlocal attack_attempted, swapped
             first_unlink = not attack_attempted
             if not attack_attempted:
@@ -737,7 +2166,7 @@ class PlanArtifactTests(unittest.TestCase):
                     swapped = True
                 except OSError as error:
                     raise HOOK.PlanArtifactError("unsafe_path") from error
-            removed = original(path, identity, directory_fd)
+            removed = original(path, identity, directory_fd, **kwargs)
             if first_unlink and directory_fd is not None:
                 quarantined_after_unlink.extend(
                     sorted(
@@ -752,7 +2181,20 @@ class PlanArtifactTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         with patch.object(HOOK, "_unlink_plan_file_if_identity", side_effect=swap_then_unlink):
-            HOOK.write_plan_artifact(state, payload, self.hard_body("swap-retention"))
+            try:
+                with HOOK.plan_session_directory_guard(
+                    self.data,
+                    HOOK.plan_artifact_session_id("s10"),
+                    create=False,
+                ) as guard:
+                    HOOK._retain_plan_artifacts(
+                        session_directory,
+                        session_directory / HOOK.PLAN_JOURNAL_NAME,
+                        directory_fd=guard["directory_fd"],
+                        verify_binding=guard["verify"],
+                    )
+            except HOOK.PlanArtifactError:
+                pass
         observed = {
             candidate.name: candidate.read_bytes()
             for candidate in outside.iterdir()
@@ -814,8 +2256,10 @@ class PlanArtifactTests(unittest.TestCase):
         state.update(
             {
                 "plan_state": "awaiting_confirmation",
-                "plan_generation": 1,
+                "plan_generation": 0,
                 "plan_digest": "2" * 32,
+                "objective": {"fingerprint": "a" * 16, "length": 1},
+                "difficulty_decision_id": "b" * 24,
                 "plan_objective_fingerprint": "a" * 16,
                 "plan_difficulty_decision_id": "b" * 24,
             }
@@ -899,6 +2343,7 @@ class PlanArtifactTests(unittest.TestCase):
             path: Path,
             identity: tuple[int, int, int],
             directory_fd: int | None,
+            **kwargs: object,
         ) -> bool:
             names = (
                 os.listdir(directory_fd)
@@ -908,7 +2353,7 @@ class PlanArtifactTests(unittest.TestCase):
             observed_quarantine_counts.append(
                 sum(".quarantine." in name for name in names)
             )
-            return original(path, identity, directory_fd)
+            return original(path, identity, directory_fd, **kwargs)
 
         with patch.object(
             HOOK,

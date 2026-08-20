@@ -20,7 +20,7 @@ If acceptance later fails but that executor recorded no successful change, do no
 
 A same-task regression report opens a read-only causal review only when it follows a succeeded bound executor with recorded changes and still refers to the active objective. Explicit acceptance success, control/progress questions, and a clearly separate new objective do not open this gate. User wording is only a trigger, never proof of causality.
 
-Before any corrective mutation, compare:
+Before any corrective mutation, verify and reread the prior canonical current revision, then compare:
 
 1. the prior objective, confirmed plan, and execution contract;
 2. the bounded change and post-change verification baseline;
@@ -47,7 +47,7 @@ The IDs must match the active baseline and review. `evidence_digest` identifies 
 
 ## Replan as one coherent system
 
-For `introduced` or `fix_ineffective`, replace the old plan instead of applying a local patch on top of it. The new Hard plan must account for the prior method, regression mechanism, rollback or correction, original acceptance, reported symptom, and risk-based regression checks for adjacent behavior. Request strict confirmation again.
+For `introduced` or `fix_ineffective`, supersede the old plan by appending one complete replacement revision to the same session's canonical journal instead of applying a local patch on top of it. The new Hard plan must account for the prior method, regression mechanism, rollback or correction, original acceptance, reported symptom, and risk-based regression checks for adjacent behavior. Request strict confirmation again.
 
 For `unrelated`, detach the symptom from the old contract, reclassify it as a separate Hard work follow-up, and prepare a separately bounded plan and acceptance surface. The old executor, plan digest, and contract remain evidence only. A resolved review binds its `review_id` into the replacement execution contract so a stale executor cannot mutate.
 
@@ -55,6 +55,6 @@ For `uncertain`, report the missing evidence and next read-only check. Do not we
 
 ## Resume and migration
 
-Schema 11 preserves the execution baseline and causal-review IDs, state, outcome, and evidence digest across compaction. Resume from the native summary plus those bindings; do not reconstruct raw feedback or repeat completed evidence. If the objective, baseline, review, files, inputs, environment, device, or verification freshness changed, take one bounded check and rebind or replan.
+Schema 20 preserves the execution baseline and causal-review IDs, state, outcome, canonical path, and digests across compaction. Resume non-plan continuity from the native summary, but verify and reread the canonical current revision for plan semantics; do not reconstruct raw feedback or plan text. If the objective, journal, baseline, review, files, inputs, environment, device, or verification freshness changed, take one bounded check and rebind or replan.
 
-When migrating Schema 10, derive only a baseline supported by existing contract and recorded-operation fingerprints. Mark acceptance incomplete and causality unset unless native evidence proves otherwise; migration must never invent user acceptance, a regression, or a causal conclusion.
+Legacy migration derives only a baseline supported by the existing contract and recorded-operation fingerprints. Mark acceptance incomplete and causality unset unless native evidence proves otherwise; migration must never invent user acceptance, a regression, a plan body, or a causal conclusion.

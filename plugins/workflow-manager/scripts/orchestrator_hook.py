@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 19
-WRITER_VERSION = "1.0.36"
+SCHEMA_VERSION = 20
+WRITER_VERSION = "1.0.37"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -58,7 +58,12 @@ MAX_COORDINATION_INBOUND = 32
 COORDINATION_SNAPSHOT_TTL_SECONDS = 60
 COORDINATION_ID_MAX_BYTES = 4096
 MAX_STATE_BYTES = 1024 * 1024
-MAX_PLAN_ARTIFACT_BODY_BYTES = 96 * 1024
+MAX_PLAN_REVISION_BYTES = 960 * 1024
+MAX_PLAN_JOURNAL_BYTES = 10 * 1024 * 1024
+# Compatibility alias for callers that inspected the v1 mirror limit.  In Schema 20
+# it is the hard per-revision limit and content is rejected instead of truncated.
+MAX_PLAN_ARTIFACT_BODY_BYTES = MAX_PLAN_REVISION_BYTES
+MAX_LEGACY_PLAN_ARTIFACTS = 6
 MAX_OLD_PLAN_ARTIFACTS = 5
 MAX_RETENTION_TRANSACTION_ITEMS = 16
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
@@ -136,6 +141,9 @@ PLAN_ARTIFACT_WRITE_STATUSES = {
     "write_failed",
     "content_drift",
     "legacy_unavailable",
+    "revision_too_large",
+    "journal_full",
+    "transaction_recovery_failed",
 }
 PLAN_ARTIFACT_WARNING_CODES = {
     "none",
@@ -144,12 +152,25 @@ PLAN_ARTIFACT_WARNING_CODES = {
     "write_error",
     "content_drift",
     "legacy_unavailable",
+    "revision_too_large",
+    "journal_full",
+    "transaction_incomplete",
+    "transaction_recovery_failed",
 }
-PLAN_ARTIFACT_OWNER = "<!-- workflow-manager-plan-artifact:v1"
+LEGACY_PLAN_ARTIFACT_OWNER = "<!-- workflow-manager-plan-artifact:v1"
+PLAN_ARTIFACT_OWNER = LEGACY_PLAN_ARTIFACT_OWNER
+PLAN_JOURNAL_OWNER = "<!-- workflow-manager-plan-journal:v2"
+PLAN_REVISION_OWNER = "<!-- workflow-manager-plan-revision:v2"
 PLAN_ARTIFACT_BODY_MARKER = "<!-- workflow-manager-plan-body -->"
-PLAN_ARTIFACT_NAME_RE = re.compile(
+PLAN_JOURNAL_NAME = "hard-plan.md"
+LEGACY_PLAN_ARTIFACT_NAME_RE = re.compile(
     r"^hard-plan-g([0-9]{4,})-([0-9a-f]{32})\.md$"
 )
+PLAN_ARTIFACT_NAME_RE = re.compile(
+    r"^(?:hard-plan\.md|hard-plan-g[0-9]{4,}-[0-9a-f]{32}\.md)$"
+)
+PLAN_TRANSACTION_MARKER_NAME = ".hard-plan.md.transaction.json"
+MAX_PLAN_TRANSACTION_MARKER_BYTES = 4096
 
 SUCCESS_STATUSES = {"ok"}
 ERROR_STATUSES = {
@@ -498,14 +519,32 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     difficulty = safe_fingerprint(state.get("difficulty_decision_id"))
     plan = safe_fingerprint(state.get("plan_digest"))
     generation = max(safe_int(state.get("plan_generation")), 0)
-    if not (objective and difficulty and plan and generation > 0):
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    canonical_path = str(artifact.get("relative_path") or "")
+    revision_digest = safe_fingerprint(artifact.get("current_revision_digest"))
+    journal_digest = safe_fingerprint(artifact.get("journal_digest"))
+    if not (
+        objective
+        and difficulty
+        and plan
+        and generation > 0
+        and artifact.get("format_version") == 2
+        and artifact.get("write_status") == "written"
+        and re.fullmatch(
+            r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan\.md",
+            canonical_path,
+        )
+        and revision_digest == plan
+        and journal_digest
+        and artifact.get("generation") == generation
+    ):
         return None
     preference = safe_session_execution_preference(
         state.get("session_execution_preference")
     )
     material = (
         f"{EXECUTION_PROFILE_VERSION}\0{preference}\0{objective}\0{difficulty}"
-        f"\0{generation}\0{plan}"
+        f"\0{generation}\0{plan}\0{canonical_path}\0{revision_digest}\0{journal_digest}"
     )
     if preference == "highest_throughout":
         material += (
@@ -1889,11 +1928,15 @@ def _safe_causal_review(item: Any) -> dict[str, Any]:
 def empty_plan_artifact() -> dict[str, Any]:
     return {
         "relative_path": None,
+        "format_version": 0,
         "objective_fingerprint": None,
         "difficulty_decision_id": None,
         "plan_digest": None,
         "content_digest": None,
+        "current_revision_digest": None,
+        "journal_digest": None,
         "generation": 0,
+        "revision_count": 0,
         "lifecycle_status": "none",
         "write_status": "none",
         "warning_code": "none",
@@ -1907,18 +1950,32 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         return result
     relative = str(item.get("relative_path") or "")
-    relative_match = re.fullmatch(
+    canonical_match = re.fullmatch(
+        r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan\.md", relative
+    )
+    legacy_match = re.fullmatch(
         r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan-g[0-9]{4,}-[0-9a-f]{32}\.md",
         relative,
     )
+    plan_digest = safe_fingerprint(item.get("plan_digest")) or None
+    content_digest = safe_fingerprint(item.get("content_digest")) or None
+    current_revision_digest = (
+        safe_fingerprint(item.get("current_revision_digest"))
+        or (content_digest if canonical_match else None)
+        or (plan_digest if canonical_match else None)
+    )
     result.update(
         {
-            "relative_path": relative if relative_match else None,
+            "relative_path": relative if canonical_match or legacy_match else None,
+            "format_version": 2 if canonical_match else 1 if legacy_match else 0,
             "objective_fingerprint": safe_fingerprint(item.get("objective_fingerprint")) or None,
             "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
-            "plan_digest": safe_fingerprint(item.get("plan_digest")) or None,
-            "content_digest": safe_fingerprint(item.get("content_digest")) or None,
+            "plan_digest": plan_digest,
+            "content_digest": content_digest,
+            "current_revision_digest": current_revision_digest,
+            "journal_digest": safe_fingerprint(item.get("journal_digest")) or None,
             "generation": max(safe_int(item.get("generation")), 0),
+            "revision_count": max(safe_int(item.get("revision_count")), 0),
             "lifecycle_status": item.get("lifecycle_status") if item.get("lifecycle_status") in PLAN_ARTIFACT_LIFECYCLE_STATUSES else "none",
             "write_status": item.get("write_status") if item.get("write_status") in PLAN_ARTIFACT_WRITE_STATUSES else "none",
             "warning_code": item.get("warning_code") if item.get("warning_code") in PLAN_ARTIFACT_WARNING_CODES else "none",
@@ -1926,8 +1983,14 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
             "updated_at": str(item.get("updated_at"))[:40] if item.get("updated_at") else None,
         }
     )
-    if result["relative_path"] and result["plan_digest"] not in result["relative_path"]:
+    if legacy_match and result["plan_digest"] not in result["relative_path"]:
         result["relative_path"] = None
+        result["format_version"] = 0
+    if result["format_version"] == 2:
+        if result["plan_digest"] != result["current_revision_digest"]:
+            result["current_revision_digest"] = None
+        if result["revision_count"] <= 0:
+            result["revision_count"] = 0
     return result
 
 
@@ -1956,6 +2019,7 @@ def _legacy_plan_artifact(state: dict[str, Any]) -> dict[str, Any]:
             "difficulty_decision_id": safe_fingerprint(state.get("plan_difficulty_decision_id")) or None,
             "plan_digest": plan_digest,
             "generation": max(safe_int(state.get("plan_generation")), 0),
+            "format_version": 1,
             "lifecycle_status": _plan_artifact_lifecycle(state, plan_digest),
             "write_status": "legacy_unavailable",
             "warning_code": "legacy_unavailable",
@@ -1975,12 +2039,8 @@ def sync_plan_artifact_lifecycle(state: dict[str, Any]) -> None:
 
 def sanitize_plan_artifact_body(value: Any) -> str:
     source = str(value or "")
-    suffix = "\n\n> Workflow Manager: plan mirror truncated at the private artifact byte limit.\n"
-    allowance = MAX_PLAN_ARTIFACT_BODY_BYTES - len(suffix.encode("utf-8"))
     bidi_controls = {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
     characters: list[str] = []
-    used_bytes = 0
-    source_truncated = False
     for character in source:
         codepoint = ord(character)
         if codepoint in bidi_controls:
@@ -1990,12 +2050,7 @@ def sanitize_plan_artifact_body(value: Any) -> str:
             codepoint = ord(character)
         if character not in {"\n", "\t"} and (codepoint < 32 or codepoint == 127):
             continue
-        encoded_character = character.encode("utf-8")
-        if used_bytes + len(encoded_character) > allowance:
-            source_truncated = True
-            break
         characters.append(character)
-        used_bytes += len(encoded_character)
     text = "".join(characters)
     protocol = re.compile(
         r"^\s*(?:WORK_ASSESSMENT|SIMPLE_EXECUTION|LOCAL_EXECUTION|EXECUTION_STALL|"
@@ -2016,14 +2071,10 @@ def sanitize_plan_artifact_body(value: Any) -> str:
         "<redacted>", "[REDACTED]"
     )
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
-    if source_truncated:
-        body = body.rstrip() + suffix
-    encoded = body.encode("utf-8")
-    if len(encoded) > MAX_PLAN_ARTIFACT_BODY_BYTES:
-        suffix = "\n\n> Workflow Manager: plan mirror truncated at the private artifact byte limit.\n"
-        allowance = MAX_PLAN_ARTIFACT_BODY_BYTES - len(suffix.encode("utf-8"))
-        body = encoded[:allowance].decode("utf-8", errors="ignore").rstrip() + suffix
-    return body.rstrip() + "\n"
+    body = body.rstrip() + "\n"
+    if len(body.encode("utf-8")) > MAX_PLAN_REVISION_BYTES:
+        raise PlanArtifactError("revision_too_large")
+    return body
 
 
 def _plan_artifact_body(document: str) -> str | None:
@@ -2036,10 +2087,162 @@ def plan_artifact_body_digest(document: str) -> str | None:
     return stable_hash(body, 32) if body is not None else None
 
 
+PLAN_JOURNAL_PREAMBLE = (
+    "# Workflow Manager Hard Plan\n\n"
+    "> Canonical private plan journal. Trusted Hook revisions define plan content; "
+    "the journal alone never grants execution authority.\n\n"
+)
+PLAN_JOURNAL_HEADER_RE = re.compile(
+    rb"\A<!-- workflow-manager-plan-journal:v2\n"
+    rb"session_token: (session-[0-9a-f]{16})\n"
+    rb"created_at: ([^\r\n]{1,40})\n"
+    rb"-->\n"
+)
+PLAN_REVISION_HEADER_RE = re.compile(
+    rb"<!-- workflow-manager-plan-revision:v2\n"
+    rb"generation: ([1-9][0-9]*)\n"
+    rb"revision_digest: ([0-9a-f]{32})\n"
+    rb"objective_fingerprint: ([0-9a-f]{16,64}|none)\n"
+    rb"difficulty_decision_id: ([0-9a-f]{16,64}|none)\n"
+    rb"created_at: ([^\r\n]{1,40})\n"
+    rb"revision_bytes: ([0-9]+)\n"
+    rb"-->\n"
+)
+
+
+def parse_plan_journal(
+    document: bytes, *, expected_session: str | None = None
+) -> dict[str, Any]:
+    if len(document) > MAX_PLAN_JOURNAL_BYTES:
+        raise PlanArtifactError("journal_full")
+    header = PLAN_JOURNAL_HEADER_RE.match(document)
+    if header is None:
+        raise PlanArtifactError("content_drift")
+    session = header.group(1).decode("ascii")
+    if expected_session is not None and session != expected_session:
+        raise PlanArtifactError("content_drift")
+    position = header.end()
+    preamble = PLAN_JOURNAL_PREAMBLE.encode("utf-8")
+    if document[position : position + len(preamble)] != preamble:
+        raise PlanArtifactError("content_drift")
+    position += len(preamble)
+    revisions: list[dict[str, Any]] = []
+    previous_generation = 0
+    while position < len(document):
+        revision_header = PLAN_REVISION_HEADER_RE.match(document, position)
+        if revision_header is None:
+            raise PlanArtifactError("content_drift")
+        generation = safe_int(revision_header.group(1).decode("ascii"))
+        if generation <= previous_generation:
+            raise PlanArtifactError("content_drift")
+        revision_digest = revision_header.group(2).decode("ascii")
+        objective = revision_header.group(3).decode("ascii")
+        difficulty = revision_header.group(4).decode("ascii")
+        revision_bytes = safe_int(revision_header.group(6).decode("ascii"))
+        if revision_bytes <= 0 or revision_bytes > MAX_PLAN_REVISION_BYTES:
+            raise PlanArtifactError("content_drift")
+        heading = f"## Revision {generation}\n\n".encode("utf-8")
+        body_start = revision_header.end()
+        if document[body_start : body_start + len(heading)] != heading:
+            raise PlanArtifactError("content_drift")
+        body_start += len(heading)
+        body_end = body_start + revision_bytes
+        body_bytes = document[body_start:body_end]
+        if len(body_bytes) != revision_bytes or not body_bytes.endswith(b"\n"):
+            raise PlanArtifactError("content_drift")
+        try:
+            body = body_bytes.decode("utf-8")
+        except UnicodeError as error:
+            raise PlanArtifactError("content_drift") from error
+        if stable_hash(body_bytes, 32) != revision_digest:
+            raise PlanArtifactError("content_drift")
+        revisions.append(
+            {
+                "generation": generation,
+                "revision_digest": revision_digest,
+                "objective_fingerprint": None if objective == "none" else objective,
+                "difficulty_decision_id": None if difficulty == "none" else difficulty,
+                "created_at": revision_header.group(5).decode("utf-8"),
+                "body": body,
+            }
+        )
+        previous_generation = generation
+        position = body_end
+    if not revisions:
+        raise PlanArtifactError("content_drift")
+    current = revisions[-1]
+    return {
+        "session_token": session,
+        "created_at": header.group(2).decode("utf-8"),
+        "revisions": revisions,
+        "revision_count": len(revisions),
+        "generation": current["generation"],
+        "current_revision_digest": current["revision_digest"],
+        "objective_fingerprint": current["objective_fingerprint"],
+        "difficulty_decision_id": current["difficulty_decision_id"],
+        "journal_digest": stable_hash(document, 32),
+    }
+
+
+def append_plan_journal_revision(
+    existing: bytes | None,
+    *,
+    session: str,
+    generation: int,
+    body: str,
+    objective_fingerprint: str | None,
+    difficulty_decision_id: str | None,
+    created_at: str,
+) -> tuple[bytes, dict[str, Any]]:
+    body_bytes = body.encode("utf-8")
+    if len(body_bytes) > MAX_PLAN_REVISION_BYTES:
+        raise PlanArtifactError("revision_too_large")
+    if existing is None:
+        prefix = (
+            f"{PLAN_JOURNAL_OWNER}\n"
+            f"session_token: {session}\n"
+            f"created_at: {created_at}\n"
+            "-->\n"
+            f"{PLAN_JOURNAL_PREAMBLE}"
+        ).encode("utf-8")
+        prior_generation = 0
+    else:
+        parsed = parse_plan_journal(existing, expected_session=session)
+        prior_generation = parsed["generation"]
+        prefix = existing
+    if generation <= prior_generation:
+        raise PlanArtifactError("content_drift")
+    revision_digest = stable_hash(body_bytes, 32)
+    revision = (
+        f"{PLAN_REVISION_OWNER}\n"
+        f"generation: {generation}\n"
+        f"revision_digest: {revision_digest}\n"
+        f"objective_fingerprint: {objective_fingerprint or 'none'}\n"
+        f"difficulty_decision_id: {difficulty_decision_id or 'none'}\n"
+        f"created_at: {created_at}\n"
+        f"revision_bytes: {len(body_bytes)}\n"
+        "-->\n"
+        f"## Revision {generation}\n\n"
+    ).encode("utf-8") + body_bytes
+    document = prefix + revision
+    if len(document) > MAX_PLAN_JOURNAL_BYTES:
+        raise PlanArtifactError("journal_full")
+    parsed = parse_plan_journal(document, expected_session=session)
+    if parsed["generation"] != generation or parsed["current_revision_digest"] != revision_digest:
+        raise PlanArtifactError("content_drift")
+    return document, parsed
+
+
 class PlanArtifactError(OSError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code if code in PLAN_ARTIFACT_WARNING_CODES else "write_error"
+
+
+class PlanTransactionPendingError(PlanArtifactError):
+    def __init__(self, transaction: dict[str, Any]) -> None:
+        super().__init__("write_error")
+        self.transaction = transaction
 
 
 def _canonical_plan_data_root(payload: dict[str, Any]) -> Path:
@@ -2252,12 +2455,23 @@ def plan_session_directory_guard(
             os.close(descriptor)
 
 
+def _fsync_plan_directory(directory_fd: int | None) -> None:
+    if directory_fd is None:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError as error:
+        raise PlanArtifactError("write_error") from error
+
+
 def _atomic_write_plan_file(
     path: Path,
     payload: bytes,
     *,
+    expected_old_bytes: bytes | None,
     directory_fd: int | None = None,
     verify_binding: Callable[[], None] | None = None,
+    prepared_backup_name: str | None = None,
 ) -> dict[str, Any]:
     if not PLAN_ARTIFACT_NAME_RE.fullmatch(path.name):
         raise PlanArtifactError("unsafe_path")
@@ -2265,8 +2479,12 @@ def _atomic_write_plan_file(
         "path": path,
         "directory_fd": directory_fd,
         "old_identity": None,
+        "old_mode": None,
+        "expected_old_bytes": expected_old_bytes,
+        "expected_new_bytes": payload,
         "backup_name": None,
         "new_identity": None,
+        "new_mode": None,
     }
     try:
         existing = _plan_lstat(path, directory_fd)
@@ -2280,6 +2498,21 @@ def _atomic_write_plan_file(
         ):
             raise PlanArtifactError("unsafe_path")
         transaction["old_identity"] = _plan_file_identity(existing)
+        transaction["old_mode"] = stat.S_IMODE(existing.st_mode)
+    if expected_old_bytes is None:
+        if transaction["old_identity"] is not None:
+            raise PlanArtifactError("content_drift")
+    else:
+        if transaction["old_identity"] is None:
+            raise PlanArtifactError("content_drift")
+        observed_old = _read_exact_plan_bytes(
+            path,
+            transaction["old_identity"],
+            directory_fd,
+            max_bytes=MAX_PLAN_JOURNAL_BYTES,
+        )
+        if observed_old != expected_old_bytes:
+            raise PlanArtifactError("content_drift")
     descriptor = -1
     temporary_name: str | None = None
     temporary_path: Path | None = None
@@ -2314,12 +2547,56 @@ def _atomic_write_plan_file(
         if verify_binding is not None:
             verify_binding()
         if transaction["old_identity"] is not None:
-            backup_name = _transaction_name(path, "backup", directory_fd)
+            backup_name = prepared_backup_name or _transaction_name(
+                path, "backup", directory_fd
+            )
+            if not re.fullmatch(
+                rf"\.{re.escape(path.name)}\.backup\.[0-9a-f]{{24}}",
+                backup_name,
+            ):
+                raise PlanArtifactError("unsafe_path")
+            try:
+                _plan_lstat(path.parent / backup_name, directory_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                raise PlanArtifactError("unsafe_path")
+            current = _plan_lstat(path, directory_fd)
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or _plan_file_identity(current) != transaction["old_identity"]
+            ):
+                raise PlanArtifactError("unsafe_path")
+            observed_old = _read_exact_plan_bytes(
+                path,
+                transaction["old_identity"],
+                directory_fd,
+                max_bytes=MAX_PLAN_JOURNAL_BYTES,
+            )
+            if observed_old != expected_old_bytes:
+                raise PlanArtifactError("content_drift")
             _plan_rename(path, backup_name, directory_fd)
             transaction["backup_name"] = backup_name
             backup_info = _plan_lstat(path.parent / backup_name, directory_fd)
             if _plan_file_identity(backup_info) != transaction["old_identity"]:
                 raise PlanArtifactError("unsafe_path")
+            backup_bytes = _read_exact_plan_bytes(
+                path.parent / backup_name,
+                transaction["old_identity"],
+                directory_fd,
+                max_bytes=MAX_PLAN_JOURNAL_BYTES,
+            )
+            if backup_bytes != expected_old_bytes:
+                raise PlanArtifactError("content_drift")
+        else:
+            try:
+                _plan_lstat(path, directory_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                raise PlanArtifactError("content_drift")
         if directory_fd is not None:
             os.replace(
                 temporary_name,
@@ -2335,6 +2612,7 @@ def _atomic_write_plan_file(
         temporary_path = None
         installed = _plan_lstat(path, directory_fd)
         transaction["new_identity"] = _plan_file_identity(installed)
+        transaction["new_mode"] = stat.S_IMODE(installed.st_mode)
         if (
             stat.S_ISLNK(installed.st_mode)
             or not stat.S_ISREG(installed.st_mode)
@@ -2344,14 +2622,19 @@ def _atomic_write_plan_file(
         try:
             if directory_fd is not None:
                 os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
-                os.fsync(directory_fd)
             else:
                 path.chmod(0o600)
         except (NotImplementedError, OSError):
             pass
+        try:
+            _fsync_plan_directory(directory_fd)
+        except PlanArtifactError as error:
+            raise PlanTransactionPendingError(transaction) from error
         if verify_binding is not None:
             verify_binding()
         return transaction
+    except PlanTransactionPendingError:
+        raise
     except Exception as error:
         if transaction["backup_name"] is not None or transaction["new_identity"] is not None:
             try:
@@ -2447,10 +2730,75 @@ def _transaction_name(path: Path, purpose: str, directory_fd: int | None) -> str
     raise PlanArtifactError("write_error")
 
 
+def _open_plan_delete_descriptor(path: Path, directory_fd: int | None) -> int:
+    if os.name != "nt":
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if directory_fd is not None:
+            return os.open(path.name, flags, dir_fd=directory_fd)
+        return os.open(path, flags)
+
+    if directory_fd is not None:
+        raise PlanArtifactError("unsafe_path")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        _windows_api_directory_path(path),
+        0x80000000,
+        0x0001 | 0x0004,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise PlanArtifactError("unsafe_path")
+    try:
+        return msvcrt.open_osfhandle(
+            int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+    except Exception as error:
+        _windows_close_handle(handle)
+        raise PlanArtifactError("unsafe_path") from error
+
+
+def _read_plan_delete_descriptor(descriptor: int, max_bytes: int) -> bytes:
+    limit = max(max_bytes, 0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    observed_size = 0
+    while observed_size <= limit:
+        chunk = os.read(descriptor, min(64 * 1024, limit + 1 - observed_size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        observed_size += len(chunk)
+    document = b"".join(chunks)
+    if len(document) > limit:
+        raise PlanArtifactError("content_drift")
+    return document
+
+
 def _unlink_plan_file_if_identity(
     path: Path,
     expected: tuple[int, int, int],
     directory_fd: int | None,
+    *,
+    expected_bytes: bytes | None = None,
+    expected_mode: int | None = None,
 ) -> bool:
     try:
         observed = _plan_lstat(path, directory_fd)
@@ -2463,6 +2811,78 @@ def _unlink_plan_file_if_identity(
         or _plan_file_identity(observed) != expected
     ):
         return False
+    if expected_bytes is not None:
+        descriptor = -1
+        unlinked = False
+        original_mode = stat.S_IMODE(observed.st_mode)
+        restore_document: bytes | None = None
+        try:
+            descriptor = _open_plan_delete_descriptor(path, directory_fd)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or _plan_file_identity(opened) != expected
+                or (
+                    expected_mode is not None
+                    and original_mode != int(expected_mode)
+                )
+            ):
+                return False
+            if os.name != "nt":
+                try:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.fchmod(descriptor, original_mode & ~0o222)
+                except (AttributeError, NotImplementedError, OSError) as error:
+                    raise PlanArtifactError("unsafe_path") from error
+            after_guard = _plan_lstat(path, directory_fd)
+            if (
+                stat.S_ISLNK(after_guard.st_mode)
+                or not stat.S_ISREG(after_guard.st_mode)
+                or after_guard.st_nlink != 1
+                or _plan_file_identity(after_guard) != expected
+            ):
+                return False
+            before_unlink = _read_plan_delete_descriptor(
+                descriptor, MAX_PLAN_JOURNAL_BYTES
+            )
+            if before_unlink != expected_bytes:
+                raise PlanArtifactError("content_drift")
+            if directory_fd is not None:
+                os.unlink(path.name, dir_fd=directory_fd)
+            else:
+                path.unlink()
+            unlinked = True
+            after_unlink = _read_plan_delete_descriptor(
+                descriptor, MAX_PLAN_JOURNAL_BYTES
+            )
+            if after_unlink != expected_bytes:
+                restore_document = after_unlink
+        finally:
+            if descriptor >= 0:
+                if not unlinked and os.name != "nt":
+                    try:
+                        os.fchmod(descriptor, original_mode)
+                    except OSError:
+                        pass
+                os.close(descriptor)
+        if restore_document is not None:
+            snapshot = {"document": restore_document, "mode": original_mode}
+            try:
+                _install_retention_snapshot(path, snapshot, directory_fd)
+            except PlanArtifactError:
+                recovery = path.parent / _transaction_name(
+                    path, "recovered", directory_fd
+                )
+                _install_retention_snapshot(recovery, snapshot, directory_fd)
+            raise PlanArtifactError("content_drift")
+        try:
+            remaining = _plan_lstat(path, directory_fd)
+        except FileNotFoundError:
+            return True
+        return _plan_file_identity(remaining) != expected
     if directory_fd is not None:
         os.unlink(path.name, dir_fd=directory_fd)
     else:
@@ -2478,7 +2898,13 @@ def _rollback_plan_write(transaction: dict[str, Any]) -> None:
     path = transaction["path"]
     directory_fd = transaction.get("directory_fd")
     new_identity = transaction.get("new_identity")
-    if new_identity and not _unlink_plan_file_if_identity(path, new_identity, directory_fd):
+    if new_identity and not _unlink_plan_file_if_identity(
+        path,
+        new_identity,
+        directory_fd,
+        expected_bytes=transaction.get("expected_new_bytes"),
+        expected_mode=transaction.get("new_mode"),
+    ):
         raise PlanArtifactError("unsafe_path")
     backup_name = transaction.get("backup_name")
     old_identity = transaction.get("old_identity")
@@ -2519,8 +2945,24 @@ def _commit_plan_write(
     if verify_binding is not None:
         verify_binding()
     backup = transaction["path"].parent / backup_name
+    old_identity = transaction.get("old_identity")
+    expected_old_bytes = transaction.get("expected_old_bytes")
+    if not old_identity or not isinstance(expected_old_bytes, bytes):
+        raise PlanArtifactError("unsafe_path")
+    backup_bytes = _read_exact_plan_bytes(
+        backup,
+        old_identity,
+        transaction.get("directory_fd"),
+        max_bytes=MAX_PLAN_JOURNAL_BYTES,
+    )
+    if backup_bytes != expected_old_bytes:
+        raise PlanArtifactError("content_drift")
     if not _unlink_plan_file_if_identity(
-        backup, transaction["old_identity"], transaction.get("directory_fd")
+        backup,
+        old_identity,
+        transaction.get("directory_fd"),
+        expected_bytes=expected_old_bytes,
+        expected_mode=transaction.get("old_mode"),
     ):
         raise PlanArtifactError("unsafe_path")
     transaction["backup_name"] = None
@@ -2531,7 +2973,7 @@ def _owned_plan_artifact_record(
 ) -> tuple[int, str, tuple[int, int, int]] | None:
     descriptor = -1
     try:
-        match = PLAN_ARTIFACT_NAME_RE.fullmatch(path.name)
+        match = LEGACY_PLAN_ARTIFACT_NAME_RE.fullmatch(path.name)
         if not match:
             return None
         if directory_fd is not None:
@@ -2575,8 +3017,10 @@ def _read_exact_plan_bytes(
     path: Path,
     expected: tuple[int, int, int],
     directory_fd: int | None,
+    *,
+    max_bytes: int = MAX_PLAN_REVISION_BYTES + 16 * 1024,
 ) -> bytes:
-    limit = MAX_PLAN_ARTIFACT_BODY_BYTES + 16 * 1024
+    limit = max(max_bytes, 0)
     descriptor = -1
     try:
         if directory_fd is not None:
@@ -2768,6 +3212,7 @@ def _retain_plan_artifacts(
     *,
     directory_fd: int | None = None,
     verify_binding: Callable[[], None] | None = None,
+    keep_old: int = MAX_OLD_PLAN_ARTIFACTS,
 ) -> None:
     def restore(staged: list[dict[str, Any]]) -> None:
         try:
@@ -2896,7 +3341,11 @@ def _retain_plan_artifacts(
                 ):
                     raise PlanArtifactError("unsafe_path")
                 if not _unlink_plan_file_if_identity(
-                    quarantine, identity, directory_fd
+                    quarantine,
+                    identity,
+                    directory_fd,
+                    expected_bytes=snapshot["document"],
+                    expected_mode=snapshot["mode"],
                 ):
                     raise PlanArtifactError("unsafe_path")
                 entry["unlinked"] = True
@@ -2928,7 +3377,7 @@ def _retain_plan_artifacts(
         key=lambda item: (item[0][0], item[0][1], item[1].name),
         reverse=True,
     )
-    stale = old[MAX_OLD_PLAN_ARTIFACTS:]
+    stale = old[max(keep_old, 0):]
     for offset in range(0, len(stale), MAX_RETENTION_TRANSACTION_ITEMS):
         retain_transaction(
             stale[offset : offset + MAX_RETENTION_TRANSACTION_ITEMS]
@@ -2938,145 +3387,1064 @@ def _retain_plan_artifacts(
 
 def _read_plan_artifact_document(
     path: Path, *, directory_fd: int | None = None
-) -> str:
-    limit = MAX_PLAN_ARTIFACT_BODY_BYTES + 16 * 1024
-    descriptor = -1
+) -> bytes:
     try:
-        if directory_fd is not None:
-            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-            before = os.fstat(descriptor)
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-                raise PlanArtifactError("unsafe_path")
-            chunks: list[bytes] = []
-            observed_size = 0
-            while observed_size <= limit:
-                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - observed_size))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                observed_size += len(chunk)
-            document = b"".join(chunks)
-            after = os.fstat(descriptor)
-            if _plan_file_identity(after) != _plan_file_identity(before):
-                raise PlanArtifactError("unsafe_path")
-        else:
-            before = path.lstat()
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-                raise PlanArtifactError("unsafe_path")
-            with path.open("rb") as stream:
-                opened = os.fstat(stream.fileno())
-                if _plan_file_identity(opened) != _plan_file_identity(before):
-                    raise PlanArtifactError("unsafe_path")
-                document = stream.read(limit + 1)
-                after_handle = os.fstat(stream.fileno())
-                after_path = path.lstat()
-            if (
-                _plan_file_identity(after_handle) != _plan_file_identity(opened)
-                or _plan_file_identity(after_path) != _plan_file_identity(opened)
-                or stat.S_ISLNK(after_path.st_mode)
-                or not stat.S_ISREG(after_path.st_mode)
-                or after_path.st_nlink != 1
-            ):
-                raise PlanArtifactError("unsafe_path")
-        if len(document) > limit:
-            raise PlanArtifactError("content_drift")
-        return document.decode("utf-8")
-    except UnicodeError as error:
+        info = _plan_lstat(path, directory_fd)
+    except FileNotFoundError as error:
         raise PlanArtifactError("content_drift") from error
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+    ):
+        raise PlanArtifactError("unsafe_path")
+    try:
+        return _read_exact_plan_bytes(
+            path,
+            _plan_file_identity(info),
+            directory_fd,
+            max_bytes=MAX_PLAN_JOURNAL_BYTES,
+        )
+    except PlanArtifactError as error:
+        if error.code == "unsafe_path" and info.st_size > MAX_PLAN_JOURNAL_BYTES:
+            raise PlanArtifactError("journal_full") from error
+        raise
+
+
+def _write_plan_transaction_marker(
+    path: Path,
+    marker: dict[str, Any],
+    *,
+    directory_fd: int | None,
+    verify_binding: Callable[[], None],
+) -> tuple[int, int, int]:
+    encoded = (
+        json.dumps(marker, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    if len(encoded) > MAX_PLAN_TRANSACTION_MARKER_BYTES:
+        raise PlanArtifactError("write_error")
+    try:
+        _plan_lstat(path, directory_fd)
+    except FileNotFoundError:
+        pass
+    else:
+        raise PlanArtifactError("transaction_incomplete")
+    descriptor = -1
+    temporary_name: str | None = None
+    temporary_path: Path | None = None
+    try:
+        for _ in range(64):
+            candidate = f".{PLAN_JOURNAL_NAME}.transaction.{secrets.token_hex(12)}.tmp"
+            try:
+                if directory_fd is not None:
+                    descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                else:
+                    temporary_path = path.parent / candidate
+                    descriptor = os.open(
+                        temporary_path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                temporary_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0 or temporary_name is None:
+            raise PlanArtifactError("write_error")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        verify_binding()
+        temporary = path.parent / temporary_name
+        _plan_rename_if_absent(temporary, path.name, directory_fd)
+        temporary_name = None
+        temporary_path = None
+        installed = _plan_lstat(path, directory_fd)
+        if (
+            stat.S_ISLNK(installed.st_mode)
+            or not stat.S_ISREG(installed.st_mode)
+            or installed.st_nlink != 1
+        ):
+            raise PlanArtifactError("unsafe_path")
+        try:
+            if directory_fd is not None:
+                os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+            else:
+                path.chmod(0o600)
+        except (NotImplementedError, OSError):
+            pass
+        _fsync_plan_directory(directory_fd)
+        identity = _plan_file_identity(installed)
+        observed = _read_exact_plan_bytes(
+            path,
+            identity,
+            directory_fd,
+            max_bytes=MAX_PLAN_TRANSACTION_MARKER_BYTES,
+        )
+        if observed != encoded:
+            raise PlanArtifactError("unsafe_path")
+        verify_binding()
+        return identity
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if temporary_name is not None:
+            try:
+                if directory_fd is not None:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                elif temporary_path is not None:
+                    temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
-def write_plan_artifact(state: dict[str, Any], payload: dict[str, Any], message: str) -> None:
-    body = sanitize_plan_artifact_body(message)
-    content_digest = stable_hash(body, 32)
-    plan_digest = safe_fingerprint(state.get("plan_digest")) or None
-    generation = max(safe_int(state.get("plan_generation")), 0)
-    session = plan_artifact_session_id(payload.get("session_id"))
-    filename = f"hard-plan-g{generation:04d}-{plan_digest}.md" if plan_digest else ""
-    relative = f"plans/{session}/{filename}" if filename else None
-    previous = _safe_plan_artifact(state.get("plan_artifact"))
-    now = utc_now()
-    artifact = empty_plan_artifact()
-    artifact.update(
-        {
-            "relative_path": relative,
-            "objective_fingerprint": safe_fingerprint(state.get("plan_objective_fingerprint")) or None,
-            "difficulty_decision_id": safe_fingerprint(state.get("plan_difficulty_decision_id")) or None,
-            "plan_digest": plan_digest,
-            "content_digest": content_digest,
-            "generation": generation,
-            "lifecycle_status": _plan_artifact_lifecycle(state, plan_digest),
-            "created_at": previous.get("created_at") if previous.get("plan_digest") == plan_digest else now,
-            "updated_at": now,
-        }
+
+def _read_plan_transaction_marker(
+    path: Path, *, directory_fd: int | None
+) -> tuple[dict[str, Any], tuple[int, int, int]]:
+    info = _plan_lstat(path, directory_fd)
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_size > MAX_PLAN_TRANSACTION_MARKER_BYTES
+    ):
+        raise PlanArtifactError("transaction_incomplete")
+    identity = _plan_file_identity(info)
+    raw = _read_exact_plan_bytes(
+        path,
+        identity,
+        directory_fd,
+        max_bytes=MAX_PLAN_TRANSACTION_MARKER_BYTES,
     )
     try:
-        if not plan_digest or not relative:
-            raise PlanArtifactError("write_error")
-        root = _canonical_plan_data_root(payload)
-        plans = root / "plans"
-        directory = plans / session
-        target = directory / filename
-        with plan_session_directory_guard(root, session) as guard:
-            guard["verify"]()
-            document = (
-                f"{PLAN_ARTIFACT_OWNER}\n"
-                f"generation: {generation}\n"
-                f"plan_digest: {plan_digest}\n"
-                f"content_digest: {content_digest}\n"
-                f"objective_fingerprint: {artifact['objective_fingerprint'] or 'none'}\n"
-                f"difficulty_decision_id: {artifact['difficulty_decision_id'] or 'none'}\n"
-                "-->\n# Workflow Manager Hard Plan\n\n"
-                "> This Markdown file is a private review mirror. The bound state plan_digest remains authoritative.\n\n"
-                f"{PLAN_ARTIFACT_BODY_MARKER}\n{body}"
-            )
+        marker = json.loads(raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PlanArtifactError("transaction_incomplete") from error
+    required = {
+        "schema",
+        "transaction_id",
+        "session_token",
+        "journal_name",
+        "backup_name",
+        "cleanup_kind",
+        "old_journal_digest",
+        "new_journal_digest",
+        "old_generation",
+        "new_generation",
+    }
+    if not isinstance(marker, dict) or set(marker) != required:
+        raise PlanArtifactError("transaction_incomplete")
+    if (
+        marker.get("schema") != 1
+        or not re.fullmatch(r"[0-9a-f]{32}", str(marker.get("transaction_id") or ""))
+        or not re.fullmatch(r"session-[0-9a-f]{16}", str(marker.get("session_token") or ""))
+        or marker.get("journal_name") != PLAN_JOURNAL_NAME
+        or marker.get("cleanup_kind") not in {"none", "legacy_v1"}
+        or not re.fullmatch(r"[0-9a-f]{32}|none", str(marker.get("old_journal_digest") or ""))
+        or not re.fullmatch(r"[0-9a-f]{32}", str(marker.get("new_journal_digest") or ""))
+        or not isinstance(marker.get("old_generation"), int)
+        or not isinstance(marker.get("new_generation"), int)
+        or marker["old_generation"] < 0
+        or marker["new_generation"] <= marker["old_generation"]
+    ):
+        raise PlanArtifactError("transaction_incomplete")
+    backup_name = marker.get("backup_name")
+    if backup_name != "none" and not re.fullmatch(
+        rf"\.{re.escape(PLAN_JOURNAL_NAME)}\.backup\.[0-9a-f]{{24}}",
+        str(backup_name or ""),
+    ):
+        raise PlanArtifactError("transaction_incomplete")
+    return marker, identity
+
+
+def _remove_verified_transaction_file(
+    path: Path,
+    identity: tuple[int, int, int],
+    directory_fd: int | None,
+    *,
+    expected_bytes: bytes | None = None,
+    expected_mode: int | None = None,
+) -> None:
+    if not _unlink_plan_file_if_identity(
+        path,
+        identity,
+        directory_fd,
+        expected_bytes=expected_bytes,
+        expected_mode=expected_mode,
+    ):
+        raise PlanArtifactError("unsafe_path")
+
+
+def _finish_plan_transaction(
+    pending: dict[str, Any], *, commit: bool
+) -> None:
+    guard = pending["guard"]
+    context = pending["guard_context"]
+    transaction = pending["transaction"]
+    marker_path = pending["marker_path"]
+    marker_identity = pending["marker_identity"]
+    try:
+        guard["verify"]()
+        if commit:
+            _commit_plan_write(transaction, guard["verify"])
+            cleanup = pending.get("legacy_cleanup")
+            if isinstance(cleanup, dict):
+                _retain_plan_artifacts(
+                    cleanup["directory"],
+                    cleanup["current"],
+                    directory_fd=guard["directory_fd"],
+                    verify_binding=guard["verify"],
+                    keep_old=0,
+                )
+        else:
+            _rollback_plan_write(transaction)
+        guard["verify"]()
+        _fsync_plan_directory(guard["directory_fd"])
+        _remove_verified_transaction_file(
+            marker_path, marker_identity, guard["directory_fd"]
+        )
+        _fsync_plan_directory(guard["directory_fd"])
+        guard["verify"]()
+    finally:
+        context.__exit__(None, None, None)
+
+
+def _leave_plan_transaction_for_recovery(pending: dict[str, Any]) -> None:
+    """Release held handles without deleting recovery evidence."""
+    pending["guard_context"].__exit__(None, None, None)
+
+
+def _persisted_plan_transaction_side(
+    path: Path, pending: dict[str, Any]
+) -> str:
+    """Classify the durable state side after an ambiguous state-write error."""
+    marker = pending.get("marker")
+    if not isinstance(marker, dict):
+        return "unknown"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        digest = None
+        generation = 0
+    except OSError:
+        return "unknown"
+    else:
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > MAX_STATE_BYTES
+        ):
+            return "unknown"
+        try:
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if _plan_file_identity(opened) != _plan_file_identity(info):
+                    return "unknown"
+                raw = stream.read(MAX_STATE_BYTES + 1)
+                after_handle = os.fstat(stream.fileno())
+            after = path.lstat()
+            if (
+                len(raw) > MAX_STATE_BYTES
+                or stat.S_ISLNK(after.st_mode)
+                or not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+                or _plan_file_identity(after_handle) != _plan_file_identity(info)
+                or _plan_file_identity(after) != _plan_file_identity(info)
+            ):
+                return "unknown"
+            decoded = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return "unknown"
+        if not isinstance(decoded, dict):
+            return "unknown"
+        artifact = _safe_plan_artifact(decoded.get("plan_artifact"))
+        if artifact.get("format_version") == 2:
+            digest = safe_fingerprint(artifact.get("journal_digest")) or None
+            generation = safe_int(artifact.get("generation"))
+        else:
+            digest = None
+            generation = 0
+    old_digest = (
+        None
+        if marker.get("old_journal_digest") == "none"
+        else marker.get("old_journal_digest")
+    )
+    if (
+        digest == marker.get("new_journal_digest")
+        and generation == marker.get("new_generation")
+    ):
+        return "new"
+    if digest == old_digest and generation == marker.get("old_generation"):
+        return "old"
+    return "unknown"
+
+
+def recover_plan_transaction(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    try:
+        try:
+            root = _canonical_plan_data_root(payload)
+        except PlanArtifactError:
+            artifact = _safe_plan_artifact(state.get("plan_artifact"))
+            if not artifact.get("journal_digest"):
+                return True
+            raise
+        session = plan_artifact_session_id(payload.get("session_id"))
+        directory = root / "plans" / session
+        try:
+            directory_info = directory.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            artifact = _safe_plan_artifact(state.get("plan_artifact"))
+            if artifact.get("format_version") == 2 and artifact.get(
+                "journal_digest"
+            ):
+                raise PlanArtifactError("transaction_incomplete")
+            return True
+        if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(
+            directory_info.st_mode
+        ):
+            raise PlanArtifactError("transaction_incomplete")
+        with plan_session_directory_guard(root, session, create=False) as guard:
             directory_fd = guard["directory_fd"]
-            transaction: dict[str, Any] | None = None
+            marker_path = directory / PLAN_TRANSACTION_MARKER_NAME
+            try:
+                marker, marker_identity = _read_plan_transaction_marker(
+                    marker_path, directory_fd=directory_fd
+                )
+            except FileNotFoundError:
+                return True
+            if marker["session_token"] != session:
+                raise PlanArtifactError("transaction_incomplete")
+            target = directory / PLAN_JOURNAL_NAME
+            current_bytes: bytes | None
+            current_identity: tuple[int, int, int] | None
+            current_mode: int | None
+            try:
+                current_info = _plan_lstat(target, directory_fd)
+            except FileNotFoundError:
+                current_bytes = None
+                current_identity = None
+                current_mode = None
+            else:
+                current_identity = _plan_file_identity(current_info)
+                current_mode = stat.S_IMODE(current_info.st_mode)
+                current_bytes = _read_exact_plan_bytes(
+                    target,
+                    current_identity,
+                    directory_fd,
+                    max_bytes=MAX_PLAN_JOURNAL_BYTES,
+                )
+            current_digest = stable_hash(current_bytes, 32) if current_bytes is not None else None
+            artifact = _safe_plan_artifact(state.get("plan_artifact"))
+            state_digest = (
+                artifact.get("journal_digest")
+                if artifact.get("format_version") == 2
+                else None
+            )
+            state_generation = (
+                safe_int(artifact.get("generation"))
+                if artifact.get("format_version") == 2
+                else 0
+            )
+            old_digest = (
+                None
+                if marker["old_journal_digest"] == "none"
+                else marker["old_journal_digest"]
+            )
+            state_is_old = bool(
+                state_digest == old_digest
+                and state_generation == marker["old_generation"]
+            )
+            state_is_new = bool(
+                state_digest == marker["new_journal_digest"]
+                and state_generation == marker["new_generation"]
+            )
+            journal_is_old = current_digest == old_digest
+            journal_is_new = current_digest == marker["new_journal_digest"]
+            backup_name = marker["backup_name"]
+            backup_identity: tuple[int, int, int] | None = None
+            backup_bytes: bytes | None = None
+            backup_mode: int | None = None
+            if backup_name != "none":
+                backup = directory / backup_name
+                try:
+                    backup_info = _plan_lstat(backup, directory_fd)
+                except FileNotFoundError:
+                    backup_identity = None
+                else:
+                    backup_identity = _plan_file_identity(backup_info)
+                    backup_mode = stat.S_IMODE(backup_info.st_mode)
+                    backup_bytes = _read_exact_plan_bytes(
+                        backup,
+                        backup_identity,
+                        directory_fd,
+                        max_bytes=MAX_PLAN_JOURNAL_BYTES,
+                    )
+                    if old_digest is None or stable_hash(backup_bytes, 32) != old_digest:
+                        raise PlanArtifactError("transaction_incomplete")
+            if state_is_new and journal_is_new:
+                parse_plan_journal(current_bytes or b"", expected_session=session)
+                if marker.get("cleanup_kind") == "legacy_v1":
+                    _retain_plan_artifacts(
+                        directory,
+                        target,
+                        directory_fd=directory_fd,
+                        verify_binding=guard["verify"],
+                        keep_old=0,
+                    )
+                if backup_identity is not None:
+                    _remove_verified_transaction_file(
+                        directory / backup_name,
+                        backup_identity,
+                        directory_fd,
+                        expected_bytes=backup_bytes,
+                        expected_mode=backup_mode,
+                    )
+                _fsync_plan_directory(directory_fd)
+                _remove_verified_transaction_file(
+                    marker_path, marker_identity, directory_fd
+                )
+                _fsync_plan_directory(directory_fd)
+                return True
+            if state_is_old and journal_is_new:
+                parse_plan_journal(current_bytes or b"", expected_session=session)
+                if old_digest is not None and backup_identity is None:
+                    raise PlanArtifactError("transaction_incomplete")
+                transaction = {
+                    "path": target,
+                    "directory_fd": directory_fd,
+                    "old_identity": backup_identity,
+                    "old_mode": backup_mode,
+                    "expected_old_bytes": backup_bytes,
+                    "expected_new_bytes": current_bytes,
+                    "backup_name": None if backup_name == "none" else backup_name,
+                    "new_identity": current_identity,
+                    "new_mode": current_mode,
+                }
+                _rollback_plan_write(transaction)
+                if old_digest is None:
+                    try:
+                        _plan_lstat(target, directory_fd)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise PlanArtifactError("transaction_incomplete")
+                else:
+                    restored = _read_plan_artifact_document(
+                        target, directory_fd=directory_fd
+                    )
+                    if stable_hash(restored, 32) != old_digest:
+                        raise PlanArtifactError("transaction_incomplete")
+                _fsync_plan_directory(directory_fd)
+                _remove_verified_transaction_file(
+                    marker_path, marker_identity, directory_fd
+                )
+                _fsync_plan_directory(directory_fd)
+                return True
+            if state_is_old and journal_is_old:
+                if backup_identity is not None:
+                    _remove_verified_transaction_file(
+                        directory / backup_name,
+                        backup_identity,
+                        directory_fd,
+                        expected_bytes=backup_bytes,
+                        expected_mode=backup_mode,
+                    )
+                _fsync_plan_directory(directory_fd)
+                _remove_verified_transaction_file(
+                    marker_path, marker_identity, directory_fd
+                )
+                _fsync_plan_directory(directory_fd)
+                return True
+            raise PlanArtifactError("transaction_incomplete")
+    except (OSError, PlanArtifactError):
+        invalidate_plan_authority(
+            state, warning_code="transaction_recovery_failed"
+        )
+        return False
+
+
+LEGACY_PLAN_DOCUMENT_RE = re.compile(
+    r"\A<!-- workflow-manager-plan-artifact:v1\n"
+    r"generation: ([0-9]+)\n"
+    r"plan_digest: ([0-9a-f]{32})\n"
+    r"content_digest: ([0-9a-f]{32})\n"
+    r"objective_fingerprint: ([0-9a-f]{16,64}|none)\n"
+    r"difficulty_decision_id: ([0-9a-f]{16,64}|none)\n"
+    r"-->\n# Workflow Manager Hard Plan\n\n"
+    r"> This Markdown file is a private review mirror\. The bound state plan_digest remains authoritative\.\n\n"
+    r"<!-- workflow-manager-plan-body -->\n",
+)
+
+
+def parse_legacy_plan_artifact(
+    document: bytes,
+    *,
+    expected_generation: int,
+    expected_plan_digest: str,
+) -> dict[str, Any]:
+    if len(document) > 96 * 1024 + 16 * 1024:
+        raise PlanArtifactError("legacy_unavailable")
+    try:
+        text = document.decode("utf-8")
+    except UnicodeError as error:
+        raise PlanArtifactError("legacy_unavailable") from error
+    match = LEGACY_PLAN_DOCUMENT_RE.match(text)
+    if match is None:
+        raise PlanArtifactError("legacy_unavailable")
+    generation = safe_int(match.group(1))
+    plan_digest = match.group(2)
+    content_digest = match.group(3)
+    if (
+        generation <= 0
+        or generation != expected_generation
+        or plan_digest != expected_plan_digest
+    ):
+        raise PlanArtifactError("legacy_unavailable")
+    body = text[match.end() :]
+    if (
+        not body.endswith("\n")
+        or stable_hash(body, 32) != content_digest
+        or "plan mirror truncated at the private artifact byte limit" in body
+    ):
+        raise PlanArtifactError("legacy_unavailable")
+    return {
+        "generation": generation,
+        "legacy_plan_digest": plan_digest,
+        "content_digest": content_digest,
+        "objective_fingerprint": None if match.group(4) == "none" else match.group(4),
+        "difficulty_decision_id": None if match.group(5) == "none" else match.group(5),
+        "body": body,
+    }
+
+
+def migrate_legacy_plan_artifacts(
+    state: dict[str, Any], payload: dict[str, Any], source_schema: int
+) -> bool:
+    legacy_plan_state = state.pop("_legacy_plan_state", state.get("plan_state"))
+    legacy_executor_state = state.pop(
+        "_legacy_executor_state", state.get("executor_state")
+    )
+    if source_schema >= SCHEMA_VERSION:
+        return True
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    if source_schema != 19 or artifact.get("format_version") != 1:
+        if state.get("plan_state") in {
+            "plan_ready",
+            "awaiting_confirmation",
+            "confirmed",
+        } or state.get("executor_state") not in {None, "none", "succeeded"}:
+            invalidate_plan_authority(state, warning_code="legacy_unavailable")
+        return False
+    try:
+        root = _canonical_plan_data_root(payload)
+        session = plan_artifact_session_id(payload.get("session_id"))
+        expected_prefix = f"plans/{session}/"
+        if not str(artifact.get("relative_path") or "").startswith(expected_prefix):
+            raise PlanArtifactError("legacy_unavailable")
+        directory = root / "plans" / session
+        guard_context = plan_session_directory_guard(root, session, create=False)
+        guard = guard_context.__enter__()
+        guard_owned = True
+        marker_path = directory / PLAN_TRANSACTION_MARKER_NAME
+        marker_identity: tuple[int, int, int] | None = None
+        transaction: dict[str, Any] | None = None
+        try:
+            directory_fd = guard["directory_fd"]
+            guard["verify"]()
+            names = (
+                os.listdir(directory_fd)
+                if directory_fd is not None
+                else [entry.name for entry in directory.iterdir()]
+            )
+            managed_names = sorted(
+                name
+                for name in names
+                if LEGACY_PLAN_ARTIFACT_NAME_RE.fullmatch(name)
+            )
+            if (
+                not managed_names
+                or len(managed_names) > MAX_LEGACY_PLAN_ARTIFACTS
+            ):
+                raise PlanArtifactError("legacy_unavailable")
+            records: list[
+                tuple[tuple[int, str, tuple[int, int, int]], Path]
+            ] = []
+            for name in managed_names:
+                candidate = directory / name
+                record = _owned_plan_artifact_record(
+                    candidate, directory_fd=directory_fd
+                )
+                if record is None:
+                    raise PlanArtifactError("legacy_unavailable")
+                records.append((record, candidate))
+            records.sort(key=lambda item: (item[0][0], item[0][1], item[1].name))
+            generations = [record[0][0] for record in records]
+            if len(set(generations)) != len(generations):
+                raise PlanArtifactError("legacy_unavailable")
+            revisions: list[dict[str, Any]] = []
+            for record, candidate in records:
+                document = _read_exact_plan_bytes(
+                    candidate,
+                    record[2],
+                    directory_fd,
+                    max_bytes=96 * 1024 + 16 * 1024,
+                )
+                revisions.append(
+                    parse_legacy_plan_artifact(
+                        document,
+                        expected_generation=record[0],
+                        expected_plan_digest=record[1],
+                    )
+                )
+            current = revisions[-1]
+            if (
+                current["generation"] != artifact.get("generation")
+                or current["legacy_plan_digest"] != artifact.get("plan_digest")
+                or current["content_digest"] != artifact.get("content_digest")
+            ):
+                raise PlanArtifactError("legacy_unavailable")
+            canonical: bytes | None = None
+            parsed: dict[str, Any] | None = None
+            migrated_at = utc_now()
+            for revision in revisions:
+                canonical, parsed = append_plan_journal_revision(
+                    canonical,
+                    session=session,
+                    generation=revision["generation"],
+                    body=revision["body"],
+                    objective_fingerprint=revision["objective_fingerprint"],
+                    difficulty_decision_id=revision["difficulty_decision_id"],
+                    created_at=migrated_at,
+                )
+            if canonical is None or parsed is None:
+                raise PlanArtifactError("legacy_unavailable")
+            target = directory / PLAN_JOURNAL_NAME
+            try:
+                _plan_lstat(target, directory_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                raise PlanArtifactError("legacy_unavailable")
+            marker = {
+                "schema": 1,
+                "transaction_id": stable_hash(
+                    f"plan-journal-migration-v1\0{session}\0{parsed['journal_digest']}\0{secrets.token_hex(16)}",
+                    32,
+                ),
+                "session_token": session,
+                "journal_name": PLAN_JOURNAL_NAME,
+                "backup_name": "none",
+                "cleanup_kind": "legacy_v1",
+                "old_journal_digest": "none",
+                "new_journal_digest": parsed["journal_digest"],
+                "old_generation": 0,
+                "new_generation": parsed["generation"],
+            }
+            marker_identity = _write_plan_transaction_marker(
+                marker_path,
+                marker,
+                directory_fd=directory_fd,
+                verify_binding=guard["verify"],
+            )
             try:
                 transaction = _atomic_write_plan_file(
                     target,
-                    document.encode("utf-8"),
+                    canonical,
+                    expected_old_bytes=None,
                     directory_fd=directory_fd,
                     verify_binding=guard["verify"],
                 )
-                guard["verify"]()
-                _retain_plan_artifacts(
-                    directory,
+                installed = _read_plan_artifact_document(
+                    target, directory_fd=directory_fd
+                )
+                if installed != canonical or parse_plan_journal(
+                    installed, expected_session=session
+                ) != parsed:
+                    raise PlanArtifactError("legacy_unavailable")
+            except PlanTransactionPendingError as error:
+                transaction = error.transaction
+                raise PlanArtifactError("legacy_unavailable") from error
+            except Exception as error:
+                if transaction is not None:
+                    _rollback_plan_write(transaction)
+                    _fsync_plan_directory(directory_fd)
+                if marker_identity is not None:
+                    _remove_verified_transaction_file(
+                        marker_path, marker_identity, directory_fd
+                    )
+                    _fsync_plan_directory(directory_fd)
+                raise PlanArtifactError("legacy_unavailable") from error
+            old_plan_state = legacy_plan_state
+            old_executor_state = legacy_executor_state
+            revision_digest = parsed["current_revision_digest"]
+            state["plan_generation"] = parsed["generation"]
+            state["plan_digest"] = revision_digest
+            state["plan_objective_fingerprint"] = parsed["objective_fingerprint"]
+            state["plan_difficulty_decision_id"] = parsed["difficulty_decision_id"]
+            state["confirmed_plan_digest"] = None
+            state["confirmed_at"] = None
+            state["plan_artifact"] = {
+                "relative_path": f"plans/{session}/{PLAN_JOURNAL_NAME}",
+                "format_version": 2,
+                "objective_fingerprint": parsed["objective_fingerprint"],
+                "difficulty_decision_id": parsed["difficulty_decision_id"],
+                "plan_digest": revision_digest,
+                "content_digest": revision_digest,
+                "current_revision_digest": revision_digest,
+                "journal_digest": parsed["journal_digest"],
+                "generation": parsed["generation"],
+                "revision_count": parsed["revision_count"],
+                "lifecycle_status": "ready",
+                "write_status": "written",
+                "warning_code": "none",
+                "created_at": migrated_at,
+                "updated_at": migrated_at,
+            }
+            running = old_executor_state in {
+                "spawn_pending",
+                "running",
+                "local_running",
+                "recovery_required",
+                "exhausted",
+            }
+            if running:
+                state["executor_failure_kind"] = "stale_contract"
+                reset_executor_binding(state, preserve_failure=True)
+                state["plan_state"] = "invalidated"
+            elif old_plan_state in {
+                "plan_ready",
+                "awaiting_confirmation",
+                "confirmed",
+            }:
+                reset_executor_binding(state)
+                state["plan_state"] = "awaiting_confirmation"
+            else:
+                reset_executor_binding(state)
+                state["plan_state"] = "invalidated"
+            pending = {
+                "guard_context": guard_context,
+                "guard": guard,
+                "transaction": transaction,
+                "marker_path": marker_path,
+                "marker_identity": marker_identity,
+                "marker": marker,
+                "legacy_cleanup": {
+                    "directory": directory,
+                    "current": target,
+                },
+            }
+            if state.get("_defer_plan_transaction"):
+                state["_plan_transaction"] = pending
+                guard_owned = False
+            else:
+                _finish_plan_transaction(pending, commit=True)
+                guard_owned = False
+            return True
+        finally:
+            if guard_owned:
+                guard_context.__exit__(None, None, None)
+    except (OSError, PlanArtifactError):
+        invalidate_plan_authority(state, warning_code="legacy_unavailable")
+        return False
+
+def invalidate_plan_authority(
+    state: dict[str, Any], *, warning_code: str = "content_drift"
+) -> None:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    had_executor = bool(
+        state.get("plan_state") == "confirmed"
+        or state.get("confirmed_plan_digest")
+        or state.get("executor_state") not in {None, "none"}
+        or state.get("execution_contract_id")
+    )
+    state["plan_state"] = "invalidated"
+    state["confirmed_plan_digest"] = None
+    state["confirmed_at"] = None
+    if had_executor:
+        state["executor_failure_kind"] = "stale_contract"
+        reset_executor_binding(state, preserve_failure=True)
+    else:
+        reset_executor_binding(state)
+    artifact["lifecycle_status"] = "invalidated"
+    artifact["write_status"] = (
+        warning_code
+        if warning_code
+        in {
+            "revision_too_large",
+            "journal_full",
+            "transaction_recovery_failed",
+            "legacy_unavailable",
+        }
+        else "content_drift"
+    )
+    artifact["warning_code"] = (
+        warning_code if warning_code in PLAN_ARTIFACT_WARNING_CODES else "content_drift"
+    )
+    artifact["updated_at"] = utc_now()
+    state["plan_artifact"] = artifact
+
+
+def _plan_artifact_binding_valid(
+    state: dict[str, Any], artifact: dict[str, Any], parsed: dict[str, Any]
+) -> bool:
+    return bool(
+        _stored_artifact_matches_journal(artifact, parsed)
+        and artifact.get("write_status") == "written"
+        and artifact.get("plan_digest") == state.get("plan_digest")
+        and artifact.get("generation")
+        == max(safe_int(state.get("plan_generation")), 0)
+        and artifact.get("objective_fingerprint")
+        == safe_fingerprint(state.get("plan_objective_fingerprint"))
+        and artifact.get("difficulty_decision_id")
+        == safe_fingerprint(state.get("plan_difficulty_decision_id"))
+    )
+
+
+def _stored_artifact_matches_journal(
+    artifact: dict[str, Any], parsed: dict[str, Any]
+) -> bool:
+    return bool(
+        artifact.get("format_version") == 2
+        and artifact.get("write_status")
+        in {"written", "write_failed", "revision_too_large", "journal_full"}
+        and artifact.get("plan_digest")
+        == artifact.get("current_revision_digest")
+        == parsed.get("current_revision_digest")
+        and artifact.get("journal_digest") == parsed.get("journal_digest")
+        and artifact.get("generation") == parsed.get("generation")
+        and artifact.get("revision_count") == parsed.get("revision_count")
+        and artifact.get("objective_fingerprint")
+        == parsed.get("objective_fingerprint")
+        and artifact.get("difficulty_decision_id")
+        == parsed.get("difficulty_decision_id")
+    )
+
+
+def write_plan_artifact(
+    state: dict[str, Any], payload: dict[str, Any], message: str
+) -> bool:
+    previous = _safe_plan_artifact(state.get("plan_artifact"))
+    session = plan_artifact_session_id(payload.get("session_id"))
+    relative = f"plans/{session}/{PLAN_JOURNAL_NAME}"
+    now = utc_now()
+    failure = dict(previous)
+    if failure.get("format_version") != 2:
+        failure = empty_plan_artifact()
+        failure.update(
+            {
+                "relative_path": relative,
+                "format_version": 2,
+                "created_at": now,
+            }
+        )
+    failure["updated_at"] = now
+    try:
+        body = sanitize_plan_artifact_body(message)
+        objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+        difficulty = safe_fingerprint(state.get("difficulty_decision_id"))
+        if not objective or not difficulty:
+            raise PlanArtifactError("write_error")
+        root = _canonical_plan_data_root(payload)
+        directory = root / "plans" / session
+        target = directory / PLAN_JOURNAL_NAME
+        generation = max(
+            safe_int(state.get("plan_generation")),
+            safe_int(previous.get("generation")),
+        ) + 1
+        guard_context = plan_session_directory_guard(root, session)
+        guard = guard_context.__enter__()
+        guard_owned = True
+        marker_path = directory / PLAN_TRANSACTION_MARKER_NAME
+        marker_identity: tuple[int, int, int] | None = None
+        transaction: dict[str, Any] | None = None
+        try:
+            guard["verify"]()
+            directory_fd = guard["directory_fd"]
+            existing: bytes | None = None
+            parsed_existing: dict[str, Any] | None = None
+            try:
+                _plan_lstat(target, directory_fd)
+            except FileNotFoundError:
+                if previous.get("format_version") == 2 and previous.get("journal_digest"):
+                    raise PlanArtifactError("content_drift")
+            else:
+                existing = _read_plan_artifact_document(
+                    target, directory_fd=directory_fd
+                )
+                parsed_existing = parse_plan_journal(
+                    existing, expected_session=session
+                )
+                if previous.get("format_version") != 2 or not _stored_artifact_matches_journal(
+                    previous, parsed_existing
+                ):
+                    raise PlanArtifactError("content_drift")
+            document, parsed = append_plan_journal_revision(
+                existing,
+                session=session,
+                generation=generation,
+                body=body,
+                objective_fingerprint=objective,
+                difficulty_decision_id=difficulty,
+                created_at=now,
+            )
+            prepared_backup_name = (
+                _transaction_name(target, "backup", directory_fd)
+                if existing is not None
+                else None
+            )
+            marker = {
+                "schema": 1,
+                "transaction_id": stable_hash(
+                    f"plan-journal-transaction-v1\0{session}\0{parsed['journal_digest']}\0{secrets.token_hex(16)}",
+                    32,
+                ),
+                "session_token": session,
+                "journal_name": PLAN_JOURNAL_NAME,
+                "backup_name": prepared_backup_name or "none",
+                "cleanup_kind": "none",
+                "old_journal_digest": (
+                    parsed_existing["journal_digest"]
+                    if parsed_existing is not None
+                    else "none"
+                ),
+                "new_journal_digest": parsed["journal_digest"],
+                "old_generation": (
+                    parsed_existing["generation"]
+                    if parsed_existing is not None
+                    else 0
+                ),
+                "new_generation": generation,
+            }
+            marker_identity = _write_plan_transaction_marker(
+                marker_path,
+                marker,
+                directory_fd=directory_fd,
+                verify_binding=guard["verify"],
+            )
+            try:
+                transaction = _atomic_write_plan_file(
                     target,
+                    document,
+                    expected_old_bytes=existing,
                     directory_fd=directory_fd,
                     verify_binding=guard["verify"],
+                    prepared_backup_name=prepared_backup_name,
                 )
                 guard["verify"]()
-                _commit_plan_write(transaction, guard["verify"])
+                installed = _read_plan_artifact_document(
+                    target, directory_fd=directory_fd
+                )
+                installed_parsed = parse_plan_journal(
+                    installed, expected_session=session
+                )
+                if installed != document or installed_parsed != parsed:
+                    raise PlanArtifactError("content_drift")
+            except PlanTransactionPendingError as error:
+                transaction = error.transaction
+                raise PlanArtifactError("write_error") from error
             except Exception as error:
                 if transaction is not None:
                     try:
                         _rollback_plan_write(transaction)
+                        _fsync_plan_directory(directory_fd)
                     except PlanArtifactError as rollback_error:
                         raise rollback_error from error
+                if marker_identity is not None:
+                    _remove_verified_transaction_file(
+                        marker_path, marker_identity, directory_fd
+                    )
+                    _fsync_plan_directory(directory_fd)
                 raise
-        artifact["write_status"] = "written"
-        artifact["warning_code"] = "none"
-    except PlanArtifactError as error:
-        artifact["write_status"] = "write_failed"
-        artifact["warning_code"] = error.code
-    except OSError:
-        artifact["write_status"] = "write_failed"
-        artifact["warning_code"] = "write_error"
-    state["plan_artifact"] = artifact
-
-
-def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> None:
-    artifact = _safe_plan_artifact(state.get("plan_artifact"))
-    if artifact.get("write_status") not in {"written", "content_drift"} or not artifact.get("relative_path"):
+            pending = {
+                "guard_context": guard_context,
+                "guard": guard,
+                "transaction": transaction,
+                "marker_path": marker_path,
+                "marker_identity": marker_identity,
+                "marker": marker,
+            }
+            if state.get("_defer_plan_transaction"):
+                state["_plan_transaction"] = pending
+                guard_owned = False
+            else:
+                _finish_plan_transaction(pending, commit=True)
+                guard_owned = False
+        finally:
+            if guard_owned:
+                guard_context.__exit__(None, None, None)
+        plan_digest = parsed["current_revision_digest"]
+        artifact = empty_plan_artifact()
+        artifact.update(
+            {
+                "relative_path": relative,
+                "format_version": 2,
+                "objective_fingerprint": objective,
+                "difficulty_decision_id": difficulty,
+                "plan_digest": plan_digest,
+                "content_digest": plan_digest,
+                "current_revision_digest": plan_digest,
+                "journal_digest": parsed["journal_digest"],
+                "generation": generation,
+                "revision_count": parsed["revision_count"],
+                "lifecycle_status": "ready",
+                "write_status": "written",
+                "warning_code": "none",
+                "created_at": previous.get("created_at") or now,
+                "updated_at": now,
+            }
+        )
+        state["plan_generation"] = generation
+        state["plan_digest"] = plan_digest
+        state["plan_objective_fingerprint"] = objective
+        state["plan_difficulty_decision_id"] = difficulty
         state["plan_artifact"] = artifact
-        return
+        return True
+    except PlanArtifactError as error:
+        failure["write_status"] = (
+            error.code
+            if error.code in {"revision_too_large", "journal_full"}
+            else "write_failed"
+        )
+        failure["warning_code"] = error.code
+    except OSError:
+        failure["write_status"] = "write_failed"
+        failure["warning_code"] = "write_error"
+    state["plan_artifact"] = failure
+    return False
+
+
+def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    if artifact.get("format_version") != 2 or not artifact.get("relative_path"):
+        state["plan_artifact"] = artifact
+        return False
+    if (
+        not artifact.get("journal_digest")
+        or not artifact.get("current_revision_digest")
+        or artifact.get("generation", 0) <= 0
+    ):
+        state["plan_artifact"] = artifact
+        return False
     try:
         parts = artifact["relative_path"].split("/")
-        if len(parts) != 3 or parts[0] != "plans":
+        if (
+            len(parts) != 3
+            or parts[0] != "plans"
+            or parts[2] != PLAN_JOURNAL_NAME
+        ):
             raise PlanArtifactError("unsafe_path")
         _, session, filename = parts
+        if session != plan_artifact_session_id(payload.get("session_id")):
+            raise PlanArtifactError("content_drift")
         root = _canonical_plan_data_root(payload)
         target = root / "plans" / session / filename
         with plan_session_directory_guard(root, session, create=False) as guard:
@@ -3084,22 +4452,74 @@ def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> None
             document = _read_plan_artifact_document(
                 target, directory_fd=guard["directory_fd"]
             )
+            parsed = parse_plan_journal(document, expected_session=session)
             guard["verify"]()
-        observed = plan_artifact_body_digest(document)
-        if observed != artifact.get("content_digest"):
+        active_binding = state.get("plan_state") in {
+            "plan_ready",
+            "awaiting_confirmation",
+            "confirmed",
+        }
+        valid = (
+            _plan_artifact_binding_valid(state, artifact, parsed)
+            if active_binding
+            else _stored_artifact_matches_journal(artifact, parsed)
+        )
+        if not valid:
             raise PlanArtifactError("content_drift")
-        artifact["write_status"] = "written"
-        artifact["warning_code"] = "none"
+        if (
+            state.get("plan_state")
+            in {"plan_ready", "awaiting_confirmation", "confirmed"}
+            and (
+                artifact.get("write_status") != "written"
+                or artifact.get("warning_code") != "none"
+            )
+        ):
+            artifact["write_status"] = "written"
+            artifact["warning_code"] = "none"
+            artifact["updated_at"] = utc_now()
+        state["plan_artifact"] = artifact
+        return True
     except PlanArtifactError as error:
-        artifact["write_status"] = "content_drift"
-        artifact["warning_code"] = (
-            error.code if error.code in {"unsafe_path", "content_drift"} else "content_drift"
+        invalidate_plan_authority(
+            state,
+            warning_code=(
+                error.code
+                if error.code in {"unsafe_path", "content_drift", "journal_full"}
+                else "content_drift"
+            ),
         )
     except OSError:
-        artifact["write_status"] = "content_drift"
-        artifact["warning_code"] = "content_drift"
-    artifact["updated_at"] = utc_now()
-    state["plan_artifact"] = artifact
+        invalidate_plan_authority(state, warning_code="content_drift")
+    return False
+
+
+def _read_verified_current_plan_revision(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> str:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    parts = str(artifact.get("relative_path") or "").split("/")
+    if len(parts) != 3:
+        raise PlanArtifactError("unsafe_path")
+    _, session, filename = parts
+    root = _canonical_plan_data_root(payload)
+    target = root / "plans" / session / filename
+    with plan_session_directory_guard(root, session, create=False) as guard:
+        document = _read_plan_artifact_document(
+            target, directory_fd=guard["directory_fd"]
+        )
+        parsed = parse_plan_journal(document, expected_session=session)
+        guard["verify"]()
+    if not _stored_artifact_matches_journal(artifact, parsed):
+        raise PlanArtifactError("content_drift")
+    return str(parsed["revisions"][-1]["body"])
+
+
+def read_current_plan_revision(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> str:
+    if not verify_plan_artifact(state, payload):
+        raise PlanArtifactError("content_drift")
+    return _read_verified_current_plan_revision(state, payload)
 
 
 def _safe_compaction(item: Any) -> dict[str, Any] | None:
@@ -3454,6 +4874,17 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             if base["executor_state"] in {"recovery_required", "exhausted"}
             else confirmed_executor_model_profile(base)
         )
+    elif (
+        base["plan_state"] == "invalidated"
+        and base.get("executor_failure_kind") == "stale_contract"
+    ):
+        base["execution_contract_id"] = None
+        base["executor_state"] = "recovery_required"
+        base["executor_agent_id"] = None
+        base["executor_model"] = None
+        base["executor_reasoning_effort"] = None
+        base["executor_fork_turns"] = None
+        base["model_profile"] = "work_assessment"
     elif base["plan_state"] != "confirmed":
         base["execution_contract_id"] = None
         base["executor_state"] = "none"
@@ -3518,6 +4949,12 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if migrated_baseline:
             migrated_baseline["acceptance_status"] = "incomplete"
             base["last_execution_baseline"] = migrated_baseline
+    if (
+        safe_int(value.get("schema_version")) < 19
+        and base.get("plan_state")
+        in {"plan_ready", "awaiting_confirmation", "confirmed"}
+    ):
+        invalidate_plan_authority(base, warning_code="legacy_unavailable")
     sync_plan_artifact_lifecycle(base)
     base["schema_version"] = SCHEMA_VERSION
     base["writer_version"] = WRITER_VERSION
@@ -3534,10 +4971,25 @@ def load_state(path: Path | None, payload: dict[str, Any]) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as stream:
             raw = stream.read(MAX_STATE_BYTES + 1)
         if len(raw.encode("utf-8")) > MAX_STATE_BYTES:
-            return new_state(payload)
-        return normalize_state(json.loads(raw), payload)
-    except Exception:
+            raise ValueError("state exceeds byte limit")
+        decoded = json.loads(raw)
+        source_schema = (
+            safe_int(decoded.get("schema_version"))
+            if isinstance(decoded, dict)
+            else 0
+        )
+        state = normalize_state(decoded, payload)
+        state["_source_schema_version"] = source_schema
+        if source_schema < SCHEMA_VERSION and isinstance(decoded, dict):
+            state["_legacy_plan_state"] = decoded.get("plan_state")
+            state["_legacy_executor_state"] = decoded.get("executor_state")
+        return state
+    except FileNotFoundError:
         return new_state(payload)
+    except Exception:
+        state = new_state(payload)
+        state["_state_load_failure"] = "invalid_state"
+        return state
 
 
 def atomic_write(path: Path, state: dict[str, Any]) -> None:
@@ -3556,11 +5008,23 @@ def atomic_write(path: Path, state: dict[str, Any]) -> None:
             json.dump(state, stream, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
             stream.write("\n")
             stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
         try:
             path.chmod(0o600)
         except OSError:
             pass
+        if os.name != "nt":
+            directory_fd = -1
+            try:
+                directory_fd = os.open(
+                    path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                os.fsync(directory_fd)
+            finally:
+                if directory_fd >= 0:
+                    os.close(directory_fd)
     finally:
         if fd >= 0:
             try:
@@ -3640,16 +5104,92 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
     """Read state under the writer lock so Windows can atomically replace the JSON file."""
     path = state_path(payload)
     if path is None:
-        return new_state(payload)
+        state = new_state(payload)
+        state["_snapshot_failure"] = "missing_session_id"
+        return state
     try:
         with state_lock(path):
-            return load_state(path, payload)
+            existed = path.exists()
+            state = load_state(path, payload)
+            if not existed:
+                state["_snapshot_failure"] = "missing_state"
+                return state
+            if state.get("_state_load_failure"):
+                state["_snapshot_failure"] = "invalid_state"
+                return state
+            if not recover_plan_transaction(state, payload):
+                state["_snapshot_failure"] = "transaction_recovery_failed"
+                state.pop("_source_schema_version", None)
+                state.pop("_legacy_plan_state", None)
+                state.pop("_legacy_executor_state", None)
+                atomic_write(path, state)
+                return state
+            source_schema = safe_int(
+                state.pop("_source_schema_version", SCHEMA_VERSION)
+            )
+            before = json.dumps(state, ensure_ascii=False, sort_keys=True)
+            canonical_current_body: str | None = None
+            state["_defer_plan_transaction"] = True
+            try:
+                if source_schema < SCHEMA_VERSION:
+                    migrate_legacy_plan_artifacts(
+                        state, payload, source_schema
+                    )
+                artifact_valid = verify_plan_artifact(state, payload)
+                if payload.get("_read_canonical_plan_body") and artifact_valid:
+                    canonical_current_body = _read_verified_current_plan_revision(
+                        state, payload
+                    )
+            finally:
+                state.pop("_defer_plan_transaction", None)
+            pending = state.pop("_plan_transaction", None)
+            after = json.dumps(state, ensure_ascii=False, sort_keys=True)
+            try:
+                if after != before or pending is not None:
+                    atomic_write(path, state)
+            except Exception:
+                if pending is not None:
+                    side = _persisted_plan_transaction_side(path, pending)
+                    if side == "old":
+                        _finish_plan_transaction(pending, commit=False)
+                    else:
+                        _leave_plan_transaction_for_recovery(pending)
+                raise
+            if state.get("plan_state") == "confirmed" and not verify_plan_artifact(
+                state, payload
+            ):
+                sync_plan_artifact_lifecycle(state)
+                set_persistence_metadata(
+                    state,
+                    payload,
+                    attempted=True,
+                    ok=True,
+                    outcome="written_invalidated",
+                )
+                atomic_write(path, state)
+            if pending is not None:
+                try:
+                    _finish_plan_transaction(pending, commit=True)
+                except (OSError, PlanArtifactError) as cleanup_error:
+                    debug_persistence(
+                        payload,
+                        path_resolved=True,
+                        outcome="transaction_cleanup_pending",
+                        error=cleanup_error,
+                    )
+            if canonical_current_body is not None:
+                state["_canonical_current_body"] = canonical_current_body
+            return state
     except TimeoutError as error:
         debug_persistence(payload, path_resolved=True, outcome="lock_timeout", error=error)
+        state = new_state(payload)
+        state["_snapshot_failure"] = "lock_timeout"
+        return state
     except OSError as error:
         debug_persistence(payload, path_resolved=True, outcome="read_error", error=error)
-    # Fail open without a second unlocked read, which could race another writer.
-    return new_state(payload)
+        state = new_state(payload)
+        state["_snapshot_failure"] = "read_error"
+        return state
 
 
 def mutate_state(
@@ -3659,7 +5199,21 @@ def mutate_state(
     if path is None:
         state = new_state(payload)
         increment_event_count(state, payload)
-        change(state)
+        state["_defer_plan_transaction"] = True
+        try:
+            change(state)
+        finally:
+            state.pop("_defer_plan_transaction", None)
+        pending = state.pop("_plan_transaction", None)
+        if pending is not None:
+            try:
+                _finish_plan_transaction(pending, commit=False)
+            finally:
+                artifact = _safe_plan_artifact(state.get("plan_artifact"))
+                artifact["write_status"] = "write_failed"
+                artifact["warning_code"] = "write_error"
+                state["plan_artifact"] = artifact
+                state["plan_state"] = "analyzing"
         sync_plan_artifact_lifecycle(state)
         outcome = "disabled" if not persistence_enabled() else "missing_session_id"
         set_persistence_metadata(state, payload, attempted=False, ok=False, outcome=outcome)
@@ -3669,6 +5223,28 @@ def mutate_state(
     try:
         with state_lock(path):
             state = load_state(path, payload)
+            if state.pop("_state_load_failure", None):
+                debug_persistence(
+                    payload, path_resolved=True, outcome="invalid_state"
+                )
+                return state, False
+            if not recover_plan_transaction(state, payload):
+                state.pop("_source_schema_version", None)
+                state.pop("_legacy_plan_state", None)
+                state.pop("_legacy_executor_state", None)
+                sync_plan_artifact_lifecycle(state)
+                set_persistence_metadata(
+                    state,
+                    payload,
+                    attempted=True,
+                    ok=False,
+                    outcome="transaction_recovery_failed",
+                )
+                atomic_write(path, state)
+                return state, False
+            source_schema = safe_int(
+                state.pop("_source_schema_version", SCHEMA_VERSION)
+            )
             if payload.get("cwd"):
                 state["cwd_fingerprint"] = stable_hash(payload.get("cwd"))
             if payload.get("model"):
@@ -3677,15 +5253,87 @@ def mutate_state(
             if run_key and run_key in state.get("processed_hook_runs", []):
                 debug_persistence(payload, path_resolved=True, outcome="duplicate")
                 return state, False
-            verify_plan_artifact(state, payload)
-            increment_event_count(state, payload)
-            change(state)
+            state["_defer_plan_transaction"] = True
+            try:
+                if source_schema < SCHEMA_VERSION:
+                    migrate_legacy_plan_artifacts(
+                        state, payload, source_schema
+                    )
+                verify_plan_artifact(state, payload)
+                increment_event_count(state, payload)
+                change(state)
+            except Exception:
+                pending = state.pop("_plan_transaction", None)
+                state.pop("_defer_plan_transaction", None)
+                if pending is not None:
+                    _finish_plan_transaction(pending, commit=False)
+                raise
+            state.pop("_defer_plan_transaction", None)
+            pending = state.pop("_plan_transaction", None)
             sync_plan_artifact_lifecycle(state)
             if run_key:
                 state.setdefault("processed_hook_runs", []).append(run_key)
             trim_state(state)
             set_persistence_metadata(state, payload, attempted=True, ok=True, outcome="written")
-            atomic_write(path, state)
+            state.pop("_snapshot_failure", None)
+            try:
+                atomic_write(path, state)
+            except Exception:
+                if pending is not None:
+                    side = _persisted_plan_transaction_side(path, pending)
+                    if side == "old":
+                        _finish_plan_transaction(pending, commit=False)
+                    else:
+                        _leave_plan_transaction_for_recovery(pending)
+                raise
+            if state.get("plan_state") == "confirmed" and not verify_plan_artifact(
+                state, payload
+            ):
+                sync_plan_artifact_lifecycle(state)
+                set_persistence_metadata(
+                    state,
+                    payload,
+                    attempted=True,
+                    ok=True,
+                    outcome="written_invalidated",
+                )
+                atomic_write(path, state)
+            if pending is not None:
+                try:
+                    _finish_plan_transaction(pending, commit=True)
+                except (OSError, PlanArtifactError) as cleanup_error:
+                    # State and journal are already new/new.  Preserve the marker so
+                    # the next locked hook can finish cleanup deterministically.
+                    if (
+                        isinstance(cleanup_error, PlanArtifactError)
+                        and cleanup_error.code == "content_drift"
+                    ):
+                        invalidate_plan_authority(
+                            state, warning_code="content_drift"
+                        )
+                        sync_plan_artifact_lifecycle(state)
+                        set_persistence_metadata(
+                            state,
+                            payload,
+                            attempted=True,
+                            ok=False,
+                            outcome="transaction_content_drift",
+                        )
+                        try:
+                            atomic_write(path, state)
+                        except OSError as write_error:
+                            debug_persistence(
+                                payload,
+                                path_resolved=True,
+                                outcome="transaction_invalidation_write_error",
+                                error=write_error,
+                            )
+                    debug_persistence(
+                        payload,
+                        path_resolved=True,
+                        outcome="transaction_cleanup_pending",
+                        error=cleanup_error,
+                    )
             debug_persistence(payload, path_resolved=True, outcome="written")
             return state, True
     except TimeoutError as error:
@@ -5144,6 +6792,19 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
             re.I,
         )
     )
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    canonical_marker = opaque_v2 or bool(
+        artifact.get("relative_path")
+        and str(artifact.get("relative_path")) in request
+        and artifact.get("current_revision_digest")
+        and str(artifact.get("current_revision_digest")) in request
+        and artifact.get("journal_digest")
+        and str(artifact.get("journal_digest")) in request
+        and (
+            re.search(r"\b(?:read|reread|load)\b.{0,48}\bcanonical\b", request, re.I)
+            or any(term in request for term in ("重读权威计划", "读取权威计划", "从权威文档加载"))
+        )
+    )
     exclusive_scope = opaque_v2 or bool(
         re.search(r"\b(?:exclusive (?:owner|executor)|only executor)\b", request, re.I)
         or any(term in request for term in ("唯一执行者", "独占执行", "独占修改"))
@@ -5209,6 +6870,8 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
         return False, "opaque V2 executor requires positive fork_turns for bound context redundancy"
     if not contract_marker or not plan_marker or not generation_marker:
         return False, "executor request is not bound to the exact confirmed plan"
+    if not canonical_marker:
+        return False, "executor must load the exact current revision from the canonical journal"
     if not exclusive_scope or not acceptance:
         return False, "executor request must declare exclusive execution ownership and acceptance"
     return True, None
@@ -5435,6 +7098,41 @@ def request_touches_shared_resource(request: str) -> bool:
     return not bool(negated or read_existing)
 
 
+def canonical_update_plan_projection(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> bool:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    digest = safe_fingerprint(artifact.get("current_revision_digest"))
+    explanation = str(tool_input.get("explanation") or "")
+    marker = re.search(
+        r"(?i)canonical_revision_digest=([0-9a-f]{32})\b", explanation
+    )
+    if (
+        not digest
+        or not marker
+        or marker.group(1).lower() != digest
+        or "projection_only" not in explanation.lower()
+    ):
+        return False
+    items = tool_input.get("plan")
+    if not isinstance(items, list) or not items:
+        return False
+    try:
+        canonical = read_current_plan_revision(state, payload)
+    except (OSError, PlanArtifactError):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        step = " ".join(str(item.get("step") or "").split())
+        if not step or step not in " ".join(canonical.split()):
+            return False
+    return True
+
+
 def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
     if state.get("work_difficulty") != "hard":
         return None
@@ -5444,7 +7142,13 @@ def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> s
     if state.get("plan_state") == "confirmed" and state.get("confirmed_plan_digest") == state.get("plan_digest"):
         return None
     tool_key = normalized_key(payload.get("tool_name"))
-    if "updateplan" in tool_key or "requestuserinput" in tool_key:
+    if "updateplan" in tool_key:
+        return (
+            None
+            if canonical_update_plan_projection(payload, state)
+            else "unbound update_plan split-brain mutation outside the canonical journal"
+        )
+    if "requestuserinput" in tool_key:
         return None
     if state.get("executor_state") == "local_running":
         if is_subagent_spawn_tool(payload):
@@ -5485,7 +7189,7 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
     if state.get("confirmed_plan_digest") != state.get("plan_digest"):
         return "invalid confirmed-plan binding"
     tool_key = normalized_key(payload.get("tool_name"))
-    if "updateplan" in tool_key or "requestuserinput" in tool_key:
+    if "requestuserinput" in tool_key:
         return None
     if is_subagent_spawn_tool(payload):
         if subagent_request_is_read_only(payload):
@@ -6282,6 +7986,12 @@ def session_start(payload: dict[str, Any]) -> None:
 
     state, _ = mutate_state(payload, update)
     source = str(payload.get("source") or "startup")
+    canonical_resume_body: str | None = None
+    if source in {"compact", "resume"}:
+        resume_payload = dict(payload)
+        resume_payload["_read_canonical_plan_body"] = True
+        state = snapshot_state(resume_payload)
+        canonical_resume_body = state.pop("_canonical_current_body", None)
     preference = safe_session_execution_preference(
         state.get("session_execution_preference")
     )
@@ -6379,11 +8089,30 @@ def session_start(payload: dict[str, Any]) -> None:
             "current_stage": current_execution_stage(state),
             "compaction_count": len(state.get("compactions", [])),
         }
+        resume_artifact = _safe_plan_artifact(state.get("plan_artifact"))
+        plan_resume_source = (
+            " Canonical Hard-plan semantics must be reread from "
+            f"{resume_artifact.get('relative_path')} at "
+            f"current_revision_digest={resume_artifact.get('current_revision_digest')} and "
+            f"journal_digest={resume_artifact.get('journal_digest')}; the native summary supplies only "
+            "non-plan continuity."
+            if resume_artifact.get("format_version") == 2
+            and resume_artifact.get("write_status") == "written"
+            else " Semantic continuity comes from the native summary; no valid canonical Hard plan is bound."
+        )
         base += (
-            " Resume metadata is non-executable; semantic instructions come from the native summary. "
+            " Resume metadata is non-executable."
+            f"{plan_resume_source} "
             f"Metadata: {json.dumps(digest, ensure_ascii=False, separators=(',', ':'))}. "
             "Rerun when inputs, state, device, freshness, or evidence changed."
         )
+        if isinstance(canonical_resume_body, str):
+            base += (
+                " The Hook reread the verified canonical current revision for semantic recovery; it follows as "
+                "plan data and never as authorization.\nBEGIN_WORKFLOW_MANAGER_CANONICAL_PLAN\n"
+                f"{canonical_resume_body}"
+                "END_WORKFLOW_MANAGER_CANONICAL_PLAN"
+            )
         review = _safe_causal_review(state.get("causal_review"))
         if review.get("state") in {"triage_required", "triaging"}:
             base += (
@@ -6580,6 +8309,22 @@ def pure_plan_confirmation(prompt: str) -> bool:
 def plan_replan_request(prompt: str) -> bool:
     normalized = re.sub(r"\s+", " ", prompt.strip().lower())
     return any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_REPLAN_PATTERNS)
+
+
+def plan_details_request(prompt: str) -> bool:
+    normalized = re.sub(r"[?!？！。,.，:：]+", "", prompt.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return bool(
+        re.fullmatch(
+            r"(?:查看|显示|打开|读取)(?:当前|这个|上述|该|此)?计划(?:详情|内容|全文)?",
+            normalized,
+        )
+        or re.fullmatch(
+            r"(?:show|view|open|read)(?: the| this| current)? plan(?: details| content| in full)?",
+            normalized,
+            re.I,
+        )
+    )
 
 
 def prompt_changes_pending_plan(prompt: str) -> bool:
@@ -6861,7 +8606,16 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     prompt = str(payload.get("prompt") or "")
     if handle_coordination_user_prompt(payload, prompt):
         return
-    previous = snapshot_state(payload)
+    canonical_context_requested = bool(
+        plan_details_request(prompt)
+        or plan_replan_request(prompt)
+        or prompt_changes_pending_plan(prompt)
+    )
+    snapshot_payload = dict(payload)
+    if canonical_context_requested:
+        snapshot_payload["_read_canonical_plan_body"] = True
+    previous = snapshot_state(snapshot_payload)
+    canonical_current_body = previous.pop("_canonical_current_body", None)
     same_assessor_objective_retry = bool(
         previous.get("task_domain") == "work"
         and previous.get("objective", {}).get("fingerprint") == stable_hash(prompt)
@@ -7034,7 +8788,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             }
             if reference.get("contract_digest") != reference_contract_digest:
                 state["plan_state"] = "analyzing"
-                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
                 state["plan_digest"] = None
                 state["plan_objective_fingerprint"] = None
                 state["plan_difficulty_decision_id"] = None
@@ -7048,7 +8801,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             reference.update({"contract_digest": stable_hash(f"{reference['contract_digest']}\0{prompt_meta['fingerprint']}", 32), "version_fingerprint": prompt_meta["fingerprint"], "phase": "planned", "state": "planned", "fidelity_candidate": "unknown", "user_final_acceptance": "unknown", "evidence_digest": None})
             state["reference_acceptance"] = reference
             state["plan_state"] = "analyzing"
-            state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
             state["plan_digest"] = state["plan_objective_fingerprint"] = state["plan_difficulty_decision_id"] = None
             state["confirmed_plan_digest"] = state["confirmed_at"] = None
             reset_executor_binding(state)
@@ -7085,7 +8837,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 state["last_execution_baseline"]["acceptance_status"] = "failed"
         elif reference_failure:
             state["plan_state"] = "analyzing"
-            state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
             state["plan_digest"] = None
             state["plan_objective_fingerprint"] = None
             state["plan_difficulty_decision_id"] = None
@@ -7097,13 +8848,23 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 state["last_execution_baseline"]["acceptance_status"] = "failed"
             state["model_profile"] = "work_assessment"
         elif confirmed_plan:
+            artifact = _safe_plan_artifact(state.get("plan_artifact"))
             binding_valid = bool(
-                state.get("plan_digest")
+                state.get("plan_state") == "awaiting_confirmation"
+                and state.get("plan_digest")
                 and state.get("plan_objective_fingerprint") == objective_fingerprint
                 and state.get("plan_difficulty_decision_id")
                 == state.get("difficulty_decision_id")
+                and artifact.get("format_version") == 2
+                and artifact.get("write_status") == "written"
+                and artifact.get("relative_path")
+                and artifact.get("generation") == state.get("plan_generation")
+                and artifact.get("plan_digest")
+                == artifact.get("current_revision_digest")
+                == state.get("plan_digest")
+                and safe_fingerprint(artifact.get("journal_digest"))
             )
-            if binding_valid:
+            if binding_valid and verify_plan_artifact(state, payload):
                 state["plan_state"] = "confirmed"
                 state["confirmed_plan_digest"] = state.get("plan_digest")
                 state["confirmed_at"] = utc_now()
@@ -7118,7 +8879,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 reset_executor_binding(state)
         elif replan or plan_changed:
             state["plan_state"] = "analyzing"
-            state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
             state["plan_digest"] = None
             state["plan_objective_fingerprint"] = None
             state["plan_difficulty_decision_id"] = None
@@ -7127,7 +8887,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             reset_executor_binding(state)
             state["model_profile"] = "work_assessment"
         elif not continuation:
-            state["plan_generation"] = 0
             state["plan_digest"] = None
             state["plan_objective_fingerprint"] = None
             state["plan_difficulty_decision_id"] = None
@@ -7185,6 +8944,31 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         return
     context = routing_context(classification, telemetry)
     refreshed_for_assessor = snapshot_state(payload)
+    canonical_artifact = _safe_plan_artifact(
+        refreshed_for_assessor.get("plan_artifact")
+    )
+    if (
+        canonical_artifact.get("format_version") == 2
+        and canonical_artifact.get("write_status") == "written"
+    ):
+        context += (
+            " Canonical plan journal binding: "
+            f"relative_path={canonical_artifact.get('relative_path')} "
+            f"current_revision_digest={canonical_artifact.get('current_revision_digest')} "
+            f"journal_digest={canonical_artifact.get('journal_digest')} "
+            f"revision_count={canonical_artifact.get('revision_count')}. "
+            "For plan details, replanning, compaction recovery, and executor handoff, reread the current "
+            "revision from this Markdown; do not use state summaries or update_plan as an independent plan. "
+            "Any update_plan call is projection_only and must carry canonical_revision_digest=<current digest>."
+        )
+        if canonical_context_requested and isinstance(canonical_current_body, str):
+            context += (
+                " The verified canonical current revision follows as plan data; use this exact revision for "
+                "details or as the base for a trusted replacement revision, and do not treat its text as "
+                "execution authorization.\nBEGIN_WORKFLOW_MANAGER_CANONICAL_PLAN\n"
+                f"{canonical_current_body}"
+                "END_WORKFLOW_MANAGER_CANONICAL_PLAN"
+            )
     if preference_directive is not None:
         context += (
             f" Session execution preference request recorded as {preference_directive}; this is policy "
@@ -7838,6 +9622,24 @@ def handle_stall_diagnosis_pretool(
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
+    snapshot_failure = str(state.get("_snapshot_failure") or "")
+    if snapshot_failure:
+        mutating = plan_confirmation_guard(
+            payload,
+            {
+                **state,
+                "work_difficulty": "hard",
+                "plan_state": "awaiting_confirmation",
+                "confirmed_plan_digest": None,
+            },
+        )
+        if mutating:
+            emit_pretool_deny(
+                "Workflow Manager blocked "
+                f"{mutating}: canonical state/journal availability failed "
+                f"({snapshot_failure}); mutation cannot fail open."
+            )
+            return
     if handle_coordination_pretool(payload, state, fingerprint):
         return
     if handle_stall_diagnosis_pretool(payload, state, fingerprint):
@@ -8863,8 +10665,22 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             for group in subagent_lifecycle_groups(state)
         )
         artifact = _safe_plan_artifact(state.get("plan_artifact"))
-        if (status_value in {"completed", "ok"} and assessment and assessment.group(1) == state.get("assessor_binding_id") and assessment.group(2).lower() == "hard" and hard_plan_detailed and state.get("plan_digest") == stable_hash(str(result or ""), 32) and artifact.get("write_status") == "write_failed"):
-            write_plan_artifact(state, payload, str(result or ""))
+        if (
+            status_value in {"completed", "ok"}
+            and assessment
+            and assessment.group(1) == state.get("assessor_binding_id")
+            and assessment.group(2).lower() == "hard"
+            and hard_plan_detailed
+            and agent_id
+            and agent_id == state.get("assessor_agent_id")
+            and state.get("assessor_state") == "hard_plan_ready"
+            and state.get("plan_state") in {"analyzing", "invalidated"}
+            and artifact.get("write_status")
+            in {"write_failed", "revision_too_large", "journal_full"}
+        ):
+            state["plan_state"] = "analyzing"
+            if write_plan_artifact(state, payload, str(result or "")):
+                state["plan_state"] = "awaiting_confirmation"
             decision["artifact_retry"] = True
         if not agent_id or (current_started is None and already_terminal):
             reason = "SubagentStop lacks a concrete agent_id" if not agent_id else "duplicate or late SubagentStop for a terminal agent"
@@ -9019,7 +10835,6 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             else:
                 stall["state"] = "resolved"
                 state["plan_state"] = "analyzing"
-                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
                 state["plan_digest"] = None
                 state["plan_objective_fingerprint"] = None
                 state["plan_difficulty_decision_id"] = None
@@ -9064,21 +10879,27 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["difficulty_confidence"] = "high"
                 state["difficulty_rule_codes"] = ["assessor_hard"]
                 state["difficulty_decision_id"] = stable_hash(f"{state.get('assessor_binding_id')}\0{assessment.group(3)}", 24)
-                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
-                state["plan_digest"] = stable_hash(str(result or ""), 32)
-                state["plan_objective_fingerprint"] = state.get("objective", {}).get("fingerprint")
-                state["plan_difficulty_decision_id"] = state.get("difficulty_decision_id")
-                state["plan_state"] = "awaiting_confirmation"
+                state["plan_state"] = "analyzing"
+                state["confirmed_plan_digest"] = None
+                state["confirmed_at"] = None
+                reset_executor_binding(state)
                 state["model_profile"] = confirmed_executor_model_profile(state)
-                write_plan_artifact(state, payload, str(result or ""))
+                if write_plan_artifact(state, payload, str(result or "")):
+                    state["plan_state"] = "awaiting_confirmation"
             state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
     updated_state, _ = mutate_state(payload, update)
     artifact = _safe_plan_artifact(updated_state.get("plan_artifact"))
-    if artifact.get("write_status") in {"write_failed", "content_drift"}:
+    if artifact.get("write_status") in {
+        "write_failed",
+        "content_drift",
+        "revision_too_large",
+        "journal_full",
+        "transaction_recovery_failed",
+    }:
         emit_context(
             "SubagentStop",
-            f"Workflow Manager plan_artifact {artifact['write_status']} warning_code={artifact['warning_code']}; the plan_digest contract remains authoritative and confirmation is not self-locked.",
+            f"Workflow Manager canonical plan journal {artifact['write_status']} warning_code={artifact['warning_code']}; confirmation and execution remain locked until a trusted revision commits.",
         )
         return
     if not decision["recorded"]:
@@ -9127,8 +10948,15 @@ def stop(payload: dict[str, Any]) -> None:
         state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
         artifact = _safe_plan_artifact(state.get("plan_artifact"))
-        if plan_ready and state.get("plan_digest") == stable_hash(assistant_message, 32) and artifact.get("write_status") == "write_failed":
-            write_plan_artifact(state, payload, assistant_message)
+        if (
+            plan_ready
+            and state.get("plan_state") in {"analyzing", "invalidated"}
+            and artifact.get("write_status")
+            in {"write_failed", "revision_too_large", "journal_full"}
+        ):
+            state["plan_state"] = "analyzing"
+            if write_plan_artifact(state, payload, assistant_message):
+                state["plan_state"] = "awaiting_confirmation"
         if state.get("plan_state") == "confirmed" and state.get("executor_state") == "local_running":
             if local_execution and local_execution.group(1) == state.get("execution_contract_id"):
                 if local_execution.group(2) == "succeeded":
@@ -9187,9 +11015,6 @@ def stop(payload: dict[str, Any]) -> None:
                             "updated_at": utc_now(),
                         }
                         state["plan_state"] = "analyzing"
-                        state["plan_generation"] = max(
-                            safe_int(state.get("plan_generation")), 0
-                        ) + 1
                         state["plan_digest"] = None
                         state["plan_objective_fingerprint"] = None
                         state["plan_difficulty_decision_id"] = None
@@ -9259,23 +11084,27 @@ def stop(payload: dict[str, Any]) -> None:
             "invalidated",
         }:
             if plan_ready:
-                state["plan_generation"] = max(safe_int(state.get("plan_generation")), 0) + 1
-                state["plan_digest"] = stable_hash(assistant_message, 32)
-                state["plan_objective_fingerprint"] = state.get("objective", {}).get("fingerprint")
-                state["plan_difficulty_decision_id"] = state.get("difficulty_decision_id")
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
-                state["plan_state"] = "awaiting_confirmation"
-                write_plan_artifact(state, payload, assistant_message)
+                reset_executor_binding(state)
+                state["plan_state"] = "analyzing"
+                if write_plan_artifact(state, payload, assistant_message):
+                    state["plan_state"] = "awaiting_confirmation"
             else:
                 state["plan_state"] = "analyzing"
 
     updated_state, _ = mutate_state(payload, update)
     artifact = _safe_plan_artifact(updated_state.get("plan_artifact"))
-    if artifact.get("write_status") in {"write_failed", "content_drift"}:
+    if artifact.get("write_status") in {
+        "write_failed",
+        "content_drift",
+        "revision_too_large",
+        "journal_full",
+        "transaction_recovery_failed",
+    }:
         emit_context(
             "Stop",
-            f"Workflow Manager plan_artifact {artifact['write_status']} warning_code={artifact['warning_code']}; the plan_digest contract remains authoritative and confirmation is not self-locked.",
+            f"Workflow Manager canonical plan journal {artifact['write_status']} warning_code={artifact['warning_code']}; confirmation and execution remain locked until a trusted revision commits.",
         )
         return
     emit_continue()

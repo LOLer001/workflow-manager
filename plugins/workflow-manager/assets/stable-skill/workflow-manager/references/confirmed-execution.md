@@ -27,24 +27,30 @@ Spawn with all of these settings:
 
 Host acceptance of this exact spawn is handoff-request evidence. Subagent start must match the pending request before mutation; report only the model/effort fields the host accepted or echoed, never assumed fields.
 
-## Private plan review mirror
+## Canonical private Hard-plan journal
 
-When a detailed Hard plan reaches `awaiting_confirmation`, the Hook may write a sanitized, size-bounded Markdown mirror under its private data root. The artifact binds its relative path, objective and difficulty fingerprints, positive generation, authoritative `plan_digest`, and body digest. It is review-only: creating or editing it never confirms the plan, changes the bound plan, or authorizes execution. The state `plan_digest` remains authoritative.
+Before a detailed Hard plan may reach `awaiting_confirmation`, the Hook must append its complete sanitized body to the fixed private `plans/<session-token>/hard-plan.md`. The same session always uses that file: every replan or later objective appends one complete revision, and `plan_generation` increases only after the journal and state commit successfully. The current trusted revision is the plan-content authority, so plan-detail views, replanning continuity, compaction/resume, and the executor must reread it rather than rely on a copied prompt or summary.
 
-Verify the artifact on later state events and after compaction/resume. Body mismatch is `content_drift`; unsafe roots, replaced directories, links, unexpected link counts, identity races, or write failures close only artifact I/O and must not self-lock confirmation. Retry the same plan mirror only after correcting the recorded cause. Retention keeps the current artifact plus the five newest owned old artifacts in deterministic order. Each deletion transaction is capped at 16, snapshots bytes and mode before quarantine, verifies the directory binding before and immediately after every unlink, and restores the whole transaction byte-for-byte without overwriting a path that appeared during the race.
+The journal alone never grants authority. The state-bound objective, difficulty, generation, current revision digest, journal digest, strict confirmation, and execution contract are still required. Any external edit, replacement, link, path-identity race, or digest mismatch invalidates the plan and marks an old executor `stale_contract`; only a trusted Hook revision followed by fresh confirmation can recover authorization.
+
+The limits are inclusive: one revision may contain exactly 983040 UTF-8 bytes and the whole journal may contain exactly 10485760 bytes. One byte over is typed `revision_too_large` or `journal_full`, respectively. Rejection leaves the prior file byte-for-byte unchanged and does not increment the generation.
+
+Journal and state use a cross-file `marker → journal → state → cleanup` transaction with atomic replacement, no-follow identity checks, file sync, and parent-directory sync where supported. A failed state write rolls the journal back. Crash recovery accepts only old journal/old state or new journal/new state; mixed or unprovable combinations fail closed as `transaction_recovery_failed` and retain the marker for diagnosis.
 
 ## Execution contract
 
-Compute `execution_contract_id` from the execution-profile version, normalized resolved policy/profile, and all four bindings:
+Compute `execution_contract_id` from the execution-profile version, normalized resolved policy/profile, and all canonical bindings:
 
 1. objective fingerprint;
 2. difficulty decision ID;
 3. positive `plan_generation`;
-4. confirmed `plan_digest`.
+4. confirmed `plan_digest`, equal to the current revision digest;
+5. canonical relative path;
+6. complete journal digest.
 
-Do not store or reconstruct the ID from raw prompt text. Any policy/profile, objective, difficulty decision, generation, or digest change makes the contract stale and requires a new executor request; changed plan bindings also require new confirmation.
+Do not store or reconstruct the ID from raw prompt text. Any policy/profile, objective, difficulty decision, generation, path, revision, or journal-digest change makes the contract stale and requires a new executor request; changed plan bindings also require new confirmation.
 
-The spawn request must include the exact `execution_contract_id`, `plan_digest`, and `plan_generation`; declare the child the only executor/exclusive owner; provide the full actionable confirmed plan, owned paths/modules, forbidden scope, dependencies and shared resources, expected artifacts, acceptance checks, rollback/stop conditions, and a compact result contract. The visible task name authorizes only the current state binding; it does not prove V2 ciphertext contains that handoff, so retain positive fork context and verify runtime identity, ownership, result, and acceptance independently.
+The spawn request must include the exact `execution_contract_id`, `plan_generation`, canonical relative path, current revision digest, and journal digest; require the child to reread the canonical current revision before work and recovery; and declare it the only executor/exclusive owner. Include bounded ownership, forbidden scope, shared resources, expected artifacts, acceptance, rollback/stop conditions, and a compact result contract, but no request summary becomes a second plan authority. The visible task name authorizes only the current state binding; it does not prove V2 ciphertext contains that handoff, so retain positive fork context and verify runtime identity, ownership, result, and acceptance independently.
 
 The executor must return decisive changes, paths/identifiers, verification evidence, unresolved risk, and typed failure if any. Raw logs stay in files or bounded excerpts. The parent independently checks contract match and acceptance evidence before reporting success.
 
@@ -66,8 +72,8 @@ Never repeat the same spawn or failed command unchanged, disguise an identical r
 
 ## Migration and resume
 
-Schema 10 adds executor state. When migrating a Schema 9 state whose plan was already `confirmed`, preserve the valid confirmed-plan binding but treat execution as not started: derive the current `execution_contract_id`, set `executor_state=spawn_required`, clear executor agent/model/reasoning/fork/attempt/failure fields, and request the one explicit executor. Never infer that a child was spawned or work was executed merely because the old plan was confirmed.
+Schema 20/writer 1.0.37 use the v2 canonical journal. Schema 19 migration accepts at most six strictly owned and parseable v1 mirrors, orders their real generations, and requires the newest mirror to match the stored current binding exactly. Missing, duplicate, drifted, truncated, unparseable, oversized, or more-than-six inputs fail closed without inventing a body. A running or recovery executor becomes `stale_contract`; a formerly pending or confirmed plan requires fresh confirmation. Old mirrors are cleaned only after the canonical journal and Schema 20 state both commit.
 
-After compaction/resume preserve only normalized `highest_throughout`/default preference and typed contract evidence, never the original policy prompt. Re-resolve host availability before a new spawn. Reuse a running/succeeded executor only when native evidence, resolved policy/profile, and every binding still match; otherwise fail closed to `spawn_required`, `recovery_required`, or re-planning. Hook metadata does not replace native summary or host evidence.
+Earlier Schema 10 migration introduced executor state: a Schema 9 confirmed plan was treated as not started and never as proof that execution occurred. Current compaction/resume preserves normalized policy and typed contract evidence in state, while the current Hard-plan semantics are reread from the verified canonical revision. Re-resolve host availability before a new spawn. Reuse a running/succeeded executor only when native non-plan evidence, resolved policy/profile, and every canonical binding still match; otherwise fail closed to `spawn_required`, `recovery_required`, or re-planning.
 
 After a succeeded executor, seal the bounded change and post-change verification baseline. If the user reports a remaining, returned, or new symptom during same-task acceptance, continue with [regression-continuity.md](regression-continuity.md) before any corrective mutation; executor success is not a causal conclusion or user acceptance.

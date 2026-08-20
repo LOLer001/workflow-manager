@@ -502,7 +502,12 @@ class WindowsHookTests(unittest.TestCase):
                     "message": (
                         "Unique exclusive executor. "
                         f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
-                        f"plan_generation={state['plan_generation']}. Exclusive execution ownership; "
+                        f"plan_generation={state['plan_generation']}. "
+                        "Reread the canonical journal before execution: "
+                        f"relative_path={state['plan_artifact']['relative_path']} "
+                        f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
+                        f"journal_digest={state['plan_artifact']['journal_digest']}. "
+                        "Exclusive execution ownership; "
                         "implement the full actionable plan and run verification acceptance tests."
                     ),
                 },
@@ -584,7 +589,12 @@ class WindowsHookTests(unittest.TestCase):
                     "message": (
                         "Unique exclusive executor. "
                         f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
-                        f"plan_generation={state['plan_generation']}. Exclusive execution ownership; "
+                        f"plan_generation={state['plan_generation']}. "
+                        "Reread the canonical journal before execution: "
+                        f"relative_path={state['plan_artifact']['relative_path']} "
+                        f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
+                        f"journal_digest={state['plan_artifact']['journal_digest']}. "
+                        "Exclusive execution ownership; "
                         "implement the full actionable plan and run verification acceptance tests."
                     ),
                 },

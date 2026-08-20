@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.0.37
+
+- Hard 详细计划只有在成功写入固定私有 `plans/<session-token>/hard-plan.md` 后才进入 `awaiting_confirmation`。同一会话的每次重规划或新目标都把完整修订追加到同一 canonical Markdown；当前受信修订定义计划内容，但文件本身绝不确认计划或授权执行。
+- 查看详情、重规划、压缩恢复和唯一执行者必须重读 canonical 当前修订；`update_plan` 只能是携带当前修订摘要且步骤文本一致的 UI 投影。外部编辑、替换或摘要漂移会立即进入 `invalidated`/`stale_contract`，旧确认与执行合同不能复用。
+- 单次修订恰好 `983040` 字节、全文恰好 `10485760` 字节允许写入；再多 1 字节分别以 `revision_too_large`、`journal_full` 拒绝，日志逐字节不变且代次不增加。跨文件提交按 `marker → journal → state → cleanup` 执行，崩溃恢复只接受 old/old 或 new/new，其他组合 fail-closed。
+- Schema 升至 20，writer/manifest 升至 1.0.37。Schema 19 最多迁移 6 个严格可验证的 v1 镜像，缺失、漂移、不可解析、超量或活动执行合同全部安全失效；旧镜像只在 canonical 日志与状态共同提交后清理。
+
 ## 1.0.36
 
 - 兼容 Codex Multi-Agent V2 在本地 `PreToolUse` 前将 collaboration `message` 加密的真实载荷：assessor 与 confirmed executor 改用可见、目标/合同绑定的 ASCII `task_name` 加正数 `fork_turns` 作为预派发状态绑定，明文宿主继续执行原有完整 message 合同校验。

@@ -15,8 +15,8 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 1. Classify **Daily** (chat/weather/reports/personal/cleanup) versus **Work** (device/App/code/engineering). Daily keeps current settings/safety.
 2. Work creates one objective-bound high assessor using highest available model/effort, a positive fork, and a state-bound ASCII task name. Record requested versus observed only.
 3. First assessor turn is read-only. **Simple** returns `WORK_ASSESSMENT`, then the same child solves+verifies and returns `SIMPLE_EXECUTION`. **Hard** returns the detailed plan+marker.
-4. Hard covers unknown cause, cross-module design, device/shared resources, or long delivery. Gather read-only evidence; plan scope/paths, changes, ownership, delivery, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
-5. Before confirmation allow reads; block write/agent/Git/build/deploy/device mutation. A private Markdown mirror is review-only, not authorization. Changes invalidate it. Read [work routing](references/work-routing.md).
+4. Hard covers unknown cause, cross-module/device/shared-resource, or long delivery. Gather read-only evidence; plan scope, ownership, verification, risk, rollback. End `计划已就绪，等待确认后执行`.
+5. Hard plan must append to fixed private canonical Markdown before confirmation. The trusted current revision defines content, never authorization; edits invalidate. Allow reads/projections and block pre-confirmation mutations. Read [work routing](references/work-routing.md).
 6. Default confirmed Hard uses lower-tier/medium; an explicit whole-session highest policy uses assessor tier+host-max. Read [confirmed execution](references/confirmed-execution.md) for proof/reset/resume.
 7. Independently route **Direct**, **Focused**, or **Complex/Extensive** shape; use only relevant `Contract > Evidence > Change > Verify > Report` stages.
 8. Seal a fingerprint-only baseline after confirmed execution. On same-task symptom feedback, read [regression continuity](references/regression-continuity.md) and compare prior objective/plan/contract/change/verification read-only. Wording only triggers review: `introduced`/`fix_ineffective` replan; `unrelated` reclassifies; `uncertain` needs evidence.
@@ -26,7 +26,7 @@ description: Manage quality-first Codex workflows with daily/work and simple/har
 ## Context gates
 
 - Below 55% work normally; at 55-70% trim presentation; at 70% checkpoint and narrow exploration.
-- After compaction resume native summary/gates, never raw prompt. Reclassify on changed inputs, repeated failures, long builds, or large output.
+- After compaction use native non-plan summary plus the canonical Hard plan, never raw prompt. Reclassify on changed inputs, failures, long builds, or large output.
 
 ## Delegation
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = PLUGIN_ROOT.parents[1]
 MANIFEST = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 SKILLS_ROOT = PLUGIN_ROOT / "assets" / "stable-skill"
 EXPECTED_ID = "workflow-manager"
@@ -28,6 +29,12 @@ class SkillIdentityTests(unittest.TestCase):
         self.skill_dir = self.skill_dirs[0]
         self.skill_text = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
         self.agent_text = (self.skill_dir / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        self.work_routing = (self.skill_dir / "references" / "work-routing.md").read_text(
+            encoding="utf-8"
+        )
+        self.confirmed_execution = (
+            self.skill_dir / "references" / "confirmed-execution.md"
+        ).read_text(encoding="utf-8")
 
     def test_plugin_and_skill_share_one_internal_identity(self) -> None:
         self.assertEqual(self.manifest["name"], EXPECTED_ID)
@@ -93,6 +100,32 @@ class SkillIdentityTests(unittest.TestCase):
             "sync_stable_skill",
             (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(encoding="utf-8"),
         )
+
+    def test_canonical_hard_plan_contract_is_documented(self) -> None:
+        self.assertIn("fixed private canonical Markdown", self.skill_text)
+        self.assertIn("plans/<session-token>/hard-plan.md", self.work_routing)
+        self.assertIn("Before `plan_state` may become `awaiting_confirmation`", self.work_routing)
+        self.assertIn("current trusted revision is the plan-content authority", self.work_routing)
+        self.assertIn(
+            "projection_only canonical_revision_digest=<digest>", self.work_routing
+        )
+        for value in ("983040", "10485760", "revision_too_large", "journal_full"):
+            self.assertIn(value, self.confirmed_execution)
+        self.assertIn("marker → journal → state → cleanup", self.confirmed_execution)
+        self.assertIn("old journal/old state or new journal/new state", self.confirmed_execution)
+        self.assertIn("Schema 20/writer 1.0.37", self.confirmed_execution)
+        self.assertIn("at most six", self.confirmed_execution)
+        self.assertIn("journal alone never grants authority", self.confirmed_execution)
+
+    def test_release_docs_target_current_version_without_fixed_suite_counts(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertEqual(self.manifest["version"], "1.0.37")
+        self.assertIn("/1.0.37/", readme)
+        self.assertNotIn("/1.0.36/", readme)
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.37\n")
+        self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
 
 if __name__ == "__main__":

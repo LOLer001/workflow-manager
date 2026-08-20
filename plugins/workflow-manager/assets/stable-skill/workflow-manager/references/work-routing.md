@@ -50,9 +50,19 @@ Read enough evidence to make the plan executable, but do not mutate merely to di
 
 Separate independent lanes from one ordered chain. Do not promise an exact file or method without evidence; label unresolved locations as bounded discovery in the plan. Finish with the exact sentence `计划已就绪，等待确认后执行`.
 
+## Canonical journal gate
+
+Before `plan_state` may become `awaiting_confirmation`, the Hook must sanitize and append the complete Hard plan as the next revision of the fixed private `plans/<session-token>/hard-plan.md`. Every replan and later objective in the same session appends another complete revision to that file. Only a successful journal-and-state transaction increments `plan_generation`; a failed write remains analyzing or invalidated and cannot be confirmed.
+
+The current trusted revision is the plan-content authority. Plan-detail views, replanning continuity, compaction recovery, and the eventual executor must reread it. The Markdown alone never confirms or authorizes anything: objective/difficulty bindings, current revision and journal digests, strict user confirmation, and the execution contract remain mandatory. An external edit or replacement invalidates the plan and makes any old executor contract stale; recovery requires a trusted new revision and confirmation.
+
+`update_plan` is only a UI projection, never a second plan store. It is allowed only with `projection_only canonical_revision_digest=<digest>` and step text already present in the current canonical revision. A semantic change must go through full journal-backed replanning, not an independent projection update.
+
+A sanitized revision of exactly 983040 UTF-8 bytes is allowed; one byte more is `revision_too_large`. A journal of exactly 10485760 bytes is allowed; an append that exceeds it is `journal_full`. Either typed rejection leaves the existing journal byte-for-byte unchanged and does not consume a generation.
+
 ## Strict confirmation and invalidation
 
-A confirmation binds only the current plan digest, objective fingerprint, and difficulty decision. Accept only a pure confirmation such as:
+A confirmation binds only the current trusted canonical revision digest, its journal digest, objective fingerprint, and difficulty decision. Accept only a pure confirmation such as:
 
 - `确认执行`
 - `确认按新计划执行`
@@ -61,11 +71,11 @@ A confirmation binds only the current plan digest, objective fingerprint, and di
 - `开始执行这个计划`
 - `confirm and execute this plan` / `execute the plan`
 
-Do not treat “继续”, “可以”, a question, partial approval, or silence as confirmation. A message containing “但是/另外/增加/删除/改为/先不要” or “but/except/add/remove/change” adds or changes a constraint: invalidate the pending confirmation, preserve compatible evidence, regenerate the plan and digest, then ask again. `重新规划`, `重做计划`, `修改计划`, `replan`, and `revise the plan` also invalidate it. A new objective always needs a new decision and plan.
+Do not treat “继续”, “可以”, a question, partial approval, or silence as confirmation. A message containing “但是/另外/增加/删除/改为/先不要” or “but/except/add/remove/change” adds or changes a constraint: invalidate the pending confirmation, preserve compatible evidence, append one complete replacement revision, then ask again. `重新规划`, `重做计划`, `修改计划`, `replan`, and `revise the plan` do the same. A new objective needs a new decision and another complete revision in the same session journal.
 
 ## Guard boundary before confirmation
 
-Allow targeted reads, searches, static inspection, safe metadata queries, plan updates, user questions, and explicitly read-only child investigation. These actions improve plan evidence and must not be misblocked merely because the task is Hard.
+Allow targeted reads, searches, static inspection, safe metadata queries, journal-backed replanning, digest-bound `update_plan` projections, user questions, and explicitly read-only child investigation. These actions improve plan evidence and must not be misblocked merely because the task is Hard.
 
 Block explicit file creation/edit/deletion, mutating child execution, mutating Git, compilation or packaging, deployment/install/flash/device mutation, and equivalent nested commands. After confirmation, normal mounted-source, destructive-action, output-budget, shared-resource, and project-specific gates still apply.
 

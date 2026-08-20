@@ -383,8 +383,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 19)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.36")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 20)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.37")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -589,7 +589,7 @@ class OrchestratorHookTests(unittest.TestCase):
         legacy = HOOK.new_state({"session_id": "legacy-local"})
         legacy.update({"schema_version": 13, "task_domain": "work", "work_difficulty": "hard", "difficulty_decision_id": "b" * 16, "objective": {"fingerprint": "a" * 16, "length": 1}, "plan_state": "confirmed", "plan_generation": 1, "plan_digest": "c" * 32, "plan_objective_fingerprint": "a" * 16, "plan_difficulty_decision_id": "b" * 16, "confirmed_plan_digest": "c" * 32, "last_route": {**HOOK.classify_prompt("修复 Android 崩溃并验证，但不要使用任何子智能体"), "delegation_opt_out": True}})
         migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-local"})
-        self.assertEqual((migrated["executor_state"], migrated["model_profile"]), ("local_running", "current"))
+        self.assertEqual((migrated["executor_state"], migrated["model_profile"]), ("recovery_required", "current"))
 
     def test_assessor_rejects_invalid_spawn_and_hard_mutation(self) -> None:
         session = "assessor-hard"
@@ -843,7 +843,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         ]
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema18-v2"})
-        self.assertEqual(migrated["schema_version"], 19)
+        self.assertEqual(migrated["schema_version"], 20)
         self.assertIsNone(migrated["subagents"][0]["request_visibility"])
 
     def test_assessor_spawn_bridge_ignores_function_wrapper_name(self) -> None:
@@ -1121,7 +1121,7 @@ class OrchestratorHookTests(unittest.TestCase):
         legacy = HOOK.new_state({"session_id": "legacy-confirmed"})
         legacy.update({"schema_version": 13, "writer_version": "1.0.26", "task_domain": "work", "work_difficulty": "hard", "difficulty_decision_id": "b" * 16, "objective": {"fingerprint": "a" * 16, "length": 12}, "plan_state": "confirmed", "plan_generation": 1, "plan_digest": "c" * 32, "plan_objective_fingerprint": "a" * 16, "plan_difficulty_decision_id": "b" * 16, "confirmed_plan_digest": "c" * 32, "assessor_state": "none"})
         migrated = HOOK.normalize_state(legacy, {"session_id": "legacy-confirmed"})
-        self.assertEqual((migrated["plan_state"], migrated["executor_state"], migrated["assessor_state"]), ("confirmed", "spawn_required", "none"))
+        self.assertEqual((migrated["plan_state"], migrated["executor_state"], migrated["assessor_state"]), ("invalidated", "recovery_required", "none"))
 
     def test_reference_contract_lifecycle_is_bounded_and_user_final_only(self) -> None:
         session = "reference-contract"
@@ -2056,7 +2056,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(state["plan_state"], "analyzing")
         self.assertIsNone(state["plan_digest"])
         self.assertIsNone(state["confirmed_plan_digest"])
-        self.assertGreater(state["plan_generation"], old_generation)
+        self.assertEqual(state["plan_generation"], old_generation)
         self.assertNotEqual(state.get("plan_digest"), old_digest)
         self.assertNotEqual(state["objective"]["fingerprint"], old_objective)
 
@@ -2160,6 +2160,10 @@ class OrchestratorHookTests(unittest.TestCase):
                 "You are the unique exclusive executor for this confirmed plan. "
                 f"execution_contract_id={contract_id or state['execution_contract_id']} "
                 f"plan_digest={state['plan_digest']} plan_generation={state['plan_generation']}. "
+                "Reread the canonical journal before execution: "
+                f"relative_path={state['plan_artifact']['relative_path']} "
+                f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
+                f"journal_digest={state['plan_artifact']['journal_digest']}. "
                 "Exclusive execution ownership: implement the full actionable plan, build/deploy in order, "
                 "run verification and acceptance tests, and report exact evidence."
                 + (
@@ -2731,7 +2735,7 @@ class OrchestratorHookTests(unittest.TestCase):
         old_contract = stalled["execution_contract_id"]
         replanned = self.complete_stall_diagnosis(stalled, "stall-replan", outcome="replan", data=replan_data)
         self.assertEqual((replanned["stall"]["state"], replanned["plan_state"], replanned["execution_contract_id"]), ("resolved", "analyzing", None))
-        self.assertGreater(replanned["plan_generation"], stalled["plan_generation"])
+        self.assertEqual(replanned["plan_generation"], stalled["plan_generation"])
         denied = self.run_hook(self.executor_spawn_payload(stalled, session="stall-replan", hook_run_id="old-contract", contract_id=old_contract, recovery_from="build_failed", material_correction="bounded correction after replan"), data=replan_data)
         self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
@@ -2889,10 +2893,10 @@ class OrchestratorHookTests(unittest.TestCase):
             legacy.pop(key, None)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema-nine"})
         self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
-        self.assertEqual(migrated["executor_state"], "spawn_required")
+        self.assertEqual(migrated["executor_state"], "recovery_required")
         self.assertEqual(migrated["executor_attempt"], 0)
         self.assertEqual(migrated["model_profile"], "work_executor_low_latest")
-        self.assertRegex(migrated["execution_contract_id"], r"^[0-9a-f]{32}$")
+        self.assertIsNone(migrated["execution_contract_id"])
 
     def test_executor_contract_survives_compaction_and_plan_drift_invalidates_it(self) -> None:
         session = "executor-compaction"
@@ -2975,6 +2979,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 data = Path(self.temporary.name) / f"causal-{label}"
                 completed = self.create_completed_execution_baseline(label, data)
                 old_contract = completed["execution_contract_id"]
+                old_generation = completed["plan_generation"]
                 baseline_id = completed["last_execution_baseline"]["baseline_id"]
                 submitted = self.run_hook(
                     {
@@ -3020,6 +3025,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 )
                 self.assertEqual(resolved["work_difficulty"], "hard")
                 self.assertEqual(resolved["plan_state"], "analyzing")
+                self.assertEqual(resolved["plan_generation"], old_generation)
                 self.assertIsNone(resolved["execution_contract_id"])
                 self.assertNotEqual(resolved.get("execution_contract_id"), old_contract)
 
@@ -4559,10 +4565,19 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         for index, (command, marker) in enumerate(cases):
             with self.subTest(command=command):
+                session = f"unbounded-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session,
+                        "hook_run_id": f"initialize-{index}",
+                        "prompt": "你好",
+                    }
+                )
                 result = self.run_hook(
                     {
                         "hook_event_name": "PreToolUse",
-                        "session_id": f"unbounded-{index}",
+                        "session_id": session,
                         "hook_run_id": f"unbounded-{index}",
                         "cwd": "/srv/repo",
                         "tool_name": "Bash",
@@ -4571,10 +4586,18 @@ class OrchestratorHookTests(unittest.TestCase):
                 )
                 output = json.loads(result.stdout)
                 self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
-                state_path = self.data / "sessions" / f"{HOOK.safe_id(f'unbounded-{index}')}.json"
+                state_path = self.data / "sessions" / f"{HOOK.safe_id(session)}.json"
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertTrue(any(item["kind"] == marker for item in state["guards"]))
 
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "capped-build-without-log",
+                "hook_run_id": "initialize-capped-build",
+                "prompt": "你好",
+            }
+        )
         capped_build = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -4616,10 +4639,19 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         for index, command in enumerate(masked_status_commands):
             with self.subTest(masked_status=command):
+                session = f"masked-build-status-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session,
+                        "hook_run_id": f"initialize-masked-{index}",
+                        "prompt": "你好",
+                    }
+                )
                 result = self.run_hook(
                     {
                         "hook_event_name": "PreToolUse",
-                        "session_id": f"masked-build-status-{index}",
+                        "session_id": session,
                         "hook_run_id": f"masked-build-status-{index}",
                         "cwd": "/srv/repo",
                         "tool_name": "Bash",
@@ -4648,10 +4680,19 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         for index, command in enumerate(bounded_commands):
             with self.subTest(bounded=command):
+                session = f"bounded-output-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session,
+                        "hook_run_id": f"initialize-bounded-{index}",
+                        "prompt": "你好",
+                    }
+                )
                 result = self.run_hook(
                     {
                         "hook_event_name": "PreToolUse",
-                        "session_id": f"bounded-output-{index}",
+                        "session_id": session,
                         "hook_run_id": f"bounded-output-{index}",
                         "cwd": "/srv/repo",
                         "tool_name": "Bash",
