@@ -1658,7 +1658,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(migrated["plan_artifact"]["plan_digest"], "a" * 32)
         self.assertNotIn("must-not-survive", json.dumps(migrated))
 
-    def test_m06_write_failure_is_typed_and_same_plan_can_retry(self) -> None:
+    def test_m06_write_failure_requires_a_parent_plan_retry_not_a_duplicate_agent_stop(self) -> None:
         self.data.mkdir(parents=True)
         (self.data / "plans").write_text("block plans directory", encoding="utf-8")
         binding, agent_id = self.begin_assessor("m06")
@@ -1679,7 +1679,21 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertIn("write_failed", first.stdout)
         (self.data / "plans").unlink()
         payload.update({"hook_run_id": "retry-stop"})
-        retry = self.run_hook(payload)
+        duplicate = self.run_hook(payload)
+        unchanged = self.state()
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertEqual(unchanged["plan_artifact"]["write_status"], "write_failed")
+        self.assertEqual(unchanged["plan_generation"], generation)
+        self.assertEqual(unchanged["plan_state"], "analyzing")
+
+        retry = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "m06",
+                "hook_run_id": "parent-plan-retry",
+                "last_assistant_message": message,
+            }
+        )
         recovered = self.state()
         self.assertEqual(retry.returncode, 0, retry.stderr)
         self.assertEqual(recovered["plan_artifact"]["write_status"], "written")

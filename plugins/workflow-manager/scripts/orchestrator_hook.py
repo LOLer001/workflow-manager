@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 20
-WRITER_VERSION = "1.0.37"
+WRITER_VERSION = "1.0.38"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
 EXECUTION_PROFILE_VERSION = "2"
@@ -10602,8 +10602,20 @@ def subagent_start(payload: dict[str, Any]) -> None:
     )
 def subagent_stop(payload: dict[str, Any]) -> None:
     result = payload.get("last_assistant_message")
-    declared_status = str(payload.get("status") or "").lower()
-    status_value = declared_status if declared_status in ERROR_STATUSES | {"completed", "ok"} else "unknown"
+    declared_status = str(payload.get("status") or "").strip().lower()
+    declared_success = declared_status in {
+        "complete",
+        "completed",
+        "done",
+        "ok",
+        "success",
+        "succeeded",
+    }
+    status_value = (
+        "completed"
+        if declared_success
+        else declared_status if declared_status in ERROR_STATUSES else "unknown"
+    )
     agent_id = safe_label(payload.get("agent_id"), 120)
     previous = snapshot_state(payload)
     started = next(
@@ -10644,6 +10656,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     stall_diagnosis = diagnosis_matches[0] if len(diagnosis_lines) == len(diagnosis_matches) == 1 else None
     decision: dict[str, Any] = {"recorded": False}
 
+    def terminal_succeeded(bound_start: dict[str, Any] | None) -> bool:
+        return bool(
+            bound_start is not None
+            and str(result or "").strip()
+            and (status_value == "completed" or not declared_status)
+        )
+
     def update(state: dict[str, Any]) -> None:
         current_result_group = None
         current_started = next(
@@ -10660,28 +10679,11 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 None,
             )
             current_started = (current_result_group or {}).get("request")
+        successful = terminal_succeeded(current_started)
         already_terminal = any(
             group.get("state") == "terminal" and group.get("agent_id") == agent_id
             for group in subagent_lifecycle_groups(state)
         )
-        artifact = _safe_plan_artifact(state.get("plan_artifact"))
-        if (
-            status_value in {"completed", "ok"}
-            and assessment
-            and assessment.group(1) == state.get("assessor_binding_id")
-            and assessment.group(2).lower() == "hard"
-            and hard_plan_detailed
-            and agent_id
-            and agent_id == state.get("assessor_agent_id")
-            and state.get("assessor_state") == "hard_plan_ready"
-            and state.get("plan_state") in {"analyzing", "invalidated"}
-            and artifact.get("write_status")
-            in {"write_failed", "revision_too_large", "journal_full"}
-        ):
-            state["plan_state"] = "analyzing"
-            if write_plan_artifact(state, payload, str(result or "")):
-                state["plan_state"] = "awaiting_confirmation"
-            decision["artifact_retry"] = True
         if not agent_id or (current_started is None and already_terminal):
             reason = "SubagentStop lacks a concrete agent_id" if not agent_id else "duplicate or late SubagentStop for a terminal agent"
             state.setdefault("guards", []).append(
@@ -10751,13 +10753,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             }
         )
         decision["recorded"] = True
+        decision["successful"] = successful
         if executor_agent and state.get("executor_agent_id") == agent_id:
             contract_current = bool(
                 not stale
                 and (effective_started or {}).get("contract_id") == state.get("execution_contract_id")
                 and state.get("execution_contract_id") == execution_contract_id(state)
             )
-            successful = status_value in {"completed", "ok"}
             if execution_stall_intent:
                 valid_stall = bool(
                     not successful
@@ -10812,7 +10814,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         if stall_assessor:
             stall = _safe_stall(state.get("stall"))
             valid = bool(
-                status_value in {"completed", "ok"}
+                successful
                 and stall.get("state") == "diagnosing"
                 and stall_diagnosis
                 and stall_diagnosis.group(1) == stall.get("stall_id")
@@ -10846,7 +10848,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             return
         if assessor_agent and state.get("assessor_agent_id") == agent_id:
             if state.get("assessor_state") == "simple_running":
-                if status_value in {"completed", "ok"} and simple_execution and simple_execution.group(1) == state.get("assessor_binding_id"):
+                if successful and simple_execution and simple_execution.group(1) == state.get("assessor_binding_id"):
                     state["assessor_state"] = "simple_complete"
                     state["assessor_failure_kind"] = None
                 else:
@@ -10854,7 +10856,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                     state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "simple_execution_invalid"
                 return
             mutated = any(item.get("assessor_binding_id") == state.get("assessor_binding_id") and item.get("category") in {"implementation", "build_package", "delivery_device", "git"} and item.get("status") in SUCCESS_STATUSES for item in state.get("operations", []))
-            valid = bool(not stale and status_value in {"completed", "ok"} and assessment and assessment.group(1) == state.get("assessor_binding_id"))
+            valid = bool(not stale and successful and assessment and assessment.group(1) == state.get("assessor_binding_id"))
             if assessment and assessment.group(2).lower() == "hard" and mutated:
                 state["assessor_state"] = "failed"
                 state["assessor_failure_kind"] = "hard_mutation_before_confirmation"
@@ -10914,7 +10916,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             "Stale subagent result: the objective changed after this agent started. Use it only as verification; "
             "it must not drive mutation for the previous objective.",
         )
-    elif executor_agent and status_value not in {"completed", "ok"}:
+    elif executor_agent and not decision.get("successful"):
         emit_context(
             "SubagentStop",
             "Confirmed executor failed. Return to the high-reasoning parent for one diagnosis. Do not repeat "
@@ -10947,16 +10949,6 @@ def stop(payload: dict[str, Any]) -> None:
     def update(state: dict[str, Any]) -> None:
         state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
-        artifact = _safe_plan_artifact(state.get("plan_artifact"))
-        if (
-            plan_ready
-            and state.get("plan_state") in {"analyzing", "invalidated"}
-            and artifact.get("write_status")
-            in {"write_failed", "revision_too_large", "journal_full"}
-        ):
-            state["plan_state"] = "analyzing"
-            if write_plan_artifact(state, payload, assistant_message):
-                state["plan_state"] = "awaiting_confirmation"
         if state.get("plan_state") == "confirmed" and state.get("executor_state") == "local_running":
             if local_execution and local_execution.group(1) == state.get("execution_contract_id"):
                 if local_execution.group(2) == "succeeded":

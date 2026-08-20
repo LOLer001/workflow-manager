@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.38
+
+- 兼容 Codex Desktop 真实 `SubagentStop` 事件缺少 `status` 的载荷：精确匹配 request/Start 且结果非空时，允许绑定 assessor/executor 继续各自既有 marker、计划、目标或执行合同校验；普通 lane 的持久化状态仍为 `terminal/unknown`，缺失状态本身不成为成功证明。
+- 显式 `failed`/`cancelled`、空结果、坏 assessment marker、陈旧目标、旧执行合同、重复或晚到 Stop 继续 fail-closed；补充真实 Hard assessor、confirmed executor、无效 marker、保守 unknown 与终态幂等回归。
+- Schema 保持 20，writer/manifest 升至 1.0.38；canonical Markdown、960 KiB/10 MiB 容量、漂移失效和 `marker → journal → state → cleanup` 合同不变。
+
 ## 1.0.37
 
 - Hard 详细计划只有在成功写入固定私有 `plans/<session-token>/hard-plan.md` 后才进入 `awaiting_confirmation`。同一会话的每次重规划或新目标都把完整修订追加到同一 canonical Markdown；当前受信修订定义计划内容，但文件本身绝不确认计划或授权执行。
