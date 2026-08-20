@@ -508,7 +508,8 @@ class WindowsHookTests(unittest.TestCase):
                         f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
                         f"journal_digest={state['plan_artifact']['journal_digest']}. "
                         "Exclusive execution ownership; "
-                        "implement the full actionable plan and run verification acceptance tests."
+                        "implement the full actionable plan and run verification acceptance tests.\n"
+                        f"EXECUTION_RESULT execution_contract_id={contract_id} outcome=succeeded|failed evidence_digest=<32hex>"
                     ),
                 },
             }
@@ -595,7 +596,8 @@ class WindowsHookTests(unittest.TestCase):
                         f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
                         f"journal_digest={state['plan_artifact']['journal_digest']}. "
                         "Exclusive execution ownership; "
-                        "implement the full actionable plan and run verification acceptance tests."
+                        "implement the full actionable plan and run verification acceptance tests.\n"
+                        f"EXECUTION_RESULT execution_contract_id={contract_id} outcome=succeeded|failed evidence_digest=<32hex>"
                     ),
                 },
             },

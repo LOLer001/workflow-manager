@@ -35,9 +35,11 @@ The journal alone never grants authority. The state-bound objective, difficulty,
 
 The limits are inclusive: one revision may contain exactly 983040 UTF-8 bytes and the whole journal may contain exactly 10485760 bytes. One byte over is typed `revision_too_large` or `journal_full`, respectively. Rejection leaves the prior file byte-for-byte unchanged and does not increment the generation.
 
-Journal and state use a cross-file `marker → journal → state → cleanup` transaction with atomic replacement, no-follow identity checks, file sync, and parent-directory sync where supported. A failed state write rolls the journal back. Crash recovery accepts only old journal/old state or new journal/new state; mixed or unprovable combinations fail closed as `transaction_recovery_failed` and retain the marker for diagnosis.
+Journal and state use a cross-file `marker → journal → state → cleanup` transaction with atomic replacement, no-follow identity checks, file sync, and parent-directory sync where supported. On mounts where `renameat2(RENAME_NOREPLACE)` returns `EINVAL`, `ENOSYS`, `ENOTSUP`, or `EOPNOTSUPP`, publication uses a no-clobber hard-link fallback with link-identity verification before unlinking the private source. A failed state write rolls the journal back. Crash recovery accepts only old journal/old state or new journal/new state; mixed or unprovable combinations fail closed as `transaction_recovery_failed` and retain the marker for diagnosis.
 
 ## Execution contract
+
+Schema 20/writer 1.0.39 uses execution profile v3. Every confirmed executor request requires the standalone exact result contract `EXECUTION_RESULT execution_contract_id=<32hex> outcome=succeeded|failed evidence_digest=<32hex>`. If `SubagentStop` omits status, only one full-match marker for the current contract with `outcome=succeeded` proves success. `outcome=failed`, an empty, malformed, duplicate, or wrong-contract marker fails closed; explicit failed or cancelled status always fails.
 
 Compute `execution_contract_id` from the execution-profile version, normalized resolved policy/profile, and all canonical bindings:
 
@@ -72,7 +74,7 @@ Never repeat the same spawn or failed command unchanged, disguise an identical r
 
 ## Migration and resume
 
-Schema 20/writer 1.0.38 use the v2 canonical journal. Schema 19 migration accepts at most six strictly owned and parseable v1 mirrors, orders their real generations, and requires the newest mirror to match the stored current binding exactly. Missing, duplicate, drifted, truncated, unparseable, oversized, or more-than-six inputs fail closed without inventing a body. A running or recovery executor becomes `stale_contract`; a formerly pending or confirmed plan requires fresh confirmation. Old mirrors are cleaned only after the canonical journal and Schema 20 state both commit.
+Schema 20/writer 1.0.39 use the v2 canonical journal. Schema 19 migration accepts at most six strictly owned and parseable v1 mirrors, orders their real generations, and requires the newest mirror to match the stored current binding exactly. Missing, duplicate, drifted, truncated, unparseable, oversized, or more-than-six inputs fail closed without inventing a body. A running or recovery executor becomes `stale_contract`; a formerly pending or confirmed plan requires fresh confirmation. Old mirrors are cleaned only after the canonical journal and Schema 20 state both commit.
 
 Earlier Schema 10 migration introduced executor state: a Schema 9 confirmed plan was treated as not started and never as proof that execution occurred. Current compaction/resume preserves normalized policy and typed contract evidence in state, while the current Hard-plan semantics are reread from the verified canonical revision. Re-resolve host availability before a new spawn. Reuse a running/succeeded executor only when native non-plan evidence, resolved policy/profile, and every canonical binding still match; otherwise fail closed to `spawn_required`, `recovery_required`, or re-planning.
 

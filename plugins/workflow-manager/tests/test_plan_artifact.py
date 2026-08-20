@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import importlib.util
 import io
 import json
@@ -2394,6 +2396,44 @@ class PlanArtifactTests(unittest.TestCase):
                 for candidate in directory.iterdir()
             )
         )
+
+    @unittest.skipIf(os.name == "nt", "POSIX renameat2 fallback only")
+    @unittest.skipUnless(hasattr(os, "link"), "hard-link fallback required")
+    def test_s14_unsupported_renameat2_uses_no_clobber_link_fallback(self) -> None:
+        class UnsupportedRename:
+            argtypes = None
+            restype = None
+
+            def __call__(self, *args: object) -> int:
+                ctypes.set_errno(errno.EINVAL)
+                return -1
+
+        class UnsupportedLibrary:
+            renameat2 = UnsupportedRename()
+
+        directory = self.root / "renameat2-fallback"
+        directory.mkdir()
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.addCleanup(os.close, directory_fd)
+        source = directory / "source.tmp"
+        source.write_bytes(b"candidate")
+        with patch("ctypes.CDLL", return_value=UnsupportedLibrary()):
+            HOOK._plan_rename_if_absent(source, "published", directory_fd)
+        published = directory / "published"
+        self.assertFalse(source.exists())
+        self.assertEqual(published.read_bytes(), b"candidate")
+        self.assertEqual(published.stat().st_nlink, 1)
+
+        guarded_source = directory / "guarded.tmp"
+        guarded_source.write_bytes(b"new")
+        guarded_target = directory / "guarded"
+        guarded_target.write_bytes(b"old")
+        with patch("ctypes.CDLL", return_value=UnsupportedLibrary()):
+            with self.assertRaises(HOOK.PlanArtifactError) as observed:
+                HOOK._plan_rename_if_absent(guarded_source, guarded_target.name, directory_fd)
+        self.assertEqual(observed.exception.code, "unsafe_path")
+        self.assertEqual(guarded_source.read_bytes(), b"new")
+        self.assertEqual(guarded_target.read_bytes(), b"old")
 
     def test_s03a_long_non_token_text_redaction_is_bounded(self) -> None:
         value = "x" * (HOOK.MAX_PLAN_ARTIFACT_BODY_BYTES * 2)

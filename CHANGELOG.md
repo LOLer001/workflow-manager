@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.0.39
+
+- 在 v9fs 等不支持 `renameat2(RENAME_NOREPLACE)` 的挂载上，当其返回 `EINVAL`、`ENOSYS`、`ENOTSUP` 或 `EOPNOTSUPP` 时，canonical transaction 改用保持 no-clobber 语义的 hard-link fallback；链接后验证常规文件身份、设备/inode 与链接计数，随后才移除私有源文件，竞态或身份异常均 fail-closed。
+- 新增 S14 回归，覆盖 `renameat2` 不支持时的成功发布、源文件清理、目标链接计数恢复，以及既有目标绝不被覆盖。
+- Schema 保持 20，writer/manifest 升至 1.0.39。
+- executor profile 升至 v3：缺失终态 status 时仅接受唯一、严格匹配当前 execution contract 的 `EXECUTION_RESULT ... outcome=succeeded`；`failed`、错合同、重复、畸形或空 marker 均 fail-closed，显式失败/取消也永不成功。
+
 ## 1.0.38
 
 - 兼容 Codex Desktop 真实 `SubagentStop` 事件缺少 `status` 的载荷：精确匹配 request/Start 且结果非空时，允许绑定 assessor/executor 继续各自既有 marker、计划、目标或执行合同校验；普通 lane 的持久化状态仍为 `terminal/unknown`，缺失状态本身不成为成功证明。

@@ -23,10 +23,10 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 20
-WRITER_VERSION = "1.0.38"
+WRITER_VERSION = "1.0.39"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "1"
-EXECUTION_PROFILE_VERSION = "2"
+EXECUTION_PROFILE_VERSION = "3"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = 1
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -2717,7 +2717,84 @@ def _plan_rename_if_absent(
     error_number = ctypes.get_errno()
     if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
         raise PlanArtifactError("unsafe_path")
+    if error_number in {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }:
+        _plan_link_unlink_if_absent(path, target_name, directory_fd)
+        return
     raise OSError(error_number, os.strerror(error_number))
+
+
+def _plan_link_unlink_if_absent(
+    path: Path, target_name: str, directory_fd: int | None
+) -> None:
+    """Publish a private temporary file without clobbering on renameat2-less mounts."""
+    source_info = _plan_lstat(path, directory_fd)
+    source_identity = _plan_file_identity(source_info)
+    if (
+        stat.S_ISLNK(source_info.st_mode)
+        or not stat.S_ISREG(source_info.st_mode)
+        or source_info.st_nlink != 1
+    ):
+        raise PlanArtifactError("unsafe_path")
+    target = path.parent / target_name
+    linked = False
+    try:
+        try:
+            if directory_fd is not None:
+                os.link(
+                    path.name,
+                    target_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            else:
+                os.link(path, target, follow_symlinks=False)
+        except FileExistsError as error:
+            raise PlanArtifactError("unsafe_path") from error
+        linked = True
+        source_after = _plan_lstat(path, directory_fd)
+        target_after = _plan_lstat(target, directory_fd)
+        if (
+            stat.S_ISLNK(source_after.st_mode)
+            or not stat.S_ISREG(source_after.st_mode)
+            or stat.S_ISLNK(target_after.st_mode)
+            or not stat.S_ISREG(target_after.st_mode)
+            or _plan_file_identity(source_after) != _plan_file_identity(target_after)
+            or source_identity[:2] != _plan_file_identity(source_after)[:2]
+            or source_after.st_nlink != 2
+            or target_after.st_nlink != 2
+        ):
+            raise PlanArtifactError("unsafe_path")
+        if directory_fd is not None:
+            os.unlink(path.name, dir_fd=directory_fd)
+        else:
+            path.unlink()
+        linked = False
+        installed = _plan_lstat(target, directory_fd)
+        if (
+            stat.S_ISLNK(installed.st_mode)
+            or not stat.S_ISREG(installed.st_mode)
+            or installed.st_nlink != 1
+            or source_identity[:2] != _plan_file_identity(installed)[:2]
+        ):
+            raise PlanArtifactError("unsafe_path")
+    except Exception:
+        if linked:
+            try:
+                installed = _plan_lstat(target, directory_fd)
+                if source_identity[:2] == _plan_file_identity(installed)[:2]:
+                    if directory_fd is not None:
+                        os.unlink(target_name, dir_fd=directory_fd)
+                    else:
+                        target.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+        raise
 
 
 def _transaction_name(path: Path, purpose: str, directory_fd: int | None) -> str:
@@ -6813,6 +6890,13 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
         re.search(r"\b(?:acceptance|verification|verify|test)\b", request, re.I)
         or any(term in request for term in ("验收", "验证", "测试"))
     )
+    result_contract = opaque_v2 or bool(
+        re.search(
+            rf"(?m)^EXECUTION_RESULT execution_contract_id={re.escape(contract_id)} "
+            r"outcome=succeeded\|failed evidence_digest=<32hex>$",
+            request,
+        )
+    )
     if state.get("executor_state") == "recovery_required":
         stall = _safe_stall(state.get("stall"))
         if stall.get("state") not in {"none", "resume_required"}:
@@ -6874,6 +6958,8 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
         return False, "executor must load the exact current revision from the canonical journal"
     if not exclusive_scope or not acceptance:
         return False, "executor request must declare exclusive execution ownership and acceptance"
+    if not result_contract:
+        return False, "executor request must require the exact bound EXECUTION_RESULT contract"
     return True, None
 
 
@@ -10325,6 +10411,10 @@ EXECUTION_STALL_RE = re.compile(
     r"^EXECUTION_STALL contract_id=([0-9a-f]{32}) "
     r"failure_kind=([a-z_]+) evidence_digest=([0-9a-f]{32})$"
 )
+EXECUTION_RESULT_RE = re.compile(
+    r"^EXECUTION_RESULT execution_contract_id=([0-9a-f]{32}) "
+    r"outcome=(succeeded|failed) evidence_digest=([0-9a-f]{32})$"
+)
 STALL_DIAGNOSIS_RE = re.compile(
     r"^STALL_DIAGNOSIS stall_id=([0-9a-f]{32}) assessor_binding_id=([0-9a-f]{32}) "
     r"outcome=(resume|replan) plan_digest=([0-9a-f]{32}) "
@@ -10651,6 +10741,9 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     stall_matches = [match for line in stall_lines if (match := EXECUTION_STALL_RE.fullmatch(line))]
     execution_stall_intent = bool(stall_lines)
     execution_stall = stall_matches[0] if len(stall_lines) == len(stall_matches) == 1 else None
+    execution_result_lines = [line for line in str(result or "").splitlines() if line.startswith("EXECUTION_RESULT")]
+    execution_result_matches = [match for line in execution_result_lines if (match := EXECUTION_RESULT_RE.fullmatch(line))]
+    execution_result = execution_result_matches[0] if len(execution_result_lines) == len(execution_result_matches) == 1 else None
     diagnosis_lines = [line for line in str(result or "").splitlines() if line.startswith("STALL_DIAGNOSIS")]
     diagnosis_matches = [match for line in diagnosis_lines if (match := STALL_DIAGNOSIS_RE.fullmatch(line))]
     stall_diagnosis = diagnosis_matches[0] if len(diagnosis_lines) == len(diagnosis_matches) == 1 else None
@@ -10680,6 +10773,24 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             )
             current_started = (current_result_group or {}).get("request")
         successful = terminal_succeeded(current_started)
+        execution_result_current = bool(
+            execution_result
+            and execution_result.group(1) == state.get("execution_contract_id")
+        )
+        execution_result_succeeded = bool(
+            execution_result_current and execution_result.group(2) == "succeeded"
+        )
+        if executor_agent:
+            # Desktop can omit terminal status.  That route needs the unique exact
+            # result marker; a declared failed/cancelled status can never succeed.
+            successful = bool(
+                current_started is not None
+                and (
+                    (status_value == "completed" and bool(str(result or "").strip()) and not execution_result)
+                    or (not declared_status and execution_result_succeeded)
+                )
+                and not (execution_result_current and execution_result.group(2) == "failed")
+            )
         already_terminal = any(
             group.get("state") == "terminal" and group.get("agent_id") == agent_id
             for group in subagent_lifecycle_groups(state)
@@ -10744,6 +10855,9 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 "stale": stale,
                 "status": status_value,
                 "result_meta": text_metadata(result),
+                "execution_result_contract_match": execution_result_current if executor_agent else None,
+                "execution_result_outcome": execution_result.group(2) if execution_result_current else None,
+                "execution_result_evidence_digest": execution_result.group(3) if execution_result_current else None,
                 "role": (effective_started or {}).get("role") or "lane",
                 "contract_id": (effective_started or {}).get("contract_id"),
                 "model": (effective_started or {}).get("model"),

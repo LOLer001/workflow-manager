@@ -384,8 +384,8 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 20)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.38")
-        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "2")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.39")
+        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "3")
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
             "这次任务请用最高模型和最高推理强度",
@@ -545,21 +545,25 @@ class OrchestratorHookTests(unittest.TestCase):
             blocked = self.load_only_state(case_data)
             self.assertEqual((blocked["assessor_state"], blocked["assessor_failure_kind"], blocked["plan_state"]), ("recovery_required", "assessment_result_invalid", "analyzing"), label)
 
-    def test_bound_executor_missing_terminal_status_uses_the_current_contract(self) -> None:
+    def test_bound_executor_missing_terminal_status_requires_a_unique_exact_result(self) -> None:
         session = "executor-status-missing"
         state = self.create_confirmed_executor_state(session)
         self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="request", fork_turns="2"))
         self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "missing-status-executor", "model": "gpt-5.6-terra", "reasoning_effort": "medium"})
-        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "missing-status-executor", "last_assistant_message": "Bound implementation and acceptance verification complete."})
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "missing-status-executor", "last_assistant_message": f"EXECUTION_RESULT execution_contract_id={state['execution_contract_id']} outcome=succeeded evidence_digest={'a' * 32}"})
         completed = self.load_only_state()
         self.assertEqual((completed["executor_state"], completed["executor_failure_kind"]), ("succeeded", None))
         self.assertEqual(completed["subagents"][-1]["status"], "unknown")
 
-        for label, explicit_status, include_result in (
+        for label, explicit_status, marker in (
             ("completed-empty", "completed", False),
             ("missing-empty", None, False),
             ("failed", "failed", True),
             ("cancelled", "cancelled", True),
+            ("marker-failed", None, "failed"),
+            ("wrong-contract", None, "wrong"),
+            ("duplicate", None, "duplicate"),
+            ("malformed", None, "malformed"),
         ):
             case_data = Path(self.temporary.name) / f"executor-status-{label}-data"
             case_session = f"executor-status-{label}"
@@ -569,8 +573,17 @@ class OrchestratorHookTests(unittest.TestCase):
             stop = {"hook_event_name": "SubagentStop", "session_id": case_session, "hook_run_id": "stop", "agent_id": f"{label}-executor"}
             if explicit_status:
                 stop["status"] = explicit_status
-            if include_result:
-                stop["last_assistant_message"] = "Bound execution did not complete."
+            if marker is True:
+                stop["last_assistant_message"] = f"EXECUTION_RESULT execution_contract_id={case_state['execution_contract_id']} outcome=succeeded evidence_digest={'b' * 32}"
+            elif marker == "failed":
+                stop["last_assistant_message"] = f"EXECUTION_RESULT execution_contract_id={case_state['execution_contract_id']} outcome=failed evidence_digest={'b' * 32}"
+            elif marker == "wrong":
+                stop["last_assistant_message"] = f"EXECUTION_RESULT execution_contract_id={'c' * 32} outcome=succeeded evidence_digest={'b' * 32}"
+            elif marker == "duplicate":
+                line = f"EXECUTION_RESULT execution_contract_id={case_state['execution_contract_id']} outcome=succeeded evidence_digest={'b' * 32}"
+                stop["last_assistant_message"] = f"{line}\n{line}"
+            elif marker == "malformed":
+                stop["last_assistant_message"] = f"EXECUTION_RESULT execution_contract_id={case_state['execution_contract_id']} outcome=succeeded evidence_digest=invalid"
             self.run_hook(stop, data=case_data)
             blocked = self.load_only_state(case_data)
             self.assertEqual((blocked["executor_state"], blocked["executor_failure_kind"]), ("recovery_required", "executor_failed"), label)
@@ -2242,14 +2255,15 @@ class OrchestratorHookTests(unittest.TestCase):
                 f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
                 f"journal_digest={state['plan_artifact']['journal_digest']}. "
                 "Exclusive execution ownership: implement the full actionable plan, build/deploy in order, "
-                "run verification and acceptance tests, and report exact evidence."
+                "run verification and acceptance tests, and report exact evidence.\n"
+                f"EXECUTION_RESULT execution_contract_id={contract_id or state['execution_contract_id']} outcome=succeeded|failed evidence_digest=<32hex>"
                 + (
-                    f" recovery_from={recovery_from} material_correction={material_correction}"
+                    f"\nrecovery_from={recovery_from} material_correction={material_correction}"
                     if recovery_from and material_correction
                     else ""
                 )
                 + (
-                    f" stall_id={stall_id} remediation_digest={remediation_digest}"
+                    f"\nstall_id={stall_id} remediation_digest={remediation_digest}"
                     if stall_id and remediation_digest
                     else ""
                 )

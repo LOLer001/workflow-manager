@@ -113,7 +113,7 @@ class SkillIdentityTests(unittest.TestCase):
             self.assertIn(value, self.confirmed_execution)
         self.assertIn("marker → journal → state → cleanup", self.confirmed_execution)
         self.assertIn("old journal/old state or new journal/new state", self.confirmed_execution)
-        self.assertIn("Schema 20/writer 1.0.38", self.confirmed_execution)
+        self.assertIn("Schema 20/writer 1.0.39", self.confirmed_execution)
         self.assertIn("at most six", self.confirmed_execution)
         self.assertIn("journal alone never grants authority", self.confirmed_execution)
 
@@ -121,10 +121,10 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.38")
-        self.assertIn("/1.0.38/", readme)
+        self.assertEqual(self.manifest["version"], "1.0.39")
+        self.assertIn("/1.0.39/", readme)
         self.assertNotIn("/1.0.37/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.38\n")
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.39\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
 
