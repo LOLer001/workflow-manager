@@ -221,7 +221,7 @@ class PlanArtifactTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "parent-objective",
-                "prompt": "修复 Android 跨模块故障、编译验证，但不要使用任何子智能体",
+                "prompt": "排查 Android 未知根因的跨 Settings/framework 故障并编译验证，但不要使用任何子智能体",
             },
             data=data,
         )

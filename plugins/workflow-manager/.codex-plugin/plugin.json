@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.44",
+  "version": "1.0.45",
   "description": "Quality-first, context-efficient workflow management with daily/work and simple/hard routing, confirmed plans, compaction recovery, and dynamic subagent orchestration.",
   "author": {
     "name": "Cong"
@@ -8,16 +8,16 @@
   "interface": {
     "displayName": "Workflow Manager",
     "shortDescription": "Classify work, gate hard plans, and protect reasoning quality.",
-    "longDescription": "Keeps daily requests on current settings, requests highest-model assessment for work, solves simple work directly, and requires strict confirmation of detailed hard-work plans while preserving evidence and compaction continuity.",
+    "longDescription": "A thin continuity and authorization layer: keeps Simple and Focused work local, reserves highest-model assessment and strict confirmation for genuinely Hard work, and preserves runtime identity, evidence, and compaction continuity.",
     "developerName": "Cong",
     "category": "Productivity",
     "capabilities": [
       "Interactive"
     ],
     "defaultPrompt": [
-      "Use $workflow-manager: keep only relevant stages while preserving required reasoning, evidence, correction, and verification.",
-      "Correctness and acceptance evidence outrank context savings; checkpoint before compaction and remove only redundancy.",
-      "For complex work, optimize expected wall-clock time; delegate positive-utility owned lanes and serialize only real conflicts."
+      "Use $workflow-manager as a thin continuity and authorization layer; do not repeat host-native guidance.",
+      "Keep Simple/Focused local. Hard needs one critical signal or two strong groups including diagnosis, scope, or continuity.",
+      "Preserve acceptance. Correct once; for unknown, critical, or repeated failure use one highest-available model at max."
     ],
     "brandColor": "#0F766E",
     "screenshots": []

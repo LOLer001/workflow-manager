@@ -23,17 +23,17 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 25
-WRITER_VERSION = "1.0.44"
+SCHEMA_VERSION = 26
+WRITER_VERSION = "1.0.45"
 DOMAIN_CLASSIFIER_VERSION = "1"
-DIFFICULTY_CLASSIFIER_VERSION = "1"
-EXECUTION_PROFILE_VERSION = "8"
+DIFFICULTY_CLASSIFIER_VERSION = "2"
+EXECUTION_PROFILE_VERSION = "9"
 # The assessor is the hard-work safety gate: use the highest generally exposed
 # effort (max); ultra is reserved for the explicit whole-session policy.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
 HIGHEST_SESSION_REASONING_EFFORT = "ultra"
 STABLE_SKILL_NAME = "workflow-manager"
-STABLE_SKILL_SCHEMA = 6
+STABLE_SKILL_SCHEMA = 7
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
@@ -193,7 +193,7 @@ PLAN_ARTIFACT_NAME_RE = re.compile(
 PLAN_TRANSACTION_MARKER_NAME = ".hard-plan.md.transaction.json"
 MAX_PLAN_TRANSACTION_MARKER_BYTES = 4096
 EXECUTION_SLICE_SCHEMA = 1
-MAX_EXECUTION_SLICES = 8
+MAX_EXECUTION_SLICES = 6
 MAX_SLICE_LIST_ITEMS = 8
 MAX_SLICE_TEXT_BYTES = 240
 EVIDENCE_DIGEST_PROFILE = "workflow-manager-host-evidence-v1"
@@ -5750,7 +5750,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and not sealed_historical_success
         and not review_profile_continuity
     ):
-        # Older revisions never gain v8 write authority. Never invent a
+        # Older revisions never gain v9 write authority. Never invent a
         # synthetic slice or silently grant a fresh attempt. The next high-plan
         # revision must append the one strict manifest to the same journal and
         # receive a new explicit confirmation.
@@ -6892,7 +6892,10 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
         matches = [op for op in patch_ops if op.get("host_input_digest") == patch_digest]
         exact_patch_match = bool(matches)
         current = current_execution_slice(state) or {}
-        if not matches and safe_int(state.get("schema_version")) == 25:
+        if not matches and (
+            safe_int(state.get("_source_schema_version")) == 25
+            or safe_int(state.get("schema_version")) == 25
+        ):
             legacy = [op for op in patch_ops if normalized_key(op.get("tool")) == "applypatch" and op.get("executor_agent_id") and op.get("execution_contract_id") == state.get("execution_contract_id") and op.get("slice_id") == current.get("id") and op.get("slice_contract_id") == slice_contract_id(state)]
             if len(legacy) == 1:
                 matches = legacy
@@ -7499,14 +7502,44 @@ def classify_task_domain(prompt: str) -> dict[str, Any]:
     }
 
 
+CRITICAL_HARD_PATTERNS = (
+    (
+        "critical_irreversible_or_production",
+        r"(?:生产发布|production\s+(?:release|deployment)|不可逆|irreversible|"
+        r"数据丢失|data\s+loss|安全漏洞|security\s+(?:incident|vulnerability)|"
+        r"销毁|wipe|erase|rotate\s+(?:production\s+)?credentials?)",
+    ),
+    (
+        "critical_architecture_delivery",
+        r"(?:从零开发|完整开发|zero[- ]downtime|零停机|完整(?:系统|应用|平台)(?:开发|迁移)|"
+        r"from\s+scratch.{0,32}(?:system|application|platform))",
+    ),
+    (
+        "critical_host_continuity",
+        r"(?:host\s+compaction|真实(?:宿主)?压缩|压缩).{0,96}"
+        r"(?:same[- ]session|同一会话|同会话|resume|恢复)",
+    ),
+)
 HARD_WORK_PATTERNS = (
     ("hard_unknown_root_cause", r"(?:根因未知|未知根因|原因不明|反复|间歇|偶现|复现|root cause|intermittent|flaky|keeps|repeated)"),
     ("hard_cross_module", r"(?:跨模块|多个模块|多模块|跨组件|多个组件|framework.{0,28}systemui|settings.{0,28}framework|cross[- ]module|multiple modules?|several modules?)"),
-    ("hard_architecture", r"(?:从零开发|完整开发|架构|离线同步|后台同步|认证系统|zero[- ]downtime|rollback|migration|迁移|生产发布|production)"),
+    ("hard_architecture", r"(?:架构|离线同步|后台同步|认证系统|rollback|migration|迁移)"),
     ("hard_host_continuity", r"(?:host\s+compaction|真实(?:宿主)?压缩|压缩).{0,96}(?:same[- ]session|同一会话|同会话|resume|恢复)"),
     ("hard_external_chain", r"(?:编译|构建|compile|build).{0,60}(?:部署|安装|烧录|刷机|实机|deploy|install|flash|device)"),
     ("hard_shared_resource", r"(?:唯一|同一|共享|only|single|same|shared).{0,20}(?:设备|构建服务器|账号|资源|device|build server|account|resource)"),
 )
+HARD_SIGNAL_GROUPS = {
+    "hard_unknown_root_cause": "diagnosis",
+    "hard_cross_module": "scope",
+    "hard_architecture": "scope",
+    "hard_host_continuity": "continuity",
+    "hard_external_chain": "external_state",
+    "hard_device_change": "external_state",
+    "hard_shared_resource": "coordination",
+    "hard_shared_or_ordered": "coordination",
+    "hard_three_phase_chain": "workflow",
+}
+PRIMARY_HARD_SIGNAL_GROUPS = {"diagnosis", "scope", "continuity"}
 SIMPLE_WORK_PATTERNS = (
     ("simple_explicit_small", r"(?:一个错字|单个错字|一处文案|小改动|单文件|one typo|single file|small change|tiny change)"),
     ("simple_bounded_contract", r"(?:给定输入输出|已有单测|现有单测|明确验收|provided input|existing tests?|clear acceptance)"),
@@ -7525,6 +7558,11 @@ def classify_work_difficulty(
         confidence = "high"
         rule_codes = ["daily_not_applicable"]
     else:
+        critical_codes = [
+            code
+            for code, pattern in CRITICAL_HARD_PATTERNS
+            if re.search(pattern, lower, re.I)
+        ]
         hard_codes = [
             code for code, pattern in HARD_WORK_PATTERNS if re.search(pattern, lower, re.I)
         ]
@@ -7537,6 +7575,7 @@ def classify_work_difficulty(
             lower,
             re.I,
         ):
+            critical_codes = []
             hard_codes = []
         domain_codes = set(as_list(domain.get("domain_rule_codes")))
         phases = set(as_list(route.get("phase_hints")))
@@ -7546,14 +7585,26 @@ def classify_work_difficulty(
             hard_codes.append("hard_three_phase_chain")
         if route.get("dependency_signal") in {"shared_resource", "ordered_shared"}:
             hard_codes.append("hard_shared_or_ordered")
-        if question_only and not hard_codes:
+        signal_groups = {
+            HARD_SIGNAL_GROUPS[code]
+            for code in hard_codes
+            if code in HARD_SIGNAL_GROUPS
+        }
+        qualified_hard = bool(
+            critical_codes
+            or (
+                len(signal_groups) >= 2
+                and bool(signal_groups & PRIMARY_HARD_SIGNAL_GROUPS)
+            )
+        )
+        if question_only and not qualified_hard:
             difficulty = "simple"
             confidence = "high"
             rule_codes = ["simple_explanation_request"]
-        elif hard_codes:
+        elif qualified_hard:
             difficulty = "hard"
             confidence = "high"
-            rule_codes = list(dict.fromkeys(hard_codes))[:8]
+            rule_codes = list(dict.fromkeys([*critical_codes, *hard_codes]))[:8]
         else:
             simple_codes = [
                 code for code, pattern in SIMPLE_WORK_PATTERNS if re.search(pattern, lower, re.I)
@@ -7566,9 +7617,15 @@ def classify_work_difficulty(
                 confidence = "high" if route_label in {"direct", "focused"} else "medium"
                 rule_codes = list(dict.fromkeys(simple_codes))[:8]
             else:
-                difficulty = "hard"
+                # Uncertainty is not itself evidence of difficulty.  Start with one
+                # bounded local diagnosis and promote only when runtime evidence adds
+                # a second independent signal or a critical-risk signal.
+                difficulty = "simple"
                 confidence = "medium"
-                rule_codes = ["hard_ambiguous_work"]
+                rule_codes = [
+                    "simple_bounded_diagnostic",
+                    *list(dict.fromkeys(hard_codes))[:3],
+                ]
     decision_seed = "\0".join(
         (
             DIFFICULTY_CLASSIFIER_VERSION,
@@ -9512,21 +9569,6 @@ def real_tmp_git_directory(cwd: Any) -> bool:
         return False
 
 
-def bounded_git_status(command: str) -> bool:
-    invocation = _git_invocation(command)
-    if not invocation:
-        return True
-    candidate, match = invocation
-    if match.group(1).lower() != "status":
-        return True
-    segment = re.split(r"(?:&&|\|\||[;|])", candidate[match.start() :], maxsplit=1)[0]
-    concise = bool(re.search(r"(?i)(?:^|\s)(?:-s|--short|--porcelain(?:=\S+)?)(?:\s|$)", segment))
-    no_untracked = bool(re.search(r"(?i)(?:^|\s)(?:-uno|--untracked-files=no)(?:\s|$)", segment))
-    path_match = re.search(r"\s--\s+([^\s]+)", segment)
-    explicit_path = bool(path_match and path_match.group(1).strip("'\"") not in {".", "./", ":/"})
-    return concise and no_untracked and explicit_path
-
-
 def command_category(payload: dict[str, Any], command: str | None = None) -> str:
     tool = str(payload.get("tool_name") or "").lower()
     value = command if command is not None else extract_command(payload)
@@ -9644,33 +9686,10 @@ def command_guard(payload: dict[str, Any]) -> tuple[str, str] | None:
             "Workflow Manager guard blocked Git because a /tmp workdir is not a real existing /tmp directory. "
             "Use an existing native Linux directory and keep cmd plus workdir/cwd in the same structured tool_input leaf.",
         )
-    if subcommand == "status" and not bounded_git_status(command):
-        return (
-            "broad_git_status",
-            "Workflow Manager guard blocked unbounded git status. On a safe authoritative Git tree, use "
-            "git status --short --untracked-files=no -- <explicit-paths>.",
-        )
-    for candidate in command_views(command):
-        detection_command = shell_syntax_view(candidate)
-        if SCREENRECORD_RE.search(detection_command) and not command_output_budget(payload, candidate, "screenrecord"):
-            return (
-                "screenrecord",
-                "Workflow Manager guard blocked unbounded screenrecord. Add --time-limit 180 or less, then inspect only "
-                "1-3 representative frames unless more evidence is required.",
-            )
-        if LOG_COMMAND_RE.search(detection_command) and not command_output_budget(payload, candidate, "streaming_log"):
-            return (
-                "streaming_log",
-                "Workflow Manager guard blocked an unbounded log stream. Capture a finite snapshot or redirect to a file, "
-                "then query only the first direct error, Caused by, fatal exception, or relevant frames.",
-            )
-        if BUILD_COMMAND_RE.search(detection_command) and not command_output_budget(payload, candidate, "build_output"):
-            return (
-                "build_output",
-                "Workflow Manager guard blocked a build/package command without a recoverable full log. Redirect complete "
-                "output to a file with no trailing shell work so the real exit code remains observable; quiet flags, output caps, and head/tail pipes "
-                "are not substitutes. Run follow-up commands separately, then inspect the exact diagnostics needed.",
-            )
+    # Git on a mounted/network working tree can corrupt identity and violates the
+    # repository contract, so it remains a hard guard.  Output shape is not an
+    # authorization boundary: builds, logs, recordings, and broad status are
+    # observed as bounded telemetry but are no longer denied by the plugin.
     return None
 def command_risk_kind(payload: dict[str, Any], command: str) -> str | None:
     for candidate in command_views(command):
@@ -9795,29 +9814,6 @@ def emit_pretool_deny(reason: str) -> None:
                     "permissionDecision": "deny",
                     "permissionDecisionReason": reason,
                 }
-            },
-            ensure_ascii=True,
-        )
-    )
-
-
-def emit_posttool_advisory(status_value: str, meta: dict[str, Any]) -> None:
-    summary = (
-        "Workflow Manager noticed an oversized tool result and preserved the original for normal model reasoning: "
-        f'status={status_value}, chars={safe_int(meta.get("output_chars"))}, '
-        f'lines={safe_int(meta.get("output_lines"))}, visuals={safe_int(meta.get("visual_items"))}, '
-        f'truncated={bool(meta.get("truncated"))}. '
-        "Correctness and evidence completeness take priority over context savings. Use the current result; "
-        "bound only future reads or queries, and obtain more exact evidence whenever the current result is insufficient."
-    )
-    print(
-        json.dumps(
-            {
-                "continue": True,
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": summary,
-                },
             },
             ensure_ascii=True,
         )
@@ -10561,35 +10557,25 @@ def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -
     shape = str(classification.get("workflow_shape") or "direct")
     order = ">".join(str(item) for item in as_list(classification.get("execution_order"))) or "work"
     cap = min(max(safe_int(classification.get("recommended_agent_cap")), 0), 3)
-    mode = str(classification.get("agent_mode") or "local")
     if cap:
-        agents = f"Agents: {mode}; subagent_cap={cap} ceiling; efficiency audit; positive-net owned lanes."
+        agents = f"Agents: cap={cap}; independent positive-net lanes only."
     elif label in {"complex", "extensive"}:
-        agents = f"Agents: 0 ({mode}); serialize conflicts; re-audit side lanes."
+        agents = "Agents: local; serialize real conflicts."
     else:
-        agents = "Agents: 0; do not delegate for pressure alone."
-    pressure = telemetry.get("pressure")
-    pressure_summary = f"{pressure:.1%}" if isinstance(pressure, (int, float)) else "unknown"
-    gate = (
-        " gate=checkpoint+stop-broad; required reasoning/evidence continue."
-        if isinstance(pressure, (int, float)) and pressure >= PRESSURE_CHECKPOINT_THRESHOLD
-        else ""
-    )
+        agents = "Agents: local."
     domain = str(classification.get("task_domain") or "unknown")
     difficulty = str(classification.get("work_difficulty") or "unknown")
     profile = str(classification.get("model_profile") or "current")
     profile_note = (
-        "requested executor profile; proof requires accepted explicit child override"
+        "explicit child override required"
         if profile in {"work_executor_low_latest", "work_executor_highest_available"}
-        else "advisory; no switch"
+        else "no parent switch"
     )
     return (
         f"Domain: {domain}/{difficulty} | profile={profile} ({profile_note}). "
-        f"Route: {label}/{shape} | pressure={pressure_summary} | budget={classification.get('future_token_range')}. "
-        f"Order: {order}. {agents}{gate} Control: bounded. "
-        "Update phase|done|next|blocker at kickoff/change/~60s wait. "
-        "Preflight path/input/acceptance; diagnose once; retry after correction. "
-        "Keep risk-based verification; reuse only unchanged evidence."
+        f"Route: {label}/{shape}; order={order}. {agents} "
+        "Keep constraints and risk-based verification. Correct a recoverable problem once; if root cause stays "
+        "unknown or risk is critical, use one highest-available model at max for diagnosis, then resume the original execution."
     )
 
 
@@ -11089,9 +11075,30 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["telemetry"] = telemetry
 
     mutate_state(payload, update)
-    pressure = telemetry.get("pressure")
-    should_inject = identity_preflight or preference_directive is not None or causal_report or reference_failure or causal_active or classification["task_domain"] == "work" or classification["label"] in {"complex", "extensive"} or (
-        isinstance(pressure, (int, float)) and pressure >= PRESSURE_TRIM_THRESHOLD
+    prior_route = safe_route(previous.get("last_route"))
+    route_changed = any(
+        prior_route.get(key) != classification.get(key)
+        for key in (
+            "task_domain",
+            "work_difficulty",
+            "difficulty_decision_id",
+            "delegation_gate",
+            "recommended_agent_cap",
+        )
+    )
+    should_inject = (
+        identity_preflight
+        or preference_directive is not None
+        or causal_report
+        or reference_failure
+        or causal_active
+        or confirmed_plan
+        or replan
+        or plan_changed
+        or pending_plan
+        or canonical_context_requested
+        or (already_confirmed and pure_plan_confirmation(prompt))
+        or (classification["task_domain"] == "work" and (not continuation or route_changed))
     )
     if not should_inject:
         return
@@ -11283,25 +11290,6 @@ def change_epoch_probe_kind(payload: dict[str, Any], category: str) -> str | Non
     return None
 
 
-def same_epoch_probe_seen(state: dict[str, Any], fingerprint: str, kind: str) -> bool:
-    epoch = safe_int(state.get("change_epoch"))
-    return any(
-        item.get("fingerprint") == fingerprint
-        and item.get("kind") == kind
-        and safe_int(item.get("epoch")) == epoch
-        for item in state.get("change_epoch_ledger", [])
-    )
-
-
-def same_stage_action_count(state: dict[str, Any], turn_id: str, category: str) -> int:
-    if turn_id == "unknown" or not category:
-        return 0
-    return sum(
-        1
-        for item in state.get("operations", [])
-        if item.get("turn_id") == turn_id and item.get("category") == category
-    )
-
 def runtime_route_escalation(state: dict[str, Any], current_category: str) -> dict[str, Any] | None:
     current_label = str(state.get("last_route", {}).get("label") or "direct")
     if ROUTE_RANK.get(current_label, 0) >= ROUTE_RANK["complex"]:
@@ -11350,9 +11338,11 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
         return False
 
     caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
-    # A child never inherits parent delegation authority.  This prevents an
-    # exclusive executor slice from becoming an untracked delegation tree.
-    if caller:
+    # Child-origin mutation would split ownership, but a read-only child may use
+    # the same route/cap checks as the parent.  Modern hosts already expose the
+    # full collaboration tree, so a blanket nested-child denial only created
+    # avoidable retries without adding an authorization boundary.
+    if caller and not subagent_request_is_read_only(payload):
         def record_child_origin_guard(current: dict[str, Any]) -> None:
             current.setdefault("guards", []).append({
                 "at": utc_now(),
@@ -11361,7 +11351,9 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
             })
 
         mutate_state(payload, record_child_origin_guard)
-        emit_pretool_deny("Subagent spawn denied: child-origin delegation is not authorized by the parent contract.")
+        emit_pretool_deny(
+            "Subagent spawn denied: a child may delegate only a read-only, non-overlapping lane; mutation remains with the parent owner."
+        )
         return True
 
     executor_request, _ = confirmed_executor_request(payload, state)
@@ -11393,8 +11385,15 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
         gate = "audit"
         cap = 1
     active = [] if executor_request else [
-        item for item in active_agent_records(state)
-        if not (assessor_safe_side_lane and item.get("role") == "high_assessor")
+        (group.get("start") or group.get("request"))
+        for group in subagent_lifecycle_groups(state)
+        if group.get("state") in {"pending", "result_pending", "live"}
+        and isinstance(group.get("start") or group.get("request"), dict)
+        and not (
+            assessor_safe_side_lane
+            and (group.get("start") or group.get("request") or {}).get("role")
+            == "high_assessor"
+        )
     ]
     task_name, scope_fingerprint = subagent_request_fields(payload)
     duplicate_scope = any(
@@ -11423,21 +11422,6 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
     elif len(active) >= cap:
         deny_kind = "subagent_cap"
         deny_reason = f"Subagent spawn denied before start: active={len(active)}, cap={cap}; reuse or stop a lane first."
-    elif not executor_request:
-        # This is a monotonic start budget, rather than a reusable slot cap.
-        # A second lane requires the explicit ready-and-disjoint re-audit.
-        side_lane_budget = 2 if reaudited else 1
-        side_lane_starts = sum(
-            1 for item in state.get("subagents", [])
-            if item.get("event") == "request" and item.get("role") == "lane"
-        )
-        if side_lane_starts >= side_lane_budget:
-            deny_kind = "side_lane_budget"
-            deny_reason = (
-                "Subagent spawn denied: the monotonic side-lane start budget is exhausted; "
-                "do not substitute delegation for required acceptance."
-            )
-
     if deny_reason:
         def record_guard(current: dict[str, Any]) -> None:
             current.setdefault("guards", []).append(
@@ -11958,7 +11942,10 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     state = snapshot_state(payload)
     snapshot_failure = str(state.get("_snapshot_failure") or "")
-    if snapshot_failure:
+    # A host may legitimately deliver PreToolUse before UserPromptSubmit/SessionStart.
+    # Absence of state is not proof of an unconfirmed Hard task and must fail open;
+    # a present-but-invalid state or failed transaction still fails closed.
+    if snapshot_failure not in {"", "missing_state", "missing_session_id"}:
         mutating = plan_confirmation_guard(
             payload,
             {
@@ -12240,23 +12227,6 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
     if handle_subagent_pretool(payload, state, fingerprint):
         return
     current_category = command_category(payload)
-    probe_kind = change_epoch_probe_kind(payload, current_category)
-    if probe_kind and same_epoch_probe_seen(state, fingerprint, probe_kind):
-        def record_epoch_throttle(current: dict[str, Any]) -> None:
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
-                    "kind": "change_epoch_throttle",
-                    "action": "deny",
-                    "fingerprint": fingerprint,
-                }
-            )
-        mutate_state(payload, record_epoch_throttle)
-        emit_pretool_deny(
-            "Workflow Manager blocked an identical read-only probe in the current change epoch; reuse fresh evidence, make a material change, or narrow/split the question."
-        )
-        return
     duplicate = next(
         (
             op
@@ -12284,15 +12254,6 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         and item.get("turn_id") == turn_id
         for item in state.get("guards", [])
     )
-    stage_count = same_stage_action_count(state, turn_id, current_category)
-    stage_already_noticed = any(
-        item.get("kind") == "stage_budget" and item.get("turn_id") == turn_id
-        for item in state.get("guards", [])
-    )
-    duplicate_already_noticed = any(
-        item.get("fingerprint") == fingerprint and item.get("turn_id") == turn_id
-        for item in state.get("duplicate_notices", [])
-    )
     escalation = runtime_route_escalation(state, current_category)
     escalation_already_noticed = any(
         item.get("kind") == "runtime_escalation" and item.get("turn_id") == turn_id
@@ -12302,26 +12263,17 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
     pressure = telemetry.get("pressure")
     pressure_notices = [
         kind
-        for threshold, kind in (
-            (PRESSURE_TRIM_THRESHOLD, "pressure_55"),
-            (PRESSURE_CHECKPOINT_THRESHOLD, "pressure_70"),
-        )
+        for threshold, kind in ((PRESSURE_CHECKPOINT_THRESHOLD, "pressure_70"),)
         if isinstance(pressure, (int, float))
         and pressure >= threshold
         and not any(item.get("kind") == kind for item in state.get("guards", []))
     ]
-    notify_duplicate = bool(duplicate and not duplicate_already_noticed)
     notify_escalation = bool(escalation and not escalation_already_noticed)
     notify_failure = bool(failed_duplicate and not failure_already_noticed)
-    notify_stage = bool(stage_count >= 25 and not stage_already_noticed)
-    if not any((notify_duplicate, notify_escalation, notify_failure, notify_stage, pressure_notices)):
+    if not any((notify_escalation, notify_failure, pressure_notices)):
         return
 
     def update(current: dict[str, Any]) -> None:
-        if notify_duplicate:
-            current.setdefault("duplicate_notices", []).append(
-                {"fingerprint": fingerprint, "turn_id": turn_id, "at": utc_now()}
-            )
         if notify_escalation and escalation:
             current["last_route"] = escalation
             current.setdefault("guards", []).append(
@@ -12333,20 +12285,16 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                     "fingerprint": fingerprint,
                 }
             )
-        for kind, enabled in (
-            ("unchanged_failure", notify_failure),
-            ("stage_budget", notify_stage),
-        ):
-            if enabled:
-                current.setdefault("guards", []).append(
-                    {
-                        "at": utc_now(),
-                        "turn_id": turn_id,
-                        "kind": kind,
-                        "action": "advise",
-                        "fingerprint": fingerprint if kind == "unchanged_failure" else None,
-                    }
-                )
+        if notify_failure:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": turn_id,
+                    "kind": "unchanged_failure",
+                    "action": "advise",
+                    "fingerprint": fingerprint,
+                }
+            )
         for kind in pressure_notices:
             current.setdefault("guards", []).append(
                 {
@@ -12364,23 +12312,17 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
     if not changed:
         return
     notices: list[str] = []
-    if notify_duplicate:
-        notices.append(
-            f"Duplicate-success hint: tool={tool}, fingerprint={fingerprint} (no command/result text). Reuse only if "
-            "input, cwd, files, device/external state, freshness, and native evidence are unchanged; otherwise rerun "
-            "the narrow check."
-        )
     if notify_failure:
         notices.append(
-            "Unchanged failure already exists for this tool/input: keep the first error, diagnose once, and retry "
-            "only after a material correction or one bounded alternate route."
+            "This exact tool/input already failed. Preserve the first error and make one material correction now. "
+            "If the root cause is still unknown, the risk is critical, or that correction fails, call one "
+            "highest-available model with max reasoning for a bounded diagnosis, then resume the original execution."
         )
-    if notify_stage:
-        notices.append("Stage action budget reached (~25): checkpoint and reclassify before more broad/equivalent work, then continue any reasoning or verification still required.")
-    if "pressure_55" in pressure_notices:
-        notices.append("Context pressure crossed 55%: trim redundant presentation only; preserve all reasoning and evidence needed for correctness. This does not raise the subagent cap.")
     if "pressure_70" in pressure_notices:
-        notices.append("Context pressure crossed 70%: checkpoint before unfocused work, then continue required reasoning, evidence, and verification narrowly or after native compaction. This does not raise the subagent cap.")
+        notices.append(
+            "Context crossed 70%: use native compaction/checkpoint once, retain current objective and acceptance "
+            "evidence, and continue without repeating completed work."
+        )
     if notify_escalation and escalation:
         phases = ",".join(escalation.get("phase_hints") or [])
         order = " > ".join(escalation.get("execution_order") or [])
@@ -12429,6 +12371,19 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     previous = snapshot_state(payload)
     telemetry = latest_token_telemetry(payload) or safe_telemetry(previous.get("telemetry"))
     oversized = output_needs_compaction(response_meta, telemetry)
+    epoch_before_event = safe_int(previous.get("change_epoch"))
+    prior_failures_same_epoch = sum(
+        1
+        for item in previous.get("operations", [])
+        if operation_failed(item)
+        and safe_int(item.get("change_epoch")) == epoch_before_event
+    )
+    difficulty_codes = set(as_list(previous.get("difficulty_rule_codes")))
+    immediate_high_recovery = bool(
+        "hard_unknown_root_cause" in difficulty_codes
+        or any(str(code).startswith("critical_") for code in difficulty_codes)
+    )
+    recovery_notice: dict[str, Any] = {}
     compacted = False
     budgeted = command_output_budget(payload, command, risk_kind) if command and risk_kind else False
     caller_id = next(
@@ -12551,6 +12506,53 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             }
         )
         failed = status_value.startswith("error") or status_value in ERROR_STATUSES
+        if failed:
+            escalate = bool(immediate_high_recovery or prior_failures_same_epoch >= 1)
+            tier = "problem_escalation" if escalate else "problem_correction"
+            recovery_fingerprint = stable_hash(
+                f"workflow-manager-recovery-v1\0{epoch_before}\0{tier}", 32
+            )
+            already_noticed = any(
+                item.get("kind") == tier
+                and item.get("fingerprint") == recovery_fingerprint
+                for item in state.get("guards", [])
+            )
+            if not already_noticed:
+                state.setdefault("guards", []).append(
+                    {
+                        "at": utc_now(),
+                        "turn_id": safe_label(payload.get("turn_id"), 120)
+                        if payload.get("turn_id")
+                        else None,
+                        "kind": tier,
+                        "action": "advise",
+                        "fingerprint": recovery_fingerprint,
+                    }
+                )
+                recovery_notice.update(
+                    {
+                        "emit": True,
+                        "escalate": escalate,
+                        "epoch": epoch_before,
+                    }
+                )
+                if (
+                    escalate
+                    and state.get("task_domain") == "work"
+                    and state.get("objective", {}).get("fingerprint")
+                    and state.get("plan_state") != "confirmed"
+                    and state.get("assessor_state")
+                    not in {"spawn_required", "spawn_pending", "running", "simple_running"}
+                ):
+                    state["assessor_generation"] = max(
+                        safe_int(state.get("assessor_generation")), 0
+                    ) + 1
+                    state["assessor_binding_id"] = assessor_binding_id(state)
+                    state["assessor_input_fingerprint"] = state["objective"]["fingerprint"]
+                    state["assessor_state"] = "spawn_required"
+                    state["assessor_failure_kind"] = None
+                    state["model_profile"] = "work_assessment"
+                    recovery_notice["assessor_required"] = True
         probe_kind = change_epoch_probe_kind(payload, category)
         if probe_kind and not failed:
             state.setdefault("change_epoch_ledger", []).append(
@@ -12642,8 +12644,34 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             state["telemetry"] = telemetry
 
     mutate_state(payload, update)
-    if oversized:
-        emit_posttool_advisory(status_value, response_meta)
+    if recovery_notice.get("emit"):
+        if recovery_notice.get("assessor_required"):
+            refreshed = snapshot_state(payload)
+            emit_context(
+                "PostToolUse",
+                "A material correction has failed, or this problem has unknown/critical risk. Continue solving: "
+                "spawn exactly one highest-available Codex assessor at reasoning_effort=max and fork_turns=1 "
+                f"with task_name={bound_assessor_task_name(refreshed)}, "
+                f"assessor_binding_id={refreshed.get('assessor_binding_id')}, and "
+                f"objective_fingerprint={refreshed.get('objective', {}).get('fingerprint')}. "
+                "Ask it for a bounded diagnosis and correction; then resume the original execution. Do not report "
+                "a blocker unless the remaining condition is external and genuinely unrecoverable.",
+            )
+        elif recovery_notice.get("escalate"):
+            emit_context(
+                "PostToolUse",
+                "The correction failed or risk is critical. Use one highest-available model at max for a bounded "
+                "diagnosis, apply the correction, and resume. Stop only for a genuine external blocker.",
+            )
+        else:
+            emit_context(
+                "PostToolUse",
+                "Treat this as recoverable: preserve the first error, make one material correction now, and resume. "
+                "Do not convert it into a blocker without testing the correction.",
+            )
+    # Oversized results remain fully available to the host.  Persist bounded
+    # metadata only; repeating an advisory after every large result was itself
+    # a major source of context growth in long sessions.
 def compact_event(payload: dict[str, Any], phase: str) -> None:
     telemetry = latest_token_telemetry(payload)
 

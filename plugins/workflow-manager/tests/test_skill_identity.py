@@ -35,6 +35,9 @@ class SkillIdentityTests(unittest.TestCase):
         self.confirmed_execution = (
             self.skill_dir / "references" / "confirmed-execution.md"
         ).read_text(encoding="utf-8")
+        self.agent_lifecycle = (
+            self.skill_dir / "references" / "agent-lifecycle.md"
+        ).read_text(encoding="utf-8")
 
     def test_plugin_and_skill_share_one_internal_identity(self) -> None:
         self.assertEqual(self.manifest["name"], EXPECTED_ID)
@@ -54,21 +57,22 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn(f"${EXPECTED_ID}", prompts)
 
     def test_quality_first_context_savings_contract_is_consistent(self) -> None:
-        self.assertIn("Correctness and required reasoning", self.skill_text)
-        self.assertIn("never the depth needed to solve the task", self.skill_text)
+        self.assertIn("thin continuity and authorization layer", self.skill_text)
+        self.assertIn("Never lower verification or acceptance", self.skill_text)
         self.assertIn("Quality-first, context-efficient", self.manifest["description"])
         prompts = " ".join(self.manifest["interface"]["defaultPrompt"])
-        self.assertIn("Correctness and acceptance evidence outrank context savings", prompts)
-        self.assertIn("preserving all reasoning, evidence, correction, and verification", self.agent_text)
+        self.assertIn("Preserve acceptance", prompts)
+        self.assertIn("preserve acceptance evidence and compaction continuity", self.agent_text)
 
-    def test_delegation_policy_is_efficiency_biased_not_read_only_quota(self) -> None:
+    def test_default_prompt_is_a_thin_layer_not_generic_model_guidance(self) -> None:
         prompts = " ".join(self.manifest["interface"]["defaultPrompt"])
-        self.assertIn("expected wall-clock time", prompts)
+        self.assertIn("thin continuity and authorization layer", prompts)
+        self.assertIn("Keep Simple/Focused local", prompts)
+        self.assertNotIn("expected wall-clock time", prompts)
+        self.assertNotIn("proactively delegating", self.agent_text)
         self.assertIn("positive-utility", self.skill_text)
-        self.assertIn("Read-only investigation is only one option", self.skill_text)
-        self.assertIn("Complex up to 2 subagents; Extensive up to 3", self.skill_text)
-        self.assertIn("caps as ceilings, never quotas", self.skill_text)
-        self.assertIn("read, write, test, research, or review", self.agent_text)
+        self.assertIn("Caps are live/reserved ceilings, not lifetime quotas", self.skill_text)
+        self.assertIn("Capacity is reusable after a terminal lane", self.skill_text)
 
     def test_legacy_skill_identity_is_absent_from_plugin(self) -> None:
         legacy_ids = ("token-frugal-" + "orchestrator", "token-frugal-" + "workflow")
@@ -83,16 +87,14 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_child_agent_purpose_naming_matches_host_constraint(self) -> None:
-        self.assertIn("concise Chinese purpose summary", self.skill_text)
-        self.assertIn("ASCII `task_name`", self.skill_text)
+        self.assertIn("concise Chinese purpose summary", self.agent_lifecycle)
+        self.assertIn("task_name=confirmed_executor_", self.confirmed_execution)
 
-    def test_plugin_upgrade_preserves_skill_path_continuity(self) -> None:
-        self.assertIn("supported host API", self.skill_text)
-        self.assertIn("$CODEX_HOME/skills/workflow-manager", self.skill_text)
-        self.assertIn("never edit rollout JSONL or live databases/indexes/tasks", self.skill_text)
-        self.assertIn("stable route covers new/resumed tasks", self.skill_text)
-        self.assertIn("preserve sealed v6 evidence", self.skill_text)
-        self.assertIn("new/resumed tasks", self.skill_text)
+    def test_plugin_upgrade_preserves_protocol_continuity_without_generic_restatement(self) -> None:
+        self.assertIn("Compaction resumes from native summary", self.skill_text)
+        self.assertIn("Schema 26/writer 1.0.45", self.confirmed_execution)
+        self.assertIn("preserve its real profile/contract", self.confirmed_execution)
+        self.assertNotIn("progress update every", self.skill_text.lower())
 
     def test_only_unversioned_user_skill_is_discoverable(self) -> None:
         self.assertFalse((PLUGIN_ROOT / "skills").exists())
@@ -103,7 +105,7 @@ class SkillIdentityTests(unittest.TestCase):
         )
 
     def test_canonical_hard_plan_contract_is_documented(self) -> None:
-        self.assertIn("fixed private canonical Markdown", self.skill_text)
+        self.assertIn("private canonical journal", self.skill_text)
         self.assertIn("plans/<session-token>/hard-plan.md", self.work_routing)
         self.assertIn("Before `plan_state` may become `awaiting_confirmation`", self.work_routing)
         self.assertIn("current trusted revision is the plan-content authority", self.work_routing)
@@ -114,18 +116,18 @@ class SkillIdentityTests(unittest.TestCase):
             self.assertIn(value, self.confirmed_execution)
         self.assertIn("marker → journal → state → cleanup", self.confirmed_execution)
         self.assertIn("old journal/old state or new journal/new state", self.confirmed_execution)
-        self.assertIn("Schema 25/writer 1.0.44", self.confirmed_execution)
-        self.assertIn("execution profile v8", self.confirmed_execution)
+        self.assertIn("Schema 26/writer 1.0.45", self.confirmed_execution)
+        self.assertIn("execution profile v9", self.confirmed_execution)
         self.assertIn("workflow-manager-execution-slices", self.confirmed_execution)
-        self.assertIn("3..5", self.confirmed_execution)
-        self.assertIn("hard upper bound is 8", self.confirmed_execution)
-        self.assertIn("reasoning_effort=max", self.skill_text)
-        self.assertIn("High-confidence **Simple** Work stays local (child Start=0)", self.skill_text)
+        self.assertIn("1..3", self.confirmed_execution)
+        self.assertIn("hard upper bound is 6", self.confirmed_execution)
+        self.assertIn("highest-available assessor at `max`", self.skill_text)
+        self.assertIn("Simple and Focused Work stay local", self.skill_text)
         self.assertIn("`requested`", self.skill_text)
         self.assertIn("`host_accepted`", self.skill_text)
-        self.assertIn("`full|partial|absent|mismatch`", self.skill_text)
-        self.assertIn("same-turn host transcript context", self.skill_text)
-        self.assertIn("ultra > max > xhigh > high > medium > low", self.work_routing)
+        self.assertIn("bound Start must be fully observed", self.skill_text)
+        self.assertIn("same-turn host effort", self.skill_text)
+        self.assertIn("reasoning_effort=max", self.work_routing)
         self.assertIn("host-generated", self.confirmed_execution)
         self.assertIn("slice_id=sNN", self.confirmed_execution)
         result_contract = re.search(
@@ -152,12 +154,12 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.44")
-        self.assertIn("/1.0.44/", readme)
+        self.assertEqual(self.manifest["version"], "1.0.45")
+        self.assertIn("/1.0.45/", readme)
         self.assertNotIn("/1.0.42/", readme)
         self.assertNotIn("/1.0.41/", readme)
         self.assertNotIn("/1.0.37/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.44\n")
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.45\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
 

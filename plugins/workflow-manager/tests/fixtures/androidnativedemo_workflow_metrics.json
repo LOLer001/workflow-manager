@@ -1,0 +1,23 @@
+{
+  "fixture_version": 1,
+  "privacy": "anonymized aggregate counters only; no session id, path, prompt, tool input, or rollout content",
+  "measurement_boundary": "token counters are cumulative host counters and cannot be attributed as marginal Workflow Manager tokens",
+  "rollout_utf8_bytes": 487649445,
+  "rollout_lines": 25588,
+  "task_cycles": 57,
+  "compactions": 31,
+  "exec_calls": 3965,
+  "cumulative_total_tokens": 672428428,
+  "cumulative_cached_input_tokens": 657001984,
+  "workflow_manager_developer_messages": 236,
+  "workflow_manager_developer_utf8_chars": 374178,
+  "oversized_notices": 194,
+  "session_start_contexts": 32,
+  "delegation_audits": 28,
+  "route_contexts": 26,
+  "pressure_55_notices": 24,
+  "pressure_70_notices": 22,
+  "stage_budget_notices": 13,
+  "assistant_explicit_mentions": 49,
+  "tool_input_explicit_mentions": 87
+}

@@ -6,7 +6,7 @@ Use this reference for difficult-work classification, plan construction, strict 
 
 1. Decide Daily or Work independently from Direct/Focused/Complex/Extensive.
 2. Daily requests keep the current session settings and have no work-plan gate.
-3. A high-confidence Simple objective stays local with zero child starts. Other new Work objectives, causal/replacement review, or reference failure create one binding from objective fingerprint plus assessor generation. Request exactly one child with the highest available Codex model and default `reasoning_effort=max`: in the ordered policy tiers `ultra > max > xhigh > high > medium > low`, this is the second-highest tier. An explicit `highest_throughout` session preference requests `ultra` instead. Use exactly `fork_turns=1`. Record requested profile separately from observed host echo; no echo means running but unproven, mismatch is typed recovery.
+3. Simple/Focused objectives stay local with zero child starts. A true Hard objective, causal/replacement review, reference failure, unknown/critical problem, or failed material correction creates one binding from objective fingerprint plus assessor generation. Request exactly one child with the highest available Codex model and default `reasoning_effort=max`; explicit `highest_throughout` requests `ultra`. Use `fork_turns=1`. Record requested, host-accepted, and observed profile separately; a bound child runs only with a full matching Start observation.
 4. Simple work proceeds directly. Hard work remains in analysis until a detailed plan is strictly confirmed.
 
 `current` and `work_assessment` are policy requests recorded by the Hook. The Hook cannot select, inspect, or prove the host model/reasoning setting. Report the requested profile and any host evidence separately; never turn an advisory into a success claim.
@@ -15,9 +15,9 @@ Use this reference for difficult-work classification, plan construction, strict 
 
 The child request carries exact `assessor_binding_id`, `objective_fingerprint`, `profile_resolution=highest_available`, and a self-contained role contract. Its first turn is read-only. For **Simple**, it ends with `WORK_ASSESSMENT binding_id=<32hex> outcome=simple evidence_digest=<32hex>`; only an exact follow-up to that same agent/binding with solve+verify may mutate, and it must end with line-level `SIMPLE_EXECUTION binding_id=<32hex> evidence_digest=<32hex>`. For **Hard**, it remains read-only, produces the detailed plan below, emits the equivalent `outcome=hard` marker, and its final line is exactly `计划已就绪，等待确认后执行`.
 
-Only requested profile fields are recorded at spawn. `SubagentStart` active-model echo must match when present; missing effort is not failure because hosts need not emit it. Fully observed profile requires both matching echoes, and absent fields never fabricate evidence. Mismatched/stale marker or child status is typed recovery. There is one materially corrected recovery at most (two attempts); recovery must name the previous typed cause and a substantive correction. A Hard outcome after successful implementation/build/deploy/device/Git mutation fails as `hard_mutation_before_confirmation` and cannot supply a plan. Compaction/resume retains only binding, state, attempt, failure, and fingerprints—never raw prompt, plan, or child result.
+Only requested profile fields are recorded at spawn. A bound child may run only after `SubagentStart` supplies a matching active-model echo and the same turn's host transcript supplies matching effort. Absent fields never fabricate evidence or mutation authority. Mismatched/stale marker or child status is typed recovery. There is one materially corrected recovery at most (two attempts); recovery must name the previous typed cause and a substantive correction. A Hard outcome after successful implementation/build/deploy/device/Git mutation fails as `hard_mutation_before_confirmation` and cannot supply a plan. Compaction/resume retains only binding, state, attempt, failure, and fingerprints—never raw prompt, plan, or child result.
 
-Difficulty and execution shape are separate axes. A Focused task can be Hard because it changes a device; a Complex task can have several bounded Simple lanes. Agent caps never determine difficulty.
+Difficulty and execution shape are separate axes. Device interaction, build/deploy, three phases, a shared resource, or ambiguity alone is not Hard. Agent caps never determine difficulty.
 
 ## Gold set
 
@@ -32,10 +32,11 @@ Difficulty and execution shape are separate axes. A Focused task can be Hard bec
 | “修复 Android 设备反复重启，根因未知” | Work / Hard | Unknown cause plus device behavior |
 | “同时修改 Settings、framework 和 SystemUI 的显示模式” | Work / Hard | Cross-module contract |
 | “从零开发带离线同步和认证的完整 App” | Work / Hard | Architecture and broad acceptance surface |
-| “编译模块、部署到共享实机并完成回归” | Work / Hard | Ordered external delivery and shared resource |
-| “先看天气，再修改应用代码并发布” | Work / Hard | Inseparable engineering output dominates the mixed request |
+| “编译模块、部署到共享实机并完成回归” | Work / Simple | Operational complexity alone; keep one bounded ordered chain |
+| “先看天气，再修改应用代码并发布” | Work / Simple | Engineering output dominates domain, but does not prove Hard difficulty |
+| “生产发布数据库迁移并提供回滚” | Work / Hard | Critical production/rollback risk |
 
-Prefer explicit hard evidence: unknown/intermittent cause, multiple modules or contracts, architecture/migration/production work, device change, three or more material phases, or shared/ordered external resources. Prefer Simple only when scope, causal chain, change surface, and acceptance are all bounded. Unresolved Work ambiguity defaults to Hard with medium confidence; investigate narrowly rather than guessing Simple.
+Hard requires one critical signal (production/irreversible/security/full-system delivery/host-continuity acceptance), or at least two independent signal groups with one from unknown cause, cross-scope, or continuity. Operational external-state, workflow-length, and coordination signals may strengthen a primary signal but cannot promote by themselves. Unresolved ambiguity defaults to a bounded Simple diagnosis with medium confidence and promotes only when evidence crosses this threshold.
 
 ## Detailed Hard plan contract
 
@@ -50,9 +51,9 @@ Read enough evidence to make the plan executable, but do not mutate merely to di
 
 Separate independent lanes from one ordered chain. Do not promise an exact file or method without evidence; label unresolved locations as bounded discovery in the plan. Finish with the exact sentence `计划已就绪，等待确认后执行`.
 
-Before that readiness sentence, include exactly one fenced JSON block with language `workflow-manager-execution-slices`. Sanitization removes protocol/readiness lines, so this block becomes the tail of the canonical revision. It uses only the exact keys `version`, `global_constraints`, and `slices`; every slice uses `id`, `title`, `scope`, `acceptance`, `rollback`, `stop_conditions`, and `expected_artifacts`. IDs are consecutive `s01` onward, all arrays contain bounded non-empty strings, and a normal Hard revision has 3..5 slices with a hard upper bound of 8. A one-slice exception must be explicitly justified as exceptionally small.
+Before that readiness sentence, include exactly one fenced JSON block with language `workflow-manager-execution-slices`. Sanitization removes protocol/readiness lines, so this block becomes the tail of the canonical revision. It uses only the exact keys `version`, `global_constraints`, and `slices`; every slice uses `id`, `title`, `scope`, `acceptance`, `rollback`, `stop_conditions`, and `expected_artifacts`. IDs are consecutive `s01` onward, all arrays contain bounded non-empty strings, and a normal Hard revision uses 1..3 acceptance checkpoints with a hard upper bound of 6.
 
-Each slice must have one independently observable acceptance surface and bounded ownership. Preserve global invariants in `global_constraints`; put prerequisites before consumers; keep shared build/device stages sequential; and split large plans so a lower-tier executor cannot silently omit a strong gate. More than 32 meaningful slices means the plan is not yet executable: consolidate or replan instead of dropping checks. The complete example and runtime contract are in [confirmed-execution.md](confirmed-execution.md).
+Each slice must have one independently observable acceptance surface and bounded ownership. Preserve global invariants in `global_constraints`; put prerequisites before consumers; keep shared build/device stages sequential; and split large plans so a lower-tier executor cannot silently omit a strong gate. More than 6 meaningful slices means the plan is not yet executable: consolidate or split the objective instead of dropping checks. The complete example and runtime contract are in [confirmed-execution.md](confirmed-execution.md).
 
 ## Canonical journal gate
 
@@ -81,7 +82,7 @@ Do not treat “继续”, “可以”, a question, partial approval, or silenc
 
 Allow targeted reads, searches, static inspection, safe metadata queries, journal-backed replanning, digest-bound `update_plan` projections, user questions, and explicitly read-only child investigation. These actions improve plan evidence and must not be misblocked merely because the task is Hard.
 
-Block explicit file or directory creation/edit/deletion (including `mkdir`), mutating child execution, mutating Git, compilation or packaging, deployment/install/flash/device mutation, and equivalent nested commands. After confirmation, normal mounted-source, destructive-action, output-budget, shared-resource, and project-specific gates still apply.
+Block explicit file or directory creation/edit/deletion (including `mkdir`), mutating child execution, mutating Git, compilation or packaging, deployment/install/flash/device mutation, and equivalent nested commands. After confirmation, mounted-source, destructive-action, conflicting ownership/resource, contract-evidence, and project-specific gates still apply. Output shape is telemetry, not an authorization gate.
 
 After a valid confirmation, continue with [confirmed-execution.md](confirmed-execution.md); confirmation opens one global contract and at most one current-slice executor, not parent mutation, parallel slice execution, or an unbound child.
 

@@ -435,11 +435,11 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_official_codex_delegation_wrapper_routes_embedded_new_task(self) -> None:
         session = "official-delegation"
-        embedded = "修复 Android 未知重启，编译部署后完成实机回归，并核对 <真实宿主> 证据"
+        embedded = "排查 Android 设备反复重启且根因未知，编译部署后完成实机回归，并核对 <真实宿主> 证据"
         wrapped = (
             "<codex_delegation>\n"
             "  <source_thread_id>01a021d3-7b61-7191-bda0-a6ea1c9dac39</source_thread_id>\n"
-            "  <input>修复 Android 未知重启，编译部署后完成实机回归，并核对 &lt;真实宿主&gt; 证据</input>\n"
+            "  <input>排查 Android 设备反复重启且根因未知，编译部署后完成实机回归，并核对 &lt;真实宿主&gt; 证据</input>\n"
             "</codex_delegation>"
         )
         result = self.run_hook(
@@ -581,10 +581,11 @@ class OrchestratorHookTests(unittest.TestCase):
             self.assertFalse(HOOK.resume_compaction_gate_misclassification_once(payload, bad))
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 25)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.44")
-        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "8")
-        self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 6)
+        self.assertEqual(HOOK.SCHEMA_VERSION, 26)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.45")
+        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "2")
+        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "9")
+        self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 7)
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
             "这次任务请用最高模型和最高推理强度",
@@ -602,7 +603,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn("policy state only", context)
         self.assertNotIn("override was applied", context)
 
-    def test_high_confidence_simple_is_local_and_child_origin_spawn_is_denied(self) -> None:
+    def test_high_confidence_simple_is_local_and_nested_lane_obeys_route_gate(self) -> None:
         session = "simple-local-zero"
         self.run_hook({
             "hook_event_name": "UserPromptSubmit", "session_id": session,
@@ -618,7 +619,22 @@ class OrchestratorHookTests(unittest.TestCase):
             "tool_name": "collaboration.spawn_agent",
             "tool_input": {"task_name": "nested", "message": "read only", "fork_turns": "1"},
         })
-        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        denied_output = json.loads(denied.stdout)["hookSpecificOutput"]
+        self.assertEqual(denied_output["permissionDecision"], "deny")
+        self.assertIn("delegation gate is closed", denied_output["permissionDecisionReason"])
+        self.assertNotIn("child-origin delegation", denied_output["permissionDecisionReason"])
+        mutating = self.run_hook({
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "child-mutation", "agent_id": "untrusted-child",
+            "tool_name": "collaboration.spawn_agent",
+            "tool_input": {
+                "task_name": "nested_write",
+                "message": "Implement and edit another file",
+                "fork_turns": "1",
+            },
+        })
+        mutation_reason = json.loads(mutating.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("read-only, non-overlapping lane", mutation_reason)
 
     def test_identity_preflight_is_zero_child_and_clears_stale_running_assessor(self) -> None:
         prompt = (
@@ -1004,8 +1020,8 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (25, "1.0.44"))
-        self.assertEqual(migrated["execution_profile_version"], "8")
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (26, "1.0.45"))
+        self.assertEqual(migrated["execution_profile_version"], "9")
         self.assertEqual(migrated["assessor_state"], "spawn_required")
         self.assertIsNone(migrated["assessor_failure_kind"])
         self.assertEqual(migrated["subagents"], [])
@@ -1099,7 +1115,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (25, "1.0.44", "8"),
+                    (26, "1.0.45", "9"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1145,7 +1161,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (25, "1.0.44", "5", "verification_required", 1),
+            (26, "1.0.45", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1202,7 +1218,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_bound_assessor_missing_terminal_status_accepts_only_an_exact_result(self) -> None:
         session = "assessor-status-missing"
-        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并编译验证"})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "排查 Android 反复崩溃且根因未知，并跨模块编译验证"})
         state = self.load_only_state()
         binding = state["assessor_binding_id"]
         request = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
@@ -1216,7 +1232,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
         invalid_data = Path(self.temporary.name) / "assessor-status-invalid-data"
         invalid_session = "assessor-status-invalid"
-        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": invalid_session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并编译验证"}, data=invalid_data)
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": invalid_session, "hook_run_id": "work", "prompt": "排查 Android 反复崩溃且根因未知，并跨模块编译验证"}, data=invalid_data)
         invalid = self.load_only_state(invalid_data)
         invalid_request = f"assessor_binding_id={invalid['assessor_binding_id']} objective_fingerprint={invalid['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
         self.run_hook({"hook_event_name": "PreToolUse", "session_id": invalid_session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": "high_assessor", "message": invalid_request, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}, data=invalid_data)
@@ -1232,7 +1248,7 @@ class OrchestratorHookTests(unittest.TestCase):
         ):
             case_data = Path(self.temporary.name) / f"assessor-status-{label}-data"
             case_session = f"assessor-status-{label}"
-            self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": case_session, "hook_run_id": "work", "prompt": "修复 Android 崩溃并编译验证"}, data=case_data)
+            self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": case_session, "hook_run_id": "work", "prompt": "排查 Android 反复崩溃且根因未知，并跨模块编译验证"}, data=case_data)
             case = self.load_only_state(case_data)
             case_binding = case["assessor_binding_id"]
             case_request = f"assessor_binding_id={case_binding} objective_fingerprint={case['objective']['fingerprint']} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
@@ -1520,6 +1536,13 @@ class OrchestratorHookTests(unittest.TestCase):
         ):
             with self.assertRaises(HOOK.PlanArtifactError):
                 HOOK.parse_execution_slice_manifest(invalid)
+
+    def test_execution_slice_manifest_accepts_six_and_rejects_seven(self) -> None:
+        parsed = HOOK.parse_execution_slice_manifest(self.execution_slices_block(6))
+        self.assertEqual(parsed["count"], 6)
+        self.assertEqual(parsed["items"][-1]["id"], "s06")
+        with self.assertRaises(HOOK.PlanArtifactError):
+            HOOK.parse_execution_slice_manifest(self.execution_slices_block(7))
 
     def test_host_digest_binds_terminal_status_and_markers_fail_closed(self) -> None:
         state = self.create_confirmed_executor_state("digest-status")
@@ -1967,7 +1990,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_opt_out_hard_confirmation_uses_structured_local_contract(self) -> None:
         session = "local-hard"
-        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "start", "prompt": "修复 Android 崩溃、编译部署实机验证，但不要使用任何子智能体"})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "start", "prompt": "排查 Android 反复崩溃且根因未知，跨模块编译部署实机验证，但不要使用任何子智能体"})
         state = self.load_only_state()
         self.assertEqual(state["assessor_failure_kind"], "delegation_opt_out")
         self.run_hook({"hook_event_name": "Stop", "session_id": session, "hook_run_id": "plan", "last_assistant_message": self.with_execution_slices("1. 定位根因\n2. 修改并编译\n验收：实机通过。") + "\n计划已就绪，等待确认后执行"})
@@ -3326,7 +3349,7 @@ class OrchestratorHookTests(unittest.TestCase):
         cases = {
             "生成日报": ("daily", "not_applicable"),
             "编写生成日报的单文件脚本": ("work", "simple"),
-            "编写含离线同步后台的日报 App": ("work", "hard"),
+            "编写含离线同步后台的日报 App": ("work", "simple"),
             "修正 README 一个错字并检查链接": ("work", "simple"),
             "Parser.java 增加空值判断并跑现有单测": ("work", "simple"),
             "按给定输入输出写单文件 CSV 转 JSON 脚本": ("work", "simple"),
@@ -3335,8 +3358,11 @@ class OrchestratorHookTests(unittest.TestCase):
             "实现跨 Settings/framework/SystemUI 的客户定制": ("work", "hard"),
             "从零开发含登录和离线同步的 App": ("work", "hard"),
             "数据库零停机迁移并提供回滚": ("work", "hard"),
-            "编译 Settings 并部署到唯一设备": ("work", "hard"),
-            "小改一下 framework 中导致重启的 bug": ("work", "hard"),
+            "编译 Settings 并部署到唯一设备": ("work", "simple"),
+            "小改一下 framework 中导致重启的 bug": ("work", "simple"),
+            "修复一个已知 Android 崩溃并跑单测": ("work", "simple"),
+            "修改三个模块并完成回归": ("work", "simple"),
+            "生产发布数据库迁移并提供回滚": ("work", "hard"),
             (
                 "WM_S03_HARD_ACCEPTANCE: This is a projectless engineering acceptance. "
                 "First create and verify slice1-note.md, then after real host compaction "
@@ -3361,7 +3387,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(route["task_domain"], "daily")
         context = HOOK.routing_context(route, {})
         self.assertIn("profile=current", context)
-        self.assertIn("advisory; no switch", context)
+        self.assertIn("no parent switch", context)
         self.assertNotIn("safety exemption", context.lower())
 
     def test_hard_work_requires_a_digest_bound_plan_and_strict_confirmation(self) -> None:
@@ -5546,18 +5572,21 @@ class OrchestratorHookTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 context = HOOK.routing_context(HOOK.classify_prompt(prompt), {"pressure": 0.70})
                 for marker in (
+                    "Domain:",
                     "Route:",
-                    "Order:",
-                    "Agents:",
-                    "Control:",
-                    "Update phase|done|next|blocker",
-                    "kickoff/change/~60s wait",
-                    "Preflight path/input/acceptance",
-                    "diagnose once",
-                    "retry after correction",
+                    "order=",
+                    "highest-available model",
+                    "resume the original execution",
                 ):
                     self.assertIn(marker, context)
-                self.assertLess(len(context), 560)
+                for redundant in (
+                    "kickoff/change/~60s wait",
+                    "Preflight path/input/acceptance",
+                    "Stage action budget",
+                    "pressure=",
+                ):
+                    self.assertNotIn(redundant, context)
+                self.assertLess(len(context), 430)
         self.assertIn("contract>evidence", context)
 
     def test_routing_context_distinguishes_subagent_cap_from_parent_lane(self) -> None:
@@ -5567,8 +5596,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(route["agent_mode"], "bounded_multi")
         self.assertEqual(route["recommended_agent_cap"], 2)
         context = HOOK.routing_context(route, {})
-        self.assertIn("subagent_cap=2 ceiling", context)
-        self.assertIn("efficiency audit", context)
+        self.assertIn("Agents: cap=2", context)
+        self.assertIn("independent positive-net lanes only", context)
         self.assertNotIn("max=1; parent counts", context)
 
     def test_pressure_boundaries_use_unrounded_ratio(self) -> None:
@@ -5593,7 +5622,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "transcript_path": str(exact),
             }
         )
-        self.assertIn("do not delegate for pressure alone", result.stdout)
+        self.assertEqual(result.stdout, "")
 
         below_high = self.token_transcript(69_999, 100_000)
         exact_high = self.token_transcript(70_000, 100_000)
@@ -5616,7 +5645,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "transcript_path": str(exact_high),
             }
         )
-        self.assertIn("gate=checkpoint+stop-broad", result.stdout)
+        self.assertNotIn("gate=checkpoint+stop-broad", result.stdout)
 
     def test_pressure_scales_output_limits_without_increasing_agent_cap(self) -> None:
         meta = {"output_chars": 13_000, "output_lines": 0, "visual_items": 0}
@@ -5635,7 +5664,7 @@ class OrchestratorHookTests(unittest.TestCase):
             self.assertEqual(route["recommended_agent_cap"], cap)
 
     def test_pressure_notices_rearm_after_compaction(self) -> None:
-        transcript = self.token_transcript(55_000, 100_000)
+        transcript = self.token_transcript(70_000, 100_000)
         base = {
             "session_id": "pressure-rearm",
             "transcript_path": str(transcript),
@@ -5645,11 +5674,11 @@ class OrchestratorHookTests(unittest.TestCase):
         first = self.run_hook(
             {"hook_event_name": "PreToolUse", "hook_run_id": "pressure-first", **base}
         )
-        self.assertIn("crossed 55%", first.stdout)
+        self.assertIn("crossed 70%", first.stdout)
         repeated = self.run_hook(
             {"hook_event_name": "PreToolUse", "hook_run_id": "pressure-repeat", **base}
         )
-        self.assertNotIn("crossed 55%", repeated.stdout)
+        self.assertNotIn("crossed 70%", repeated.stdout)
 
         compacted = self.run_hook(
             {
@@ -5664,7 +5693,7 @@ class OrchestratorHookTests(unittest.TestCase):
         rearmed = self.run_hook(
             {"hook_event_name": "PreToolUse", "hook_run_id": "pressure-rearmed", **base}
         )
-        self.assertIn("crossed 55%", rearmed.stdout)
+        self.assertIn("crossed 70%", rearmed.stdout)
 
     def test_zero_pressure_is_valid_telemetry(self) -> None:
         transcript = self.token_transcript(0, 100_000)
@@ -5854,7 +5883,7 @@ class OrchestratorHookTests(unittest.TestCase):
             )
         self.assertEqual(self.state_files(), [])
 
-    def test_change_epoch_throttles_identical_read_only_probes_and_allows_new_epoch(self) -> None:
+    def test_change_epoch_tracks_identical_read_only_probes_without_blocking(self) -> None:
         session = "change-epoch"
         search = {
             "hook_event_name": "PreToolUse", "session_id": session,
@@ -5863,8 +5892,11 @@ class OrchestratorHookTests(unittest.TestCase):
         }
         self.assertEqual(self.run_hook(search).stdout, "")
         self.run_hook({**search, "hook_event_name": "PostToolUse", "hook_run_id": "search-post", "tool_response": {"status": "ok", "exit_code": 0}})
-        denied = self.run_hook({**search, "hook_run_id": "search-2"})
-        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        repeated = self.run_hook({**search, "hook_run_id": "search-2"})
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(repeated.stdout or "{}").get("hookSpecificOutput", {}),
+        )
         changed = self.run_hook({
             "hook_event_name": "PostToolUse", "session_id": session,
             "hook_run_id": "change", "tool_name": "apply_patch",
@@ -5908,8 +5940,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         first = self.run_hook({**base, "hook_event_name": "PreToolUse", "hook_run_id": "pre-1"})
-        self.assertIn("Duplicate-success hint", first.stdout)
-        self.assertNotIn("pwd", first.stdout)
+        self.assertEqual(first.stdout, "")
         second = self.run_hook({**base, "hook_event_name": "PreToolUse", "hook_run_id": "pre-2"})
         self.assertEqual(second.stdout, "")
 
@@ -5924,10 +5955,11 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         check = self.run_hook({**failed, "hook_event_name": "PreToolUse", "hook_run_id": "pre-failed"})
         self.assertNotIn("Duplicate-success hint", check.stdout)
-        self.assertIn("Unchanged failure already exists", check.stdout)
+        self.assertIn("make one material correction", check.stdout)
+        self.assertIn("highest-available model", check.stdout)
 
 
-    def test_unchanged_failure_and_stage_budget_are_bounded(self) -> None:
+    def test_unchanged_failure_recovery_notice_is_bounded(self) -> None:
         session = "failure-budget"
         tool = {
             "session_id": session,
@@ -5947,7 +5979,7 @@ class OrchestratorHookTests(unittest.TestCase):
         retry = self.run_hook(
             {**tool, "hook_event_name": "PreToolUse", "hook_run_id": "retry-1"}
         )
-        self.assertIn("Unchanged failure already exists", retry.stdout)
+        self.assertIn("make one material correction", retry.stdout)
         repeated = self.run_hook(
             {**tool, "hook_event_name": "PreToolUse", "hook_run_id": "retry-2"}
         )
@@ -5958,13 +5990,74 @@ class OrchestratorHookTests(unittest.TestCase):
             1,
         )
 
-        synthetic = HOOK.new_state({"session_id": "synthetic"})
-        synthetic["operations"] = [
-            {"turn_id": "turn-budget", "category": "analysis"} for _ in range(25)
-        ]
+    def test_failure_recovery_corrects_once_then_requires_one_high_assessor(self) -> None:
+        session = "active-problem-recovery"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": "修复一个已知 Android 崩溃并跑单测",
+            }
+        )
+        initial = self.load_only_state()
+        self.assertEqual((initial["work_difficulty"], initial["assessor_state"]), ("simple", "simple_complete"))
+
+        first = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "turn_id": "turn-failure",
+                "hook_run_id": "first-failure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -m unittest tests.test_parser"},
+                "tool_response": {"exit_code": 1, "output": "first error"},
+            }
+        )
+        self.assertIn("make one material correction now", first.stdout)
+        after_first = self.load_only_state()
+        self.assertEqual(after_first["assessor_state"], "simple_complete")
         self.assertEqual(
-            HOOK.same_stage_action_count(synthetic, "turn-budget", "analysis"),
-            25,
+            sum(item["kind"] == "problem_correction" for item in after_first["guards"]),
+            1,
+        )
+
+        second = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "turn_id": "turn-failure",
+                "hook_run_id": "second-failure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -m unittest tests.test_parser.ParserRegression"},
+                "tool_response": {"exit_code": 1, "output": "second error"},
+            }
+        )
+        self.assertIn("highest-available Codex assessor", second.stdout)
+        self.assertIn("reasoning_effort=max", second.stdout)
+        escalated = self.load_only_state()
+        self.assertEqual((escalated["assessor_state"], escalated["model_profile"]), ("spawn_required", "work_assessment"))
+        self.assertRegex(escalated["assessor_binding_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(
+            sum(item["kind"] == "problem_escalation" for item in escalated["guards"]),
+            1,
+        )
+
+        third = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "turn_id": "turn-failure",
+                "hook_run_id": "third-failure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -m unittest tests.test_parser.Third"},
+                "tool_response": {"exit_code": 1, "output": "third error"},
+            }
+        )
+        self.assertEqual(third.stdout, "")
+        self.assertEqual(
+            sum(item["kind"] == "problem_escalation" for item in self.load_only_state()["guards"]),
+            1,
         )
 
     def test_pretool_enforces_subagent_gate_cap_and_request_bridge(self) -> None:
@@ -6086,14 +6179,15 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": audit_session,
                 "turn_id": "audit-turn",
                 "hook_run_id": "second-spawn",
+                "agent_id": "agent-1",
                 "tool_name": "Agent",
                 "tool_input": {"description": "second lane", "prompt": "Inspect another source lane"},
             },
             data=audit_data,
         )
         second_output = json.loads(second.stdout)["hookSpecificOutput"]
-        self.assertEqual(second_output["permissionDecision"], "deny")
-        self.assertIn("monotonic side-lane start budget", second_output["permissionDecisionReason"])
+        self.assertNotIn("permissionDecision", second_output)
+        self.assertIn("Delegation gate is audit", second_output["additionalContext"])
 
         over_cap = self.run_hook(
             {
@@ -6108,12 +6202,12 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         over_cap_output = json.loads(over_cap.stdout)["hookSpecificOutput"]
         self.assertEqual(over_cap_output["permissionDecision"], "deny")
-        self.assertIn("monotonic side-lane start budget", over_cap_output["permissionDecisionReason"])
+        self.assertIn("active=2, cap=2", over_cap_output["permissionDecisionReason"])
         final_state = self.load_only_state(audit_data)
         self.assertEqual(len([item for item in HOOK.active_agent_records(final_state) if item["role"] == "lane"]), 1)
         self.assertEqual(
             sum(item["event"] == "request" and item["role"] == "lane" for item in final_state["subagents"]),
-            1,
+            2,
         )
 
     def test_pretool_reaudits_newly_independent_owned_lane(self) -> None:
@@ -6227,7 +6321,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(blocked_output["permissionDecision"], "deny")
         self.assertIn("delegation gate is closed", blocked_output["permissionDecisionReason"])
 
-    def test_pretool_denies_mounted_git_and_unbounded_status(self) -> None:
+    def test_pretool_denies_mounted_git_but_allows_native_status(self) -> None:
         mounted = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -6252,7 +6346,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {"cmd": "git status --short"},
             }
         )
-        self.assertEqual(json.loads(broad.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(broad.stdout, "")
 
         nested = self.run_hook(
             {
@@ -6563,7 +6657,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 )
                 self.assertEqual(result.stdout, "")
 
-    def test_pretool_detects_chained_and_wrapped_risky_commands(self) -> None:
+    def test_pretool_allows_output_shape_commands_even_when_wrapped(self) -> None:
         device = "a" + "db"
         log_reader = "log" + "cat"
         recorder = "screen" + "record"
@@ -6589,12 +6683,45 @@ class OrchestratorHookTests(unittest.TestCase):
                         "tool_input": {"command": command},
                     }
                 )
-                self.assertEqual(
-                    json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"],
-                    "deny",
-                )
+                self.assertEqual(result.stdout, "")
 
-    def test_pretool_requires_budgets_for_build_logs_and_screenrecord(self) -> None:
+    def test_pretool_missing_state_fails_open_but_present_invalid_state_fails_closed(self) -> None:
+        missing = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "missing-state-open",
+                "hook_run_id": "missing-state-open",
+                "cwd": "/srv/repo",
+                "tool_name": "Bash",
+                "tool_input": {"command": "./gradlew assembleDebug"},
+            }
+        )
+        self.assertEqual(missing.stdout, "")
+
+        session = "invalid-state-closed"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "initialize-invalid-state",
+                "prompt": "修复未知根因并跨模块验证",
+            }
+        )
+        self.state_files()[0].write_text("{invalid", encoding="utf-8")
+        invalid = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "invalid-state-closed",
+                "cwd": "/srv/repo",
+                "tool_name": "Bash",
+                "tool_input": {"command": "./gradlew assembleDebug"},
+            }
+        )
+        self.assertIn("permissionDecision", invalid.stdout)
+        self.assertIn("invalid_state", invalid.stdout)
+
+    def test_pretool_observes_but_does_not_gate_output_shape(self) -> None:
         cases = (
             ("./gradlew assembleDebug", "build_output"),
             ("./gradlew assembleDebug --quiet", "build_output"),
@@ -6623,11 +6750,10 @@ class OrchestratorHookTests(unittest.TestCase):
                         "tool_input": {"command": command},
                     }
                 )
-                output = json.loads(result.stdout)
-                self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertEqual(result.stdout, "")
                 state_path = self.data / "sessions" / f"{HOOK.safe_id(session)}.json"
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                self.assertTrue(any(item["kind"] == marker for item in state["guards"]))
+                self.assertFalse(any(item["kind"] == marker for item in state["guards"]))
 
         self.run_hook(
             {
@@ -6647,9 +6773,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {"command": "./gradlew assembleDebug", "max_output_tokens": 2000},
             }
         )
-        capped_output = json.loads(capped_build.stdout)
-        self.assertEqual(capped_output["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIn("recoverable full log", capped_output["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(capped_build.stdout, "")
 
         masked_status_commands = (
             "./gradlew assembleDebug > /tmp/build.log 2>&1 || true",
@@ -6697,9 +6821,7 @@ class OrchestratorHookTests(unittest.TestCase):
                         "tool_input": {"command": command},
                     }
                 )
-                denied = json.loads(result.stdout)["hookSpecificOutput"]
-                self.assertEqual(denied["permissionDecision"], "deny")
-                self.assertIn("real exit code", denied["permissionDecisionReason"])
+                self.assertEqual(result.stdout, "")
 
         bounded_commands = (
             "./gradlew assembleDebug > /tmp/build.log 2>&1",
@@ -6754,14 +6876,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_response": response,
             }
         )
-        output = json.loads(result.stdout)
-        self.assertTrue(output["continue"])
-        self.assertNotIn("decision", output)
-        context = output["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("preserved the original", context)
-        self.assertIn("Correctness and evidence completeness take priority", context)
-        self.assertNotIn(secret, result.stdout)
-        self.assertLess(len(result.stdout), 4000)
+        self.assertIn("make one material correction now", result.stdout)
+        self.assertNotIn("large output", result.stdout.lower())
         state_text = self.state_files()[0].read_text(encoding="utf-8")
         self.assertNotIn(secret, state_text)
         state = json.loads(state_text)
@@ -6800,13 +6916,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_response": {"exit_code": 0, "output": "line\n" * 320},
             }
         )
-        output = json.loads(result.stdout)
-        self.assertTrue(output["continue"])
-        self.assertNotIn("decision", output)
-        context = output["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("preserved the original", context)
-        self.assertIn("Use the current result", context)
-        self.assertIn("obtain more exact evidence", context)
+        self.assertEqual(result.stdout, "")
 
     def test_posttool_preserves_excess_visual_items_under_pressure(self) -> None:
         transcript = self.token_transcript(70_000, 100_000)
@@ -6824,9 +6934,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 },
             }
         )
-        output = json.loads(result.stdout)
-        self.assertTrue(output["continue"])
-        self.assertNotIn("decision", output)
+        self.assertEqual(result.stdout, "")
         operation = self.load_only_state()["operations"][-1]
         self.assertEqual(operation["visual_items"], 4)
         self.assertTrue(operation["oversized"])

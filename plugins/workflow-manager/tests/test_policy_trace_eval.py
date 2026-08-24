@@ -908,12 +908,7 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                     },
                 )
                 same_state = self._load_hook_state(session)
-                self.assertEqual(len(same_state["duplicate_notices"]), 1)
-                same_fingerprint = HOOK.tool_fingerprint(tool)[0]
-                self.assertEqual(
-                    [item["fingerprint"] for item in same_state["duplicate_notices"]],
-                    [same_fingerprint],
-                )
+                self.assertEqual(same_state["duplicate_notices"], [])
 
                 changed = {
                     **tool,
@@ -930,13 +925,8 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                     },
                 )
                 changed_state = self._load_hook_state(session)
-                self.assertEqual(len(changed_state["duplicate_notices"]), 1)
+                self.assertEqual(changed_state["duplicate_notices"], [])
                 self.assertEqual(len(changed_state["operations"]), 1)
-                changed_fingerprint = HOOK.tool_fingerprint(changed)[0]
-                self.assertNotIn(
-                    changed_fingerprint,
-                    {item["fingerprint"] for item in changed_state["duplicate_notices"]},
-                )
 class FrozenV1043TraceTests(unittest.TestCase):
     def test_frozen_trace_measures_reduction_without_claiming_real_tokens(self) -> None:
         fixture = json.loads(

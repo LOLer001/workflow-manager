@@ -1,0 +1,42 @@
+{
+  "fixture_version": 1,
+  "task": "unknown rendering divergence across two modules, one failed correction, compaction, resume, and acceptance verification",
+  "classification": "hard",
+  "events": [
+    {"id": "objective", "v1044": "Workflow Manager route: Work objective detected. Run bounded identity, routing, pressure and delegation preflight before proceeding.", "optimized": "Workflow Manager: Hard (unknown cause + cross-scope); one assessor at max."},
+    {"id": "read", "v1044": "Delegation audit: current lane, readiness, dependency, side-lane budget and agent cap remain under evaluation.", "optimized": ""},
+    {"id": "search", "v1044": "Exact read/search probe recorded for this change epoch. Repeating it before a material change is denied.", "optimized": ""},
+    {"id": "plan", "v1044": "Canonical Hard plan requires a 3-5 slice manifest, private journal persistence, projection binding and strict confirmation.", "optimized": "Canonical Hard plan ready: 2 acceptance slices; confirmation required."},
+    {"id": "confirm", "v1044": "Strict confirmation accepted. Recompute contract, current slice token, lower-tier executor profile and side-lane lifetime budget.", "optimized": ""},
+    {"id": "large_output", "v1044": "Large tool output detected. Keep the original result, narrow subsequent reads, preserve a checkpoint and avoid repeating broad output.", "optimized": ""},
+    {"id": "duplicate_success", "v1044": "An unchanged successful operation was detected and recorded as a duplicate notice; do not replay it in this epoch.", "optimized": ""},
+    {"id": "pressure55", "v1044": "Context pressure reached 55 percent. Reduce side lanes, narrow output, preserve required evidence and prepare a checkpoint.", "optimized": ""},
+    {"id": "stage_budget", "v1044": "Stage action budget is nearing its limit. Stop broad actions, preserve the first error and split work before further attempts.", "optimized": ""},
+    {"id": "first_failure", "v1044": "Execution failure recorded. Enter recovery_required and wait for a bounded correction path before resuming the slice.", "optimized": "First failure: preserve it, make one material correction now, then resume."},
+    {"id": "failed_correction", "v1044": "Recovery failed. Re-evaluate routing, stall evidence, assessor reuse, attempt budget and whether a fresh execution generation is required.", "optimized": "Correction failed: one highest-available assessor at max; return the minimal fix to the owner."},
+    {"id": "compact", "v1044": "PreCompact pressure checkpoint: save route, budgets, agents, plan, operations, retry ledger, evidence and stage counters.", "optimized": "Checkpoint once; resume from native summary and canonical plan."},
+    {"id": "resume", "v1044": "SessionStart resume: reload writer, schema, profile, stable Skill, plugin root, route, pressure and all continuity ledgers.", "optimized": ""},
+    {"id": "verify", "v1044": "Parent verification requires current-slice evidence, host-generated review binding and exact final review marker.", "optimized": ""},
+    {"id": "report", "v1044": "Execution complete. Preserve terminal groups, duplicate notices, stage budgets, context-pressure state and sealed evidence.", "optimized": ""}
+  ],
+  "arms": {
+    "no_workflow_manager": {
+      "workflow_confirmations": 0,
+      "child_starts": 0,
+      "tool_attempts": 17,
+      "correctness_evidence": ["diagnosis", "scoped_change", "unit_tests", "integration_test", "visual_acceptance", "rollback_note"]
+    },
+    "v1.0.44": {
+      "workflow_confirmations": 1,
+      "child_starts": 4,
+      "tool_attempts": 20,
+      "correctness_evidence": ["diagnosis", "scoped_change", "unit_tests", "integration_test", "visual_acceptance", "rollback_note"]
+    },
+    "optimized": {
+      "workflow_confirmations": 1,
+      "child_starts": 3,
+      "tool_attempts": 17,
+      "correctness_evidence": ["diagnosis", "scoped_change", "unit_tests", "integration_test", "visual_acceptance", "rollback_note"]
+    }
+  }
+}

@@ -202,7 +202,7 @@ class WindowsHookTests(unittest.TestCase):
 
     def test_hook_stdout_is_ascii_safe_for_non_utf8_windows_code_pages(self) -> None:
         source = (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(encoding="utf-8")
-        for function in ("emit_pretool_deny", "emit_posttool_advisory", "emit_context"):
+        for function in ("emit_pretool_deny", "emit_context"):
             start = source.index(f"def {function}")
             end = source.find("\ndef ", start + 4)
             body = source[start : end if end >= 0 else None]
@@ -538,12 +538,8 @@ class WindowsHookTests(unittest.TestCase):
             }
         )
         self.assertEqual(compacted.returncode, 0, compacted.stderr)
-        preserved_output = json.loads(compacted.stdout)
-        self.assertTrue(preserved_output["continue"])
-        self.assertNotIn("decision", preserved_output)
-        context = preserved_output["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("preserved the original", context)
-        self.assertIn("Correctness and evidence completeness take priority", context)
+        self.assertIn("make one material correction now", compacted.stdout)
+        self.assertNotIn("large output", compacted.stdout.lower())
         state_files = list((self.data / "sessions").glob("*.json"))
         states = [json.loads(path.read_text(encoding="utf-8")) for path in state_files]
         operations = [item for state in states for item in state.get("operations", [])]

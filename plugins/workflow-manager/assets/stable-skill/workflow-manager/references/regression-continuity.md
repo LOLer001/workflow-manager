@@ -56,6 +56,6 @@ For `uncertain`, report the missing evidence and next read-only check. Do not we
 
 ## Resume and migration
 
-Schema 25 preserves the execution baseline, host-normalized review binding, slice manifest/progress chain, causal-review IDs, state, outcome, canonical path, and digests across compaction. Resume non-plan continuity from the native summary, but verify and reread the canonical current revision for plan semantics; do not reconstruct raw feedback or plan/slice text. If the objective, journal, manifest, accepted-prefix, baseline, review, files, inputs, environment, device, or verification freshness changed, take one bounded check and rebind or replan.
+Schema 26 preserves the execution baseline, host-normalized review binding, slice manifest/progress chain, causal-review IDs, state, outcome, canonical path, and digests across compaction. Resume non-plan continuity from the native summary, but verify and reread the canonical current revision for plan semantics; do not reconstruct raw feedback or plan/slice text. If the objective, journal, manifest, accepted-prefix, baseline, review, files, inputs, environment, device, or verification freshness changed, take one bounded check and rebind or replan.
 
 Legacy migration derives only a baseline supported by the existing contract and recorded-operation fingerprints. Mark acceptance incomplete and causality unset unless native evidence proves otherwise; migration must never invent user acceptance, a regression, a plan body, or a causal conclusion.

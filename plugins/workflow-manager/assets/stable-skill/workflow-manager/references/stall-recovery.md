@@ -4,7 +4,9 @@ Use this reference only after a confirmed Hard plan has one live bound slice exe
 
 ## Trigger on strong evidence, not every error
 
-An ordinary first implementation, build, deploy, or verification failure keeps the existing typed lower-profile recovery path. Do not spend a high-tier turn on a routine compiler error that the executor can correct locally.
+An ordinary first implementation, build, deploy, or verification failure gets one immediate material correction in the existing execution path. Do not stop or ask the user to operate merely because that first attempt failed.
+
+If the root cause is unknown, risk is critical, or the material correction fails, immediately use the one bound high-tier diagnosis below and then resume. A recoverable host/tool/path/result mismatch is a diagnosis target, not a blocker. Stop only when the remaining condition is external and still unrecoverable after the bounded diagnosis and alternate route.
 
 Escalate only when the live bound executor has a current typed failure, cannot make progress within the confirmed contract, stops mutation, and ends with exactly one independent line:
 

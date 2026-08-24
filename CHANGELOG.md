@@ -1,5 +1,15 @@
 # 更新记录
 
+## 1.0.45
+
+- Schema 升至 26、writer/manifest 升至 1.0.45、execution profile 升至 v9、stable-skill schema 升至 7、difficulty classifier 升至 v2；旧 1.0.44 状态按来源 Schema 保留严格 transcript/host evidence 迁移边界。
+- 提高 Hard 门槛：只有单个关键风险，或至少两个独立强信号组且包含诊断、范围、连续性之一才进入困难计划；设备、构建、三阶段、共享资源或含糊文字不再单独触发 assessor。
+- 将硬门禁收敛为授权相关边界：未确认 Hard 写入、错执行者/错切片、挂载树 Git 与破坏性/外发操作。大输出、重复只读、阶段计数、55% 压力提示和常规命令形态只保留遥测，不再打断解决过程。
+- 首个普通失败要求原路线立即做一次实质修正；未知根因、关键风险或修正仍失败时，主动请求最高可用模型与 `max` 做一次绑定诊断，然后继续最小修正，只有真实外部阻塞才停止。
+- 路由上下文改为事件驱动，只在目标、路由、授权或恢复边界变化时注入；移除重复成功、阶段预算、55% 压力和大输出 `additionalContext`。稳定 Skill 缩为薄的连续性与授权层，不复述新模型原生的编码、进度、工具及通用多智能体规则。
+- 困难计划切片上限降至 6，正常为 1–3；并行容量按当前 active/reserved 通道计算，终态后可复用，允许明确只读且不重叠的 child lane，仍拒绝 child-origin mutation。
+- 增加 AndroidNativeDemo 历史任务的匿名额度审计与同题三臂 A/B 模拟；直接 Workflow Manager 上下文开销必须相对 1.0.44 基线显著下降，且正确性证据和强验收不降低。真实 token 无法从累计计数中可靠归因时明确报告边界。
+
 ## 1.0.44
 
 - Schema 升至 25、writer/manifest 升至 1.0.44、execution profile 升至 v8、stable-skill schema 升至 6；迁移保留已封存 host evidence 与父审候选，但 v7 的 pending/running 状态绝不获得 v8 写入权。

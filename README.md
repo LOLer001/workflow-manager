@@ -6,17 +6,17 @@
 
 - 正确性与必要推理、证据、纠错和验收验证始终高于 token 或上下文节省。
 - 先判断日常问题或工作问题：聊天、天气、日报、电脑清理等日常请求保持当前会话设置；设备定制、设备 Bug、App/代码开发、构建部署、工程诊断，以及明确创建并验证文件产物的工程验收合同进入工作评估。
-- 高置信 Simple Work 保持本地、真实 child Start=0；其余新 Work 目标显式创建一个最高可用模型的绑定评估子智能体。默认计划推理强度为第二高档 `max`（`ultra > max > xhigh > high > medium > low`），仅显式“本会话全程最高”改为 `ultra`。PreTool 仅接受完整证明请求；Start 的 active model/effort 回显只作为观测证据，缺失不伪造证明。
+- 高置信 Simple/Focused Work 保持本地、真实 child Start=0。只有命中单个关键风险，或至少两个独立强信号组且其中包含诊断、范围、连续性之一，才认定 Hard；设备、构建、三阶段、共享资源或文字含糊本身都不构成 Hard。Hard 评估默认请求最高可用模型与 `max`，仅显式“本会话全程最高”改为 `ultra`。
 - 同时明确声明“身份/激活预检、禁用 tool、禁用 child”的宿主本地探针固定为 Daily/direct、child Start=0；即使探针文字提到 Work/Hard 或 Workflow Manager，也不得升级为工程评估。若它替换了一个被中断且仍显示 running 的错误预检，状态会留下归一化 guard 后清除陈旧绑定。
 - `identity_evidence.plugin_root_fingerprint` 是当前处理事件的 Hook 身份，而不是历史会话属性；每个成功持久化的当前事件都会用实际 `PLUGIN_ROOT` 刷新它，cachebuster/reload 后不得继续回显旧缓存。
 - 简单工作问题由评估档直接解决和验证，不额外增加计划确认轮次。
 - 困难工作问题先只读取证据，再给出包含模块、文件、方法、改动、构建部署、验收、风险和回退的详细计划；只有用户严格确认当前计划后才开始写入、构建或部署。
 - 详细困难计划只有在成功追加到插件私有 `plans/<session-token>/hard-plan.md` 后才能进入待确认；同一会话的每次完整修订都追加到这个固定 canonical Markdown，当前受信修订定义计划内容。
-- 每个新版困难计划修订末尾都带唯一 `workflow-manager-execution-slices` JSON manifest；1 到 8 个连续 `sNN` 切片分别绑定范围、验收、回退、停止条件与产物，正常为 3–5 个，逐片串行执行和父级验收，防止低档模型在超大计划中漏掉强门禁。
+- 每个新版困难计划修订末尾都带唯一 `workflow-manager-execution-slices` JSON manifest；1 到 6 个连续 `sNN` 切片分别绑定范围、验收、回退、停止条件与产物，正常为 1–3 个，只在真实依赖或风险边界需要时拆分。
 - canonical Markdown 本身绝不确认计划或授权执行；状态中的目标/难度/代次及修订与全文摘要负责验证和授权绑定，外部改动会立即使计划与执行合同失效。
 - 严格确认后，父会话继续以高推理负责协调和复核；从宿主当时实际暴露的选项中选择最新的较低档 Codex 模型，创建唯一合同执行子智能体并固定 `reasoning_effort=medium`，不硬编码具体模型名。
 - Hook 不能切换父会话模型；PreTool 只记录 `requested`，PostToolUse 成功/失败独立记录 `host_accepted`，Start 再记录 `full|partial|absent|mismatch`。bound child 只有 host accepted 且 Start 完整匹配才可运行；Start `model` 只取官方 Hook payload，effort 只取同一 turn 的宿主 transcript context，绝不从请求值或 child 自报补造。
-- `execution_contract_id` 同时绑定目标、难度决策、计划代次和计划摘要；失败按类型记录，初次失败后最多允许一次有实质修正的恢复，禁止原样重试。
+- `execution_contract_id` 同时绑定目标、难度决策、计划代次和计划摘要。首个普通失败要求原执行者立即做一次实质修正并继续；根因未知、风险关键或修正仍失败时，主动调用最高可用模型与 `max` 做一次绑定诊断，再把最小修正交回原执行路线。只有真实外部阻塞才停止。
 - 当前切片执行者的严格末行 `EXECUTION_RESULT execution_contract_id=<32hex> slice_id=sNN outcome=succeeded|failed` 只进入候选态；父会话必须独立验收并以严格末行 `EXECUTION_REVIEW execution_contract_id=<32hex> slice_id=sNN outcome=passed|failed` 才能推进。两种 marker 都不再由模型自报 evidence digest；Hook 从合同、切片、尝试与完整结果生成并规范化证据。每片最多一次 fresh v2，只有最后一片通过才封存全局成功。
 - 已确认计划执行后封存不含原文的改动/验证基线；同一会话验收发现新问题时，先结合前目标、计划、合同和证据做只读因果复核，再决定重规划、重分类或继续取证。
 - 新增约束、范围或目标会使待确认计划失效并要求重新规划；日常/工作与简单/困难分类都不改变删除、覆盖、安装、外发等安全边界。
@@ -30,7 +30,8 @@
 - 跨任务协调只在 fresh `list_threads` 同时证明当前任务与目标任务同宿主、不同任务且均为 active，并且当前证据确认双方争用同一资源的冲突阶段时发送一次；idle、`notLoaded`、已完成、异资源或兼容阶段不通知，普通跨任务消息不受影响。
 - 已确认困难计划的绑定执行者真正卡住时，普通首个失败仍由原档修正；只有执行者停止变更并提交精确 stall 证据，才复用原最高档评估者做一次只读诊断。合同内修正恢复卡顿前的执行档，扩大范围则重新规划并严格确认，失败或再次卡顿不会循环升档。
 - 子智能体结果返回后，父会话只在宿主仍把该精确代理显示为 running 时停止它；状态按完整生命周期折叠，所有 pending/live/当前绑定代理始终保留，终态历史超过 10 个时只裁最旧完整终态组。Hook 不会伪装成能删除宿主任务或侧边栏历史。
-- 在上下文压力升高时只收窄冗余展示并提前保存检查点；必要调查继续进行。
+- 插件只保留四类有授权意义的硬门禁：未确认的 Hard 写入、错执行者/错切片、挂载树 Git 与破坏性/外发边界。大输出、重复只读、阶段动作计数和常规上下文压力只作遥测，不拦截正常解决问题。
+- 路由上下文只在新目标、路由改变、授权变化或恢复边界出现时注入；不重复输出压力、阶段预算、重复成功和通用工作建议。
 - 压缩后由原生摘要续接非计划状态、由 canonical Markdown 重读当前困难计划，并复用仍然有效的验证结果，不从头重复。
 
 ## 30 秒安装
@@ -46,14 +47,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.44\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.45\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.44/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.45/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -64,7 +65,7 @@ codex plugin list --json
 
 同步成功时会输出 `"status": "installed"`、`"updated"` 或 `"current"`，目标固定为 `$CODEX_HOME/skills/workflow-manager`。随后重启 Codex 并新建会话，以重新加载 Skills 目录。Hook 会在 `SessionStart` 自动补建或更新稳定副本，但显式同步可以保证安装后的第一条新任务就能发现它。若稳定目录已存在但不带 Workflow Manager 受管标记，安装器会拒绝覆盖。
 
-当无版本稳定 Skill 已验证能覆盖新任务和恢复任务时，1.0.44 会清理严格更旧、确认为 Workflow Manager 自有且不再需要的版本缓存与 bytecode；更高版本、非版本目录、符号链接及无法证明安全的条目一律保留并报告。插件不会直接改写 Codex 的 rollout JSONL、SQLite、索引或活动任务文件；旧任务的 sealed host evidence 按迁移边界保留，而不是伪造成 v8 执行。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
+当无版本稳定 Skill 已验证能覆盖新任务和恢复任务时，1.0.45 会清理严格更旧、确认为 Workflow Manager 自有且不再需要的版本缓存与 bytecode；更高版本、非版本目录、符号链接及无法证明安全的条目一律保留并报告。插件不会直接改写 Codex 的 rollout JSONL、SQLite、索引或活动任务文件；旧任务的 sealed host evidence 按迁移边界保留，而不是伪造成 v9 执行。若团队策略限制 GitHub 市场，请先让管理员允许该仓库来源。
 
 ## Hook 命令信任
 
@@ -74,14 +75,14 @@ codex plugin list --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.44\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.45\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.44/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.45/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
 ```
 
 `hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
@@ -122,7 +123,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.44 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.45 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -146,7 +147,7 @@ Codex Multi-Agent V2 可能在本地 `PreToolUse` 前加密 collaboration `messa
 
 私有 canonical 日志只接受 Hook 清理并绑定的完整计划修订。单次修订最多 `983040` 字节、整个 `hard-plan.md` 最多 `10485760` 字节，恰好达到上限允许写入；超出时分别以 `revision_too_large` 或 `journal_full` 类型化拒绝，文件逐字节不变且代次不增加。查看计划详情、重规划、压缩恢复和执行者都必须重读当前受信修订；任何外部改动、路径身份异常或摘要漂移都会进入 `invalidated`/`stale_contract`，不能靠编辑 Markdown 获得权限。
 
-日志与状态采用 `marker → journal → state → cleanup` 两阶段事务。崩溃恢复只接受旧日志/旧状态或新日志/新状态；其他组合 fail-closed，保留诊断标记。Schema 19 最多迁移 6 个严格可验证的旧镜像，只有 canonical 日志和当前 Schema 25 状态共同提交后才清理旧文件；缺失、漂移、不可解析或超量迁移都不会臆造计划正文或切片 manifest。
+日志与状态采用 `marker → journal → state → cleanup` 两阶段事务。崩溃恢复只接受旧日志/旧状态或新日志/新状态；其他组合 fail-closed，保留诊断标记。Schema 19 最多迁移 6 个严格可验证的旧镜像，只有 canonical 日志和当前 Schema 26 状态共同提交后才清理旧文件；缺失、漂移、不可解析或超量迁移都不会臆造计划正文或切片 manifest。
 
 插件会读取 Codex 生命周期事件来判断路由、输出规模和续接状态；持久化数据只保留摘要、指纹、验收待办状态和计数，不保存原始提示词、命令或子智能体结果。大工具结果会保留给模型正常推理，插件只提示后续查询如何收窄，不会仅因为输出较大而替换必要证据。钩子属于工作流护栏，不是安全边界。子智能体可能减少主会话噪声，但不保证降低总 token 消耗。
 
@@ -154,7 +155,7 @@ Codex Multi-Agent V2 可能在本地 `PreToolUse` 前加密 collaboration `messa
 
 全局执行合同由 profile、目标指纹、难度决策 ID、正数计划代次、canonical 相对路径、当前修订/全文摘要和 slice manifest 摘要共同生成；当前 slice token 还绑定切片内容、顺序和已验收前缀。该相对路径只是在插件数据根内定位的合同元数据，绝不能按 `cwd` 或 workspace 解析。匹配的 executor `SubagentStart` 必须先验证 journal/manifest，再由 Hook 私下交付全局约束和 exact current slice；读取失败、摘要漂移、错误 token 或跳片都不会进入 running。每片初次失败后仅在实质修正对应原因时允许一个 fresh v2，总尝试最多两次；第二次失败或没有修正时停止并交回父会话，禁止 follow-up 复活 terminal executor 或换一种命令写法原样重试。
 
-升级边界不会把旧结果伪装成新协议：Schema 23 已有 passed baseline 的 sealed v6 成功保留原 profile/contract；v6 `verification_required` 候选只能延续一次只读父审，旧 marker 中的 32 位 digest 只作兼容语法并由 Hook 忽略后重新规范化。其他缺少合法 manifest 的活动 v6 状态 fail-closed，`spawn_pending`/`running` 不获得 v8 写权，必须向同一个 Markdown 追加完整 manifest 修订、重新严格确认并生成新合同；失败复核不能重置为两次新恢复。
+升级边界不会把旧结果伪装成新协议：Schema 23 已有 passed baseline 的 sealed v6 成功保留原 profile/contract；v6 `verification_required` 候选只能延续一次只读父审，旧 marker 中的 32 位 digest 只作兼容语法并由 Hook 忽略后重新规范化。其他缺少合法 manifest 的活动 v6 状态 fail-closed，`spawn_pending`/`running` 不获得 v9 写权，必须向同一个 Markdown 追加完整 manifest 修订、重新严格确认并生成新合同；失败复核不能重置为两次新恢复。
 
 所有切片都经父会话独立验收后，系统才封存上一次目标、计划、合同、切片完成链、改动和验证的有界指纹基线。用户在同一会话验收发现遗留、复现或新症状时，表述只会触发只读复核，不会直接被当作因果证据。`introduced` 或 `fix_ineffective` 会要求整体重规划和再次确认，`unrelated` 会脱离旧合同重新分类，`uncertain` 会保持只读并继续取得缺失证据。
 
