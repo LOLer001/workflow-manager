@@ -18,6 +18,7 @@ from unittest.mock import patch
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PLUGIN_ROOT / "scripts" / "orchestrator_hook.py"
 SCENARIO_DIR = Path(__file__).with_name("scenarios")
+FIXTURE_DIR = Path(__file__).with_name("fixtures")
 
 SPEC = importlib.util.spec_from_file_location("orchestrator_hook_trace_eval", SCRIPT)
 assert SPEC and SPEC.loader
@@ -52,6 +53,19 @@ PRODUCTION_ROUTE_FIELDS = {
 
 class TraceEvaluationError(AssertionError):
     pass
+
+
+def trace_measurements(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Measure the frozen compatibility trace without hard-coded percentages."""
+    starts = [event for event in events if event.get("kind") == "child_start"]
+    return {
+        "child_starts": len(starts),
+        "additional_context_utf8_bytes": sum(
+            len(str(event.get("additional_context") or "").encode("utf-8"))
+            for event in events
+            if "additional_context" in event
+        ),
+    }
 
 
 def stable_fingerprint(value: Any) -> str:
@@ -689,8 +703,12 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                 assessor_state = self._load_hook_state(session)
                 binding = assessor_state["assessor_binding_id"]
                 assessor_message = f"assessor_binding_id={binding} objective_fingerprint={objective} profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
-                self._capture_hook(HOOK.pre_tool_use, {"hook_event_name": "PreToolUse", "session_id": session, "turn_id": "turn-1", "hook_run_id": "assessor-request", "tool_name": "Agent", "tool_input": {"description": "high_assessor", "prompt": assessor_message, "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none"}})
-                self._capture_hook(HOOK.subagent_start, {"hook_event_name": "SubagentStart", "session_id": session, "turn_id": "turn-1", "hook_run_id": "assessor-start", "agent_id": "high-assessor", "model": "gpt-5.6-sol"})
+                assessor_spawn = {"session_id": session, "turn_id": "turn-1", "tool_name": "Agent", "tool_input": {"description": "high_assessor", "prompt": assessor_message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+                self._capture_hook(HOOK.pre_tool_use, {"hook_event_name": "PreToolUse", "hook_run_id": "assessor-request", **assessor_spawn})
+                self._capture_hook(HOOK.post_tool_use, {"hook_event_name": "PostToolUse", "hook_run_id": "assessor-post", "tool_response": {"status": "ok"}, **assessor_spawn})
+                transcript = Path(data) / "turn-context.jsonl"
+                transcript.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-sol", "effort": "max"}}) + "\n", encoding="utf-8")
+                self._capture_hook(HOOK.subagent_start, {"hook_event_name": "SubagentStart", "session_id": session, "turn_id": "turn-1", "hook_run_id": "assessor-start", "agent_id": "high-assessor", "model": "gpt-5.6-sol", "transcript_path": str(transcript)})
                 approved_output = self._capture_hook(
                     HOOK.pre_tool_use,
                     {
@@ -919,7 +937,26 @@ class PolicyTraceEvaluationTests(unittest.TestCase):
                     changed_fingerprint,
                     {item["fingerprint"] for item in changed_state["duplicate_notices"]},
                 )
-
+class FrozenV1043TraceTests(unittest.TestCase):
+    def test_frozen_trace_measures_reduction_without_claiming_real_tokens(self) -> None:
+        fixture = json.loads(
+            (FIXTURE_DIR / "v1043_frozen_trace.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(fixture["writer_version"], "1.0.43")
+        self.assertEqual(
+            fixture["initial_hook_sha256"],
+            "09dedf65175b618cdf254f4b696210908b8c04695b26e9829a5057acd24e811d",
+        )
+        old = trace_measurements(fixture["old_events"])
+        new = trace_measurements(fixture["new_events"])
+        self.assertLessEqual(new["child_starts"], old["child_starts"] * 0.40)
+        self.assertLessEqual(
+            new["additional_context_utf8_bytes"],
+            old["additional_context_utf8_bytes"] * 0.50,
+        )
+        self.assertEqual(old["child_starts"], 8)
+        self.assertEqual(new["child_starts"], 3)
+        self.assertEqual((old["child_starts"] - new["child_starts"]) / old["child_starts"], 0.625)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+{
+  "fixture_version": 1,
+  "writer_version": "1.0.43",
+  "initial_hook_sha256": "09dedf65175b618cdf254f4b696210908b8c04695b26e9829a5057acd24e811d",
+  "boundary": "Frozen compatibility trace: source cache was unavailable; it records observable event inputs only, not real token usage.",
+  "old_events": [
+    {"kind": "child_start", "case": "simple-1", "role": "assessor", "additional_context": "assess Simple; solve and verify; objective=fix typo A"},
+    {"kind": "same_agent_followup", "case": "simple-1", "role": "assessor", "additional_context": "continue same Simple execution and verification; objective=fix typo A"},
+    {"kind": "child_start", "case": "simple-2", "role": "assessor", "additional_context": "assess Simple; solve and verify; objective=fix typo B"},
+    {"kind": "same_agent_followup", "case": "simple-2", "role": "assessor", "additional_context": "continue same Simple execution and verification; objective=fix typo B"},
+    {"kind": "child_start", "case": "simple-3", "role": "assessor", "additional_context": "assess Simple; solve and verify; objective=fix typo C"},
+    {"kind": "same_agent_followup", "case": "simple-3", "role": "assessor", "additional_context": "continue same Simple execution and verification; objective=fix typo C"},
+    {"kind": "child_start", "case": "simple-4", "role": "assessor", "additional_context": "assess Simple; solve and verify; objective=fix typo D"},
+    {"kind": "same_agent_followup", "case": "simple-4", "role": "assessor", "additional_context": "continue same Simple execution and verification; objective=fix typo D"},
+    {"kind": "child_start", "case": "simple-5", "role": "assessor", "additional_context": "assess Simple; solve and verify; objective=fix typo E"},
+    {"kind": "same_agent_followup", "case": "simple-5", "role": "assessor", "additional_context": "continue same Simple execution and verification; objective=fix typo E"},
+    {"kind": "child_start", "case": "hard", "role": "assessor", "additional_context": "full canonical hard plan: investigate; implement; build; deploy; verify; slice s01"},
+    {"kind": "child_start", "case": "hard", "role": "executor", "profile": "lower-tier/medium", "additional_context": "full canonical hard plan: investigate; implement; build; deploy; verify; slice s01"},
+    {"kind": "child_start", "case": "hard", "role": "executor", "profile": "lower-tier/medium", "additional_context": "full canonical hard plan: investigate; implement; build; deploy; verify; slice s02"}
+  ],
+  "new_events": [
+    {"kind": "child_start", "case": "hard", "role": "assessor", "profile": "max", "additional_context": "global constraints; current slice s01; cursor delta"},
+    {"kind": "child_start", "case": "hard", "role": "executor", "profile": "lower-tier/medium", "additional_context": "global constraints; current slice s02; cursor delta"},
+    {"kind": "child_start", "case": "hard", "role": "executor", "profile": "lower-tier/medium", "additional_context": "global constraints; current slice s03; cursor delta"}
+  ]
+}

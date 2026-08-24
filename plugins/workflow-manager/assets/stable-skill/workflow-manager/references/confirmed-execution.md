@@ -5,25 +5,25 @@ Read this reference after a Hard plan is strictly confirmed. It extends the sing
 ## Roles and runtime truth
 
 - Keep the parent conversation on its high-reasoning coordination and review role. It owns contract integrity, dependency ordering, shared-resource scheduling, progress synthesis, failure decisions, and final acceptance. It must not perform the executor's mutations itself.
-- Use exactly one child as the confirmed plan's contract executor. Other agents are not co-executors: during confirmed execution they may only run genuinely independent read-only investigation or review within the existing Direct/Focused/Complex/Extensive caps.
+- Use at most one live contract executor. A multi-slice plan runs one bound slice child at a time; a passed parent review closes that slice before the next child can start. Other agents are not co-executors and may only run genuinely independent read-only investigation or review within the existing caps.
 - Daily requests and Simple work keep their existing behavior. They do not create this executor contract. Existing positive-utility parallel routing remains unchanged outside the exclusive confirmed-plan mutation scope.
 
 The Hook cannot change the parent model. A logical profile only requests a child handoff. Record requested, host-accepted, and host-observed model/effort separately. Host acceptance of explicit spawn fields proves the accepted request; matching runtime echo proves the observed profile. A Hook message, state field, attempted spawn, guessed product name, or absent echo is not proof that a model or effort took effect.
 
-Daily/current behavior and the bound assessor's Simple two-stage flow remain unchanged. Only an explicit whole-session user policy such as “本会话全程最高模型和最高推理” activates `highest_throughout`; one-step, one-agent, current-task, “尽量”, or “高质量” requests do not. After strict Hard-plan confirmation, this preference changes only that plan's executor: resolve `highest_available` to the same currently available high model tier used for coordination/assessment and request the highest reasoning effort the host supports for that model. Never infer support or silently fall back; unresolved availability is `model_unavailable`, rejection is `spawn_failed`/`invalid_spawn_config`, and mismatching runtime echo is `start_mismatch`.
+Daily/current behavior and the bound assessor's Simple two-stage flow remain unchanged. Only an explicit whole-session user policy such as “本会话全程最高模型和最高推理” activates `highest_throughout`; one-step, one-agent, current-task, “尽量”, or “高质量” requests do not. After strict Hard-plan confirmation, this preference changes only that plan's executor: resolve `highest_available` to the same currently available high model tier used for coordination/assessment and request `ultra` only for that explicit policy. Never infer support or silently fall back; unresolved availability is `model_unavailable`, rejection is `spawn_failed`/`invalid_spawn_config`, and mismatching runtime echo is `start_mismatch`.
 
 If the user explicitly restores the default, clear `highest_throughout` and invalidate every pending, running, or reusable execution contract created under it; stop further mutation under that contract. Re-resolve the default profile and create a fresh contract/request from still-valid plan bindings, or re-plan and reconfirm if a binding changed. Completed evidence remains evidence but cannot authorize new work under the invalidated contract.
 
 ## Resolve the executor profile
 
-The default confirmed-Hard profile remains `work_executor_low_latest`: from overrides the current host exposes, choose the newest available lower-tier model relative to the high coordination/assessment tier and request `reasoning_effort=medium` exactly. For `highest_throughout`, use the high tier and host-max effort resolved above. Do not hard-code product names; if the resolved profile is unavailable, record `model_unavailable` and stop for parent reassessment rather than inventing or silently substituting a profile.
+The default confirmed-Hard profile remains `work_executor_low_latest`: from overrides the current host exposes, choose the newest available lower-tier model relative to the high coordination/assessment tier and request `reasoning_effort=medium` exactly. Hard assessment requests `max` by default; `highest_throughout` alone uses the high tier and `ultra`. Do not hard-code product names; if the resolved profile is unavailable, record `model_unavailable` and stop for parent reassessment rather than inventing or silently substituting a profile.
 
 Spawn with all of these settings:
 
 - the resolved explicit `model` override;
-- the resolved effort: `medium` by default, or host-max for `highest_throughout`;
-- positive `fork_turns` for redundant bound context when V2 hides message from local `PreToolUse`;
-- visible `task_name=confirmed_executor_<execution_contract_id>_v1` plus the normal concise Chinese purpose summary.
+- the resolved effort: `medium` by default, or `ultra` for `highest_throughout`;
+- exact `fork_turns=1` for minimal bound context when V2 hides message from local `PreToolUse`;
+- initial visible `task_name=confirmed_executor_<execution_contract_id>_<slice_id>_<slice_token16>_v1` plus the normal concise Chinese purpose summary. After an ordinary first failure becomes terminal, the sole recovery appends `_<failure_kind>_v2`; after parent verification fails, use `..._<slice_id>_<slice_token16>_vf_<host_review_evidence32>_v2`. The evidence in that name is generated by the Hook, never copied from a child or manually counted.
 
 Host acceptance of this exact spawn is handoff-request evidence. Subagent start must match the pending request before mutation; report only the model/effort fields the host accepted or echoed, never assumed fields.
 
@@ -33,13 +33,37 @@ Before a detailed Hard plan may reach `awaiting_confirmation`, the Hook must app
 
 The journal alone never grants authority. The state-bound objective, difficulty, generation, current revision digest, journal digest, strict confirmation, and execution contract are still required. Any external edit, replacement, link, path-identity race, or digest mismatch invalidates the plan and marks an old executor `stale_contract`; only a trusted Hook revision followed by fresh confirmation can recover authorization.
 
+The canonical `relative_path` is plugin-data-root-relative contract metadata within the trusted plugin data. Never resolve it against the child or parent `cwd`, a workspace, or a same-named decoy tree. Immediately before a matching confirmed-executor Start may become `running`, the Hook must verify and read the current revision from plugin data, bind its exact digest, and privately inject that exact body into the child Start context. Read failure, journal drift, path mismatch, or digest mismatch delivers no body and leaves mutation locked.
+
 The limits are inclusive: one revision may contain exactly 983040 UTF-8 bytes and the whole journal may contain exactly 10485760 bytes. One byte over is typed `revision_too_large` or `journal_full`, respectively. Rejection leaves the prior file byte-for-byte unchanged and does not increment the generation.
 
 Journal and state use a cross-file `marker → journal → state → cleanup` transaction with atomic replacement, no-follow identity checks, file sync, and parent-directory sync where supported. On mounts where `renameat2(RENAME_NOREPLACE)` returns `EINVAL`, `ENOSYS`, `ENOTSUP`, or `EOPNOTSUPP`, publication uses a no-clobber hard-link fallback with link-identity verification before unlinking the private source. A failed state write rolls the journal back. Crash recovery accepts only old journal/old state or new journal/new state; mixed or unprovable combinations fail closed as `transaction_recovery_failed` and retain the marker for diagnosis.
 
+## Canonical execution-slice manifest
+
+Every execution-profile-v8 Hard revision ends with exactly one fenced JSON block whose language is `workflow-manager-execution-slices`. A small exceptional plan may have one slice; normal plans use 3..5 and the hard upper bound is 8 ordered, independently verifiable slices. No text may follow the closing fence. The JSON shape is:
+
+```workflow-manager-execution-slices
+{"version":1,"global_constraints":["constraint"],"slices":[{"id":"s01","title":"bounded objective","scope":["owned surface"],"acceptance":["observable check"],"rollback":["recovery action"],"stop_conditions":["typed stop"],"expected_artifacts":["path or identifier"]}]}
+```
+
+`id` values are consecutive `s01`, `s02`, ... in array order. All required arrays and their string entries are non-empty and bounded. A missing, duplicate, malformed, non-tail, oversized, discontinuous, or semantically incomplete manifest cannot create v8 write authority. The human-readable plan remains authoritative context, but it must agree with this one machine-readable manifest; an `update_plan` projection is never a second manifest.
+
+The Hook binds the manifest digest into the global execution contract. For the current slice it derives `slice_token16` from that global contract, the exact slice content, its ordinal, and the accepted-prefix chain. Only the current token may spawn or report. The Start handoff privately supplies global constraints plus the exact current slice and acceptance, not an unconstrained copy that lets a lower-tier executor silently skip later gates.
+
 ## Execution contract
 
-Schema 20/writer 1.0.39 uses execution profile v3. Every confirmed executor request requires the standalone exact result contract `EXECUTION_RESULT execution_contract_id=<32hex> outcome=succeeded|failed evidence_digest=<32hex>`. If `SubagentStop` omits status, only one full-match marker for the current contract with `outcome=succeeded` proves success. `outcome=failed`, an empty, malformed, duplicate, or wrong-contract marker fails closed; explicit failed or cancelled status always fails.
+Schema 25/writer 1.0.44 uses execution profile v8. Every current-slice request requires this standalone exact final non-empty line: `EXECUTION_RESULT execution_contract_id=<32hex> slice_id=sNN outcome=succeeded|failed`. The executor never supplies an evidence digest. The Hook scans all marker-like intent, accepts exactly one unindented full-line marker at the end, and generates/normalizes bounded candidate evidence from the bound contract, slice, attempt, terminal result, and child identity facts. Indented, fenced, embedded, duplicated, malformed, wrong-contract, wrong-slice, or explicit failed/cancelled terminal results fail closed.
+
+The high-reasoning parent must independently inspect the current slice's bounded artifacts and acceptance evidence. It ends with exactly one unindented final line: `EXECUTION_REVIEW execution_contract_id=<32hex> slice_id=sNN outcome=passed|failed`. The parent also never supplies a digest; the Hook derives host-generated review evidence from the pending candidate binding and full parent result. Missing, duplicate, indented, embedded, malformed, wrong-contract, or wrong-slice review never seals or changes the candidate.
+
+For shell verification, preserve the complete structured host result (for example `text(JSON.stringify(r))`), not only `text(r.output)`: stdout and a `Script completed` wrapper alone are not proof of an inner command exit status. The Hook may reconcile an unknown result only when a new operation's exact input digest, the same turn, one outer host call, and one matching structured outcome agree. For `apply_patch`, only the matching outer call plus one in-window `patch_apply_end success=true`/`status=completed` qualifies. Missing, duplicate, cross-turn, or ambiguous evidence remains unknown.
+
+One attempt-one failed parent read-only probe may return to review once when its bound structured error and digest prove no later bound mutation. That correction never proves artifacts succeeded; a second failure, missing evidence, or any later mutation still requires v2 or exhaustion.
+
+On `passed`, the Hook records only the bounded slice acceptance chain. If another slice remains, the global baseline stays incomplete and state advances to that exact next slice's `spawn_required`; no later slice may start early. Only a passed review of the last slice atomically seals global executor `succeeded` and baseline acceptance `passed`. A failed attempt-one review may reserve the sole fresh v2 for that slice; a failed attempt-two review exhausts the contract. v2 success is still only `verification_required` and needs another parent pass.
+
+Persist only bounded `executor_review` and slice-progress facts: current contract/slice/token, attempt, candidate-result and candidate-agent fingerprints, host-generated candidate/review evidence digests, accepted-prefix digest, status, and timestamp—never agent ID, result, probe, review prose, or slice body. Plaintext verification recovery must match `recovery_from=verification_failed`, a material correction, and the Hook-issued review binding. Opaque V2 relies on the `..._<slice_id>_<slice_token16>_vf_<host_review_evidence32>_v2` name, pending review, terminal v1, parent caller, attempt one, and exact `fork_turns=1`.
 
 Compute `execution_contract_id` from the execution-profile version, normalized resolved policy/profile, and all canonical bindings:
 
@@ -48,17 +72,18 @@ Compute `execution_contract_id` from the execution-profile version, normalized r
 3. positive `plan_generation`;
 4. confirmed `plan_digest`, equal to the current revision digest;
 5. canonical relative path;
-6. complete journal digest.
+6. complete journal digest;
+7. canonical execution-slice manifest digest.
 
 Do not store or reconstruct the ID from raw prompt text. Any policy/profile, objective, difficulty decision, generation, path, revision, or journal-digest change makes the contract stale and requires a new executor request; changed plan bindings also require new confirmation.
 
-The spawn request must include the exact `execution_contract_id`, `plan_generation`, canonical relative path, current revision digest, and journal digest; require the child to reread the canonical current revision before work and recovery; and declare it the only executor/exclusive owner. Include bounded ownership, forbidden scope, shared resources, expected artifacts, acceptance, rollback/stop conditions, and a compact result contract, but no request summary becomes a second plan authority. The visible task name authorizes only the current state binding; it does not prove V2 ciphertext contains that handoff, so retain positive fork context and verify runtime identity, ownership, result, and acceptance independently.
+The spawn request must include the exact `execution_contract_id`, current `slice_id`/token, plan generation, canonical relative path, current revision/journal/manifest digests, and accepted-prefix binding; require the private Start handoff before work and recovery; and declare the child the only live executor/exclusive owner of that slice. Include its bounded scope, forbidden surfaces, shared resources, expected artifacts, acceptance, rollback/stop conditions, and compact result contract, but no request summary becomes a second plan authority.
 
 The executor must return decisive changes, paths/identifiers, verification evidence, unresolved risk, and typed failure if any. Raw logs stay in files or bounded excerpts. The parent independently checks contract match and acceptance evidence before reporting success.
 
 ## Typed state and failure handling
 
-Use the lifecycle `spawn_required → spawn_pending → running → succeeded`. Classify failures rather than collapsing them into an uninformative retry:
+For each slice use `spawn_required → spawn_pending → running → verification_required → slice_accepted`; only the final accepted slice reaches global `succeeded`. Executor self-report never skips parent review. Classify failures rather than collapsing them into an uninformative retry:
 
 - `model_unavailable`: the resolved policy's eligible model/effort is not actually available;
 - `invalid_spawn_config`: wrong/missing resolved policy/profile, model override, reasoning effort, fork context, contract marker, exclusivity, or acceptance;
@@ -68,14 +93,20 @@ Use the lifecycle `spawn_required → spawn_pending → running → succeeded`. 
 - `executor_failed`: uncategorized executor failure;
 - `implementation_failed`, `build_failed`, `deploy_failed`, or `verification_failed`: stage-specific execution failure.
 
-An initial attempt may receive at most one recovery attempt, so the total is at most two. Recovery is allowed only after a material correction to the recorded cause—for example resolving real model availability, correcting explicit spawn fields, repairing a stale binding through re-analysis/reconfirmation, or changing the implementation/verification route based on concrete diagnostics. Record the correction and new evidence.
+An initial slice attempt may receive at most one recovery attempt, so that slice has at most two attempts. Recovery requires a terminal first child and material correction. Never revive terminal v1 with `followup_task`: spawn a different child with the exact contract/slice/token/failure-bound v2 name, same profile, `recovery_from`, and correction. Verification recovery additionally binds the Hook-generated review evidence in its visible name. Denied spawns record a guard only and never rewrite candidate, accepted-prefix, sealed failure, or review state.
 
 Never repeat the same spawn or failed command unchanged, disguise an identical retry through another shell form, create a second simultaneous executor, let the parent take over mutations, or weaken acceptance. Without a material correction, or after the recovery attempt fails, set the executor state to `exhausted`, return control to high-reasoning parent assessment, and report the typed blocker.
 
 ## Migration and resume
 
-Schema 20/writer 1.0.39 use the v2 canonical journal. Schema 19 migration accepts at most six strictly owned and parseable v1 mirrors, orders their real generations, and requires the newest mirror to match the stored current binding exactly. Missing, duplicate, drifted, truncated, unparseable, oversized, or more-than-six inputs fail closed without inventing a body. A running or recovery executor becomes `stale_contract`; a formerly pending or confirmed plan requires fresh confirmation. Old mirrors are cleaned only after the canonical journal and Schema 20 state both commit.
+Schema 25/writer 1.0.44 use the canonical journal, required slice manifest, execution profile v8, and stable-Skill schema 6. A Schema 23 v6 historical success remains sealed only when its matching baseline has `acceptance_status=passed`; preserve its real profile/contract instead of pretending it ran v8 slices. A v6 `verification_required` candidate may continue one read-only parent review. Its exact legacy marker with `evidence_digest=<32hex>` is accepted only in that preserved v6 boundary; the supplied value is ignored and normalized by the Host. A failed legacy review cannot reset attempts, acquire two new recoveries, or become v8 mutation authority.
+
+Other active v6 states without a valid current manifest fail closed. `spawn_pending` or `running` v6 state has no v8 write authority; ordinary pending/failed work must append a complete manifest-bearing revision to the same canonical Markdown, strictly reconfirm, and receive a fresh v8 contract. Schema 19 migration still accepts at most six strictly owned, ordered, current-binding mirrors, and old mirrors are cleaned only after canonical journal and Schema 25 state commit.
 
 Earlier Schema 10 migration introduced executor state: a Schema 9 confirmed plan was treated as not started and never as proof that execution occurred. Current compaction/resume preserves normalized policy and typed contract evidence in state, while the current Hard-plan semantics are reread from the verified canonical revision. Re-resolve host availability before a new spawn. Reuse a running/succeeded executor only when native non-plan evidence, resolved policy/profile, and every canonical binding still match; otherwise fail closed to `spawn_required`, `recovery_required`, or re-planning.
 
-After a succeeded executor, seal the bounded change and post-change verification baseline. If the user reports a remaining, returned, or new symptom during same-task acceptance, continue with [regression-continuity.md](regression-continuity.md) before any corrective mutation; executor success is not a causal conclusion or user acceptance.
+Some Desktop builds write native compaction only into the host rollout rather than dispatching PreCompact/PostCompact. At a same-session `SessionStart` with source `resume` or `compact`, the Hook may record one idempotent `source=host_rollout_reconciled` checkpoint only after the bounded regular rollout proves one matching `session_meta`, an ordered `compacted` window chain, and each exact `context_compacted` acknowledgement (with only token telemetry between). Prompt text, Hook payload window fields, cross-session paths, text-only notices, missing pairs, duplicates, and disorder are not evidence. This bridge confirms native compaction/resume continuity; it never authorizes a slice or replaces parent review.
+
+Forbidden execution controls (for example, “严禁删除或修改任何文件” or “do not remove files”) do not revise a confirmed plan merely because they contain mutation words; an affirmative scope or plan change still does. If a prior host gate-control prompt caused exactly that narrow invalidation, only the next same-session resume may make one repair: the reconciled checkpoint must preserve the confirmed artifact, accepted slice prefix, and `spawn_required` current slice; the latest host final must be the exact `COMPACTION_GATE_READY` line for that session/window/slice; and no child or implementation may have appeared since the checkpoint. Any mismatch, drift, duplicate repair, or later work fails closed.
+
+After parent review seals success, retain the bounded change/verification baseline. If the user reports a remaining, returned, or new symptom, continue with [regression-continuity.md](regression-continuity.md); sealed execution still is not a causal conclusion or user acceptance.

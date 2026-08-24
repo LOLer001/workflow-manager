@@ -1,5 +1,48 @@
 # 更新记录
 
+## 1.0.44
+
+- Schema 升至 25、writer/manifest 升至 1.0.44、execution profile 升至 v8、stable-skill schema 升至 6；迁移保留已封存 host evidence 与父审候选，但 v7 的 pending/running 状态绝不获得 v8 写入权。
+- Hard assessor 默认请求最高可用模型与 `max`；只有显式 `highest_throughout` 请求 `ultra`。所有绑定 child 固定 `fork_turns=1`，confirmed executor 保持 lower-tier + `medium`。
+- 执行切片硬上限降为 8（正常 3–5）；恢复仅携带 global constraints、当前切片和游标后的最小 delta。重复宽搜/精确只读/视觉探针按变更 epoch 节流，变更后强验收重新放行。
+- Simple 不启动额外 assessor；child-origin spawn fail-closed；side-lane 总启动预算默认 1，只有显式 ready+disjoint 的独立并行最多 2，预算单调耗尽且不得为降级验收补充。
+- 将 child profile evidence 明确拆为 `requested`、`host_accepted` 和 Start `full|partial|absent|mismatch`：Start model 仅来自官方 Hook payload，effort 仅来自同 turn 宿主 transcript 的 `turn_context.payload.effort`；旧 event_msg 兼容来源单独标记，缺失或冲突一律不授予 bound mutation。
+- 修正 projectless 文件产物/工程验收合同被低置信默认路由误判为 Daily：显式 Work/Hard 工程合同、创建并验证文件产物，以及跨真实 host compaction + same-session resume 的连续性任务分别进入 Work/Hard；`do not edit files` / `不要创建或修改文件` 等否定边界仍保持 Daily，并以正反 gold-set 回归锁定。
+- 修正身份/激活预检中的 Work/Hard 文字误触发 assessor：只有同时显式禁用 tool 与 child 的预检才进入 Daily/direct 零 Start 路由；替换中断预检时审计并清除陈旧 running assessor，后续 spawn 仍由 Hook fail-closed 拒绝。
+- 修正 cachebuster/reload 后 `identity_evidence.plugin_root_fingerprint` 沿用旧会话值：每个成功持久化的当前 Hook 事件都从实际 `PLUGIN_ROOT` 刷新身份回显。
+
+## 1.0.43
+
+- 困难任务计划生成默认改为“最高可用模型 + 第三高推理档 `xhigh`”；推理档位按 `ultra > max > xhigh > high > medium > low` 排序。只有显式 `highest_throughout` 会话偏好继续请求 `ultra`，确认后的默认低档执行切片仍固定 `medium`。
+- Schema 升至 24、writer/manifest 升至 1.0.43、execution profile 升至 v7、stable-skill schema 升至 5，并新增发布版本矩阵校验，拒绝任一版本或协议指标漂移。
+- v7 executor/review marker 改为严格唯一、无缩进、最后非空整行：`EXECUTION_RESULT execution_contract_id=<32hex> slice_id=sNN outcome=succeeded|failed` 与 `EXECUTION_REVIEW execution_contract_id=<32hex> slice_id=sNN outcome=passed|failed`。模型不再手写 evidence digest；Hook 从合同、切片、尝试、完整结果和调用者绑定生成/规范化有界证据，重复、缩进、嵌入、错合同或错切片均 fail-closed。
+- 每个 Hard canonical 修订末尾新增唯一 `workflow-manager-execution-slices` JSON manifest：1 到 32 个连续 `sNN` 切片分别绑定全局约束、范围、验收、回退、停止条件和预期产物。Hook 以全局合同、manifest、当前切片和已验收前缀派生可见 token；至多一个切片写执行者存活，父审通过后才推进下一片，只有最后一片通过才 sealed 全局成功。
+- 每片初次失败后最多一个合同/切片/token 绑定 fresh v2；父审失败的 opaque 名称携带 Hook 生成的 review evidence，不复活 terminal v1，也不允许低档执行者跳片、提前封存或通过摘要格式错误绕过强门禁。
+- Schema 23 已有 passed baseline 的 sealed v6 成功保留原 profile/contract；v6 review candidate 仅延续只读复核，旧自报 digest 只在该边界兼容且其值被忽略后由宿主规范化。其他无合法 manifest 的活动 v6 状态没有 v7 写权，须向同一 canonical Markdown 追加完整修订、重新严格确认并生成新合同，失败复核不重置恢复预算。
+- 安装器、Unix/Windows Hook launcher 与仓库校验统一禁用 Python bytecode；稳定路径覆盖已验证后只清理严格更旧且可证明自有的缓存/残留，保留更高版本、非版本目录、符号链接和不能安全判定的条目。
+
+## 1.0.42
+
+- Schema 升至 23、writer/manifest 升至 1.0.42、execution profile 升至 v6、stable-skill schema 升至 4。已有 `acceptance_status=passed` 的 sealed 历史成功继续保留真实 profile/contract；活动或普通失败的 v5 合同重绑 v6。
+- confirmed executor 的精确 `EXECUTION_RESULT ... outcome=succeeded` 现在只进入 `verification_required` 候选态并保存有界 `executor_review`；父会话独立只读验收后，只有精确 `EXECUTION_REVIEW ... outcome=passed` 才原子封存 `succeeded` 与 passed baseline，错合同、缺失、重复或畸形 review 均不能封存。
+- 父级验收失败在 attempt 1 可直接创建唯一 fresh v2；其可见 task name 同时绑定旧 contract、`verification_failed` 和 32 位验收证据摘要，plaintext 还须匹配 `recovery_from`、`material_correction` 与 `verification_evidence_digest`，opaque V2 依赖精确名称、review binding、terminal 边界及正数 fork。v2 候选仍需父级复核，失败则 exhausted。
+- Schema 22 的 `succeeded + baseline incomplete`（包括后续错误拒绝残留的 `invalid_spawn_config`）迁移为原 v5/旧 contract/attempt 1 的 review candidate，清除虚假 failure 且不依赖会被升级清理的 transient subagent cache；被拒 executor spawn 不再污染候选或已 sealed 状态。
+
+## 1.0.41
+
+- Schema 升至 22、writer/manifest 升至 1.0.41、execution profile 升至 v5、stable-skill schema 升至 3；活动/失败的旧 v4 合同重绑 v5，已有 sealed baseline 的历史成功继续保留真实 v4 合同与 profile。
+- matching confirmed executor 的 `SubagentStart` 现在先从受信 plugin-data canonical journal 验证并读取 current revision，成功后才进入 `running`，并把 exact body 私下交给 child；相对路径明确只属于 plugin-data-root contract metadata，`cwd` 同名文件、读取失败和摘要漂移均不能解锁写入。
+- 初次 executor 使用可见 v1 task name；普通失败后的唯一恢复必须以绑定 current contract、failure kind 与 attempt 2 的可见 v2 task name 新建 child。terminal v1 的 `followup_task` 明确拒绝，opaque V2 recovery 仅凭精确 v2 名称、当前失败/尝试及正数 fork fail-closed 接受，第二次失败 exhausted。
+- `mkdir` 纳入文件变更识别，未确认计划和未绑定 recovery executor 不能预建空目录；补充真实 lifecycle/journal 模拟回归覆盖 private handoff、cwd decoy、drift/read failure、fresh v2 写权限和迁移。
+
+## 1.0.40
+
+- Schema 升至 21、writer/manifest 升至 1.0.40、execution profile 升至 v4、stable-skill schema 升至 2。
+- 新 objective/replan 原子失效旧 assessor/plan/executor 绑定；Daily 切换同步清除旧 failure、binding 与 observed profile，旧失败不再冻结新任务。
+- 真实 `create_thread` 的严格 `<codex_delegation>` 首条包装现在提取并路由其中的 bounded input；畸形、混合或伪造结构仍按协调控制 fail-closed，不再吞掉新任务 objective。
+- writer 迁移将活动/失败合同重绑到当前 execution profile，并清除不再有授权效力的旧 lifecycle/coordination 缓存；已有 sealed baseline 的成功历史合同保留其真实 profile/contract，绝不伪造 v4 成功或重新执行。
+- stable Skill 验证成功后仅在 canonical 插件缓存边界内清理旧插件版本；保留 migration marker/lock 作为并发安全哨兵，运行器仅保留当前 SHA-256 内容寻址缓存。
+
 ## 1.0.39
 
 - 在 v9fs 等不支持 `renameat2(RENAME_NOREPLACE)` 的挂载上，当其返回 `EINVAL`、`ENOSYS`、`ENOTSUP` 或 `EOPNOTSUPP` 时，canonical transaction 改用保持 no-clobber 语义的 hard-link fallback；链接后验证常规文件身份、设备/inode 与链接计数，随后才移除私有源文件，竞态或身份异常均 fail-closed。

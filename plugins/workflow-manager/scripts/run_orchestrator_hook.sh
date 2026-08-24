@@ -4,7 +4,7 @@ set -eu
 source_file="$PLUGIN_ROOT/scripts/orchestrator_hook.py"
 
 run_direct() {
-    exec python3 "$source_file"
+    exec env PYTHONDONTWRITEBYTECODE=1 python3 -B "$source_file"
 }
 
 [ -f "$source_file" ] || exit 0
@@ -27,9 +27,13 @@ cache_owner="$(ls -nd "$cache_root" 2>/dev/null | awk '{print $3}')" || run_dire
 [ "$cache_owner" = "$user_id" ] || run_direct
 chmod 700 "$cache_root" 2>/dev/null || run_direct
 
-# Content addressing prevents stale execution even when an update preserves mtime.
-cache_key="$(cksum "$source_file" 2>/dev/null | awk '{print $1 "-" $2}')" || run_direct
-[ -n "$cache_key" ] || run_direct
+# SHA-256 content addressing prevents stale execution even when an update
+# preserves mtime, and lets us verify the cached bytes before every execution.
+cache_key="$(sha256sum "$source_file" 2>/dev/null | awk '{print $1}')" || run_direct
+case "$cache_key" in
+    *[!0-9a-f]*) run_direct ;;
+esac
+[ "${#cache_key}" -eq 64 ] || run_direct
 cache_dir="$cache_root/$cache_key"
 cached_file="$cache_dir/orchestrator_hook.py"
 
@@ -46,10 +50,16 @@ chmod 700 "$cache_dir" 2>/dev/null || run_direct
 if [ -L "$cached_file" ]; then
     run_direct
 fi
-if [ ! -f "$cached_file" ]; then
+cached_digest=""
+if [ -f "$cached_file" ]; then
+    cached_digest="$(sha256sum "$cached_file" 2>/dev/null | awk '{print $1}')" || cached_digest=""
+fi
+if [ "$cached_digest" != "$cache_key" ]; then
     temporary="$cache_dir/.orchestrator_hook.py.$$"
     trap 'rm -f "$temporary"' EXIT HUP INT TERM
     cp "$source_file" "$temporary" 2>/dev/null || run_direct
+    temporary_digest="$(sha256sum "$temporary" 2>/dev/null | awk '{print $1}')" || run_direct
+    [ "$temporary_digest" = "$cache_key" ] || run_direct
     chmod 600 "$temporary" 2>/dev/null || run_direct
     mv "$temporary" "$cached_file" 2>/dev/null || run_direct
     trap - EXIT HUP INT TERM
@@ -58,4 +68,19 @@ cached_owner="$(ls -nd "$cached_file" 2>/dev/null | awk '{print $3}')" || run_di
 [ "$cached_owner" = "$user_id" ] || run_direct
 chmod 600 "$cached_file" 2>/dev/null || run_direct
 
-exec python3 "$cached_file"
+# The private runtime cache is content addressed, so every other well-formed key
+# is obsolete once the current file is verified. Keep unknown entries untouched.
+for old_cache_dir in "$cache_root"/*; do
+    [ "$old_cache_dir" = "$cache_dir" ] && continue
+    [ -d "$old_cache_dir" ] && [ ! -L "$old_cache_dir" ] || continue
+    old_cache_name=${old_cache_dir##*/}
+    case "$old_cache_name" in
+        *[!0-9a-f]*) continue ;;
+    esac
+    [ "${#old_cache_name}" -eq 64 ] || continue
+    old_cache_owner="$(ls -nd "$old_cache_dir" 2>/dev/null | awk '{print $3}')" || continue
+    [ "$old_cache_owner" = "$user_id" ] || continue
+    rm -rf -- "$old_cache_dir" 2>/dev/null || true
+done
+
+exec env PYTHONDONTWRITEBYTECODE=1 python3 -B "$cached_file"

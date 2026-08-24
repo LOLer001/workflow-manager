@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import re
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "extract_release_notes.py"
 SPEC = importlib.util.spec_from_file_location("extract_release_notes", SCRIPT)
 assert SPEC and SPEC.loader
@@ -14,9 +17,73 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseAutomationTests(unittest.TestCase):
+    def test_current_release_version_matrix_is_consistent(self) -> None:
+        manifest = json.loads(
+            (PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        hook = (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(
+            encoding="utf-8"
+        )
+        constants = {
+            name: re.search(
+                rf'^\s*{name}\s*=\s*"?([^"\s]+)"?\s*$', hook, re.MULTILINE
+            ).group(1)
+            for name in (
+                "SCHEMA_VERSION",
+                "WRITER_VERSION",
+                "EXECUTION_PROFILE_VERSION",
+                "STABLE_SKILL_SCHEMA",
+            )
+        }
+        self.assertEqual(
+            constants,
+            {
+                "SCHEMA_VERSION": "25",
+                "WRITER_VERSION": "1.0.44",
+                "EXECUTION_PROFILE_VERSION": "8",
+                "STABLE_SKILL_SCHEMA": "6",
+            },
+        )
+        self.assertEqual(manifest["version"], constants["WRITER_VERSION"])
+
+    def test_release_launchers_disable_bytecode(self) -> None:
+        installer = (PLUGIN_ROOT / "scripts" / "install_stable_skill.py").read_text(
+            encoding="utf-8"
+        )
+        posix = (PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.sh").read_text(
+            encoding="utf-8"
+        )
+        windows = (PLUGIN_ROOT / "scripts" / "run_orchestrator_hook.ps1").read_text(
+            encoding="utf-8"
+        )
+        validator = (ROOT / "scripts" / "validate_repository.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            installer.index("sys.dont_write_bytecode = True"),
+            installer.index("import importlib.util"),
+        )
+        self.assertLess(
+            validator.index("sys.dont_write_bytecode = True"),
+            validator.index("import importlib.util"),
+        )
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", posix)
+        self.assertIn("python3 -B", posix)
+        self.assertIn('$env:PYTHONDONTWRITEBYTECODE = "1"', windows)
+        self.assertIn("-3 -B $hookScript", windows)
+        self.assertIn("-B $hookScript", windows)
+
     def test_every_unpublished_version_has_release_notes(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        for version in ("1.0.15", "1.0.16", "1.0.17", "1.0.18", "1.0.19", "1.0.20"):
+        for version in (
+            "1.0.15",
+            "1.0.16",
+            "1.0.17",
+            "1.0.18",
+            "1.0.19",
+            "1.0.20",
+            "1.0.44",
+        ):
             with self.subTest(version=version):
                 notes = MODULE.extract_release_notes(changelog, version)
                 self.assertTrue(notes.startswith("- "))

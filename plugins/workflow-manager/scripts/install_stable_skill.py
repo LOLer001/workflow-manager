@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+import sys
+
+# This installer dynamically imports the release Hook. Keep installation and
+# upgrades free of stale bytecode even when the caller omitted Python's -B flag.
+sys.dont_write_bytecode = True
+
 import argparse
 import importlib.util
 import json

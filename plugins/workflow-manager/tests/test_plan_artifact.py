@@ -93,6 +93,9 @@ class PlanArtifactTests(unittest.TestCase):
             "2. 修改 framework 与 SystemUI 的绑定实现\n"
             "3. 编译、回归并按 Unity 参考验收\n"
             f"验收：{label} 功能、回归和视觉证据全部通过。{extra}\n"
+            "```workflow-manager-execution-slices\n"
+            '{"version":1,"global_constraints":["preserve acceptance"],"slices":[{"id":"s01","title":"bounded repair","scope":["owned module"],"acceptance":["targeted verification"],"rollback":["revert bounded change"],"stop_conditions":["typed blocker"],"expected_artifacts":["verification log"]}]}\n'
+            "```\n"
         )
 
     @staticmethod
@@ -146,8 +149,8 @@ class PlanArtifactTests(unittest.TestCase):
                     "task_name": "high_assessor",
                     "message": request,
                     "model": "gpt-5.6-sol",
-                    "reasoning_effort": "ultra",
-                    "fork_turns": "none",
+                    "reasoning_effort": "max",
+                    "fork_turns": "1",
                 },
             },
             data=selected,
@@ -156,15 +159,32 @@ class PlanArtifactTests(unittest.TestCase):
             "permissionDecision",
             json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}),
         )
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": f"{suffix}-request-post",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "high_assessor", "message": request,
+                    "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1",
+                },
+                "tool_response": {"status": "ok"},
+            },
+            data=selected,
+        )
+        transcript = selected.parent / f"{suffix}-start.jsonl"
+        transcript.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": f"{suffix}-turn", "model": "gpt-5.6-sol", "effort": "max"}}) + "\n", encoding="utf-8")
         agent_id = f"{suffix}-assessor"
         self.run_hook(
             {
                 "hook_event_name": "SubagentStart",
                 "session_id": session,
                 "hook_run_id": f"{suffix}-start",
+                "turn_id": f"{suffix}-turn",
                 "agent_id": agent_id,
                 "model": "gpt-5.6-sol",
-                "reasoning_effort": "ultra",
+                "transcript_path": str(transcript),
             },
             data=selected,
         )
@@ -798,8 +818,8 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(
             [item["generation"] for item in parsed["revisions"]], [2, 4, 6]
         )
-        self.assertEqual(migrated["schema_version"], 20)
-        self.assertEqual(migrated["plan_state"], "awaiting_confirmation")
+        self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
+        self.assertEqual(migrated["plan_state"], "invalidated")
         self.assertEqual(migrated["plan_artifact"]["revision_count"], 3)
         self.assertEqual(list(directory.glob("hard-plan-g*.md")), [])
         self.assertEqual(list(directory.glob(".*transaction*")), [])
@@ -1107,13 +1127,13 @@ class PlanArtifactTests(unittest.TestCase):
         ):
             first = HOOK.snapshot_state(payload)
         marker = directory / HOOK.PLAN_TRANSACTION_MARKER_NAME
-        self.assertEqual(first["schema_version"], 20)
+        self.assertEqual(first["schema_version"], HOOK.SCHEMA_VERSION)
         self.assertTrue((directory / HOOK.PLAN_JOURNAL_NAME).exists())
         self.assertTrue(legacy_path.exists())
         self.assertTrue(marker.exists())
 
         recovered = HOOK.snapshot_state(payload)
-        self.assertEqual(recovered["plan_state"], "awaiting_confirmation")
+        self.assertEqual(recovered["plan_state"], "invalidated")
         self.assertFalse(legacy_path.exists())
         self.assertFalse(marker.exists())
 

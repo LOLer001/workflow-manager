@@ -90,7 +90,8 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn("supported host API", self.skill_text)
         self.assertIn("$CODEX_HOME/skills/workflow-manager", self.skill_text)
         self.assertIn("never edit rollout JSONL or live databases/indexes/tasks", self.skill_text)
-        self.assertIn("Keep old caches until either route covers all tasks", self.skill_text)
+        self.assertIn("stable route covers new/resumed tasks", self.skill_text)
+        self.assertIn("preserve sealed v6 evidence", self.skill_text)
         self.assertIn("new/resumed tasks", self.skill_text)
 
     def test_only_unversioned_user_skill_is_discoverable(self) -> None:
@@ -113,7 +114,37 @@ class SkillIdentityTests(unittest.TestCase):
             self.assertIn(value, self.confirmed_execution)
         self.assertIn("marker → journal → state → cleanup", self.confirmed_execution)
         self.assertIn("old journal/old state or new journal/new state", self.confirmed_execution)
-        self.assertIn("Schema 20/writer 1.0.39", self.confirmed_execution)
+        self.assertIn("Schema 25/writer 1.0.44", self.confirmed_execution)
+        self.assertIn("execution profile v8", self.confirmed_execution)
+        self.assertIn("workflow-manager-execution-slices", self.confirmed_execution)
+        self.assertIn("3..5", self.confirmed_execution)
+        self.assertIn("hard upper bound is 8", self.confirmed_execution)
+        self.assertIn("reasoning_effort=max", self.skill_text)
+        self.assertIn("High-confidence **Simple** Work stays local (child Start=0)", self.skill_text)
+        self.assertIn("`requested`", self.skill_text)
+        self.assertIn("`host_accepted`", self.skill_text)
+        self.assertIn("`full|partial|absent|mismatch`", self.skill_text)
+        self.assertIn("same-turn host transcript context", self.skill_text)
+        self.assertIn("ultra > max > xhigh > high > medium > low", self.work_routing)
+        self.assertIn("host-generated", self.confirmed_execution)
+        self.assertIn("slice_id=sNN", self.confirmed_execution)
+        result_contract = re.search(
+            r"`EXECUTION_RESULT execution_contract_id=<32hex>[^`]+`",
+            self.confirmed_execution,
+        )
+        review_contract = re.search(
+            r"`EXECUTION_REVIEW execution_contract_id=<32hex>[^`]+`",
+            self.confirmed_execution,
+        )
+        self.assertIsNotNone(result_contract)
+        self.assertIsNotNone(review_contract)
+        self.assertNotIn("evidence_digest", result_contract.group(0))
+        self.assertNotIn("evidence_digest", review_contract.group(0))
+        self.assertIn("plugin-data-root", self.confirmed_execution)
+        self.assertIn("privately inject that exact body", self.confirmed_execution)
+        self.assertIn("_<failure_kind>_v2", self.confirmed_execution)
+        self.assertIn("verification_required", self.confirmed_execution)
+        self.assertIn("EXECUTION_REVIEW", self.confirmed_execution)
         self.assertIn("at most six", self.confirmed_execution)
         self.assertIn("journal alone never grants authority", self.confirmed_execution)
 
@@ -121,10 +152,12 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.39")
-        self.assertIn("/1.0.39/", readme)
+        self.assertEqual(self.manifest["version"], "1.0.44")
+        self.assertIn("/1.0.44/", readme)
+        self.assertNotIn("/1.0.42/", readme)
+        self.assertNotIn("/1.0.41/", readme)
         self.assertNotIn("/1.0.37/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.39\n")
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.44\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
 

@@ -3,17 +3,29 @@
 
 from __future__ import annotations
 
+import sys
+
+# Validation imports release tooling. It must not leave bytecode that can be
+# mistaken for an installed or source release surface.
+sys.dont_write_bytecode = True
+
 import base64
 import importlib.util
 import json
 import re
-import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_NAME = "workflow-manager"
 PLUGIN = ROOT / "plugins" / PLUGIN_NAME
+EXPECTED_VERSION_MATRIX = {
+    "1.0.44": {
+        "schema": 25,
+        "execution_profile": "8",
+        "stable_skill_schema": 6,
+    }
+}
 
 
 def read_json(path: Path) -> dict:
@@ -69,13 +81,60 @@ def main() -> int:
         re.MULTILINE,
     )
     assert writer_version and writer_version.group(1) == release_version
+    matrix = EXPECTED_VERSION_MATRIX.get(release_version)
+    assert matrix is not None, f"release version missing from matrix: {release_version}"
+    schema_version = re.search(
+        r"^SCHEMA_VERSION\s*=\s*([0-9]+)\s*$", orchestrator_source, re.MULTILINE
+    )
+    execution_profile = re.search(
+        r'^EXECUTION_PROFILE_VERSION\s*=\s*"([0-9]+)"\s*$',
+        orchestrator_source,
+        re.MULTILINE,
+    )
+    stable_skill_schema = re.search(
+        r"^STABLE_SKILL_SCHEMA\s*=\s*([0-9]+)\s*$",
+        orchestrator_source,
+        re.MULTILINE,
+    )
+    assert schema_version and int(schema_version.group(1)) == matrix["schema"]
+    assert execution_profile and execution_profile.group(1) == matrix["execution_profile"]
+    assert stable_skill_schema and int(stable_skill_schema.group(1)) == matrix["stable_skill_schema"]
     prompts = manifest.get("interface", {}).get("defaultPrompt")
     assert isinstance(prompts, list) and 1 <= len(prompts) <= 3
     assert all(isinstance(prompt, str) and len(prompt) <= 128 for prompt in prompts)
     stable_asset = PLUGIN / "assets" / "stable-skill" / PLUGIN_NAME / "SKILL.md"
     assert stable_asset.is_file()
+    confirmed_execution = (
+        PLUGIN
+        / "assets"
+        / "stable-skill"
+        / PLUGIN_NAME
+        / "references"
+        / "confirmed-execution.md"
+    ).read_text(encoding="utf-8")
+    assert f"Schema {matrix['schema']}/writer {release_version}" in confirmed_execution
+    assert f"execution profile v{matrix['execution_profile']}" in confirmed_execution
+    result_marker = re.search(r"`EXECUTION_RESULT [^`]+`", confirmed_execution)
+    review_marker = re.search(r"`EXECUTION_REVIEW [^`]+`", confirmed_execution)
+    assert result_marker and "evidence_digest" not in result_marker.group(0)
+    assert review_marker and "evidence_digest" not in review_marker.group(0)
+    assert "workflow-manager-execution-slices" in confirmed_execution
     assert not (PLUGIN / "skills").exists()
-    assert (PLUGIN / "scripts" / "install_stable_skill.py").is_file()
+    installer_path = PLUGIN / "scripts" / "install_stable_skill.py"
+    assert installer_path.is_file()
+    installer_source = installer_path.read_text(encoding="utf-8")
+    assert installer_source.index("sys.dont_write_bytecode = True") < installer_source.index(
+        "import importlib.util"
+    )
+    posix_runner = (PLUGIN / "scripts" / "run_orchestrator_hook.sh").read_text(
+        encoding="utf-8"
+    )
+    windows_runner = (PLUGIN / "scripts" / "run_orchestrator_hook.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "PYTHONDONTWRITEBYTECODE=1" in posix_runner and "python3 -B" in posix_runner
+    assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in windows_runner
+    assert "-3 -B $hookScript" in windows_runner and "-B $hookScript" in windows_runner
     doctor_path = PLUGIN / "scripts" / "hook_trust_doctor.py"
     assert doctor_path.is_file()
     doctor_source = doctor_path.read_text(encoding="utf-8")

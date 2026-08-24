@@ -4,17 +4,18 @@ Read this reference when the user reports a remaining, returned, or new symptom 
 
 ## Seal the prior execution baseline
 
-After the confirmed-plan executor finishes, keep one bounded baseline for causal comparison:
+Only after every contract-bound slice passes independent parent review, keep one bounded global baseline for causal comparison:
 
 - prior objective fingerprint and confirmed `plan_digest`;
 - prior `execution_contract_id`;
+- execution-slice manifest digest, final accepted-prefix digest, and bounded per-slice completion/review chain;
 - digest of successful implementation/build/delivery operations;
 - digest of verification performed after the last recorded change;
 - bounded acceptance state: `passed`, `failed`, `incomplete`, or `unknown`.
 
-Agent completion is not automatically user acceptance. Store only fingerprints, digests, identifiers, and enums—never the user's report, plan text, commands, tool output, or child result. If no change-set digest exists, do not pretend there is an execution-caused regression to review.
+A child or intermediate slice completion is not global completion or user acceptance. Store only fingerprints, digests, identifiers, and enums—never the user's report, plan/slice text, commands, tool output, or child result. If any slice lacks a passed parent review or no change-set digest exists, do not pretend there is a sealed execution-caused regression to review.
 
-If acceptance later fails but that executor recorded no successful change, do not leave the succeeded contract active and do not invent a causal review. Mark the baseline acceptance failed, invalidate the old executor contract, return to high-reasoning analysis, and prepare one replacement Hard plan for strict confirmation.
+If acceptance later fails but the sealed slice chain recorded no successful change, do not leave the succeeded contract active and do not invent a causal review. Mark the baseline acceptance failed, invalidate the old executor contract, return to high-reasoning analysis, and prepare one replacement Hard plan and manifest for strict confirmation.
 
 ## Open a causal review narrowly
 
@@ -47,7 +48,7 @@ The IDs must match the active baseline and review. `evidence_digest` identifies 
 
 ## Replan as one coherent system
 
-For `introduced` or `fix_ineffective`, supersede the old plan by appending one complete replacement revision to the same session's canonical journal instead of applying a local patch on top of it. The new Hard plan must account for the prior method, regression mechanism, rollback or correction, original acceptance, reported symptom, and risk-based regression checks for adjacent behavior. Request strict confirmation again.
+For `introduced` or `fix_ineffective`, supersede the old plan by appending one complete replacement revision and one unique tail slice manifest to the same session's canonical journal instead of applying a local patch on top of it. The new Hard plan must account for the prior method, regression mechanism, rollback or correction, original acceptance, reported symptom, and risk-based regression checks for adjacent behavior. Request strict confirmation again.
 
 For `unrelated`, detach the symptom from the old contract, reclassify it as a separate Hard work follow-up, and prepare a separately bounded plan and acceptance surface. The old executor, plan digest, and contract remain evidence only. A resolved review binds its `review_id` into the replacement execution contract so a stale executor cannot mutate.
 
@@ -55,6 +56,6 @@ For `uncertain`, report the missing evidence and next read-only check. Do not we
 
 ## Resume and migration
 
-Schema 20 preserves the execution baseline and causal-review IDs, state, outcome, canonical path, and digests across compaction. Resume non-plan continuity from the native summary, but verify and reread the canonical current revision for plan semantics; do not reconstruct raw feedback or plan text. If the objective, journal, baseline, review, files, inputs, environment, device, or verification freshness changed, take one bounded check and rebind or replan.
+Schema 25 preserves the execution baseline, host-normalized review binding, slice manifest/progress chain, causal-review IDs, state, outcome, canonical path, and digests across compaction. Resume non-plan continuity from the native summary, but verify and reread the canonical current revision for plan semantics; do not reconstruct raw feedback or plan/slice text. If the objective, journal, manifest, accepted-prefix, baseline, review, files, inputs, environment, device, or verification freshness changed, take one bounded check and rebind or replan.
 
 Legacy migration derives only a baseline supported by the existing contract and recorded-operation fingerprints. Mark acceptance incomplete and causality unset unless native evidence proves otherwise; migration must never invent user acceptance, a regression, a plan body, or a causal conclusion.

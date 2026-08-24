@@ -1,6 +1,6 @@
 # Confirmed-execution stall recovery
 
-Use this reference only after a confirmed Hard plan has one bound executor. It extends the single invocable `workflow-manager` Skill; it is not a second Skill.
+Use this reference only after a confirmed Hard plan has one live bound slice executor. It extends the single invocable `workflow-manager` Skill; it is not a second Skill.
 
 ## Trigger on strong evidence, not every error
 
@@ -10,7 +10,7 @@ Escalate only when the live bound executor has a current typed failure, cannot m
 
 `EXECUTION_STALL contract_id=<32hex> failure_kind=<typed-kind> evidence_digest=<32hex>`
 
-The Hook first verifies the canonical journal, then binds the stall to the current objective, canonical revision/journal digests, execution contract, executor attempt, and failure kind. Wrong caller/status/contract/type, embedded or duplicate markers, external journal drift, or a second stall on the same contract exhausts or invalidates the route instead of opening a loop.
+The Hook first verifies the canonical journal and slice manifest, then binds the stall to the current objective, revision/journal/manifest digests, global contract, current slice/token, accepted-prefix chain, executor attempt, and failure kind. Wrong caller/status/contract/type, embedded or duplicate markers, external journal drift, or a second stall on the same slice exhausts or invalidates the route instead of opening a loop.
 
 ## One high-tier read-only diagnosis
 
@@ -26,6 +26,6 @@ The assessor rereads the canonical current revision and ends with one exact line
 
 ## Resume the prior execution profile
 
-For `resume`, the recovery request must bind the exact stall/remediation and canonical journal digests, require rereading the current revision, name the typed failure, and provide a substantive correction. Restore the profile that was bound before the stall: normally lower-tier+medium; if the user explicitly enabled whole-session `highest_throughout`, restore that highest profile instead of silently downgrading. Host acceptance/echo rules remain unchanged.
+For `resume`, the recovery request must bind the exact stall/remediation, canonical journal/manifest digests, current slice/token, and accepted-prefix chain; require rereading only the bound plan context; name the typed failure; and provide a substantive correction. Restore the profile that was bound before the stall: normally lower-tier+medium; if the user explicitly enabled whole-session `highest_throughout`, restore that highest profile instead of silently downgrading. Host acceptance/echo rules remain unchanged.
 
-Successful implementation and verification resolve the stall. Any resumed execution failure becomes terminal for this stall and returns to replan or user-visible blockage; it never launches a second high diagnosis. Compaction/resume and Schema migration retain only bounded fingerprints, enums, attempts, profile, timestamps, and canonical bindings in state—never raw errors, prompts, commands, plans, or child results; plan semantics are reread from the journal.
+Successful resumed implementation creates only a current-slice candidate; the stall resolves after the parent independently verifies it and returns exact final `EXECUTION_REVIEW execution_contract_id=<32hex> slice_id=sNN outcome=passed`. Parent review failure exhausts attempt two. Any resumed execution failure is likewise terminal and never launches a second high diagnosis. Compaction/resume and Schema migration retain only bounded fingerprints, enums, attempts, profile, timestamps, review, slice/token, accepted-prefix, and canonical bindings—never raw errors, prompts, commands, plans, or child results.

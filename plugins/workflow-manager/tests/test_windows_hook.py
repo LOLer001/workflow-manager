@@ -42,6 +42,7 @@ class WindowsHookTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.data = self.root / "data"
         self.driver = self.root / "invoke-command-windows.cmd"
+        self._spawn_requests: dict[str, dict] = {}
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -80,8 +81,18 @@ class WindowsHookTests(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         resolved_env = env or self.environment()
+        if payload.get("hook_event_name") == "SubagentStart" and not payload.get("transcript_path"):
+            request = self._spawn_requests.get(str(payload.get("session_id") or ""))
+            if request:
+                self.prepare_driver()
+                subprocess.run(self.command(), input=json.dumps({**request, "hook_event_name": "PostToolUse", "hook_run_id": f"{payload.get('hook_run_id')}-fixture-post", "tool_response": {"status": "ok"}}, ensure_ascii=True), text=True, capture_output=True, env=resolved_env, timeout=45)
+                turn_id = str(payload.get("turn_id") or f"fixture-{payload.get('hook_run_id')}")
+                options = request.get("tool_input") if isinstance(request.get("tool_input"), dict) else {}
+                transcript = self.root / f"{payload.get('hook_run_id')}-context.jsonl"
+                transcript.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": turn_id, "model": payload.get("model") or options.get("model"), "effort": options.get("reasoning_effort")}}) + "\n", encoding="utf-8")
+                payload = {**payload, "turn_id": turn_id, "transcript_path": str(transcript)}
         self.prepare_driver()
-        return subprocess.run(
+        result = subprocess.run(
             self.command(),
             input=json.dumps(payload, ensure_ascii=True),
             text=True,
@@ -92,6 +103,9 @@ class WindowsHookTests(unittest.TestCase):
             # fail-open path, so the timeout is a harness allowance rather than a product SLA.
             timeout=45,
         )
+        if payload.get("hook_event_name") == "PreToolUse" and str(payload.get("tool_name") or "") in {"collaboration.spawn_agent", "collaborationspawn_agent", "Agent"}:
+            self._spawn_requests[str(payload.get("session_id") or "")] = payload
+        return result
 
     def test_plan_directory_guard_blocks_rename_until_handles_close(self) -> None:
         root = self.data
@@ -116,6 +130,75 @@ class WindowsHookTests(unittest.TestCase):
         ]
         self.assertEqual(len(commands), 9)
         self.assertEqual(set(commands), {EXPECTED_WINDOWS_COMMAND})
+
+    def test_windows_transcript_turn_context_is_exactly_correlated(self) -> None:
+        transcript = self.root / "start-context.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "turn_context", "payload": {"turn_id": "windows-turn", "model": "gpt-5.6-sol", "effort": "max"}}) + "\n",
+            encoding="utf-8",
+        )
+        observed = HOOK.start_turn_observation({"turn_id": "windows-turn", "model": "gpt-5.6-sol", "transcript_path": str(transcript)})
+        self.assertEqual(observed, ("gpt-5.6-sol", "max", "transcript_turn_context_effort"))
+        self.assertEqual(HOOK.start_turn_observation({"turn_id": "other-turn", "model": "gpt-5.6-sol", "transcript_path": str(transcript)}), (None, None, None))
+
+    def test_windows_identity_preflight_is_direct_and_denies_child_spawn(self) -> None:
+        session = "windows-identity-preflight"
+        prompt = (
+            "WM_1044_FINAL_ACTIVATION_PREFLIGHT: identity preflight; "
+            "do not call any tool; do not start any child; reply PREFLIGHT_OK."
+        )
+        submitted = self.run_command_windows(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "preflight",
+                "prompt": prompt,
+            }
+        )
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        self.assertIn(
+            "child Start=0",
+            json.loads(submitted.stdout)["hookSpecificOutput"]["additionalContext"],
+        )
+        state = json.loads(
+            next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            (state["task_domain"], state["work_difficulty"], state["assessor_state"]),
+            ("daily", "not_applicable", "none"),
+        )
+        denied = self.run_command_windows(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "forbidden-child",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "preflight_child",
+                    "message": "identity probe",
+                    "fork_turns": "1",
+                },
+            }
+        )
+        self.assertEqual(
+            json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+    def test_windows_host_response_wrapper_is_top_level_only(self) -> None:
+        self.assertEqual(
+            HOOK.response_status(
+                [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": '{"exit_code": 0}'},
+                ]
+            ),
+            "ok",
+        )
+        self.assertEqual(
+            HOOK.response_status({"output": "Script completed\nWall time 0.1 seconds\nOutput:\n"}),
+            "unknown",
+        )
 
     def test_hook_stdout_is_ascii_safe_for_non_utf8_windows_code_pages(self) -> None:
         source = (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(encoding="utf-8")
@@ -261,6 +344,37 @@ class WindowsHookTests(unittest.TestCase):
                 / "SKILL.md"
             ).read_bytes(),
         )
+
+    def test_windows_resume_reconciles_only_exact_host_rollout_compaction(self) -> None:
+        session = "01a03314-58fc-71d2-aeb9-a32ea684249a"
+        rollout = self.root / "host-rollout.jsonl"
+        prior = "01a03314-58fc-71d2-aeb9-a33106ee9f9e"
+        current = "01a03398-77ea-76c3-abf0-bdffd0ac34b7"
+        records = (
+            {"type": "session_meta", "payload": {"session_id": session, "id": session}},
+            {"type": "compacted", "payload": {"window_number": 1, "window_id": current, "previous_window_id": prior}},
+            {"type": "event_msg", "payload": {"type": "token_count"}},
+            {"type": "event_msg", "payload": {"type": "context_compacted"}},
+        )
+        rollout.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+        started = self.run_command_windows(
+            {"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "start", "source": "startup"}
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        resumed = self.run_command_windows(
+            {"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume", "source": "resume", "turn_id": "resume-turn", "transcript_path": str(rollout)}
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        observed = [item for item in state["compactions"] if item.get("source") == "host_rollout_reconciled"]
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["window_id"], current)
+        duplicate = self.run_command_windows(
+            {"hook_event_name": "SessionStart", "session_id": session, "hook_run_id": "resume-again", "source": "resume", "turn_id": "resume-turn-2", "transcript_path": str(rollout)}
+        )
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(len([item for item in state["compactions"] if item.get("source") == "host_rollout_reconciled"]), 1)
 
     def test_python_fallback_handles_spaces_and_unicode(self) -> None:
         fake_root = self.root / "插件 root with spaces"
@@ -458,7 +572,7 @@ class WindowsHookTests(unittest.TestCase):
         assessor_request = self.run_command_windows({
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "executor-assessor-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none", "message": (
+            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
                 "profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
             )},
@@ -476,6 +590,9 @@ class WindowsHookTests(unittest.TestCase):
             {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "executor-assessor-stop", "agent_id": "windows-executor-assessor", "status": "completed", "last_assistant_message": (
                 "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n3. 完成实机验证与回滚检查\n"
                 "验收：问题不再复现。\n"
+                "```workflow-manager-execution-slices\n"
+                '{"version":1,"global_constraints":["preserve acceptance"],"slices":[{"id":"s01","title":"repair and verify","scope":["bounded Windows test flow"],"acceptance":["verification passes"],"rollback":["revert bounded change"],"stop_conditions":["verification fails"],"expected_artifacts":["verification evidence"]}]}\n'
+                "```\n"
                 f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n"
                 "计划已就绪，等待确认后执行"
             )},
@@ -495,10 +612,10 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_run_id": "executor-request",
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
-                    "task_name": "execute_confirmed_plan",
+                    "task_name": HOOK.bound_executor_task_name(state),
                     "model": "gpt-5.6-terra",
                     "reasoning_effort": "medium",
-                    "fork_turns": "none",
+                    "fork_turns": "1",
                     "message": (
                         "Unique exclusive executor. "
                         f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
@@ -507,9 +624,11 @@ class WindowsHookTests(unittest.TestCase):
                         f"relative_path={state['plan_artifact']['relative_path']} "
                         f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
                         f"journal_digest={state['plan_artifact']['journal_digest']}. "
+                        f"slice_id={(HOOK.current_execution_slice(state) or {}).get('id', '')} "
+                        f"slice_contract_id={HOOK.slice_contract_id(state)}. "
                         "Exclusive execution ownership; "
                         "implement the full actionable plan and run verification acceptance tests.\n"
-                        f"EXECUTION_RESULT execution_contract_id={contract_id} outcome=succeeded|failed evidence_digest=<32hex>"
+                        f"EXECUTION_RESULT execution_contract_id={contract_id} slice_id=s01 outcome=succeeded|failed"
                     ),
                 },
             }
@@ -518,9 +637,95 @@ class WindowsHookTests(unittest.TestCase):
         self.assertTrue(request.stdout.isascii())
         request_output = json.loads(request.stdout)["hookSpecificOutput"]
         self.assertNotIn("permissionDecision", request_output)
-        final_state = json.loads(next((self.data / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+        state_path = next((self.data / "sessions").glob("*.json"))
+        final_state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(final_state["executor_state"], "spawn_pending")
         self.assertEqual(final_state["executor_model"], "gpt-5.6-terra")
+
+        for payload in (
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "executor-start",
+                "agent_id": "windows-confirmed-executor",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "executor-change",
+                "agent_id": "windows-confirmed-executor",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+                "tool_response": {"status": "completed"},
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "executor-verification",
+                "agent_id": "windows-confirmed-executor",
+                "tool_name": "Bash",
+                "tool_input": {"command": "py -3 -m unittest tests.test_reboot"},
+                "tool_response": {"exit_code": 0, "output": "1 test passed"},
+            },
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": session,
+                "hook_run_id": "executor-stop-without-status",
+                "agent_id": "windows-confirmed-executor",
+                "last_assistant_message": (
+                    "EXECUTION_RESULT "
+                    f"execution_contract_id={contract_id} slice_id=s01 outcome=succeeded"
+                ),
+            },
+        ):
+            result = self.run_command_windows(payload)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout:
+                self.assertTrue(result.stdout.isascii())
+                json.loads(result.stdout)
+        candidate = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(candidate["executor_state"], "verification_required")
+        self.assertEqual(candidate["executor_review"]["status"], "review_required")
+        self.assertRegex(candidate["executor_review"]["candidate_evidence_digest"], r"^[0-9a-f]{32}$")
+        self.assertRegex(candidate["executor_review"]["candidate_agent_fingerprint"], r"^[0-9a-f]{32}$")
+        self.assertNotIn("EXECUTION_RESULT", json.dumps(candidate, ensure_ascii=True))
+
+        parent_verify = self.run_command_windows(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "executor-parent-verify",
+                "tool_name": "Bash",
+                "tool_input": {"command": "test -f bounded_acceptance && stat -c %s bounded_acceptance"},
+                "tool_response": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": '{"exit_code": 0}'},
+                ],
+            }
+        )
+        self.assertEqual(parent_verify.returncode, 0, parent_verify.stderr)
+        sealed_result = self.run_command_windows(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "executor-parent-review",
+                "last_assistant_message": (
+                    "EXECUTION_REVIEW "
+                    f"execution_contract_id={contract_id} slice_id=s01 outcome=passed"
+                ),
+            }
+        )
+        self.assertEqual(sealed_result.returncode, 0, sealed_result.stderr)
+        if sealed_result.stdout:
+            self.assertTrue(sealed_result.stdout.isascii())
+            json.loads(sealed_result.stdout)
+        sealed = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(sealed["executor_state"], "succeeded")
+        self.assertEqual(sealed["last_execution_baseline"]["acceptance_status"], "passed")
+        self.assertEqual(sealed["executor_review"]["status"], "passed")
+        self.assertRegex(sealed["executor_review"]["review_evidence_digest"], r"^[0-9a-f]{32}$")
 
     def test_causal_review_roundtrip_is_fingerprint_only_and_ascii_safe(self) -> None:
         session = "windows-causal-review"
@@ -546,7 +751,7 @@ class WindowsHookTests(unittest.TestCase):
         assessor = self.run_command_windows({
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "causal-assessor-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "ultra", "fork_turns": "none", "message": (
+            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
                 "profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
             )},
@@ -564,6 +769,9 @@ class WindowsHookTests(unittest.TestCase):
             {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "causal-assessor-stop", "agent_id": "windows-causal-assessor", "status": "completed", "last_assistant_message": (
                 "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n3. 完成实机验证与回滚检查\n"
                 "验收：问题不再复现。\n"
+                "```workflow-manager-execution-slices\n"
+                '{"version":1,"global_constraints":["preserve acceptance"],"slices":[{"id":"s01","title":"repair and verify","scope":["bounded Windows test flow"],"acceptance":["verification passes"],"rollback":["revert bounded change"],"stop_conditions":["verification fails"],"expected_artifacts":["verification evidence"]}]}\n'
+                "```\n"
                 f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'b' * 32}\n"
                 "计划已就绪，等待确认后执行"
             )},
@@ -583,10 +791,10 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_run_id": "causal-executor-request",
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
-                    "task_name": "execute_confirmed_plan",
+                    "task_name": HOOK.bound_executor_task_name(state),
                     "model": "gpt-5.6-terra",
                     "reasoning_effort": "medium",
-                    "fork_turns": "none",
+                    "fork_turns": "1",
                     "message": (
                         "Unique exclusive executor. "
                         f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
@@ -595,9 +803,11 @@ class WindowsHookTests(unittest.TestCase):
                         f"relative_path={state['plan_artifact']['relative_path']} "
                         f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
                         f"journal_digest={state['plan_artifact']['journal_digest']}. "
+                        f"slice_id={(HOOK.current_execution_slice(state) or {}).get('id', '')} "
+                        f"slice_contract_id={HOOK.slice_contract_id(state)}. "
                         "Exclusive execution ownership; "
                         "implement the full actionable plan and run verification acceptance tests.\n"
-                        f"EXECUTION_RESULT execution_contract_id={contract_id} outcome=succeeded|failed evidence_digest=<32hex>"
+                        f"EXECUTION_RESULT execution_contract_id={contract_id} slice_id=s01 outcome=succeeded|failed"
                     ),
                 },
             },
@@ -606,6 +816,7 @@ class WindowsHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "causal-executor-start",
                 "agent_id": "windows-causal-executor",
+                "model": "gpt-5.6-terra",
             },
             {
                 "hook_event_name": "PostToolUse",
@@ -631,7 +842,30 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_run_id": "causal-executor-stop",
                 "agent_id": "windows-causal-executor",
                 "status": "completed",
-                "last_assistant_message": "implementation and verification complete",
+                "last_assistant_message": (
+                    "EXECUTION_RESULT "
+                    f"execution_contract_id={contract_id} slice_id=s01 outcome=succeeded"
+                ),
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "causal-parent-verify",
+                "tool_name": "Bash",
+                "tool_input": {"command": "test -f bounded_acceptance && stat -c %s bounded_acceptance"},
+                "tool_response": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": '{"exit_code": 0}'},
+                ],
+            },
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "causal-parent-review",
+                "last_assistant_message": (
+                    "EXECUTION_REVIEW "
+                    f"execution_contract_id={contract_id} slice_id=s01 outcome=passed"
+                ),
             },
         ]
         for payload in execution_events:
