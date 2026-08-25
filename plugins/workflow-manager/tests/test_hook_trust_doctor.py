@@ -167,10 +167,12 @@ class HookTrustDoctorTests(unittest.TestCase):
     def test_nine_trusted_hooks_exit_zero_and_output_is_redacted(self) -> None:
         result = self.run_doctor("trusted")
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 3, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["pluginId"], PLUGIN_ID)
         self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["configuration_status"], "ok")
+        self.assertEqual(payload["dispatch_status"]["status"], "current_session_unavailable")
         self.assertEqual(payload["count"], 9)
         self.assertEqual(len(payload["hooks"]), 9)
         for hook in payload["hooks"]:
@@ -220,7 +222,7 @@ class HookTrustDoctorTests(unittest.TestCase):
         target_cwd.mkdir()
         result = self.run_doctor("trusted", cwd=target_cwd)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 3, result.stderr)
         record = self.read_record()
         self.assertEqual(record["argv"], ["app-server", "--stdio"])
         self.assertEqual(Path(str(record["cwd"])).resolve(), target_cwd.resolve())

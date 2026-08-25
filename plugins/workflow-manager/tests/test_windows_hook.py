@@ -328,9 +328,11 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(len(states), 1)
         state = json.loads(states[0].read_text(encoding="utf-8"))
         self.assertEqual(state["schema_version"], HOOK.SCHEMA_VERSION)
-        # PreToolUse without a duplicate is intentionally read-only.
-        self.assertEqual(len(state["processed_hook_runs"]), 8)
-        self.assertEqual(sum(state["event_counts"].values()), 8)
+        # PreToolUse is intentionally read-only, and ordinary unbound
+        # SubagentStart/SubagentStop now pass through native Codex without
+        # entering the plugin ledger. Six authorization/continuity events remain.
+        self.assertEqual(len(state["processed_hook_runs"]), 6)
+        self.assertEqual(sum(state["event_counts"].values()), 6)
         self.assertEqual(list((self.data / "sessions").glob("*.tmp")), [])
         stable_skill = self.root / ".codex" / "skills" / "workflow-manager" / "SKILL.md"
         self.assertTrue(stable_skill.is_file())
@@ -538,7 +540,7 @@ class WindowsHookTests(unittest.TestCase):
             }
         )
         self.assertEqual(compacted.returncode, 0, compacted.stderr)
-        self.assertIn("make one material correction now", compacted.stdout)
+        self.assertEqual(compacted.stdout, "")
         self.assertNotIn("large output", compacted.stdout.lower())
         state_files = list((self.data / "sessions").glob("*.json"))
         states = [json.loads(path.read_text(encoding="utf-8")) for path in state_files]
@@ -570,7 +572,7 @@ class WindowsHookTests(unittest.TestCase):
             "hook_run_id": "executor-assessor-request", "tool_name": "collaboration.spawn_agent",
             "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
-                "profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+                "profile_resolution=highest_available Hard read-only plan then confirmation"
             )},
         })
         self.assertEqual(assessor_request.returncode, 0, assessor_request.stderr)
@@ -749,7 +751,7 @@ class WindowsHookTests(unittest.TestCase):
             "hook_run_id": "causal-assessor-request", "tool_name": "collaboration.spawn_agent",
             "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
-                "profile_resolution=highest_available assess Simple directly solve and verify; Hard read-only plan then confirmation"
+                "profile_resolution=highest_available Hard read-only plan then confirmation"
             )},
         })
         self.assertEqual(assessor.returncode, 0, assessor.stderr)

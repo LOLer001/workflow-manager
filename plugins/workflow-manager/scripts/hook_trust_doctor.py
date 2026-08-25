@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, TextIO
 
 
@@ -24,6 +26,14 @@ HEALTHY_TRUST_STATUSES = frozenset({"trusted", "managed"})
 REVIEW_TRUST_STATUSES = frozenset({"untrusted", "modified"})
 DEFAULT_TIMEOUT_SECONDS = 15.0
 _EOF = object()
+DISPATCH_RECEIPT_SCHEMA = 1
+DISPATCH_RECEIPT_MAX_BYTES = 4096
+DISPATCH_STALE_SECONDS = 15 * 60
+DISPATCH_WRITER_VERSION = "1.0.46"
+DISPATCH_STATE_SCHEMA = 27
+DISPATCH_EXECUTION_PROFILE = "10"
+DISPATCH_STABLE_SKILL_SCHEMA = 8
+DISPATCH_RUNNER_KINDS = frozenset({"posix_direct", "posix_cached", "windows_py", "windows_python"})
 
 
 class DoctorError(RuntimeError):
@@ -117,7 +127,27 @@ def _signal_process(process: subprocess.Popen[str], *, force: bool) -> None:
         return
     try:
         if os.name == "nt":
-            (process.kill if force else process.terminate)()
+            # A configured Codex CLI may be a .cmd launcher. Terminating only the
+            # wrapper leaves its Python/app-server child alive, which keeps pipes
+            # and temporary directories open past the doctor's deadline. Kill the
+            # exact Windows process tree without invoking a shell.
+            system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            taskkill = system_root / "System32" / "taskkill.exe"
+            command = [str(taskkill), "/PID", str(process.pid), "/T"]
+            if force:
+                command.append("/F")
+            try:
+                subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.5,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                (process.kill if force else process.terminate)()
         else:
             os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
     except (OSError, ProcessLookupError):
@@ -330,7 +360,7 @@ def _needs_review(hooks: list[dict[str, Any]]) -> bool:
     )
 
 
-def _print_report(hooks: list[dict[str, Any]], *, as_json: bool) -> int:
+def _print_report(hooks: list[dict[str, Any]], *, as_json: bool, dispatch: dict[str, Any] | None = None) -> int:
     review = _needs_review(hooks)
     status = "review_required" if review else "ok"
     if as_json:
@@ -339,6 +369,8 @@ def _print_report(hooks: list[dict[str, Any]], *, as_json: bool) -> int:
                 {
                     "pluginId": PLUGIN_ID,
                     "status": status,
+                    "configuration_status": status,
+                    "dispatch_status": dispatch or {"status": "not_requested"},
                     "count": len(hooks),
                     "hooks": hooks,
                 },
@@ -355,7 +387,88 @@ def _print_report(hooks: list[dict[str, Any]], *, as_json: bool) -> int:
                 f"{hook['key']}\t{hook['event']}\t{str(hook['enabled']).lower()}\t"
                 f"{hook['trustStatus']}\t{hook['currentHash']}"
             )
+        dispatch_status = (dispatch or {"status": "not_requested"})["status"]
+        print(f"configuration_status: {status}")
+        print(f"dispatch_status: {dispatch_status}")
     return 2 if review else 0
+
+
+def _receipt_path(plugin_data: str, session: str) -> Path:
+    token = hashlib.sha256(("workflow-manager-dispatch-receipt-v1\0" + session).encode("utf-8")).hexdigest()[:32]
+    root = Path(plugin_data).expanduser().resolve(strict=True)
+    if not root.is_dir() or root.is_symlink():
+        raise DoctorError("plugin data is unavailable")
+    return root / "dispatch-receipts" / f"{token}.json"
+
+
+def _parse_since(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DoctorError("--since must be RFC3339") from exc
+    if parsed.tzinfo is None:
+        raise DoctorError("--since must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _dispatch_status(plugin_data: str | None, session: str | None, since: datetime | None, required: list[str]) -> dict[str, Any]:
+    if session is None:
+        return {"status": "current_session_unavailable"}
+    if not plugin_data:
+        raise DoctorError("--plugin-data is required with --session")
+    path = _receipt_path(plugin_data, session)
+    try:
+        info = path.lstat()
+        if path.is_symlink() or not path.is_file() or info.st_size > DISPATCH_RECEIPT_MAX_BYTES:
+            return {"status": "receipt_invalid"}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, Mapping) or raw.get("schema") != DISPATCH_RECEIPT_SCHEMA:
+            return {"status": "receipt_invalid"}
+        at = raw.get("at")
+        events = raw.get("events")
+        timeline = raw.get("timeline")
+        if raw.get("source") != "hook":
+            return {"status": "source_mismatch"}
+        if (raw.get("writer_version") != DISPATCH_WRITER_VERSION
+                or raw.get("state_schema") != DISPATCH_STATE_SCHEMA
+                or raw.get("execution_profile") != DISPATCH_EXECUTION_PROFILE
+                or raw.get("stable_skill_schema") != DISPATCH_STABLE_SKILL_SCHEMA):
+            return {"status": "runtime_mismatch"}
+        if raw.get("runner_kind") not in DISPATCH_RUNNER_KINDS:
+            return {"status": "runtime_mismatch"}
+        fingerprints = ("plugin_root_fingerprint", "source_fingerprint", "stable_skill_fingerprint")
+        if any(not isinstance(raw.get(key), str) or len(raw[key]) not in {7, 32} for key in fingerprints):
+            return {"status": "receipt_invalid"}
+        if (not isinstance(at, str) or not isinstance(events, list)
+                or not all(x in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "SubagentStart", "SubagentStop", "Stop") for x in events)
+                or not isinstance(timeline, list) or len(timeline) != len(events)
+                or raw.get("event_count") != len(events)):
+            return {"status": "receipt_invalid"}
+        for index, item in enumerate(timeline):
+            if (not isinstance(item, Mapping) or item.get("event") != events[index]
+                    or not isinstance(item.get("at"), str) or not isinstance(item.get("run"), str)
+                    or len(item["run"]) != 32):
+                return {"status": "receipt_invalid"}
+            _parse_since(item["at"])
+        observed = _parse_since(at)
+        now = datetime.now(timezone.utc)
+        if since is not None and observed < since:
+            return {"status": "stale"}
+        if (now - observed).total_seconds() > DISPATCH_STALE_SECONDS:
+            return {"status": "stale"}
+        cursor = 0
+        for expected in required:
+            try:
+                cursor = events.index(expected, cursor) + 1
+            except ValueError:
+                return {"status": "event_missing"}
+        return {"status": "ok", "schema": DISPATCH_RECEIPT_SCHEMA, "event_count": len(events), "runner_kind": raw["runner_kind"]}
+    except FileNotFoundError:
+        return {"status": "receipt_missing"}
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {"status": "receipt_invalid"}
 
 
 def _print_error(message: str, *, as_json: bool) -> None:
@@ -373,6 +486,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-cli", help="Explicit path to the Codex CLI executable.")
     parser.add_argument("--cwd", help="Working directory whose effective hooks are checked.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    parser.add_argument("--session", help="Explicit session identifier to check; never inferred.")
+    parser.add_argument("--plugin-data", help="Explicit plugin-data root required for --session.")
+    parser.add_argument("--since", help="RFC3339 lower freshness bound for the dispatch receipt.")
+    parser.add_argument("--require-event", action="append", default=[], choices=("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "SubagentStart", "SubagentStop", "Stop"), help="Required receipt event; may be repeated in order.")
     parser.add_argument(
         "--timeout",
         type=float,
@@ -391,7 +508,9 @@ def main(argv: list[str] | None = None) -> int:
         cli = _resolve_cli(args.codex_cli)
         cwd = _resolve_cwd(args.cwd)
         hooks = _project_hooks(_run_rpc(cli, cwd, args.timeout), cwd)
-        return _print_report(hooks, as_json=args.json)
+        dispatch = _dispatch_status(args.plugin_data, args.session, _parse_since(args.since), args.require_event)
+        configuration_exit = _print_report(hooks, as_json=args.json, dispatch=dispatch)
+        return 3 if configuration_exit == 0 and dispatch["status"] != "ok" else configuration_exit
     except DoctorError as exc:
         _print_error(str(exc), as_json=args.json)
         return 1

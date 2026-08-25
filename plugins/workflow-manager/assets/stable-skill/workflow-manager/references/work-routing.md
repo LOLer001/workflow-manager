@@ -4,20 +4,20 @@ Use this reference for difficult-work classification, plan construction, strict 
 
 ## Decision order and runtime truth
 
-1. Decide Daily or Work independently from Direct/Focused/Complex/Extensive.
-2. Daily requests keep the current session settings and have no work-plan gate.
-3. Simple/Focused objectives stay local with zero child starts. A true Hard objective, causal/replacement review, reference failure, unknown/critical problem, or failed material correction creates one binding from objective fingerprint plus assessor generation. Request exactly one child with the highest available Codex model and default `reasoning_effort=max`; explicit `highest_throughout` requests `ultra`. Use `fork_turns=1`. Record requested, host-accepted, and observed profile separately; a bound child runs only with a full matching Start observation.
-4. Simple work proceeds directly. Hard work remains in analysis until a detailed plan is strictly confirmed.
+1. Decide Daily or Work, then decide whether engineering Work crosses the narrow Hard threshold.
+2. Daily and non-Hard Work use native Codex directly. Workflow Manager does not assign phases, routes, agent caps, retry behavior, or progress format.
+3. A true Hard objective creates one binding from objective fingerprint plus assessor generation. Request exactly one child with the highest available Codex model and default `reasoning_effort=max`; explicit `highest_throughout` requests `ultra`. Use `fork_turns=1`. Record requested, host-accepted, and observed profile separately; a bound child runs only with a full matching Start observation.
+4. Hard work remains read-only until a detailed canonical plan is strictly confirmed.
 
 `current` and `work_assessment` are policy requests recorded by the Hook. The Hook cannot select, inspect, or prove the host model/reasoning setting. Report the requested profile and any host evidence separately; never turn an advisory into a success claim.
 
 ## Bound assessor lifecycle
 
-The child request carries exact `assessor_binding_id`, `objective_fingerprint`, `profile_resolution=highest_available`, and a self-contained role contract. Its first turn is read-only. For **Simple**, it ends with `WORK_ASSESSMENT binding_id=<32hex> outcome=simple evidence_digest=<32hex>`; only an exact follow-up to that same agent/binding with solve+verify may mutate, and it must end with line-level `SIMPLE_EXECUTION binding_id=<32hex> evidence_digest=<32hex>`. For **Hard**, it remains read-only, produces the detailed plan below, emits the equivalent `outcome=hard` marker, and its final line is exactly `计划已就绪，等待确认后执行`.
+The child request carries exact `assessor_binding_id`, `objective_fingerprint`, `profile_resolution=highest_available`, and a self-contained Hard-planning contract. It remains read-only, produces the detailed plan below, and its final line is exactly `计划已就绪，等待确认后执行`. `WORK_ASSESSMENT binding_id=<32hex> outcome=hard evidence_digest=<32hex>` remains a supported compatibility marker, but a bound full Start/Stop plus a structurally valid plan is authoritative; the Hook derives the evidence digest when the redundant child marker is absent.
 
-Only requested profile fields are recorded at spawn. A bound child may run only after `SubagentStart` supplies a matching active-model echo and the same turn's host transcript supplies matching effort. Absent fields never fabricate evidence or mutation authority. Mismatched/stale marker or child status is typed recovery. There is one materially corrected recovery at most (two attempts); recovery must name the previous typed cause and a substantive correction. A Hard outcome after successful implementation/build/deploy/device/Git mutation fails as `hard_mutation_before_confirmation` and cannot supply a plan. Compaction/resume retains only binding, state, attempt, failure, and fingerprints—never raw prompt, plan, or child result.
+Only requested profile fields are recorded at spawn. A bound child may run only after `SubagentStart` supplies a matching active-model echo and the same turn's host transcript supplies matching effort. Absent fields never fabricate evidence or mutation authority. Mismatched/stale marker or child status is typed recovery. There is one materially corrected assessor recovery at most. A Hard outcome after successful implementation/build/deploy/device/Git mutation fails as `hard_mutation_before_confirmation` and cannot supply a plan. Compaction/resume retains only binding, state, attempt, failure, and fingerprints—never raw prompt, plan, or child result.
 
-Difficulty and execution shape are separate axes. Device interaction, build/deploy, three phases, a shared resource, or ambiguity alone is not Hard. Agent caps never determine difficulty.
+Device interaction, build/deploy, three phases, a shared resource, or ambiguity alone is not Hard. Host-native execution shape and agent count never determine difficulty.
 
 ## Gold set
 
@@ -51,7 +51,7 @@ Read enough evidence to make the plan executable, but do not mutate merely to di
 
 Separate independent lanes from one ordered chain. Do not promise an exact file or method without evidence; label unresolved locations as bounded discovery in the plan. Finish with the exact sentence `计划已就绪，等待确认后执行`.
 
-Before that readiness sentence, include exactly one fenced JSON block with language `workflow-manager-execution-slices`. Sanitization removes protocol/readiness lines, so this block becomes the tail of the canonical revision. It uses only the exact keys `version`, `global_constraints`, and `slices`; every slice uses `id`, `title`, `scope`, `acceptance`, `rollback`, `stop_conditions`, and `expected_artifacts`. IDs are consecutive `s01` onward, all arrays contain bounded non-empty strings, and a normal Hard revision uses 1..3 acceptance checkpoints with a hard upper bound of 6.
+Before that readiness sentence, include exactly one fenced JSON block, preferably with language `workflow-manager-execution-slices`. A bound assessor's single unambiguous tail `json` fence is accepted only when its payload already matches the exact execution-slice schema, then the Hook canonicalizes the language before journaling. Sanitization removes protocol/readiness lines, so this block becomes the tail of the canonical revision. It uses only the exact keys `version`, `global_constraints`, and `slices`; every slice uses `id`, `title`, `scope`, `acceptance`, `rollback`, `stop_conditions`, and `expected_artifacts`. IDs are consecutive `s01` onward, all arrays contain bounded non-empty strings, and a normal Hard revision uses 1..3 acceptance checkpoints with a hard upper bound of 6.
 
 Each slice must have one independently observable acceptance surface and bounded ownership. Preserve global invariants in `global_constraints`; put prerequisites before consumers; keep shared build/device stages sequential; and split large plans so a lower-tier executor cannot silently omit a strong gate. More than 6 meaningful slices means the plan is not yet executable: consolidate or split the objective instead of dropping checks. The complete example and runtime contract are in [confirmed-execution.md](confirmed-execution.md).
 
@@ -76,7 +76,7 @@ A confirmation binds only the current trusted canonical revision digest, its jou
 - `开始执行这个计划`
 - `confirm and execute this plan` / `execute the plan`
 
-Do not treat “继续”, “可以”, a question, partial approval, or silence as confirmation. A message containing “但是/另外/增加/删除/改为/先不要” or “but/except/add/remove/change” adds or changes a constraint: invalidate the pending confirmation, preserve compatible evidence, append one complete replacement revision, then ask again. `重新规划`, `重做计划`, `修改计划`, `replan`, and `revise the plan` do the same. A new objective needs a new decision and another complete revision in the same session journal.
+Do not treat “继续”, “可以”, a question, partial approval, or silence as confirmation. A message containing “但是/另外/增加/删除/改为/作废/修正版/写入/先不要” or “but/except/add/remove/change” adds or changes a constraint: invalidate the pending confirmation, preserve compatible evidence, append one complete replacement revision, then ask again. Sentences beginning with `重新规划`, `重做计划`, `修改计划`, `replan`, or `revise the plan` do the same even when details follow after punctuation or whitespace. An official delegated recovery/control message retains the active Work/Hard route and binding; it must not fall through to the Daily default merely because its text is short. A new objective needs a new decision and another complete revision in the same session journal.
 
 ## Guard boundary before confirmation
 

@@ -23,18 +23,30 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 26
-WRITER_VERSION = "1.0.45"
+SCHEMA_VERSION = 27
+WRITER_VERSION = "1.0.46"
 DOMAIN_CLASSIFIER_VERSION = "1"
 DIFFICULTY_CLASSIFIER_VERSION = "2"
-EXECUTION_PROFILE_VERSION = "9"
+EXECUTION_PROFILE_VERSION = "10"
 # The assessor is the hard-work safety gate: use the highest generally exposed
 # effort (max); ultra is reserved for the explicit whole-session policy.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
 HIGHEST_SESSION_REASONING_EFFORT = "ultra"
 STABLE_SKILL_NAME = "workflow-manager"
-STABLE_SKILL_SCHEMA = 7
+STABLE_SKILL_SCHEMA = 8
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
+# 1.0.46 removed these generic workflow references from the bundled Skill, but
+# the old updater only overlaid current files.  Delete a retired path only when
+# its bytes still match a released Workflow Manager asset; preserve user edits,
+# symlinks, and unrelated files.
+RETIRED_STABLE_SKILL_FILE_DIGESTS = {
+    "references/agent-lifecycle.md": frozenset(
+        {"1660459ebc40e297bf4733e71de53739ce6eb0a903b70753aa88e14e8be74c04"}
+    ),
+    "references/live-coordination.md": frozenset(
+        {"da0814dcf89aaef8d6ee65e3ecb72824f0583c05fa5de066dfc363a2f10f576b"}
+    ),
+}
 MAX_EVENT_COUNT = 2**63 - 1
 STATE_EVENTS = frozenset(
     {
@@ -57,12 +69,6 @@ MAX_COMPACTIONS = 16
 MAX_GUARDS = 32
 MAX_PROCESSED_RUNS = 128
 MAX_DUPLICATE_NOTICES = 64
-MAX_COORDINATION_ACTIVITY = 32
-MAX_COORDINATION_NOTICES = 32
-MAX_COORDINATION_INBOUND = 32
-MAX_CHANGE_EPOCH_LEDGER = 16
-COORDINATION_SNAPSHOT_TTL_SECONDS = 60
-COORDINATION_ID_MAX_BYTES = 4096
 MAX_STATE_BYTES = 1024 * 1024
 MAX_PLAN_REVISION_BYTES = 960 * 1024
 MAX_PLAN_JOURNAL_BYTES = 10 * 1024 * 1024
@@ -84,8 +90,11 @@ DEFAULT_MAX_SESSION_FILES = 200
 DEFAULT_OUTPUT_CHAR_LIMIT = 16_000
 DEFAULT_OUTPUT_LINE_LIMIT = 300
 DEFAULT_VISUAL_ITEM_LIMIT = 3
-PRESSURE_TRIM_THRESHOLD = 0.55
-PRESSURE_CHECKPOINT_THRESHOLD = 0.70
+DISPATCH_RECEIPT_SCHEMA = 1
+MAX_DISPATCH_RECEIPT_BYTES = 4096
+MAX_DISPATCH_RECEIPT_EVENTS = 32
+DISPATCH_RECEIPT_MAX_AGE_SECONDS = 15 * 60
+DISPATCH_RUNNER_KINDS = frozenset({"posix_direct", "posix_cached", "windows_py", "windows_python"})
 
 MODEL_PROFILES = {
     "current",
@@ -99,7 +108,6 @@ EXECUTOR_STATES = {
     "spawn_required",
     "spawn_pending",
     "running",
-    "local_running",
     "verification_required",
     "succeeded",
     "recovery_required",
@@ -142,7 +150,7 @@ STALL_RESUME_PROFILES = {
     "work_executor_highest_available",
 }
 MAX_STALL_DIAGNOSIS_ATTEMPTS = 2
-ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "simple_execution_required", "simple_running", "simple_complete", "hard_plan_ready", "recovery_required", "failed"}
+ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "hard_plan_ready", "recovery_required", "failed"}
 CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
 CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
@@ -309,6 +317,10 @@ EXECUTION_SLICES_FENCE_RE = re.compile(
 EXECUTION_SLICES_FENCE_INTENT_RE = re.compile(
     r"(?m)^\s*```workflow-manager-execution-slices\b"
 )
+EXECUTION_SLICES_JSON_FENCE_RE = re.compile(
+    r"(?ms)^```json[ \t]*\n(.*?)^```[ \t]*(?:\n)?\Z"
+)
+EXECUTION_SLICES_JSON_FENCE_INTENT_RE = re.compile(r"(?m)^\s*```json\b")
 EXECUTION_SLICE_FIELDS = (
     "title",
     "scope",
@@ -403,17 +415,49 @@ def parse_execution_slice_manifest(plan_body: str) -> dict[str, Any]:
     }
 
 
+def normalize_execution_slice_manifest_fence(plan_body: str) -> str:
+    """Canonicalize an unambiguous tail JSON manifest from a bound assessor.
+
+    Current Codex models occasionally emit the exact execution-slice schema in a
+    generic ``json`` fence. Requiring a fresh highest-tier assessor merely to
+    relabel that already-validated payload wastes quota and does not add trust:
+    the bound Start/Stop lifecycle and strict schema remain authoritative.
+    """
+    normalized = str(plan_body or "").replace("\r\n", "\n").replace("\r", "\n")
+    if EXECUTION_SLICES_FENCE_INTENT_RE.search(normalized):
+        return normalized
+    matches = list(EXECUTION_SLICES_JSON_FENCE_RE.finditer(normalized))
+    intents = EXECUTION_SLICES_JSON_FENCE_INTENT_RE.findall(normalized)
+    if len(matches) != 1 or len(intents) != 1:
+        return normalized
+    match = matches[0]
+    try:
+        decoded = json.loads(match.group(1), object_pairs_hook=_strict_json_object_pairs)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return normalized
+    if not isinstance(decoded, dict) or set(decoded) != {
+        "version",
+        "global_constraints",
+        "slices",
+    }:
+        return normalized
+    replacement = (
+        "```workflow-manager-execution-slices\n" + match.group(1) + "```\n"
+    )
+    return normalized[: match.start()] + replacement
+
+
 def _safe_execution_slices(value: Any) -> dict[str, Any]:
     empty = _empty_execution_slices()
     if not isinstance(value, dict) or safe_int(value.get("schema")) != EXECUTION_SLICE_SCHEMA:
         return empty
-    plan_digest = _coordination_fp32(value.get("plan_digest"))
-    manifest_digest = _coordination_fp32(value.get("manifest_digest"))
-    global_digest = _coordination_fp32(value.get("global_constraints_digest"))
+    plan_digest = _fingerprint32(value.get("plan_digest"))
+    manifest_digest = _fingerprint32(value.get("manifest_digest"))
+    global_digest = _fingerprint32(value.get("global_constraints_digest"))
     raw_items = value.get("items")
     count = safe_int(value.get("count"))
     current_index = safe_int(value.get("current_index"))
-    completed_chain = _coordination_fp32(value.get("completed_chain"))
+    completed_chain = _fingerprint32(value.get("completed_chain"))
     if (
         not plan_digest
         or not manifest_digest
@@ -428,13 +472,13 @@ def _safe_execution_slices(value: Any) -> dict[str, Any]:
     for index, raw in enumerate(raw_items, start=1):
         if not isinstance(raw, dict) or raw.get("id") != f"s{index:02d}":
             return empty
-        slice_digest = _coordination_fp32(raw.get("slice_digest"))
+        slice_digest = _fingerprint32(raw.get("slice_digest"))
         if not slice_digest:
             return empty
         status = raw.get("status") if raw.get("status") in {"pending", "passed"} else "pending"
-        completion = _coordination_fp32(raw.get("completion_digest"))
-        review = _coordination_fp32(raw.get("review_digest"))
-        operation = _coordination_fp32(raw.get("operation_digest"))
+        completion = _fingerprint32(raw.get("completion_digest"))
+        review = _fingerprint32(raw.get("review_digest"))
+        operation = _fingerprint32(raw.get("operation_digest"))
         change_evidence = bool(raw.get("change_evidence"))
         verification_evidence = bool(raw.get("verification_evidence"))
         if status == "passed" and not (completion and review and operation and verification_evidence):
@@ -521,7 +565,7 @@ def current_execution_slice(state: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def slice_contract_id(state: dict[str, Any]) -> str | None:
-    contract = _coordination_fp32(state.get("execution_contract_id"))
+    contract = _fingerprint32(state.get("execution_contract_id"))
     slices = _safe_execution_slices(state.get("execution_slices"))
     item = current_execution_slice(state)
     if not contract or not item:
@@ -549,7 +593,7 @@ def slice_task_token(state: dict[str, Any]) -> str | None:
 
 def recompute_completed_slice_chain(slices: dict[str, Any]) -> str | None:
     safe = _safe_execution_slices(slices)
-    manifest = _coordination_fp32(safe.get("manifest_digest"))
+    manifest = _fingerprint32(safe.get("manifest_digest"))
     if not manifest:
         return None
     chain = stable_hash(f"workflow-manager-slice-chain-v1\0{manifest}", 32)
@@ -571,28 +615,6 @@ def recompute_completed_slice_chain(slices: dict[str, Any]) -> str | None:
     return chain
 
 
-COORDINATION_ENVELOPE_START = "WORKFLOW_COORDINATION_V1"
-COORDINATION_ENVELOPE_END = "END_WORKFLOW_COORDINATION"
-COORDINATION_RESOURCE_STAGES = {
-    "build_account": {"build", "compile", "package"},
-    "adb_device": {"adb", "deploy", "device_verify", "flash", "install", "reboot"},
-}
-COORDINATION_TRANSITIONS = {"blocked", "released"}
-COORDINATION_NOTICE_STATES = {"pending", "sent", "failed", "exhausted", "unconfirmed"}
-COORDINATION_THREAD_STATUSES = {"active", "idle", "notLoaded", "completed", "missing", "unknown"}
-COORDINATION_ENVELOPE_FIELDS = (
-    "source_task_fingerprint",
-    "source_host_fingerprint",
-    "target_task_fingerprint",
-    "target_host_fingerprint",
-    "sender_resource_identity",
-    "target_resource_identity",
-    "resource_kind",
-    "sender_stage",
-    "target_stage",
-    "lease_generation",
-    "transition",
-)
 CODEX_DELEGATION_MAX_BYTES = 1024 * 1024
 
 
@@ -626,270 +648,6 @@ def codex_delegation_input(value: str) -> str | None:
         return None
     return delegated if delegated.strip() else None
 
-
-def coordination_host_fingerprint(host_id: Any) -> str:
-    return stable_hash(f"workflow-coordination-host-v1\0{str(host_id or '')}", 32)
-
-
-def coordination_task_fingerprint_for_host(thread_id: Any, host_fingerprint: Any) -> str:
-    return stable_hash(
-        f"workflow-coordination-task-v1\0{str(host_fingerprint or '')}\0{str(thread_id or '')}",
-        32,
-    )
-
-
-def coordination_task_fingerprint(thread_id: Any, host_id: Any) -> str:
-    return coordination_task_fingerprint_for_host(
-        thread_id, coordination_host_fingerprint(host_id)
-    )
-
-
-def is_list_threads_tool(payload: dict[str, Any]) -> bool:
-    return str(payload.get("tool_name") or "") in {"list_threads", "codex_app__list_threads"}
-
-
-def is_send_message_to_thread_tool(payload: dict[str, Any]) -> bool:
-    return str(payload.get("tool_name") or "") in {
-        "send_message_to_thread",
-        "codex_app__send_message_to_thread",
-    }
-
-
-def coordination_send_fields(payload: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
-    value = payload.get("tool_input")
-    if not isinstance(value, dict):
-        return None, "send_message_to_thread requires one structured tool_input object"
-    aliases = {
-        "thread_id": ("threadId",),
-        "host_id": ("hostId",),
-        "message": ("prompt", "message"),
-    }
-    result: dict[str, str] = {}
-    for field, names in aliases.items():
-        raw_values = [value.get(name) for name in names if value.get(name) not in (None, "")]
-        if any(not isinstance(raw, str) for raw in raw_values):
-            return None, f"send_message_to_thread {field} must be a string"
-        observed = [raw for raw in raw_values if isinstance(raw, str)]
-        if len(set(observed)) > 1:
-            return None, f"send_message_to_thread has conflicting {field} aliases"
-        if not observed:
-            return None, f"send_message_to_thread lacks {field}"
-        if len(observed[0].encode("utf-8", errors="replace")) > COORDINATION_ID_MAX_BYTES:
-            return None, f"send_message_to_thread {field} exceeds the bounded input limit"
-        result[field] = observed[0]
-    return result, None
-
-
-def coordination_control_text(payload: dict[str, Any]) -> str | None:
-    value = payload.get("tool_input")
-    if not isinstance(value, dict):
-        return None
-    messages = [value.get(key) for key in ("prompt", "message")]
-    return next(
-        (
-            message
-            for message in messages
-            if isinstance(message, str)
-            and (
-                message.startswith(COORDINATION_ENVELOPE_START)
-                or message.startswith("<codex_delegation>")
-            )
-        ),
-        None,
-    )
-
-
-def parse_coordination_envelope(text: Any) -> tuple[dict[str, Any] | None, str | None]:
-    if not isinstance(text, str) or not text.startswith(COORDINATION_ENVELOPE_START):
-        return None, "missing WORKFLOW_COORDINATION_V1 marker"
-    if len(text.encode("utf-8", errors="replace")) > 8192:
-        return None, "coordination envelope exceeds the bounded byte limit"
-    lines = text.splitlines()
-    if len(lines) != len(COORDINATION_ENVELOPE_FIELDS) + 2:
-        return None, "coordination envelope has extra, missing, or mixed content"
-    if lines[0] != COORDINATION_ENVELOPE_START or lines[-1] != COORDINATION_ENVELOPE_END:
-        return None, "coordination envelope markers must be exact and complete"
-    result: dict[str, Any] = {}
-    for line, expected in zip(lines[1:-1], COORDINATION_ENVELOPE_FIELDS):
-        if "=" not in line:
-            return None, f"coordination envelope lacks {expected}"
-        key, value = line.split("=", 1)
-        if key != expected or not value or value != value.strip():
-            return None, f"coordination envelope field order/value is invalid at {expected}"
-        result[key] = value
-    for key in (
-        "source_task_fingerprint",
-        "source_host_fingerprint",
-        "target_task_fingerprint",
-        "target_host_fingerprint",
-        "sender_resource_identity",
-        "target_resource_identity",
-    ):
-        if not re.fullmatch(r"[0-9a-f]{32}", str(result.get(key) or "")):
-            return None, f"coordination envelope {key} must be 32hex"
-    kind = str(result.get("resource_kind") or "")
-    if kind not in COORDINATION_RESOURCE_STAGES:
-        return None, "coordination resource_kind must be build_account or adb_device"
-    if result.get("transition") not in COORDINATION_TRANSITIONS:
-        return None, "coordination transition must be blocked or released"
-    generation = str(result.get("lease_generation") or "")
-    if not re.fullmatch(r"[1-9]\d{0,8}", generation):
-        return None, "coordination lease_generation must be positive"
-    result["lease_generation"] = int(generation)
-    return result, None
-
-
-def coordination_conflict_class(envelope: dict[str, Any]) -> str | None:
-    kind = str(envelope.get("resource_kind") or "")
-    allowed = COORDINATION_RESOURCE_STAGES.get(kind, set())
-    sender = str(envelope.get("sender_stage") or "")
-    target = str(envelope.get("target_stage") or "")
-    if sender not in allowed or target not in allowed:
-        return None
-    stages = sorted((sender, target))
-    return stable_hash(f"workflow-coordination-conflict-v1\0{kind}\0{stages[0]}\0{stages[1]}", 32)
-
-
-def coordination_notice_identity(envelope: dict[str, Any]) -> dict[str, str]:
-    peers = sorted(
-        (
-            f"{envelope['source_host_fingerprint']}:{envelope['source_task_fingerprint']}",
-            f"{envelope['target_host_fingerprint']}:{envelope['target_task_fingerprint']}",
-        )
-    )
-    peer_pair = stable_hash(f"workflow-coordination-peers-v1\0{peers[0]}\0{peers[1]}", 32)
-    conflict = coordination_conflict_class(envelope) or ""
-    owner = stable_hash(
-        f"workflow-coordination-owner-v1\0{envelope['source_host_fingerprint']}\0{envelope['source_task_fingerprint']}",
-        32,
-    )
-    scope = stable_hash(
-        "\0".join(
-            (
-                "workflow-coordination-scope-v1",
-                peer_pair,
-                str(envelope.get("sender_resource_identity") or ""),
-                str(envelope.get("resource_kind") or ""),
-                conflict,
-            )
-        ),
-        32,
-    )
-    phase = stable_hash(
-        "\0".join(
-            (
-                "workflow-coordination-phase-v1",
-                owner,
-                str(envelope.get("sender_stage") or ""),
-                str(envelope.get("target_stage") or ""),
-            )
-        ),
-        32,
-    )
-    notice = stable_hash(
-        "\0".join(
-            (
-                "workflow-coordination-notice-v1",
-                peer_pair,
-                str(envelope.get("sender_resource_identity") or ""),
-                conflict,
-                str(envelope.get("lease_generation") or ""),
-                str(envelope.get("transition") or ""),
-            )
-        ),
-        32,
-    )
-    return {
-        "peer_pair_fingerprint": peer_pair,
-        "conflict_class_fingerprint": conflict,
-        "notice_fingerprint": notice,
-        "owner_fingerprint": owner,
-        "scope_fingerprint": scope,
-        "phase_fingerprint": phase,
-    }
-
-
-def coordination_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
-
-
-def coordination_activity_from_response(response: Any) -> list[dict[str, Any]]:
-    if not isinstance(response, dict) or response_status(response) == "error":
-        return []
-    direct = "schemaVersion" in response or "threads" in response
-    structured = "structuredContent" in response
-    if direct == structured:
-        return []
-    leaf = response if direct else response.get("structuredContent")
-    if not isinstance(leaf, dict) or set(("schemaVersion", "threads")) - set(leaf):
-        return []
-    schema = leaf.get("schemaVersion")
-    if isinstance(schema, bool) or not re.fullmatch(r"[1-9]\d{0,2}", str(schema or "")):
-        return []
-    threads = leaf.get("threads")
-    if not isinstance(threads, list) or len(threads) > MAX_COORDINATION_ACTIVITY:
-        return []
-    observed_at = coordination_now()
-    result: list[dict[str, Any]] = []
-    seen: dict[str, str] = {}
-    total_bytes = 0
-    for item in threads:
-        if not isinstance(item, dict):
-            return []
-        ids = [
-            str(item.get(key)).strip()
-            for key in ("id", "threadId")
-            if item.get(key) not in (None, "")
-        ]
-        if not ids or len(set(ids)) > 1:
-            return []
-        thread_id = ids[0]
-        host_id = item.get("hostId")
-        if not isinstance(thread_id, str) or not isinstance(host_id, str) or not thread_id or not host_id:
-            return []
-        total_bytes += len(thread_id.encode("utf-8", errors="replace")) + len(
-            host_id.encode("utf-8", errors="replace")
-        )
-        if (
-            max(
-                len(thread_id.encode("utf-8", errors="replace")),
-                len(host_id.encode("utf-8", errors="replace")),
-            )
-            > COORDINATION_ID_MAX_BYTES
-            or total_bytes > COORDINATION_ID_MAX_BYTES * MAX_COORDINATION_ACTIVITY
-        ):
-            return []
-        raw_status = item.get("status")
-        status = raw_status if raw_status in COORDINATION_THREAD_STATUSES else "missing" if raw_status is None else "unknown"
-        task_fp = coordination_task_fingerprint(thread_id, host_id)
-        host_fp = coordination_host_fingerprint(host_id)
-        if task_fp in seen:
-            if seen[task_fp] != status:
-                return []
-            continue
-        seen[task_fp] = status
-        result.append(
-            {
-                "task_fingerprint": task_fp,
-                "host_fingerprint": host_fp,
-                "status": status,
-                "snapshot_fingerprint": stable_hash(
-                    f"workflow-coordination-snapshot-v1\0{task_fp}\0{host_fp}\0{status}\0{observed_at}",
-                    32,
-                ),
-                "observed_at": observed_at,
-            }
-        )
-    return result
-
-
-def coordination_snapshot_fresh(item: dict[str, Any]) -> bool:
-    try:
-        observed = datetime.fromisoformat(str(item.get("observed_at") or "")).timestamp()
-        age = time.time() - observed
-        return -5 <= age <= COORDINATION_SNAPSHOT_TTL_SECONDS
-    except (TypeError, ValueError):
-        return False
 
 
 def execution_contract_id(state: dict[str, Any]) -> str | None:
@@ -1288,8 +1046,6 @@ def highest_execution_effort(state: dict[str, Any]) -> str | None:
 
 
 def confirmed_executor_model_profile(state: dict[str, Any]) -> str:
-    if safe_route(state.get("last_route")).get("delegation_opt_out"):
-        return "current"
     if safe_session_execution_preference(
         state.get("session_execution_preference")
     ) == "highest_throughout":
@@ -1308,8 +1064,6 @@ def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
     elif state.get("executor_state") not in EXECUTOR_STATES - {"none"}:
         state["executor_state"] = "spawn_required"
     state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
-    if safe_route(state.get("last_route")).get("delegation_opt_out"):
-        state["executor_state"] = "local_running"
     state["model_profile"] = confirmed_executor_model_profile(state)
     return True
 
@@ -1485,88 +1239,27 @@ def safe_fingerprint(value: Any) -> str:
 def safe_route(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    label = value.get("label") if value.get("label") in {"direct", "focused", "complex", "extensive"} else None
-    if not label:
+    if not value.get("task_domain") and not value.get("work_difficulty"):
         return {}
-    return decorate_route({
-        "label": label,
-        "score": max(safe_int(value.get("score")), 0),
-        "future_token_range": safe_label(value.get("future_token_range"), 32),
-        "recommended_agent_cap": min(max(safe_int(value.get("recommended_agent_cap")), 0), 3),
-        "parallel_signal": bool(value.get("parallel_signal")),
-        "delegation_gate": value.get("delegation_gate")
-        if value.get("delegation_gate") in {"closed", "audit", "open"}
-        else None,
-        "readiness_signal": value.get("readiness_signal")
-        if value.get("readiness_signal") in {"none", "possible", "ready_two", "ready_three_plus"}
-        else "none",
-        "dependency_signal": value.get("dependency_signal")
-        if value.get("dependency_signal") in {"none", "ordered", "shared_resource", "ordered_shared"}
-        else "none",
-        "meta_delegation": bool(value.get("meta_delegation")),
-        "delegation_opt_out": bool(value.get("delegation_opt_out")),
-        "lane_signal": value.get("lane_signal")
-        if value.get("lane_signal") in {"none", "possible", "explicit", "sequential"}
-        else "none",
-        "phase_hints": [
-            safe_label(item, 32)
-            for item in as_list(value.get("phase_hints"))
-            if item
-        ][:8],
-        "dependency_hint": safe_label(value.get("dependency_hint"), 64)
-        if value.get("dependency_hint")
-        else None,
-        "workflow_shape": safe_label(value.get("workflow_shape"), 32)
-        if value.get("workflow_shape")
-        else "direct",
-        "execution_order": [
-            safe_label(item, 24)
-            for item in as_list(value.get("execution_order"))
-            if item
-        ][:8],
-        "agent_mode": safe_label(value.get("agent_mode"), 32)
-        if value.get("agent_mode")
-        else "local",
-        "route_source": safe_label(value.get("route_source"), 32)
-        if value.get("route_source")
-        else "prompt",
-        "task_domain": value.get("task_domain")
-        if value.get("task_domain") in {"daily", "work", "unknown"}
-        else "unknown",
-        "domain_confidence": value.get("domain_confidence")
-        if value.get("domain_confidence") in {"low", "medium", "high"}
-        else "low",
-        "domain_rule_codes": [
-            safe_label(item, 48)
-            for item in as_list(value.get("domain_rule_codes"))
-            if item
-        ][:8],
-        "model_profile": value.get("model_profile")
-        if value.get("model_profile") in MODEL_PROFILES
-        else "current",
-        "domain_classifier_version": safe_label(
-            value.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
-        ),
-        "domain_decision_id": safe_fingerprint(value.get("domain_decision_id")) or None,
-        "work_difficulty": value.get("work_difficulty")
-        if value.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
-        else "unknown",
-        "difficulty_confidence": value.get("difficulty_confidence")
-        if value.get("difficulty_confidence") in {"low", "medium", "high"}
-        else "low",
-        "difficulty_rule_codes": [
-            safe_label(item, 48)
-            for item in as_list(value.get("difficulty_rule_codes"))
-            if item
-        ][:8],
-        "difficulty_classifier_version": safe_label(
-            value.get("difficulty_classifier_version") or DIFFICULTY_CLASSIFIER_VERSION, 16
-        ),
-        "difficulty_decision_id": safe_fingerprint(value.get("difficulty_decision_id")) or None,
-        "at": str(value.get("at"))[:40] if value.get("at") else None,
-    })
-
-
+    return decorate_route(
+        {
+            "task_domain": value.get("task_domain"),
+            "domain_confidence": value.get("domain_confidence"),
+            "domain_rule_codes": as_list(value.get("domain_rule_codes")),
+            "model_profile": value.get("model_profile"),
+            "domain_classifier_version": value.get("domain_classifier_version"),
+            "domain_decision_id": value.get("domain_decision_id"),
+            "work_difficulty": value.get("work_difficulty"),
+            "difficulty_confidence": value.get("difficulty_confidence"),
+            "difficulty_rule_codes": as_list(value.get("difficulty_rule_codes")),
+            "difficulty_classifier_version": value.get("difficulty_classifier_version"),
+            "difficulty_decision_id": value.get("difficulty_decision_id"),
+            "phase_hints": as_list(value.get("phase_hints")),
+            "route_source": safe_label(value.get("route_source"), 32)
+            if value.get("route_source")
+            else "authorization_classifier",
+        }
+    )
 def safe_label(value: Any, limit: int = 96) -> str:
     text = re.sub(r"[^A-Za-z0-9._:@/+-]+", "_", str(value or "unknown"))
     return (text[:limit] or "unknown").strip("_") or "unknown"
@@ -1622,6 +1315,79 @@ def state_path(payload: dict[str, Any]) -> Path | None:
     if raw_id in (None, ""):
         return None
     return data_root() / "sessions" / f"{safe_id(raw_id)}.json"
+
+
+def dispatch_receipt_path(payload: dict[str, Any]) -> Path | None:
+    """Return an opaque, session-bound receipt path without retaining the session id."""
+    if not persistence_enabled() or payload.get("session_id") in (None, ""):
+        return None
+    token = stable_hash("workflow-manager-dispatch-receipt-v1\0" + str(payload["session_id"]), 32)
+    return data_root() / "dispatch-receipts" / f"{token}.json"
+
+
+def record_dispatch_receipt(payload: dict[str, Any]) -> None:
+    """Best-effort private receipt. It must never alter the Hook's fail-open behavior."""
+    path = dispatch_receipt_path(payload)
+    event = str(payload.get("hook_event_name") or "")
+    if path is None or event not in STATE_EVENTS:
+        return
+    try:
+        # Do not copy host input into the receipt.  These are deliberately one-way
+        # identifiers: they permit the doctor to bind a dispatch to this release
+        # without turning the private receipt into a second transcript.
+        configured_kind = os.environ.get("WORKFLOW_MANAGER_RUNNER_KIND", "posix_direct")
+        runner_kind = configured_kind if configured_kind in DISPATCH_RUNNER_KINDS else "posix_direct"
+        plugin_root = os.environ.get("PLUGIN_ROOT") or str(Path(__file__).resolve().parents[1])
+        source_file = Path(__file__).resolve()
+        source_digest = stable_hash(source_file.read_bytes(), 32)
+        root_fingerprint = stable_hash(str(Path(plugin_root).resolve(strict=True)), 32)
+        stable = _stable_source_files(_stable_skill_source(Path(plugin_root)))
+        skill_digest = stable[1][:32] if stable is not None else "unknown"
+        run_value = payload.get("hook_run_id", payload.get("event_id", payload.get("id", "")))
+        # Older hosts do not provide a run id.  This conservative fallback makes a
+        # retry idempotent; it never records the session or any host identifier.
+        run_fingerprint = stable_hash(
+            "workflow-manager-hook-run-v1\0" + str(payload.get("session_id"))
+            + "\0" + event + "\0" + str(run_value), 32
+        )
+        ensure_private_dir(path.parent)
+        if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode)):
+            return
+        with state_lock(path):
+            timeline: list[dict[str, str]] = []
+            if path.exists():
+                info = path.lstat()
+                if info.st_size > MAX_DISPATCH_RECEIPT_BYTES or not stat.S_ISREG(info.st_mode):
+                    return
+                decoded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(decoded, dict) and decoded.get("schema") == DISPATCH_RECEIPT_SCHEMA:
+                    candidate = decoded.get("timeline")
+                    if isinstance(candidate, list):
+                        for item in candidate[-MAX_DISPATCH_RECEIPT_EVENTS:]:
+                            if (isinstance(item, dict) and item.get("event") in STATE_EVENTS
+                                    and isinstance(item.get("at"), str) and isinstance(item.get("run"), str)):
+                                timeline.append({"event": item["event"], "at": item["at"], "run": item["run"]})
+            if not any(item["run"] == run_fingerprint for item in timeline):
+                timeline.append({"event": event, "at": utc_now(), "run": run_fingerprint})
+            timeline = timeline[-MAX_DISPATCH_RECEIPT_EVENTS:]
+            atomic_write(path, {
+                "schema": DISPATCH_RECEIPT_SCHEMA,
+                "writer_version": WRITER_VERSION,
+                "state_schema": SCHEMA_VERSION,
+                "execution_profile": EXECUTION_PROFILE_VERSION,
+                "stable_skill_schema": STABLE_SKILL_SCHEMA,
+                "source": "hook",
+                "runner_kind": runner_kind,
+                "plugin_root_fingerprint": root_fingerprint,
+                "source_fingerprint": source_digest,
+                "stable_skill_fingerprint": skill_digest,
+                "at": timeline[-1]["at"],
+                "events": [item["event"] for item in timeline],
+                "timeline": timeline,
+                "event_count": len(timeline),
+            })
+    except Exception:
+        return
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -1794,6 +1560,87 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
             pass
 
 
+def _stable_skill_file_digests(files: dict[str, bytes]) -> dict[str, str]:
+    return {
+        relative: hashlib.sha256(payload).hexdigest()
+        for relative, payload in sorted(files.items())
+    }
+
+
+def _stable_skill_relative_path(target: Path, relative: str) -> Path | None:
+    if not relative or "\\" in relative or relative.startswith("/"):
+        return None
+    parts = relative.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    return target.joinpath(*parts)
+
+
+def _prune_retired_stable_skill_files(
+    target: Path,
+    current_marker: dict[str, Any],
+    files: dict[str, bytes],
+) -> tuple[list[str], list[str]]:
+    """Remove only byte-identical files previously shipped by this Skill."""
+    expected: dict[str, set[str]] = {
+        relative: set(digests)
+        for relative, digests in RETIRED_STABLE_SKILL_FILE_DIGESTS.items()
+        if relative not in files
+    }
+    marker_digests = current_marker.get("file_digests")
+    if isinstance(marker_digests, dict):
+        for relative, digest in marker_digests.items():
+            if (
+                relative not in files
+                and isinstance(relative, str)
+                and isinstance(digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                expected.setdefault(relative, set()).add(digest)
+
+    removed: list[str] = []
+    retained: list[str] = []
+    removable_parents: set[Path] = set()
+    for relative in sorted(expected):
+        path = _stable_skill_relative_path(target, relative)
+        if path is None:
+            retained.append(relative)
+            continue
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_size > 1024 * 1024
+        ):
+            retained.append(relative)
+            continue
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            retained.append(relative)
+            continue
+        if digest not in expected[relative]:
+            retained.append(relative)
+            continue
+        path.unlink()
+        removed.append(relative)
+        removable_parents.add(path.parent)
+
+    for parent in sorted(removable_parents, key=lambda item: len(item.parts), reverse=True):
+        if parent == target:
+            continue
+        try:
+            info = parent.lstat()
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                parent.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+    return removed, retained
+
+
 def sync_stable_skill(
     plugin_root: Path | None = None,
     codex_home: Path | None = None,
@@ -1808,12 +1655,14 @@ def sync_stable_skill(
     if source_data is None:
         return {**result, "status": "missing_or_unsafe_source"}
     files, digest = source_data
+    file_digests = _stable_skill_file_digests(files)
     marker_payload = {
         "schema": STABLE_SKILL_SCHEMA,
         "managed_by": STABLE_SKILL_NAME,
         "writer_version": WRITER_VERSION,
         "source_digest": digest,
         "files": sorted(files),
+        "file_digests": file_digests,
     }
     try:
         try:
@@ -1840,11 +1689,20 @@ def sync_stable_skill(
                 current_marker = _managed_skill_marker(target)
                 if current_marker is None:
                     return {**result, "status": "unmanaged_target"}
+                removed, retained = _prune_retired_stable_skill_files(
+                    target, current_marker, files
+                )
                 if (
                     current_marker.get("source_digest") == digest
                     and current_marker.get("writer_version") == WRITER_VERSION
+                    and current_marker.get("files") == sorted(files)
+                    and current_marker.get("file_digests") == file_digests
+                    and not removed
                 ):
-                    return {**result, "status": "current", "digest": digest}
+                    current_result = {**result, "status": "current", "digest": digest}
+                    if retained:
+                        current_result["retained_retired_files"] = retained
+                    return current_result
                 for relative, payload in files.items():
                     relative_path = Path(relative)
                     parent = _ensure_real_parents(target, relative_path.parent)
@@ -1855,7 +1713,12 @@ def sync_stable_skill(
                         "utf-8"
                     ),
                 )
-                return {**result, "status": "updated", "digest": digest}
+                updated_result = {**result, "status": "updated", "digest": digest}
+                if removed:
+                    updated_result["removed_files"] = removed
+                if retained:
+                    updated_result["retained_retired_files"] = retained
+                return updated_result
 
             staging = Path(
                 tempfile.mkdtemp(prefix=f".{STABLE_SKILL_NAME}.", dir=str(skills_root))
@@ -1886,81 +1749,10 @@ def sync_stable_skill(
         }
 
 
-def _coordination_fp32(value: Any) -> str | None:
+def _fingerprint32(value: Any) -> str | None:
     text = str(value or "")
     return text if re.fullmatch(r"[0-9a-f]{32}", text) else None
 
-
-def _safe_coordination_activity(item: Any) -> dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    task = _coordination_fp32(item.get("task_fingerprint"))
-    host = _coordination_fp32(item.get("host_fingerprint"))
-    snapshot = _coordination_fp32(item.get("snapshot_fingerprint"))
-    if not task or not host or not snapshot:
-        return None
-    return {
-        "task_fingerprint": task,
-        "host_fingerprint": host,
-        "status": item.get("status") if item.get("status") in COORDINATION_THREAD_STATUSES else "unknown",
-        "snapshot_fingerprint": snapshot,
-        "observed_at": str(item.get("observed_at") or "")[:40],
-    }
-
-
-def _safe_coordination_notice(item: Any) -> dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    fingerprints = {
-        key: _coordination_fp32(item.get(key))
-        for key in (
-            "notice_fingerprint",
-            "peer_pair_fingerprint",
-            "resource_identity",
-            "conflict_class_fingerprint",
-            "owner_fingerprint",
-            "scope_fingerprint",
-            "phase_fingerprint",
-            "request_fingerprint",
-        )
-    }
-    if not all(fingerprints.values()):
-        return None
-    return {
-        **fingerprints,
-        "resource_kind": item.get("resource_kind") if item.get("resource_kind") in COORDINATION_RESOURCE_STAGES else None,
-        "lease_generation": min(max(safe_int(item.get("lease_generation")), 1), 999_999_999),
-        "transition": item.get("transition") if item.get("transition") in COORDINATION_TRANSITIONS else None,
-        "state": item.get("state") if item.get("state") in COORDINATION_NOTICE_STATES else "failed",
-        "attempt": min(max(safe_int(item.get("attempt")), 1), 2),
-        "at": str(item.get("at") or "")[:40],
-    }
-
-
-def _safe_coordination_inbound(item: Any) -> dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    fingerprints = {
-        key: _coordination_fp32(item.get(key))
-        for key in (
-            "notice_fingerprint",
-            "peer_pair_fingerprint",
-            "resource_identity",
-            "conflict_class_fingerprint",
-            "owner_fingerprint",
-            "scope_fingerprint",
-            "phase_fingerprint",
-        )
-    }
-    if not all(fingerprints.values()):
-        return None
-    return {
-        **fingerprints,
-        "resource_kind": item.get("resource_kind") if item.get("resource_kind") in COORDINATION_RESOURCE_STAGES else None,
-        "lease_generation": min(max(safe_int(item.get("lease_generation")), 1), 999_999_999),
-        "transition": item.get("transition") if item.get("transition") in COORDINATION_TRANSITIONS else None,
-        "received_at": str(item.get("received_at") or "")[:40],
-    }
 
 
 def _safe_stall(item: Any) -> dict[str, Any]:
@@ -1969,14 +1761,14 @@ def _safe_stall(item: Any) -> dict[str, Any]:
     state_value = item.get("state") if item.get("state") in STALL_STATES else "none"
     result = {
         "state": state_value,
-        "stall_id": _coordination_fp32(item.get("stall_id")),
+        "stall_id": _fingerprint32(item.get("stall_id")),
         "objective_fingerprint": safe_fingerprint(item.get("objective_fingerprint")) or None,
-        "plan_digest": _coordination_fp32(item.get("plan_digest")),
-        "execution_contract_id": _coordination_fp32(item.get("execution_contract_id")),
-        "evidence_digest": _coordination_fp32(item.get("evidence_digest")),
-        "diagnosis_request_fingerprint": _coordination_fp32(item.get("diagnosis_request_fingerprint")),
-        "remediation_digest": _coordination_fp32(item.get("remediation_digest")),
-        "correction_digest": _coordination_fp32(item.get("correction_digest")),
+        "plan_digest": _fingerprint32(item.get("plan_digest")),
+        "execution_contract_id": _fingerprint32(item.get("execution_contract_id")),
+        "evidence_digest": _fingerprint32(item.get("evidence_digest")),
+        "diagnosis_request_fingerprint": _fingerprint32(item.get("diagnosis_request_fingerprint")),
+        "remediation_digest": _fingerprint32(item.get("remediation_digest")),
+        "correction_digest": _fingerprint32(item.get("correction_digest")),
         "failure_kind": item.get("failure_kind") if item.get("failure_kind") in EXECUTOR_FAILURE_KINDS else None,
         "resume_profile": item.get("resume_profile") if item.get("resume_profile") in STALL_RESUME_PROFILES else None,
         "executor_attempt": min(max(safe_int(item.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS),
@@ -2082,14 +1874,10 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "guards": [],
         "processed_hook_runs": [],
         "duplicate_notices": [],
-        "coordination_activity": [],
-        "coordination_notices": [],
-        "coordination_inbound": [],
         # A bounded, fingerprint-only freshness boundary.  Requests and host
         # Start echoes deliberately remain separate: a request is never proof
         # that the host applied it.
         "change_epoch": 0,
-        "change_epoch_ledger": [],
         "identity_evidence": {
             "requested_profile": None,
             "start_echo_profile": None,
@@ -2109,82 +1897,31 @@ def _safe_prompt(item: Any) -> dict[str, Any] | None:
     prompt_meta = item.get("prompt_meta")
     if not isinstance(prompt_meta, dict):
         prompt_meta = text_metadata(item.get("prompt"))
-    return decorate_route({
-        "at": item.get("at"),
-        "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
-        "prompt_meta": {
-            "fingerprint": safe_label(prompt_meta.get("fingerprint"), 64),
-            "length": max(safe_int(prompt_meta.get("length")), 0),
-        },
-        "label": item.get("label") if item.get("label") in {"direct", "focused", "complex", "extensive"} else "direct",
-        "score": max(safe_int(item.get("score")), 0),
-        "future_token_range": safe_label(item.get("future_token_range"), 32),
-        "recommended_agent_cap": min(max(safe_int(item.get("recommended_agent_cap")), 0), 3),
-        "parallel_signal": bool(item.get("parallel_signal")),
-        "delegation_gate": item.get("delegation_gate")
-        if item.get("delegation_gate") in {"closed", "audit", "open"}
-        else None,
-        "readiness_signal": item.get("readiness_signal")
-        if item.get("readiness_signal") in {"none", "possible", "ready_two", "ready_three_plus"}
-        else "none",
-        "dependency_signal": item.get("dependency_signal")
-        if item.get("dependency_signal") in {"none", "ordered", "shared_resource", "ordered_shared"}
-        else "none",
-        "meta_delegation": bool(item.get("meta_delegation")),
-        "delegation_opt_out": bool(item.get("delegation_opt_out")),
-        "lane_signal": item.get("lane_signal")
-        if item.get("lane_signal") in {"none", "possible", "explicit", "sequential"}
-        else "none",
-        "phase_hints": [safe_label(value, 32) for value in as_list(item.get("phase_hints")) if value][:8],
-        "dependency_hint": safe_label(item.get("dependency_hint"), 64)
-        if item.get("dependency_hint")
-        else None,
-        "workflow_shape": safe_label(item.get("workflow_shape"), 32)
-        if item.get("workflow_shape")
-        else "direct",
-        "execution_order": [safe_label(value, 24) for value in as_list(item.get("execution_order")) if value][
-            :8
-        ],
-        "agent_mode": safe_label(item.get("agent_mode"), 32) if item.get("agent_mode") else "local",
-        "route_source": safe_label(item.get("route_source"), 32)
-        if item.get("route_source")
-        else "prompt",
-        "task_domain": item.get("task_domain")
-        if item.get("task_domain") in {"daily", "work", "unknown"}
-        else "unknown",
-        "domain_confidence": item.get("domain_confidence")
-        if item.get("domain_confidence") in {"low", "medium", "high"}
-        else "low",
-        "domain_rule_codes": [
-            safe_label(value, 48)
-            for value in as_list(item.get("domain_rule_codes"))
-            if value
-        ][:8],
-        "model_profile": item.get("model_profile")
-        if item.get("model_profile") in MODEL_PROFILES
-        else "current",
-        "domain_classifier_version": safe_label(
-            item.get("domain_classifier_version") or DOMAIN_CLASSIFIER_VERSION, 16
-        ),
-        "domain_decision_id": safe_fingerprint(item.get("domain_decision_id")) or None,
-        "work_difficulty": item.get("work_difficulty")
-        if item.get("work_difficulty") in {"not_applicable", "simple", "hard", "unknown"}
-        else "unknown",
-        "difficulty_confidence": item.get("difficulty_confidence")
-        if item.get("difficulty_confidence") in {"low", "medium", "high"}
-        else "low",
-        "difficulty_rule_codes": [
-            safe_label(value, 48)
-            for value in as_list(item.get("difficulty_rule_codes"))
-            if value
-        ][:8],
-        "difficulty_classifier_version": safe_label(
-            item.get("difficulty_classifier_version") or DIFFICULTY_CLASSIFIER_VERSION, 16
-        ),
-        "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
-    })
-
-
+    return decorate_route(
+        {
+            "at": item.get("at"),
+            "turn_id": safe_label(item.get("turn_id"), 120)
+            if item.get("turn_id")
+            else None,
+            "prompt_meta": {
+                "fingerprint": safe_label(prompt_meta.get("fingerprint"), 64),
+                "length": max(safe_int(prompt_meta.get("length")), 0),
+            },
+            "task_domain": item.get("task_domain"),
+            "domain_confidence": item.get("domain_confidence"),
+            "domain_rule_codes": as_list(item.get("domain_rule_codes")),
+            "model_profile": item.get("model_profile"),
+            "domain_classifier_version": item.get("domain_classifier_version"),
+            "domain_decision_id": item.get("domain_decision_id"),
+            "work_difficulty": item.get("work_difficulty"),
+            "difficulty_confidence": item.get("difficulty_confidence"),
+            "difficulty_rule_codes": as_list(item.get("difficulty_rule_codes")),
+            "difficulty_classifier_version": item.get("difficulty_classifier_version"),
+            "difficulty_decision_id": item.get("difficulty_decision_id"),
+            "phase_hints": as_list(item.get("phase_hints")),
+            "route_source": item.get("route_source") or "authorization_classifier",
+        }
+    )
 def _safe_operation(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -2199,8 +1936,9 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
         "host_event_turn_id": safe_label(item.get("host_event_turn_id"), 120) if item.get("host_event_turn_id") else None,
         "host_input_digest": safe_fingerprint(item.get("host_input_digest")) or None,
+        "host_command_digest": safe_fingerprint(item.get("host_command_digest")) or None,
         "legacy_host_input_digest": safe_fingerprint(item.get("legacy_host_input_digest")) or None,
-        "reconciliation_source": item.get("reconciliation_source") if item.get("reconciliation_source") in {"legacy_unique_turn_patch_event_v1", "host_rollout_exact_patch_digest_v1"} else None,
+        "reconciliation_source": item.get("reconciliation_source") if item.get("reconciliation_source") in {"legacy_unique_turn_patch_event_v1", "host_rollout_exact_patch_digest_v1", "host_rollout_exact_command_text_v1", "host_rollout_unique_file_change_v1"} else None,
         "tool": safe_label(item.get("tool"), 120),
         "fingerprint": fingerprint[:64],
         "status": status_value,
@@ -2212,7 +1950,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
             if re.fullmatch(r"s(?:0[1-9]|[12][0-9]|3[0-2])", str(item.get("slice_id") or ""))
             else None
         ),
-        "slice_contract_id": _coordination_fp32(item.get("slice_contract_id")),
+        "slice_contract_id": _fingerprint32(item.get("slice_contract_id")),
         "assessor_binding_id": safe_fingerprint(item.get("assessor_binding_id")) or None,
         "executor_agent_id": (
             safe_label(item.get("executor_agent_id"), 120)
@@ -2325,7 +2063,7 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
             if re.fullmatch(r"s(?:0[1-9]|[12][0-9]|3[0-2])", str(item.get("slice_id") or ""))
             else None
         ),
-        "slice_contract_id": _coordination_fp32(item.get("slice_contract_id")),
+        "slice_contract_id": _fingerprint32(item.get("slice_contract_id")),
         "model": safe_label(item.get("model"), 80) if item.get("model") else None,
         "reasoning_effort": (
             safe_label(item.get("reasoning_effort"), 24)
@@ -2504,13 +2242,6 @@ def retained_subagent_records(state: dict[str, Any], records: Any = None) -> lis
     kept_ids = {id(group) for group in protected + terminal[-MAX_TERMINAL_SUBAGENT_LIFECYCLES:]}
     kept = [pair for group in groups if id(group) in kept_ids for pair in group.get("records", [])]
     return [item for _, item in sorted(kept, key=lambda pair: pair[0])]
-
-
-def protected_subagent_lifecycle_count(state: dict[str, Any]) -> int:
-    return sum(
-        group.get("state") in {"pending", "result_pending", "live"} or subagent_lifecycle_is_bound(state, group)
-        for group in subagent_lifecycle_groups(state)
-    )
 
 
 def append_result_pending_subagent(
@@ -2693,7 +2424,6 @@ def _plan_artifact_lifecycle(state: dict[str, Any], artifact_digest: str | None)
         if state.get("executor_state") in {
             "spawn_pending",
             "running",
-            "local_running",
             "verification_required",
             "recovery_required",
             "exhausted",
@@ -2745,8 +2475,8 @@ def sanitize_plan_artifact_body(value: Any) -> str:
         characters.append(character)
     text = "".join(characters)
     protocol = re.compile(
-        r"^\s*(?:WORK_ASSESSMENT|SIMPLE_EXECUTION|LOCAL_EXECUTION|EXECUTION_STALL|"
-        r"STALL_DIAGNOSIS|CAUSAL_REVIEW|WORKFLOW_COORDINATION_V1|END_WORKFLOW_COORDINATION)\b",
+        r"^\s*(?:WORK_ASSESSMENT|EXECUTION_STALL|"
+        r"STALL_DIAGNOSIS|CAUSAL_REVIEW)\b",
         re.I,
     )
     lines = [
@@ -2763,6 +2493,7 @@ def sanitize_plan_artifact_body(value: Any) -> str:
         "<redacted>", "[REDACTED]"
     )
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
+    body = normalize_execution_slice_manifest_fence(body)
     body = body.rstrip() + "\n"
     if len(body.encode("utf-8")) > MAX_PLAN_REVISION_BYTES:
         raise PlanArtifactError("revision_too_large")
@@ -4886,7 +4617,6 @@ def migrate_legacy_plan_artifacts(
             running = old_executor_state in {
                 "spawn_pending",
                 "running",
-                "local_running",
                 "recovery_required",
                 "exhausted",
             }
@@ -5388,18 +5118,6 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         ),
         "causal_review": _safe_causal_review(item.get("causal_review")),
         "stall": _safe_stall(item.get("stall")),
-        "coordination_activity": [
-            safe for raw in as_list(item.get("coordination_activity"))
-            if (safe := _safe_coordination_activity(raw)) is not None
-        ][:MAX_COORDINATION_ACTIVITY],
-        "coordination_notices": [
-            safe for raw in as_list(item.get("coordination_notices"))
-            if (safe := _safe_coordination_notice(raw)) is not None
-        ][-MAX_COORDINATION_NOTICES:],
-        "coordination_inbound": [
-            safe for raw in as_list(item.get("coordination_inbound"))
-            if (safe := _safe_coordination_inbound(raw)) is not None
-        ][-MAX_COORDINATION_INBOUND:],
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
             if (scope := _safe_active_agent_scope(raw)) is not None
@@ -5492,7 +5210,11 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             base["difficulty_confidence"] = "high"
             base["difficulty_rule_codes"] = ["migrated_daily"]
         elif base["task_domain"] == "work":
-            legacy_route = base["last_route"]
+            legacy_route = (
+                value.get("last_route")
+                if isinstance(value.get("last_route"), dict)
+                else {}
+            )
             legacy_rules = set(base["domain_rule_codes"])
             legacy_hard = (
                 legacy_route.get("label") in {"complex", "extensive"}
@@ -5576,8 +5298,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and source_baseline.get("plan_digest") == base.get("plan_digest")
         and source_baseline.get("acceptance_status") == "incomplete"
     )
-    # Profile v7 may retain a terminal candidate for a read-only parent review,
-    # but no pending/running v7 state may gain v8 mutation authority by migration.
+    # A verified legacy candidate may retain one read-only parent review, but
+    # no pending/running legacy state gains current-profile mutation authority.
     review_profile_continuity = bool(
         source_schema >= 23
         and source_contract
@@ -5695,20 +5417,6 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["causal_review"] = _safe_causal_review(value.get("causal_review"))
     if safe_int(value.get("schema_version")) >= 17:
         base["stall"] = _safe_stall(value.get("stall"))
-    if safe_int(value.get("schema_version")) >= 16:
-        base["coordination_activity"] = [
-            safe for raw in as_list(value.get("coordination_activity"))
-            if (safe := _safe_coordination_activity(raw)) is not None
-        ][:MAX_COORDINATION_ACTIVITY]
-        base["coordination_notices"] = [
-            safe for raw in as_list(value.get("coordination_notices"))
-            if (safe := _safe_coordination_notice(raw)) is not None
-        ][-MAX_COORDINATION_NOTICES:]
-        base["coordination_inbound"] = [
-            safe for raw in as_list(value.get("coordination_inbound"))
-            if (safe := _safe_coordination_inbound(raw)) is not None
-        ][-MAX_COORDINATION_INBOUND:]
-
     base["last_assistant"] = safe_metadata(value.get("last_assistant"))
     expected_assessor = assessor_binding_id(base) if base["assessor_generation"] else None
     if base["assessor_state"] in {"spawn_pending", "running", "hard_plan_ready"} and base["assessor_binding_id"] != expected_assessor:
@@ -5750,7 +5458,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and not sealed_historical_success
         and not review_profile_continuity
     ):
-        # Older revisions never gain v9 write authority. Never invent a
+        # Older revisions never gain current-profile write authority. Never invent a
         # synthetic slice or silently grant a fresh attempt. The next high-plan
         # revision must append the one strict manifest to the same journal and
         # receive a new explicit confirmation.
@@ -5792,8 +5500,6 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_fork_turns"] = None
         base["executor_review"] = _empty_executor_review()
         base["model_profile"] = confirmed_executor_model_profile(base)
-        if base["last_route"].get("delegation_opt_out"):
-            base["executor_state"] = "local_running"
     elif base["plan_state"] == "confirmed":
         base["model_profile"] = (
             "work_assessment"
@@ -5916,16 +5622,6 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             item["request_visibility"] = None
     base["subagents"] = retained_subagent_records(base, safe_subagents)
     base["change_epoch"] = min(max(safe_int(value.get("change_epoch")), 0), MAX_EVENT_COUNT)
-    base["change_epoch_ledger"] = [
-        {
-            "epoch": min(max(safe_int(item.get("epoch")), 0), MAX_EVENT_COUNT),
-            "fingerprint": safe_fingerprint(item.get("fingerprint")) or None,
-            "kind": safe_label(item.get("kind"), 24),
-            "at": str(item.get("at") or "")[:40] or None,
-        }
-        for item in as_list(value.get("change_epoch_ledger"))
-        if isinstance(item, dict) and safe_fingerprint(item.get("fingerprint"))
-    ][-MAX_CHANGE_EPOCH_LEDGER:]
     raw_identity = value.get("identity_evidence") if isinstance(value.get("identity_evidence"), dict) else {}
     base["identity_evidence"] = {
         "requested_profile": safe_fingerprint(raw_identity.get("requested_profile")) or None,
@@ -5970,9 +5666,6 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["subagents"] = []
         base["processed_hook_runs"] = []
         base["duplicate_notices"] = []
-        base["coordination_activity"] = []
-        base["coordination_notices"] = []
-        base["coordination_inbound"] = []
         base["assessor_agent_id"] = None
         base["assessor_model"] = None
         base["assessor_reasoning_effort"] = None
@@ -5984,6 +5677,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["assessor_attempt"] = 0
         if (
             base["task_domain"] == "work"
+            and base.get("work_difficulty") == "hard"
             and base.get("objective", {}).get("fingerprint")
             and base.get("plan_state") in {"none", "analyzing"}
         ):
@@ -6093,9 +5787,6 @@ def trim_state(state: dict[str, Any]) -> None:
     state["guards"] = list(state.get("guards", []))[-MAX_GUARDS:]
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
     state["duplicate_notices"] = list(state.get("duplicate_notices", []))[-MAX_DUPLICATE_NOTICES:]
-    state["coordination_activity"] = list(state.get("coordination_activity", []))[:MAX_COORDINATION_ACTIVITY]
-    state["coordination_notices"] = list(state.get("coordination_notices", []))[-MAX_COORDINATION_NOTICES:]
-    state["coordination_inbound"] = list(state.get("coordination_inbound", []))[-MAX_COORDINATION_INBOUND:]
 
 
 def increment_event_count(state: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -6777,7 +6468,6 @@ def reconcile_host_rollout_compactions(payload: dict[str, Any], state: dict[str,
                 "previous_window_id": item["previous_window_id"],
                 "telemetry": {},
                 "objective_meta": state.get("objective", {}),
-                "current_stage": current_execution_stage(state),
                 "work_difficulty": state.get("work_difficulty", "unknown"),
                 "difficulty_decision_id": state.get("difficulty_decision_id"),
                 "plan_state": state.get("plan_state", "none"),
@@ -6797,12 +6487,8 @@ def reconcile_host_rollout_compactions(payload: dict[str, Any], state: dict[str,
                 "last_execution_baseline": _safe_execution_baseline(state.get("last_execution_baseline")),
                 "causal_review": _safe_causal_review(state.get("causal_review")),
                 "stall": _safe_stall(state.get("stall")),
-                "coordination_activity": [],
-                "coordination_notices": [],
-                "coordination_inbound": [],
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [],
-                "continuity": quality_continuity(state),
             }
         )
     return len(new_items)
@@ -6816,23 +6502,21 @@ def _host_event_turn_id(event: dict[str, Any]) -> str | None:
     return top if top and (not nested or top == nested) else nested if nested and not top else None
 
 
-def transcript_turn_structured_exec_result(path_value: Any, turn_id: str) -> tuple[str, str, str] | None:
-    """Return (exact command digest, explicit status, command) for one host exec chain only."""
-    calls: dict[str, str] = {}; outputs: dict[str, Any] = {}; count = 0
-    for raw in read_transcript_tail(path_value):
-        try:
-            item = json.loads(raw); event = item.get("payload") or {}
-            if _host_event_turn_id(event) != turn_id:
-                continue
-            if event.get("type") == "custom_tool_call" and event.get("name") == "exec":
-                count += 1; calls[str(event.get("call_id") or "")] = str(event.get("input") or "")
-            elif event.get("type") == "custom_tool_call_output":
-                outputs[str(event.get("call_id") or "")] = event.get("output")
-        except Exception:
-            continue
-    if count != 1 or len(calls) != 1 or set(calls) != set(outputs):
+def literal_exec_command_source(source: str) -> tuple[str, str] | None:
+    """Parse one inert JS/JSON ``tools.exec_command`` literal without eval."""
+    if source.count("tools.exec_command(") != 1:
         return None
-    source = next(iter(calls.values()))
+    json_call = re.search(
+        r"tools\.exec_command\(\s*(\{.*\})\s*\)\s*;", source, re.S
+    )
+    if json_call:
+        try:
+            value = json.loads(json_call.group(1))
+        except Exception:
+            value = None
+        if isinstance(value, dict) and isinstance(value.get("cmd"), str):
+            workdir = value.get("workdir", "")
+            return (value["cmd"], workdir) if isinstance(workdir, str) else None
     match = re.search(r'\bcmd\s*:\s*("(?:[^"\\]|\\.)*")', source, re.S)
     raw_match = re.search(r'\bcmd\s*:\s*String\.raw`([^`]*)`', source, re.S)
     cwd_match = re.search(r'\bworkdir\s*:\s*("(?:[^"\\]|\\.)*")', source, re.S)
@@ -6843,14 +6527,110 @@ def transcript_turn_structured_exec_result(path_value: Any, turn_id: str) -> tup
         cwd = json.loads(cwd_match.group(1)) if cwd_match else ""
     except Exception:
         return None
-    output = outputs[next(iter(outputs))]
-    texts = [item.get("text") for item in output if isinstance(item, dict) and isinstance(item.get("text"), str)] if isinstance(output, list) else []
-    structured = next((json.loads(text) for text in texts if text.lstrip()[:1] in "[{" and isinstance(json.loads(text), dict)), None)
-    status = response_status(structured) if structured is not None else "unknown"
-    if status == "unknown":
-        return None
-    digest = stable_hash("host-operation-command-v1\0" + command.replace("\r\n", "\n").replace("\r", "\n") + "\0" + cwd, 32)
-    return digest, status, command
+    return command, cwd
+
+
+def host_exec_output_status(output: Any) -> str:
+    """Preserve an exact structured exit code inside the host exec wrapper."""
+    structured_statuses: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            text = item["text"].strip()
+            if text[:1] not in "[{":
+                continue
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                continue
+            if isinstance(decoded, dict):
+                status = response_status(decoded)
+                if status != "unknown":
+                    structured_statuses.append(status)
+    typed_error = next(
+        (status for status in structured_statuses if status.startswith("error:")),
+        None,
+    )
+    if typed_error:
+        return typed_error
+    if any(status.startswith("error") for status in structured_statuses):
+        return "error"
+    return response_status(output)
+
+
+def transcript_turn_structured_exec_results(
+    path_value: Any, turn_id: str
+) -> list[tuple[str, str, str]]:
+    """Return independently bound host exec chains from one turn.
+
+    Current Codex may issue several native ``exec`` calls in one turn.  Each
+    chain remains admissible only when its call id, literal command, optional
+    workdir, output, and resulting digest are individually unique.  Ambiguous
+    duplicate ids or duplicate command digests stay unknown without poisoning
+    unrelated exact chains.
+    """
+    records: list[dict[str, Any]] = []
+    for raw in read_transcript_tail(path_value):
+        try:
+            item = json.loads(raw)
+            if isinstance(item, dict):
+                records.append(item)
+        except Exception:
+            continue
+    return rollout_turn_structured_exec_results(records, turn_id)
+
+
+def rollout_turn_structured_exec_results(
+    records: list[dict[str, Any]], turn_id: str
+) -> list[tuple[str, str, str]]:
+    """Return exact exec chains from an already bounded host rollout."""
+    calls: dict[str, list[str]] = {}
+    outputs: dict[str, list[Any]] = {}
+    for item in records:
+        event = item.get("payload") or {}
+        if not isinstance(event, dict) or _host_event_turn_id(event) != turn_id:
+            continue
+        if event.get("type") == "custom_tool_call" and event.get("name") == "exec":
+            calls.setdefault(str(event.get("call_id") or ""), []).append(
+                str(event.get("input") or "")
+            )
+        elif event.get("type") == "custom_tool_call_output":
+            outputs.setdefault(str(event.get("call_id") or ""), []).append(
+                event.get("output")
+            )
+    parsed: list[tuple[str, str, str]] = []
+    for call_id, sources in calls.items():
+        if not call_id or len(sources) != 1 or len(outputs.get(call_id, [])) != 1:
+            continue
+        parsed_source = literal_exec_command_source(sources[0])
+        if not parsed_source:
+            continue
+        command, cwd = parsed_source
+        output = outputs[call_id][0]
+        status = host_exec_output_status(output)
+        if status == "unknown":
+            continue
+        digest = stable_hash(
+            "host-operation-command-v1\0"
+            + command.replace("\r\n", "\n").replace("\r", "\n")
+            + "\0"
+            + cwd,
+            32,
+        )
+        parsed.append((digest, status, command))
+    digest_counts: dict[str, int] = {}
+    for digest, _, _ in parsed:
+        digest_counts[digest] = digest_counts.get(digest, 0) + 1
+    return [item for item in parsed if digest_counts[item[0]] == 1]
+
+
+def transcript_turn_structured_exec_result(
+    path_value: Any, turn_id: str
+) -> tuple[str, str, str] | None:
+    """Compatibility helper for callers that require one sole exec chain."""
+    results = transcript_turn_structured_exec_results(path_value, turn_id)
+    return results[0] if len(results) == 1 else None
 
 
 def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state: dict[str, Any]) -> None:
@@ -6892,6 +6672,27 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
         matches = [op for op in patch_ops if op.get("host_input_digest") == patch_digest]
         exact_patch_match = bool(matches)
         current = current_execution_slice(state) or {}
+        call_index = next((index for index, event in enumerate(turn_events) if event.get("type") == "custom_tool_call" and event.get("call_id") == patch_call_id), -1)
+        output_index = next((index for index, event in enumerate(turn_events[call_index + 1 :], call_index + 1) if event.get("type") == "custom_tool_call_output" and event.get("call_id") == patch_call_id), -1)
+        successes = [
+            event
+            for event in turn_events[call_index + 1 : output_index]
+            if (
+                event.get("type") == "patch_apply_end"
+                and event.get("success") is True
+                and str(event.get("status") or "").lower() == "completed"
+            )
+            or (
+                event.get("type") == "item_completed"
+                and isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "FileChange"
+                and str(event["item"].get("status") or "").lower()
+                == "completed"
+                and isinstance(event["item"].get("changes"), dict)
+                and bool(event["item"]["changes"])
+                and not str(event["item"].get("stderr") or "").strip()
+            )
+        ]
         if not matches and (
             safe_int(state.get("_source_schema_version")) == 25
             or safe_int(state.get("schema_version")) == 25
@@ -6902,26 +6703,68 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
                 matches[0]["legacy_host_input_digest"] = matches[0].get("host_input_digest")
                 matches[0]["host_input_digest"] = patch_digest
                 matches[0]["reconciliation_source"] = "legacy_unique_turn_patch_event_v1"
+        if not matches and len(successes) == 1 and successes[0].get("type") == "item_completed":
+            current_host_shape = [
+                op
+                for op in patch_ops
+                if normalized_key(op.get("tool")) == "applypatch"
+                and op.get("executor_agent_id")
+                and op.get("execution_contract_id") == state.get("execution_contract_id")
+                and op.get("slice_id") == current.get("id")
+                and op.get("slice_contract_id") == slice_contract_id(state)
+            ]
+            if len(current_host_shape) == 1:
+                matches = current_host_shape
+                matches[0]["legacy_host_input_digest"] = matches[0].get("host_input_digest")
+                matches[0]["host_input_digest"] = patch_digest
+                matches[0]["reconciliation_source"] = "host_rollout_unique_file_change_v1"
         if len(matches) == 1:
             # Host event is authoritative only when exactly one bounded success
             # event is present in this turn; missing/ambiguous remains unknown.
-            call_index = next((index for index, event in enumerate(turn_events) if event.get("type") == "custom_tool_call" and event.get("call_id") == patch_call_id), -1)
-            output_index = next((index for index, event in enumerate(turn_events[call_index + 1 :], call_index + 1) if event.get("type") == "custom_tool_call_output" and event.get("call_id") == patch_call_id), -1)
-            successes = [event for event in turn_events[call_index + 1 : output_index] if event.get("type") == "patch_apply_end" and event.get("success") is True and str(event.get("status") or "").lower() == "completed"]
             if len(successes) == 1:
                 matches[0]["status"] = "ok"; matches[0]["category"] = "implementation"
                 if exact_patch_match:
                     matches[0]["reconciliation_source"] = "host_rollout_exact_patch_digest_v1"
-    result = transcript_turn_structured_exec_result(payload.get("transcript_path"), turn_id)
-    if not result:
-        return
-    digest, status, command = result
-    candidates = [op for op in state.get("operations", []) if op.get("status") == "unknown" and op.get("host_event_turn_id") == turn_id and op.get("host_input_digest") == digest]
-    if len(candidates) != 1:
-        return
-    op = candidates[0]
-    op["status"] = status
-    op["category"] = command_category({"tool_name": op.get("tool")}, command)
+    payload_cwd = str(payload.get("cwd") or "")
+    for digest, status, command in transcript_turn_structured_exec_results(
+        payload.get("transcript_path"), turn_id
+    ):
+        normalized_command = command.replace("\r\n", "\n").replace("\r", "\n")
+        command_digest = stable_hash(
+            "host-operation-command-text-v1\0" + normalized_command, 32
+        )
+        payload_cwd_digest = stable_hash(
+            "host-operation-command-v1\0"
+            + normalized_command
+            + "\0"
+            + payload_cwd,
+            32,
+        )
+        candidates = [
+            op
+            for op in state.get("operations", [])
+            if op.get("status") == "unknown"
+            and op.get("host_event_turn_id") == turn_id
+            and (
+                op.get("host_input_digest") == digest
+                or op.get("host_command_digest") == command_digest
+                or (
+                    not op.get("host_command_digest")
+                    and payload_cwd
+                    and op.get("host_input_digest") == payload_cwd_digest
+                )
+            )
+        ]
+        if len(candidates) != 1:
+            continue
+        op = candidates[0]
+        if op.get("host_input_digest") != digest:
+            op["legacy_host_input_digest"] = op.get("host_input_digest")
+            op["host_input_digest"] = digest
+            op["reconciliation_source"] = "host_rollout_exact_command_text_v1"
+        op["host_command_digest"] = command_digest
+        op["status"] = status
+        op["category"] = command_category({"tool_name": op.get("tool")}, command)
 
 
 def transcript_has_exact_parent_review_pass(
@@ -6969,17 +6812,124 @@ def latest_parent_review_host_success(path_value: Any, contract_id: str, slice_i
     return None
 
 
+def completed_parent_review_rollout(
+    payload: dict[str, Any], contract_id: str, slice_id: str
+) -> dict[str, Any] | None:
+    """Prove one exact, completed parent-pass turn from the host rollout.
+
+    This bridge exists for Desktop builds whose Stop payload omits the final
+    assistant body/status even though the durable rollout contains it.  It
+    deliberately requires the full regular rollout, one same-session meta,
+    one exact final marker, and the matching task_complete record.
+    """
+    session_id = safe_label(payload.get("session_id"), 120)
+    if not session_id:
+        return None
+    records = read_host_rollout_records(payload.get("transcript_path"))
+    if not records:
+        return None
+    metas = [
+        item.get("payload")
+        for item in records
+        if item.get("type") == "session_meta"
+        and isinstance(item.get("payload"), dict)
+    ]
+    if (
+        len(metas) != 1
+        or metas[0].get("session_id") != session_id
+        or metas[0].get("id") != session_id
+    ):
+        return None
+
+    candidates: list[tuple[int, str, str, str]] = []
+    for index, item in enumerate(records):
+        event = item.get("payload") or {}
+        if (
+            item.get("type") != "response_item"
+            or not isinstance(event, dict)
+            or event.get("type") != "message"
+            or event.get("role") != "assistant"
+            or event.get("phase") != "final_answer"
+        ):
+            continue
+        content = event.get("content")
+        if not (
+            isinstance(content, list)
+            and len(content) == 1
+            and isinstance(content[0], dict)
+            and isinstance(content[0].get("text"), str)
+        ):
+            continue
+        message = content[0]["text"]
+        match, body, intent = _strict_terminal_marker(
+            message, "EXECUTION_REVIEW", EXECUTION_REVIEW_RE
+        )
+        if not intent:
+            continue
+        if not match:
+            if contract_id in message and f"slice_id={slice_id}" in message:
+                return None
+            continue
+        if match.group(1) != contract_id or match.group(2) != slice_id:
+            continue
+        if match.group(3) != "passed":
+            return None
+        turn_id = _host_event_turn_id(event)
+        if not turn_id:
+            return None
+        candidates.append((index, turn_id, message, body))
+    if len(candidates) != 1:
+        return None
+    message_index, turn_id, message, body = candidates[0]
+    completions = [
+        (index, item)
+        for index, item in enumerate(records)
+        if item.get("type") == "event_msg"
+        and isinstance(item.get("payload"), dict)
+        and item["payload"].get("type") == "task_complete"
+        and item["payload"].get("turn_id") == turn_id
+        and item["payload"].get("last_agent_message") == message
+    ]
+    if len(completions) != 1 or completions[0][0] <= message_index:
+        return None
+    completion_index, completion = completions[0]
+    for item in records[message_index + 1 : completion_index]:
+        event = item.get("payload") or {}
+        if not isinstance(event, dict) or _host_event_turn_id(event) != turn_id:
+            continue
+        if event.get("type") in {"custom_tool_call", "custom_tool_call_output"}:
+            return None
+        if event.get("type") == "item_completed" and isinstance(event.get("item"), dict):
+            if event["item"].get("type") in {"CommandExecution", "FileChange"}:
+                return None
+    results = rollout_turn_structured_exec_results(records, turn_id)
+    if not results:
+        return None
+    return {
+        "body": body,
+        "completion_at": completion.get("timestamp"),
+        "message": message,
+        "result_digests": {digest: status for digest, status, _ in results},
+        "turn_id": turn_id,
+    }
+
+
 def reconcile_current_parent_review_on_resume(payload: dict[str, Any], state: dict[str, Any]) -> None:
     current = current_execution_slice(state) or {}
     candidates = [op for op in state.get("operations", []) if op.get("status") == "unknown" and op.get("category") == "verification" and op.get("executor_agent_id") is None and op.get("execution_contract_id") == state.get("execution_contract_id") and op.get("slice_id") == current.get("id") and op.get("slice_contract_id") == slice_contract_id(state) and op.get("host_input_digest") and op.get("host_event_turn_id")]
-    if len(candidates) == 1:
-        reconcile_unknown_operations_from_transcript({**payload, "turn_id": candidates[0]["host_event_turn_id"]}, state)
+    for turn_id in dict.fromkeys(str(item["host_event_turn_id"]) for item in candidates):
+        reconcile_unknown_operations_from_transcript(
+            {**payload, "turn_id": turn_id}, state
+        )
 
 
 def reconcile_current_executor_rollout_on_resume(payload: dict[str, Any], state: dict[str, Any]) -> None:
     """Bounded child-rollout repair for current executor operations only."""
     current = current_execution_slice(state) or {}; contract = state.get("execution_contract_id")
-    starts = [item for item in state.get("subagents", []) if item.get("event") == "start" and item.get("role") == "confirmed_executor" and item.get("contract_id") == contract and item.get("slice_id") == current.get("id") and item.get("agent_id") and item.get("at")]
+    review = _safe_executor_review(state.get("executor_review"))
+    current_attempt = safe_int(state.get("executor_attempt"))
+    candidate_agent = _fingerprint32(review.get("candidate_agent_fingerprint"))
+    starts = [item for item in state.get("subagents", []) if item.get("event") == "start" and item.get("role") == "confirmed_executor" and item.get("contract_id") == contract and item.get("slice_id") == current.get("id") and safe_int(item.get("attempt")) == current_attempt and item.get("agent_id") and item.get("at") and (not candidate_agent or stable_hash(str(item.get("agent_id")), 32) == candidate_agent)]
     if len(starts) != 1:
         return
     start = starts[0]; agent = safe_label(start.get("agent_id"), 120); date = str(start.get("at"))[:10]
@@ -7102,6 +7052,323 @@ def current_slice_host_change_digest(state: dict[str, Any]) -> str | None:
     current = current_execution_slice(state) or {}; contract = state.get("execution_contract_id")
     facts=[{k:op.get(k) for k in ("fingerprint","host_input_digest","legacy_host_input_digest","reconciliation_source","host_event_turn_id","status")} for op in state.get("operations",[]) if isinstance(op,dict) and op.get("execution_contract_id")==contract and op.get("slice_id")==current.get("id") and op.get("slice_contract_id")==slice_contract_id(state) and op.get("executor_agent_id") and op.get("status") in SUCCESS_STATUSES and op.get("category") in {"implementation","build_package","delivery_device"} and op.get("reconciliation_source")]
     return stable_hash("current-slice-host-change-v1\0"+canonical_json(facts),32) if facts else None
+
+
+def repair_prior_slice_change_status_omission_once(state: dict[str, Any]) -> bool:
+    """Recover one sealed change whose V2 child Stop omitted terminal status.
+
+    The repair never converts an arbitrary attempted write into success.  It
+    requires a uniquely bound full-Start executor, its exact succeeded result,
+    a missing host terminal status, the already-passed parent review, and a
+    host-recorded implementation operation with no conflicting error.
+    """
+    slices = _safe_execution_slices(state.get("execution_slices"))
+    if any(item.get("status") == "passed" and item.get("change_evidence") for item in slices.get("items", [])):
+        return True
+    contract = safe_fingerprint(state.get("execution_contract_id"))
+    if not contract:
+        return False
+    candidates: list[tuple[int, dict[str, Any], list[dict[str, Any]]]] = []
+    for index, item in enumerate(slices.get("items", [])):
+        if not (
+            item.get("status") == "passed"
+            and item.get("completion_digest")
+            and item.get("review_digest")
+            and item.get("operation_digest")
+            and item.get("verification_evidence")
+        ):
+            continue
+        starts = [
+            event
+            for event in state.get("subagents", [])
+            if isinstance(event, dict)
+            and event.get("event") == "start"
+            and event.get("role") == "confirmed_executor"
+            and event.get("contract_id") == contract
+            and event.get("slice_id") == item.get("id")
+            and event.get("agent_id")
+            and event.get("host_accepted") is True
+            and event.get("start_observed") == "full"
+        ]
+        if len(starts) != 1:
+            continue
+        start = starts[0]
+        stops = [
+            event
+            for event in state.get("subagents", [])
+            if isinstance(event, dict)
+            and event.get("event") == "stop"
+            and event.get("role") == "confirmed_executor"
+            and event.get("contract_id") == contract
+            and event.get("slice_id") == item.get("id")
+            and event.get("agent_id") == start.get("agent_id")
+            and event.get("execution_result_contract_match") is True
+            and event.get("execution_result_outcome") == "succeeded"
+            and event.get("terminal_status") == "missing"
+            and event.get("terminal_status_source") == "host_missing"
+        ]
+        if len(stops) != 1:
+            continue
+        slice_contract = start.get("slice_contract_id")
+        operations = [
+            operation
+            for operation in state.get("operations", [])
+            if isinstance(operation, dict)
+            and operation.get("execution_contract_id") == contract
+            and operation.get("slice_id") == item.get("id")
+            and operation.get("slice_contract_id") == slice_contract
+        ]
+        changes = [
+            operation
+            for operation in operations
+            if operation.get("executor_agent_id") == start.get("agent_id")
+            and operation.get("category") in {"implementation", "build_package", "delivery_device"}
+            and operation.get("host_input_digest")
+        ]
+        parent_verification = [
+            operation
+            for operation in operations
+            if operation.get("executor_agent_id") is None
+            and operation.get("category") in {"verification", "evidence"}
+            and operation.get("status") in SUCCESS_STATUSES
+        ]
+        if (
+            changes
+            and parent_verification
+            and not any(str(operation.get("status") or "").startswith("error") for operation in changes)
+        ):
+            candidates.append((index, start, changes))
+    if len(candidates) != 1:
+        return False
+    index, start, changes = candidates[0]
+    fingerprint = stable_hash(
+        "accepted-slice-change-status-omission-v1\0"
+        + canonical_json(
+            {
+                "agent": stable_hash(str(start.get("agent_id")), 32),
+                "completion": slices["items"][index].get("completion_digest"),
+                "contract": contract,
+                "inputs": [operation.get("host_input_digest") for operation in changes],
+                "slice": slices["items"][index].get("id"),
+            }
+        ),
+        32,
+    )
+    guards = state.setdefault("guards", [])
+    if any(
+        isinstance(item, dict)
+        and item.get("kind") == "accepted_slice_change_status_omission_repair"
+        and item.get("fingerprint") == fingerprint
+        for item in guards
+    ):
+        return False
+    slices["items"][index]["change_evidence"] = True
+    state["execution_slices"] = slices
+    guards.append(
+        {
+            "at": utc_now(),
+            "turn_id": None,
+            "kind": "accepted_slice_change_status_omission_repair",
+            "action": "repair",
+            "fingerprint": fingerprint,
+        }
+    )
+    return True
+
+
+def resume_completed_parent_review_once(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> bool:
+    """Seal a host-completed parent pass that an incomplete Stop misclassified."""
+    review = _safe_executor_review(state.get("executor_review"))
+    current = current_execution_slice(state)
+    contract = safe_fingerprint(state.get("execution_contract_id"))
+    if not (
+        payload.get("hook_event_name") == "SessionStart"
+        and str(payload.get("source") or "") in {"resume", "compact"}
+        and state.get("plan_state") == "confirmed"
+        and state.get("confirmed_plan_digest") == state.get("plan_digest")
+        and state.get("executor_state") == "recovery_required"
+        and state.get("executor_failure_kind") == "verification_failed"
+        and str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
+        and safe_int(state.get("executor_attempt")) == 1
+        and review.get("status") == "failed"
+        and review.get("attempt") == 1
+        and contract
+        and contract == execution_contract_id(state)
+        and current
+        and current.get("status") == "pending"
+        and review.get("execution_contract_id") == contract
+        and review.get("slice_id") == current.get("id")
+        and review.get("slice_contract_id") == slice_contract_id(state)
+        and review.get("candidate_result_fingerprint")
+        and review.get("candidate_evidence_digest")
+    ):
+        return False
+    proof = completed_parent_review_rollout(payload, contract, current["id"])
+    if not proof:
+        return False
+    result_digests = proof["result_digests"]
+    parent_operations = [
+        operation
+        for operation in state.get("operations", [])
+        if isinstance(operation, dict)
+        and operation.get("host_event_turn_id") == proof["turn_id"]
+        and operation.get("executor_agent_id") is None
+        and operation.get("execution_contract_id") == contract
+        and operation.get("slice_id") == current.get("id")
+        and operation.get("slice_contract_id") == slice_contract_id(state)
+        and operation.get("category") in {"verification", "evidence"}
+        and operation.get("host_input_digest")
+    ]
+    if not parent_operations or any(
+        operation.get("status") not in SUCCESS_STATUSES
+        or result_digests.get(operation.get("host_input_digest")) not in SUCCESS_STATUSES
+        for operation in parent_operations
+    ):
+        return False
+    operation_indexes = [state.get("operations", []).index(operation) for operation in parent_operations]
+    if any(
+        operation.get("executor_agent_id")
+        or operation.get("category") in {"implementation", "build_package", "delivery_device"}
+        for operation in state.get("operations", [])[max(operation_indexes) + 1 :]
+        if isinstance(operation, dict)
+    ):
+        return False
+    completion_at = str(proof.get("completion_at") or "")
+    if completion_at and any(
+        str(event.get("at") or "") > completion_at
+        and event.get("event") in {"request", "start", "stop"}
+        for event in state.get("subagents", [])
+        if isinstance(event, dict)
+    ):
+        return False
+
+    operation_evidence = slice_operation_evidence(state)
+    if not (
+        operation_evidence.get("verification_evidence")
+        and operation_evidence.get("parent_review_evidence")
+        and operation_evidence.get("operation_digest")
+    ):
+        return False
+    slices = _safe_execution_slices(state.get("execution_slices"))
+    item_index = safe_int(slices.get("current_index")) - 1
+    if item_index < 0 or item_index >= len(slices.get("items", [])):
+        return False
+    if item_index + 1 == slices.get("count") and not repair_prior_slice_change_status_omission_once(state):
+        return False
+    slices = _safe_execution_slices(state.get("execution_slices"))
+    item = slices["items"][item_index]
+    prior_chain = slices["completed_chain"]
+    evidence_digest = host_evidence_digest(
+        domain="parent-review-v1",
+        state=state,
+        agent_id="parent",
+        request_fingerprint=review.get("candidate_result_fingerprint"),
+        body_without_marker=proof["body"],
+        outcome="passed",
+        candidate_review=review,
+    )
+    completion_digest = stable_hash(
+        "workflow-manager-slice-completion-v1\0"
+        + canonical_json(
+            {
+                "candidate_evidence_digest": review.get("candidate_evidence_digest"),
+                "execution_contract_id": contract,
+                "operation_digest": operation_evidence["operation_digest"],
+                "review_evidence_digest": evidence_digest,
+                "slice_contract_id": slice_contract_id(state),
+                "slice_digest": item["slice_digest"],
+                "slice_id": item["id"],
+            }
+        ),
+        32,
+    )
+    item.update(
+        {
+            "status": "passed",
+            "completion_digest": completion_digest,
+            "review_digest": evidence_digest,
+            "operation_digest": operation_evidence["operation_digest"],
+            "change_evidence": bool(operation_evidence.get("change_evidence")),
+            "verification_evidence": True,
+        }
+    )
+    slices["current_index"] = item_index + 2
+    slices["completed_chain"] = stable_hash(
+        "workflow-manager-slice-chain-step-v1\0"
+        + canonical_json(
+            {
+                "completion_digest": completion_digest,
+                "previous_chain": prior_chain,
+                "slice_digest": item["slice_digest"],
+                "slice_id": item["id"],
+            }
+        ),
+        32,
+    )
+    expected_chain = recompute_completed_slice_chain(slices)
+    if not (
+        slices["current_index"] == slices["count"] + 1
+        and all(
+            item.get("status") == "passed" and item.get("verification_evidence")
+            for item in slices["items"]
+        )
+        and any(item.get("change_evidence") for item in slices["items"])
+        and expected_chain
+        and expected_chain == slices.get("completed_chain")
+    ):
+        return False
+    operation_digests = [item["operation_digest"] for item in slices["items"]]
+    change_digests = [
+        item["operation_digest"]
+        for item in slices["items"]
+        if item.get("change_evidence")
+    ]
+    state["execution_slices"] = slices
+    state["last_execution_baseline"] = {
+        "baseline_id": stable_hash(
+            "workflow-manager-sliced-baseline-v1\0"
+            + canonical_json(
+                {"chain": expected_chain, "contract": contract, "operations": operation_digests}
+            ),
+            32,
+        ),
+        "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+        "plan_digest": state.get("plan_digest"),
+        "execution_contract_id": contract,
+        "change_set_digest": stable_hash(canonical_json(change_digests), 32),
+        "verification_digest": stable_hash(canonical_json(operation_digests), 32),
+        "acceptance_status": "passed",
+    }
+    review.update(
+        {
+            "status": "passed",
+            "review_evidence_digest": evidence_digest,
+            "digest_profile": EVIDENCE_DIGEST_PROFILE,
+            "digest_source": EVIDENCE_DIGEST_SOURCE,
+            "at": utc_now(),
+        }
+    )
+    state["executor_review"] = review
+    state["executor_state"] = "succeeded"
+    state["executor_failure_kind"] = None
+    state["model_profile"] = confirmed_executor_model_profile(state)
+    state["causal_review"] = _safe_causal_review(None)
+    repair_fingerprint = stable_hash(
+        f"completed-parent-review-rollout-v1\0{contract}\0{current['id']}\0{proof['turn_id']}\0{evidence_digest}",
+        32,
+    )
+    state.setdefault("guards", []).append(
+        {
+            "at": utc_now(),
+            "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+            "kind": "completed_parent_review_rollout_repair",
+            "action": "repair",
+            "fingerprint": repair_fingerprint,
+        }
+    )
+    return True
 
 
 def resume_failed_review_evidence_once(payload: dict[str, Any], state: dict[str, Any]) -> bool:
@@ -7257,85 +7524,6 @@ def start_observation_status(model: str | None, effort: str | None, source: str 
     return "absent"
 
 
-EN_ACTIONS = (
-    "build",
-    "compile",
-    "debug",
-    "deploy",
-    "diagnose",
-    "fix",
-    "implement",
-    "integrate",
-    "investigate",
-    "install",
-    "migrate",
-    "optimize",
-    "package",
-    "record",
-    "refactor",
-    "reboot",
-    "reproduce",
-    "review",
-    "simulate",
-    "test",
-    "verify",
-)
-ZH_ACTIONS = (
-    "编译",
-    "构建",
-    "检查",
-    "核对",
-    "确认",
-    "查看",
-    "调试",
-    "部署",
-    "诊断",
-    "修复",
-    "修改",
-    "实现",
-    "集成",
-    "安装",
-    "排查",
-    "迁移",
-    "优化",
-    "合包",
-    "打包",
-    "刷机",
-    "重启",
-    "复现",
-    "录像",
-    "录屏",
-    "抓日志",
-    "重构",
-    "审查",
-    "模拟",
-    "测试",
-    "验证",
-)
-EN_BREADTH = (
-    "all files",
-    "comprehensive",
-    "complex",
-    "end-to-end",
-    "exhaustive",
-    "multiple",
-    "parallel",
-    "systematic",
-)
-ZH_BREADTH = (
-    "不要停止",
-    "多个",
-    "复杂",
-    "完整流程",
-    "全面",
-    "全量",
-    "并行",
-    "彻底",
-    "所有文件",
-    "系统性",
-    "端到端",
-)
-
 PHASE_TERMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "analysis": (
         ("audit", "debug", "diagnose", "investigate", "log analysis", "reproduce", "review", "root cause"),
@@ -7366,13 +7554,6 @@ PHASE_TERMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("对比", "文档", "历史", "调研", "搜索"),
     ),
 }
-
-EN_RECURRENCE = ("again", "crash loop", "flaky", "intermittent", "keeps", "repeated", "repeatedly", "still")
-ZH_RECURRENCE = ("反复", "重复", "多次", "不断", "还是", "仍然", "仍旧", "又", "死循环")
-EN_SMALL_SCOPE = ("one small", "single file", "small change", "tiny change")
-ZH_SMALL_SCOPE = ("一个小", "单个文件", "仅修改", "小改动")
-SEQUENTIAL_PHASES = {"build_package", "delivery_device", "verification", "evidence"}
-ROUTE_RANK = {"direct": 0, "focused": 1, "complex": 2, "extensive": 3}
 
 DAILY_EXACT_PATTERNS = (
     ("daily_weather", r"(?:天气|气温|下雨|空气质量|weather|forecast)"),
@@ -7609,12 +7790,12 @@ def classify_work_difficulty(
             simple_codes = [
                 code for code, pattern in SIMPLE_WORK_PATTERNS if re.search(pattern, lower, re.I)
             ]
-            route_label = str(route.get("label") or "direct")
-            if route_label in {"direct", "focused"} and len(phases) <= 2:
-                simple_codes.append("simple_bounded_route")
+            bounded_shape = len(phases) <= 2
+            if bounded_shape:
+                simple_codes.append("simple_bounded_scope")
             if simple_codes:
                 difficulty = "simple"
-                confidence = "high" if route_label in {"direct", "focused"} else "medium"
+                confidence = "high" if bounded_shape else "medium"
                 rule_codes = list(dict.fromkeys(simple_codes))[:8]
             else:
                 # Uncertainty is not itself evidence of difficulty.  Start with one
@@ -7653,65 +7834,6 @@ def phase_hints(prompt: str) -> list[str]:
     return result
 
 
-def meta_delegation_signal(prompt: str) -> bool:
-    lower = prompt.lower()
-    mentions_delegation = bool(
-        re.search(r"\b(?:subagents?|child agents?|delegation|agent routing)\b", lower)
-        or any(term in prompt for term in ("子智能体", "子代理", "代理路由", "委派"))
-        or "workflow-manager" in lower
-        or "workflow manager" in lower
-    )
-    if not mentions_delegation:
-        return False
-    return bool(
-        re.search(
-            r"\b(?:discuss|evaluate|judge|test|testing|decide|determine|consider|explain|"
-            r"whether|when|how)\b.{0,48}\b(?:subagents?|delegation|agent routing|orchestrator)\b",
-            lower,
-        )
-        or re.search(
-            r"\b(?:subagents?|delegation|agent routing)\b.{0,48}\b(?:test|whether|when|how|needed)\b",
-            lower,
-        )
-        or any(
-            re.search(pattern, prompt)
-            for pattern in (
-                r"(?:讨论|测试|判断|评估|验证|决定|考虑|解释).{0,24}(?:子智能体|子代理|代理路由|编排器)",
-                r"(?:是否|何时|什么时候|如何|怎么).{0,24}(?:使用|启用|需要|启动)?.{0,8}(?:子智能体|子代理)",
-                r"(?:子智能体|子代理).{0,24}(?:是否|何时|如何|怎么|需要)",
-            )
-        )
-    )
-
-
-def explicit_spawn_signal(prompt: str, meta_delegation: bool = False) -> bool:
-    lower = prompt.lower()
-    if meta_delegation:
-        return False
-    if delegation_opt_out_signal(prompt):
-        return False
-    return bool(
-        re.search(
-            r"\b(?:spawn|launch|create|use|delegate to|assign to)\b.{0,32}"
-            r"\b(?:subagents?|child agents?|workers?)\b",
-            lower,
-        )
-        or re.search(r"(?:派出|启动|创建|使用|安排|委派给).{0,16}(?:子智能体|子代理|代理)", prompt)
-    )
-
-
-def delegation_opt_out_signal(prompt: str) -> bool:
-    lower = prompt.lower()
-    return bool(
-        re.search(
-        r"\b(?:do not|don't|never|without)\s+(?:use|spawn|launch|create|delegate to)\s+"
-        r"(?:any\s+)?(?:subagents?|agents?|workers?)\b",
-        lower,
-        )
-        or re.search(r"(?:不要|无需|禁止|不许).{0,12}(?:子智能体|子代理|委派)", prompt)
-    )
-
-
 def prompt_dependency_signal(prompt: str) -> str:
     lower = prompt.lower()
     ordered = bool(
@@ -7744,68 +7866,13 @@ def prompt_dependency_signal(prompt: str) -> str:
     return "none"
 
 
-def ready_lane_evidence(prompt: str, list_items: int = 0) -> tuple[str, int]:
-    lower = prompt.lower()
-    ready_now = bool(
-        re.search(
-            r"\b(?:ready[- ]now|ready to start (?:now|immediately)|start immediately|"
-            r"immediately (?:ready|available)|(?:can|may|able to) (?:all |both )?start (?:right )?now)\b",
-            lower,
-        )
-        or re.search(r"(?:现在|立即|当前).{0,10}(?:可|可以|能|已经).{0,6}(?:开始|启动|开展|就绪)", prompt)
-        or re.search(r"(?:可|可以|能)(?:立即|现在).{0,6}(?:开始|启动|开展)", prompt)
-    )
-    independent = bool(
-        re.search(
-            r"\b(?:independent|dependency[- ]free|no dependencies|disjoint|non-overlapping|"
-            r"separate (?:files|modules|worktrees|lanes)|do not share|without shared)\b",
-            lower,
-        )
-        or any(term in prompt for term in ("互不依赖", "无依赖", "各自独立", "独立工作线", "不重叠", "不同文件", "各自"))
-    )
-    count = 0
-    number_map = {
-        "two": 2,
-        "three": 3,
-        "four": 4,
-        "2": 2,
-        "3": 3,
-        "4": 4,
-    }
-    for match in re.finditer(
-        r"\b(two|three|four|[234])\b.{0,32}\b(?:lanes?|workstreams?|subtasks?|tasks?)\b",
-        lower,
-    ):
-        count = max(count, number_map.get(match.group(1), 0))
-    chinese_number_map = {"二": 2, "两": 2, "三": 3, "四": 4, "2": 2, "3": 3, "4": 4}
-    for match in re.finditer(r"([二两三四234])\s*条?.{0,20}(?:工作线|子任务|任务|lane)", prompt, re.I):
-        count = max(count, chinese_number_map.get(match.group(1), 0))
-    named_lanes = {
-        match.group(0).lower()
-        for match in re.finditer(r"\b(?:lane|workstream|subtask)\s*(?:[a-d]|[1-4])\b", lower)
-    }
-    named_lanes.update(
-        match.group(0) for match in re.finditer(r"(?:工作线|子任务)\s*[一二三四1-4]", prompt)
-    )
-    count = max(count, len(named_lanes))
-    if list_items >= 2:
-        count = max(count, min(list_items, 4))
-    plural = bool(
-        re.search(r"\b(?:both|each|several|multiple|parallel|lanes|workstreams|subtasks)\b", lower)
-        or any(term in prompt for term in ("两条", "三条", "多个", "各自", "并行", "分别"))
-    )
-    if ready_now and independent and count < 2 and plural:
-        count = 2
-    if ready_now and independent and count >= 3:
-        return "ready_three_plus", count
-    if ready_now and independent and count >= 2:
-        return "ready_two", count
-    if ready_now or independent:
-        return "possible", count
-    return "none", count
-
-
 def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the retained authorization decision.
+
+    Codex now owns ordinary task shaping and subagent scheduling.  Legacy route
+    fields remain zeroed only so Schema <=26 state can migrate without
+    manufacturing a new execution policy.
+    """
     result = dict(route)
     result["task_domain"] = (
         result.get("task_domain")
@@ -7850,103 +7917,26 @@ def decorate_route(route: dict[str, Any]) -> dict[str, Any]:
         result.get("difficulty_classifier_version") or DIFFICULTY_CLASSIFIER_VERSION, 16
     )
     result["difficulty_decision_id"] = safe_fingerprint(result.get("difficulty_decision_id")) or None
-    label = str(result.get("label") or "direct")
-    lane_signal = str(result.get("lane_signal") or "none")
-    readiness = str(result.get("readiness_signal") or "none")
-    if readiness not in {"none", "possible", "ready_two", "ready_three_plus"}:
-        readiness = "none"
-    dependency = str(result.get("dependency_signal") or "none")
-    if dependency not in {"none", "ordered", "shared_resource", "ordered_shared"}:
-        dependency = "none"
-    meta_delegation = bool(result.get("meta_delegation"))
-    delegation_opt_out = bool(result.get("delegation_opt_out"))
-    gate = str(result.get("delegation_gate") or "")
     phases = list(dict.fromkeys(str(item) for item in as_list(result.get("phase_hints")) if item))[:8]
     result["phase_hints"] = phases
-
-    if delegation_opt_out:
-        gate = "closed"
-    elif dependency != "none" or lane_signal == "sequential":
-        lane_signal = "sequential"
-        gate = "closed"
-    elif label in {"direct", "focused"}:
-        gate = "closed"
-    elif meta_delegation and gate == "open":
-        gate = "audit"
-    elif gate not in {"closed", "audit", "open"}:
-        gate = "open" if lane_signal == "explicit" and readiness in {"ready_two", "ready_three_plus"} else "audit"
-
-    cap = min(max(safe_int(result.get("recommended_agent_cap")), 0), 3)
-    if gate == "closed" or label in {"direct", "focused"}:
-        cap = 0
-    elif label == "complex":
-        cap = 2
-    elif label == "extensive":
-        cap = 3
-    else:
-        cap = 0
-
-    result["lane_signal"] = lane_signal
-    result["delegation_gate"] = gate
-    result["readiness_signal"] = readiness
-    result["dependency_signal"] = dependency
-    result["meta_delegation"] = meta_delegation
-    result["delegation_opt_out"] = delegation_opt_out
-    result["recommended_agent_cap"] = cap
-    if dependency != "none" and not result.get("dependency_hint"):
-        result["dependency_hint"] = (
-            "shared_artifact_or_device"
-            if dependency in {"shared_resource", "ordered_shared"}
-            else "ordered_dependency"
-        )
-
-    if label == "direct":
-        shape = "direct"
-    elif label == "focused":
-        shape = "single_chain"
-    elif lane_signal == "sequential":
-        shape = "sequential_pipeline"
-    elif gate == "open":
-        shape = "multi_lane"
-    elif lane_signal in {"possible", "explicit"}:
-        shape = "lane_audit"
-    else:
-        shape = "bounded_complex"
-
-    if label == "direct":
-        order = ["answer"]
-    else:
-        order = ["contract"]
-        phase_set = set(phases)
-        if phase_set & {"analysis", "research"}:
-            order.append("evidence")
-        if "implementation" in phase_set:
-            order.append("change")
-        if "build_package" in phase_set:
-            order.append("build")
-        if "delivery_device" in phase_set:
-            order.append("deliver")
-        if phase_set & {"verification", "evidence"}:
-            order.append("verify")
-        if label in {"complex", "extensive"} and "evidence" not in order:
-            order.insert(1, "evidence")
-        if label in {"complex", "extensive"} and "verify" not in order:
-            order.append("verify")
-        if label == "focused" and phase_set & {"implementation", "build_package", "delivery_device"} and "verify" not in order:
-            order.append("verify")
-        if label == "focused" and len(order) == 1:
-            order.extend(("work", "verify"))
-        order.append("report")
-
-    if cap <= 0:
-        agent_mode = "sequential_local" if lane_signal == "sequential" else "local"
-    elif cap == 1:
-        agent_mode = "parent_plus_one"
-    else:
-        agent_mode = "bounded_multi"
-    result["workflow_shape"] = shape
-    result["execution_order"] = list(dict.fromkeys(order))[:8]
-    result["agent_mode"] = agent_mode
+    for obsolete in (
+        "label",
+        "score",
+        "future_token_range",
+        "recommended_agent_cap",
+        "parallel_signal",
+        "delegation_gate",
+        "readiness_signal",
+        "dependency_signal",
+        "meta_delegation",
+        "delegation_opt_out",
+        "lane_signal",
+        "dependency_hint",
+        "workflow_shape",
+        "execution_order",
+        "agent_mode",
+    ):
+        result.pop(obsolete, None)
     return result
 
 
@@ -7995,19 +7985,7 @@ def identity_preflight_route(prompt: str) -> dict[str, Any]:
             "difficulty_decision_id": stable_hash(
                 f"{DIFFICULTY_CLASSIFIER_VERSION}\0identity-preflight\0{fingerprint}", 24
             ),
-            "label": "direct",
-            "score": 0,
-            "future_token_range": "under 4k",
-            "recommended_agent_cap": 0,
-            "parallel_signal": False,
-            "delegation_gate": "closed",
-            "readiness_signal": "none",
-            "dependency_signal": "none",
-            "meta_delegation": True,
-            "delegation_opt_out": True,
-            "lane_signal": "none",
             "phase_hints": [],
-            "dependency_hint": None,
             "route_source": "identity_preflight",
         }
     )
@@ -8017,113 +7995,14 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
     normalized = prompt.strip()
     if identity_preflight_prompt(normalized):
         return identity_preflight_route(normalized)
-    lower = normalized.lower()
     domain = classify_task_domain(normalized)
-    score = 0
-    if len(normalized) > 280:
-        score += 1
-    if len(normalized) > 1200:
-        score += 1
-    list_items = len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", normalized))
-    if list_items >= 3:
-        score += 1
-    if list_items >= 8:
-        score += 1
-
-    action_hits = _english_hits(lower, EN_ACTIONS) + sum(1 for term in ZH_ACTIONS if term in normalized)
-    breadth_hits = _english_hits(lower, EN_BREADTH) + sum(1 for term in ZH_BREADTH if term in normalized)
-    if action_hits >= 1:
-        score += 1
-    if action_hits >= 2:
-        score += 1
-    if action_hits >= 5:
-        score += 1
-    if breadth_hits >= 1:
-        score += 1
-    if breadth_hits >= 3:
-        score += 1
-
     phases = phase_hints(normalized)
-    recurrence = bool(_english_hits(lower, EN_RECURRENCE) or any(term in normalized for term in ZH_RECURRENCE))
-    small_scope = any(term in lower for term in EN_SMALL_SCOPE) or any(term in normalized for term in ZH_SMALL_SCOPE)
-    if small_scope and breadth_hits == 0 and score > 1:
-        score -= 1
-    if len(phases) >= 3:
-        score = max(score, 2)
-    if len(phases) >= 5:
-        score = max(score, 5)
-    if recurrence and ({"analysis", "delivery_device"} & set(phases)):
-        score = max(score, 2)
-
-    meta_delegation = meta_delegation_signal(normalized)
-    delegation_opt_out = delegation_opt_out_signal(normalized)
-    spawn_request = explicit_spawn_signal(normalized, meta_delegation)
-    raw_parallel = any(
-        term in lower
-        for term in ("in parallel", "independent", "parallel", "separate lane", "two issues")
-    ) or any(term in normalized for term in ("并行", "独立", "两条线", "两个问题", "分别", "同时"))
-    parallel_signal = bool((raw_parallel or spawn_request) and not meta_delegation)
-    if parallel_signal:
-        score += 1
-
-    readiness_signal, ready_lane_count = ready_lane_evidence(normalized, list_items)
-    if readiness_signal == "ready_two":
-        score = max(score, 2)
-    elif readiness_signal == "ready_three_plus":
-        score = max(score, 5)
-
-    if score <= 0:
-        label, future = "direct", "under 4k"
-    elif score == 1:
-        label, future = "focused", "4k-15k"
-    elif score <= 4:
-        label, future = "complex", "15k-50k"
-    else:
-        label, future = "extensive", "50k-120k+"
-
-    phase_set = set(phases)
     dependency_signal = prompt_dependency_signal(normalized)
-    if dependency_signal == "none" and len(phase_set) >= 2 and phase_set <= SEQUENTIAL_PHASES:
-        dependency_signal = "ordered_shared"
-    sequential = dependency_signal != "none"
-    if label in {"direct", "focused"}:
-        lane_signal, agents, gate = "none", 0, "closed"
-    elif delegation_opt_out:
-        lane_signal, agents, gate = "none", 0, "closed"
-    elif sequential:
-        lane_signal, agents, gate = "sequential", 0, "closed"
-    elif (
-        parallel_signal
-        and readiness_signal in {"ready_two", "ready_three_plus"}
-        and ready_lane_count >= 2
-    ):
-        lane_signal, gate = "explicit", "open"
-        agents = 3 if label == "extensive" else 2
-    else:
-        lane_signal = "possible" if parallel_signal or len(phase_set) >= 2 or breadth_hits else "none"
-        agents, gate = (3 if label == "extensive" else 2), "audit"
-
-    dependency_hint = None
-    if dependency_signal in {"shared_resource", "ordered_shared"}:
-        dependency_hint = "shared_artifact_or_device"
-    elif dependency_signal == "ordered":
-        dependency_hint = "ordered_dependency"
     route = {
         **domain,
-        "label": label,
-        "score": score,
-        "future_token_range": future,
-        "recommended_agent_cap": agents,
-        "parallel_signal": parallel_signal,
-        "delegation_gate": gate,
-        "readiness_signal": readiness_signal,
         "dependency_signal": dependency_signal,
-        "meta_delegation": meta_delegation,
-        "delegation_opt_out": delegation_opt_out,
-        "lane_signal": lane_signal,
         "phase_hints": phases,
-        "dependency_hint": dependency_hint,
-        "route_source": "prompt",
+        "route_source": "authorization_classifier",
     }
     route.update(classify_work_difficulty(normalized, domain, route))
     return decorate_route(route)
@@ -8617,7 +8496,7 @@ def verification_recovery_evidence_digest(
         return None
     if str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION:
         review = _safe_executor_review(state.get("executor_review"))
-        digest = _coordination_fp32(review.get("review_evidence_digest"))
+        digest = _fingerprint32(review.get("review_evidence_digest"))
         expected = bound_executor_task_name(state)
         return digest if digest and task_name == expected else None
     match = re.fullmatch(
@@ -8725,11 +8604,11 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
     if resolution.get("error"):
         return False, f"executor {resolution['error']}"
     contract_id = str(state.get("execution_contract_id") or "")
-    profile_v7 = str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
+    profile_current = str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
     current_slice = current_execution_slice(state)
     current_slice_contract = slice_contract_id(state)
     request = subagent_request_text(payload)
-    if not contract_id or not request or (profile_v7 and (not current_slice or not current_slice_contract)):
+    if not contract_id or not request or (profile_current and (not current_slice or not current_slice_contract)):
         return False, "missing execution contract"
     options = subagent_request_options(payload)
     task_name, _ = subagent_request_fields(payload)
@@ -8771,7 +8650,7 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
             re.I,
         )
     )
-    slice_marker = not profile_v7 or opaque_v2 or bool(
+    slice_marker = not profile_current or opaque_v2 or bool(
         re.search(
             rf"(?:slice_id|slice-id|执行切片)\s*[:=：]\s*{re.escape(str((current_slice or {}).get('id') or ''))}\b",
             request,
@@ -8818,7 +8697,7 @@ def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -
                 rf"(?m)^EXECUTION_RESULT execution_contract_id={re.escape(contract_id)} "
                 rf"slice_id={re.escape(str((current_slice or {}).get('id') or ''))} "
                 r"outcome=succeeded\|failed$"
-                if profile_v7
+                if profile_current
                 else rf"(?m)^EXECUTION_RESULT execution_contract_id={re.escape(contract_id)} "
                 r"outcome=succeeded\|failed evidence_digest=<32hex>$"
             ),
@@ -8946,10 +8825,9 @@ def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -
     fork = str(options.get("fork_turns") or "").lower()
     if fork != "1":
         return False, "every bound assessor requires fork_turns=1"
-    simple_contract = opaque_v2 or bool(re.search(r"(?:simple.{0,32}(?:direct|solve|execute|解决|直接).{0,40}(?:verify|验证|测试)|(?:直接|解决).{0,40}simple)", request, re.I))
     hard_contract = opaque_v2 or bool(re.search(r"(?:hard.{0,48}(?:read[- ]only|plan|confirmation|只读|计划|确认)|hard.{0,48}(?:plan|只读|计划).{0,48}(?:read[- ]only|confirmation|只读|确认))", request, re.I))
-    if not simple_contract or not hard_contract:
-        return False, "assessor request lacks the Simple/Hard assessment contract"
+    if not hard_contract:
+        return False, "assessor request lacks the read-only Hard planning contract"
     if state.get("assessor_state") == "recovery_required":
         failure = safe_label(state.get("assessor_failure_kind"), 48)
         if (
@@ -8969,62 +8847,6 @@ def subagent_request_text(payload: dict[str, Any]) -> str:
 
 def subagent_request_has_assessor_intent(payload: dict[str, Any]) -> bool:
     return bool(subagent_request_resolution(payload).get("assessor_intent"))
-
-
-def request_supports_delegation_reaudit(payload: dict[str, Any], route: dict[str, Any]) -> bool:
-    if route.get("label") not in {"complex", "extensive"}:
-        return False
-    if route.get("delegation_opt_out"):
-        return False
-    request = subagent_request_text(payload)
-    if not request:
-        return False
-    lower = request.lower()
-    ready_now = bool(
-        re.search(r"\b(?:ready[- ]now|start (?:right )?now|start immediately|can start now)\b", lower)
-        or re.search(r"(?:现在|立即|当前).{0,10}(?:可|可以|能|已经).{0,6}(?:开始|启动|开展|就绪)", request)
-        or re.search(r"(?:可|可以|能)(?:立即|现在).{0,6}(?:开始|启动|开展)", request)
-    )
-    independent = bool(
-        re.search(r"\b(?:independent|disjoint|non-overlapping|no dependencies|separate (?:files|modules|paths))\b", lower)
-        or any(term in request for term in ("互不依赖", "无依赖", "独立工作线", "不重叠", "不同文件", "独立于父"))
-    )
-    read_only = bool(
-        re.search(r"\b(?:read[- ]only|no writes?|without modifying|do not modify)\b", lower)
-        or any(term in request for term in ("只读", "只读检查", "不修改", "不要修改", "不写入"))
-    )
-    exclusive_write_owner = bool(
-        re.search(
-            r"\b(?:exclusive write owner|only (?:modify|edit|write)|owns? (?:the )?(?:files?|paths?|module))\b",
-            lower,
-        )
-        or any(term in request for term in ("独占修改", "独占写入", "只修改", "仅修改", "负责修改", "写入所有权"))
-    )
-    dependency = str(route.get("dependency_signal") or "none")
-    excludes_shared_resource = bool(
-        re.search(
-            r"\b(?:do not|does not|will not|without|won't)\b.{0,36}"
-            r"\b(?:device|build server|build account|shared artifact|shared workspace)\b",
-            lower,
-        )
-        or re.search(
-            r"(?:不操作|不使用|不接触|不占用|无需).{0,16}"
-            r"(?:设备|构建服务器|构建账号|共享产物|共享工作区)",
-            request,
-        )
-    )
-    conflicting_shared_action = bool(
-        re.search(
-            r"\b(?:build(?! (?:server|account))|compile|deploy|install|reboot|flash|run adb|"
-            r"validate on (?:the )?device)\b",
-            lower,
-        )
-        or re.search(r"(?:编译|构建(?!服务器|账号)|部署|安装|重启|刷机|设备验证|实机验证)", request)
-    )
-    if dependency in {"shared_resource", "ordered_shared"}:
-        if not excludes_shared_resource or conflicting_shared_action:
-            return False
-    return ready_now and independent and (read_only or exclusive_write_owner)
 
 
 PLAN_MUTATING_GIT_COMMANDS = {
@@ -9165,9 +8987,6 @@ def canonical_update_plan_projection(
 def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
     if state.get("work_difficulty") != "hard":
         return None
-    caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
-    if caller and state.get("assessor_state") == "simple_running" and caller == state.get("assessor_agent_id"):
-        return None
     if state.get("plan_state") == "confirmed" and state.get("confirmed_plan_digest") == state.get("plan_digest"):
         return None
     tool_key = normalized_key(payload.get("tool_name"))
@@ -9178,10 +8997,6 @@ def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> s
             else "unbound update_plan split-brain mutation outside the canonical journal"
         )
     if "requestuserinput" in tool_key:
-        return None
-    if state.get("executor_state") == "local_running":
-        if is_subagent_spawn_tool(payload):
-            return "delegation is explicitly opted out for this confirmed local contract"
         return None
     if is_subagent_spawn_tool(payload):
         return None if subagent_request_is_read_only(payload) else "subagent execution"
@@ -9289,25 +9104,24 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
 
 def assessor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
     assessor_state = state.get("assessor_state")
-    if assessor_state not in {"spawn_required", "spawn_pending", "running", "simple_execution_required", "simple_running", "recovery_required", "failed"}:
-        return None
-    if assessor_state == "failed" and state.get("assessor_failure_kind") == "delegation_opt_out":
+    if assessor_state not in {"spawn_required", "spawn_pending", "running", "recovery_required", "failed"}:
         return None
     if is_subagent_spawn_tool(payload):
-        if assessor_state == "running" and subagent_request_is_read_only(payload):
-            route = safe_route(state.get("last_route"))
-            request = subagent_request_text(payload)
-            touches_shared = request_touches_shared_resource(request)
-            if not touches_shared:
-                return None
-        return "non-assessor subagent while high assessment is incomplete"
-    if assessor_state == "simple_execution_required":
-        return "Simple assessment requires the bound assessor follow-up before mutation"
+        # Codex owns ordinary subagent scheduling.  Workflow Manager intervenes
+        # only when the request would create mutation authority before the Hard
+        # plan is confirmed.
+        mutating = plan_confirmation_guard(
+            payload,
+            {
+                **state,
+                "work_difficulty": "hard",
+                "plan_state": "awaiting_confirmation",
+                "confirmed_plan_digest": None,
+            },
+        )
+        return f"unconfirmed Hard {mutating}" if mutating else None
     mutating = plan_confirmation_guard(payload, {**state, "work_difficulty": "hard", "plan_state": "awaiting_confirmation"})
     if not mutating:
-        return None
-    caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
-    if caller and caller == state.get("assessor_agent_id") and assessor_state == "simple_running":
         return None
     return f"parent or unbound {mutating} while high assessor is active; hard work plan is not strictly confirmed"
 
@@ -9783,19 +9597,15 @@ def analyze_tool_response(response: Any) -> tuple[dict[str, Any], str]:
 
 
 def output_compaction_limits(telemetry: dict[str, Any] | None = None) -> dict[str, int]:
-    pressure = (telemetry or {}).get("pressure")
-    factor = 0.5 if isinstance(pressure, (int, float)) and pressure >= PRESSURE_CHECKPOINT_THRESHOLD else (
-        0.75 if isinstance(pressure, (int, float)) and pressure >= PRESSURE_TRIM_THRESHOLD else 1.0
-    )
     configured = {
         "output_chars": env_int("TOKEN_FRUGAL_OUTPUT_CHAR_LIMIT", DEFAULT_OUTPUT_CHAR_LIMIT, 1000, 500_000),
         "output_lines": env_int("TOKEN_FRUGAL_OUTPUT_LINE_LIMIT", DEFAULT_OUTPUT_LINE_LIMIT, 50, 10_000),
         "visual_items": env_int("TOKEN_FRUGAL_VISUAL_ITEM_LIMIT", DEFAULT_VISUAL_ITEM_LIMIT, 1, 50),
     }
     dynamic = {
-        "output_chars": max(int(DEFAULT_OUTPUT_CHAR_LIMIT * factor), 1000),
-        "output_lines": max(int(DEFAULT_OUTPUT_LINE_LIMIT * factor), 50),
-        "visual_items": max(int(DEFAULT_VISUAL_ITEM_LIMIT * factor), 1),
+        "output_chars": DEFAULT_OUTPUT_CHAR_LIMIT,
+        "output_lines": DEFAULT_OUTPUT_LINE_LIMIT,
+        "visual_items": DEFAULT_VISUAL_ITEM_LIMIT,
     }
     return {key: min(configured[key], dynamic[key]) for key in configured}
 
@@ -9944,97 +9754,81 @@ def emit_continue() -> None:
     print(json.dumps({"continue": True}))
 
 
-def pressure_text(telemetry: dict[str, Any]) -> str:
-    pressure = telemetry.get("pressure")
-    active = telemetry.get("active_tokens")
-    window = telemetry.get("context_window")
-    if isinstance(pressure, (int, float)) and active is not None and window:
-        return f"active context about {active:,}/{window:,} tokens ({pressure:.1%})"
-    return "live token telemetry unavailable"
-
-
-def active_agent_count(state: dict[str, Any]) -> int:
-    return sum(group.get("state") == "live" for group in subagent_lifecycle_groups(state))
-
-
-def agent_activity_counts(state: dict[str, Any]) -> dict[str, int]:
-    groups = subagent_lifecycle_groups(state)
-    return {
-        "started": sum(group.get("start") is not None for group in groups),
-        "completed": sum(group.get("state") == "terminal" for group in groups),
-        "active": sum(group.get("state") == "live" for group in groups),
-        "pending": sum(group.get("state") in {"pending", "result_pending"} for group in groups),
-        "result_pending": sum(group.get("state") == "result_pending" for group in groups),
+def current_slice_resume_delta(
+    state: dict[str, Any], canonical_body: str
+) -> dict[str, Any] | None:
+    """Project one verified current-slice handoff without replaying the plan."""
+    if (
+        state.get("plan_state") != "confirmed"
+        or state.get("confirmed_plan_digest") != state.get("plan_digest")
+        or str(state.get("execution_profile_version")) != EXECUTION_PROFILE_VERSION
+    ):
+        return None
+    try:
+        parsed = parse_execution_slice_manifest(canonical_body)
+    except PlanArtifactError:
+        return None
+    persisted = _safe_execution_slices(state.get("execution_slices"))
+    if (
+        parsed.get("manifest_digest") != persisted.get("manifest_digest")
+        or parsed.get("global_constraints_digest")
+        != persisted.get("global_constraints_digest")
+        or parsed.get("count") != persisted.get("count")
+    ):
+        return None
+    index = safe_int(persisted.get("current_index"))
+    delta: dict[str, Any] = {
+        "schema": 1,
+        "plan_digest": state.get("plan_digest"),
+        "plan_generation": safe_int(state.get("plan_generation")),
+        "execution_contract_id": state.get("execution_contract_id"),
+        "executor_state": state.get("executor_state"),
+        "executor_attempt": safe_int(state.get("executor_attempt")),
+        "executor_failure_kind": state.get("executor_failure_kind"),
+        "completed_prefix": {
+            "count": min(max(index - 1, 0), persisted.get("count", 0)),
+            "chain_digest": persisted.get("completed_chain"),
+            "total_slices": persisted.get("count"),
+        },
+        "global_constraints": parsed.get("global_constraints"),
     }
-
-
-def current_execution_stage(state: dict[str, Any]) -> str:
-    stage_by_category = {
-        "planning": "contract",
-        "analysis": "evidence",
-        "research": "evidence",
-        "git": "evidence",
-        "implementation": "change",
-        "build_package": "build",
-        "delivery_device": "deliver",
-        "verification": "verify",
-        "evidence": "verify",
-    }
-    for operation in reversed(state.get("operations", [])):
-        stage = stage_by_category.get(str(operation.get("category") or ""))
-        if stage:
-            return stage
-    order = as_list(state.get("last_route", {}).get("execution_order"))
-    return str(order[0]) if order else "unknown"
-
-
-def quality_continuity(state: dict[str, Any]) -> dict[str, Any]:
-    operations = [item for item in state.get("operations", []) if isinstance(item, dict)]
-    if not operations:
-        compactions = [item for item in state.get("compactions", []) if isinstance(item, dict)]
-        if compactions:
-            prior = _safe_continuity(compactions[-1].get("continuity"))
-            if prior:
-                return prior
-    order = [str(item) for item in as_list(state.get("last_route", {}).get("execution_order")) if item]
-    current_stage = current_execution_stage(state)
-    last_status = str(operations[-1].get("status") or "unknown") if operations else "unknown"
-    last_change_index = -1
-    last_verification_success = -1
-    evidence_available = False
-    change_fingerprint: str | None = None
-    for index, operation in enumerate(operations):
-        category = str(operation.get("category") or "")
-        status_value = str(operation.get("status") or "")
-        if category in {"implementation", "build_package", "delivery_device"}:
-            last_change_index = index
-            fingerprint = str(operation.get("fingerprint") or "")
-            if re.fullmatch(r"[0-9a-f]{8,64}", fingerprint):
-                change_fingerprint = fingerprint[:64]
-        if status_value in SUCCESS_STATUSES and category in {"analysis", "research", "evidence", "verification"}:
-            evidence_available = True
-        if status_value in SUCCESS_STATUSES and category in {"evidence", "verification"}:
-            last_verification_success = index
-    acceptance_pending = "verify" in order and (
-        last_verification_success < last_change_index or last_verification_success < 0
-    )
-    if not operations:
-        next_required_stage = order[0] if order else "unknown"
-    elif last_status not in SUCCESS_STATUSES:
-        next_required_stage = current_stage
-    elif current_stage in order:
-        current_index = order.index(current_stage)
-        next_required_stage = order[current_index + 1] if current_index + 1 < len(order) else "complete"
+    if 1 <= index <= persisted.get("count", 0):
+        parsed_item = parsed["items"][index - 1]
+        stored_item = persisted["items"][index - 1]
+        if parsed_item.get("slice_digest") != stored_item.get("slice_digest"):
+            return None
+        delta["current_slice"] = {
+            key: parsed_item[key]
+            for key in ("id", "title", *EXECUTION_SLICE_FIELDS[1:])
+        }
+        delta["current_slice"].update(
+            {
+                "slice_digest": stored_item.get("slice_digest"),
+                "slice_contract_id": slice_contract_id(state),
+                "slice_task_token": slice_task_token(state),
+            }
+        )
     else:
-        next_required_stage = "verify" if acceptance_pending else "report"
-    return {
-        "current_stage": current_stage,
-        "acceptance_pending": acceptance_pending,
-        "next_required_stage": next_required_stage,
-        "last_outcome_status": last_status,
-        "evidence_available": evidence_available,
-        "change_fingerprint": change_fingerprint,
-    }
+        delta["current_slice"] = None
+    review = _safe_executor_review(state.get("executor_review"))
+    if review.get("status") != "none":
+        delta["parent_review"] = {
+            key: review.get(key)
+            for key in (
+                "status",
+                "slice_id",
+                "slice_contract_id",
+                "attempt",
+                "candidate_result_fingerprint",
+                "candidate_agent_fingerprint",
+                "candidate_evidence_digest",
+                "review_evidence_digest",
+            )
+        }
+    stall = _safe_stall(state.get("stall"))
+    if stall.get("state") != "none":
+        delta["stall"] = stall
+    return delta
 
 
 def session_start(payload: dict[str, Any]) -> None:
@@ -10057,6 +9851,7 @@ def session_start(payload: dict[str, Any]) -> None:
             resume_compaction_gate_misclassification_once(payload, state)
             reconcile_current_parent_review_on_resume(payload, state)
             reconcile_current_executor_rollout_on_resume(payload, state)
+            resume_completed_parent_review_once(payload, state)
             resume_failed_parent_probe_once(state, payload)
             resume_failed_review_evidence_once(payload, state)
 
@@ -10070,12 +9865,23 @@ def session_start(payload: dict[str, Any]) -> None:
     preference = safe_session_execution_preference(
         state.get("session_execution_preference")
     )
+    active_contract = bool(
+        state.get("plan_state") not in {None, "none"}
+        or state.get("assessor_state") not in {None, "none"}
+        or state.get("executor_state") not in {None, "none"}
+        or _safe_causal_review(state.get("causal_review")).get("state") != "none"
+        or _safe_reference_acceptance(state.get("reference_acceptance")).get("enabled")
+    )
+    confirmed_execution = bool(
+        state.get("plan_state") == "confirmed"
+        and state.get("confirmed_plan_digest") == state.get("plan_digest")
+        and str(state.get("execution_profile_version"))
+        == EXECUTION_PROFILE_VERSION
+    )
     base = (
-        "Workflow Manager: availability only, not proof of effectiveness. Acceptance outranks "
-        "context savings. Protocol: Contract > Evidence > Change > Verify > Report; skip irrelevant stages. "
-        "Direct stays local. For Complex/Extensive work audit wall-clock gain; use owned read/write/test/research/"
-        "review lanes and bias low-risk close calls parallel. Reuse unchanged evidence; "
-        f"checkpoint before compaction. Pressure: {pressure_text(telemetry)}."
+        f"Workflow Manager {WRITER_VERSION} active. Codex owns ordinary execution, progress, recovery, "
+        "compaction, and subagent scheduling; Workflow Manager adds only Hard authorization, canonical "
+        "contracts, runtime-truth evidence, and fixed safety boundaries."
     )
     if preference == "highest_throughout":
         base += (
@@ -10089,13 +9895,11 @@ def session_start(payload: dict[str, Any]) -> None:
             " Stable Workflow Manager Skill activation is not verified "
             f"(sync={safe_label(stable_skill.get('status'), 48)}); do not claim the unversioned path is active."
         )
-    if source in {"compact", "resume"}:
+    if source in {"compact", "resume"} and active_contract:
         successful = [op for op in state.get("operations", []) if op.get("status") in SUCCESS_STATUSES][-6:]
-        agent_counts = agent_activity_counts(state)
         digest = {
             "schema": SCHEMA_VERSION,
             "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
-            "last_route": state.get("last_route", {}).get("label"),
             "task_domain": state.get("task_domain", "unknown"),
             "domain_decision_id": state.get("domain_decision_id"),
             "work_difficulty": state.get("work_difficulty", "unknown"),
@@ -10133,38 +9937,41 @@ def session_start(payload: dict[str, Any]) -> None:
             "causal_review": _safe_causal_review(state.get("causal_review")),
             "stall": _safe_stall(state.get("stall")),
             "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
-            "coordination_activity": [
-                safe
-                for raw in state.get("coordination_activity", [])
-                if (safe := _safe_coordination_activity(raw)) is not None
-            ][:MAX_COORDINATION_ACTIVITY],
-            "coordination_notices": [
-                safe
-                for raw in state.get("coordination_notices", [])
-                if (safe := _safe_coordination_notice(raw)) is not None
-            ][-MAX_COORDINATION_NOTICES:],
-            "coordination_inbound": [
-                safe
-                for raw in state.get("coordination_inbound", [])
-                if (safe := _safe_coordination_inbound(raw)) is not None
-            ][-MAX_COORDINATION_INBOUND:],
             "terminal_successes": [
                 {"tool": op.get("tool"), "fingerprint": op.get("fingerprint")} for op in successful
             ],
-            "agents_started": agent_counts["started"],
-            "agents_completed": agent_counts["completed"],
-            "active_agent_count": agent_counts["active"],
-            "active_agent_scopes": active_agent_scope_summary(state),
             "guard_blocks": sum(1 for item in state.get("guards", []) if item.get("action") == "deny"),
-            "outputs_compacted": sum(1 for item in state.get("operations", []) if item.get("compacted")),
-            "oversized_outputs_preserved": sum(1 for item in state.get("operations", []) if item.get("oversized")),
-            "continuity": quality_continuity(state),
-            "runtime_escalations": sum(
-                1 for item in state.get("guards", []) if item.get("kind") == "runtime_escalation"
-            ),
-            "current_stage": current_execution_stage(state),
             "compaction_count": len(state.get("compactions", [])),
         }
+        if confirmed_execution:
+            artifact = _safe_plan_artifact(state.get("plan_artifact"))
+            current = current_execution_slice(state)
+            slices = _safe_execution_slices(state.get("execution_slices"))
+            digest = {
+                "schema": SCHEMA_VERSION,
+                "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+                "plan_state": "confirmed",
+                "plan_generation": safe_int(state.get("plan_generation")),
+                "plan_digest": state.get("plan_digest"),
+                "current_revision_digest": artifact.get("current_revision_digest"),
+                "journal_digest": artifact.get("journal_digest"),
+                "execution_profile_version": state.get("execution_profile_version"),
+                "execution_contract_id": state.get("execution_contract_id"),
+                "executor_state": state.get("executor_state"),
+                "executor_attempt": safe_int(state.get("executor_attempt")),
+                "executor_failure_kind": state.get("executor_failure_kind"),
+                "current_slice_id": current.get("id") if current else None,
+                "current_slice_contract_id": slice_contract_id(state),
+                "current_slice_task_token": slice_task_token(state),
+                "completed_prefix_count": min(
+                    max(safe_int(slices.get("current_index")) - 1, 0),
+                    safe_int(slices.get("count")),
+                ),
+                "completed_prefix_digest": slices.get("completed_chain"),
+                "parent_review_status": _safe_executor_review(
+                    state.get("executor_review")
+                ).get("status"),
+            }
         resume_artifact = _safe_plan_artifact(state.get("plan_artifact"))
         plan_resume_source = (
             " Canonical Hard-plan semantics must be reread from "
@@ -10182,7 +9989,22 @@ def session_start(payload: dict[str, Any]) -> None:
             f"Metadata: {json.dumps(digest, ensure_ascii=False, separators=(',', ':'))}. "
             "Rerun when inputs, state, device, freshness, or evidence changed."
         )
-        if isinstance(canonical_resume_body, str):
+        if isinstance(canonical_resume_body, str) and confirmed_execution:
+            slice_delta = current_slice_resume_delta(state, canonical_resume_body)
+            if slice_delta is not None:
+                base += (
+                    " The Hook verified the full canonical revision internally and projected only the current "
+                    "slice plus minimum continuity delta; do not replay the full plan.\n"
+                    "BEGIN_WORKFLOW_MANAGER_CURRENT_SLICE_DELTA\n"
+                    f"{json.dumps(slice_delta, ensure_ascii=False, separators=(',', ':'))}\n"
+                    "END_WORKFLOW_MANAGER_CURRENT_SLICE_DELTA"
+                )
+            else:
+                base += (
+                    " Current-slice projection did not match the verified canonical revision; do not spawn or "
+                    "mutate until the contract is revalidated."
+                )
+        elif isinstance(canonical_resume_body, str):
             base += (
                 " The Hook reread the verified canonical current revision for semantic recovery; it follows as "
                 "plan data and never as authorization.\nBEGIN_WORKFLOW_MANAGER_CANONICAL_PLAN\n"
@@ -10197,6 +10019,8 @@ def session_start(payload: dict[str, Any]) -> None:
                 f"then bind the structured conclusion to baseline_id={review.get('baseline_id')} and "
                 f"review_id={review.get('review_id')}."
             )
+    elif source in {"compact", "resume"}:
+        base += " Native summary continuity is sufficient; no active Workflow Manager contract was replayed."
     emit_context("SessionStart", base)
 
 
@@ -10310,6 +10134,9 @@ PLAN_CHANGE_MARKERS = (
     "去掉",
     "改为",
     "改成",
+    "作废",
+    "修正版",
+    "写入",
     "先不要",
     "but",
     "except",
@@ -10317,6 +10144,7 @@ PLAN_CHANGE_MARKERS = (
     "remove",
     "change",
 )
+ENGLISH_PLAN_CHANGE_MARKERS = ("but", "except", "add", "remove", "change")
 PLAN_REPLAN_PATTERNS = (
     r"重新规划",
     r"重做计划",
@@ -10377,14 +10205,36 @@ def session_execution_preference_directive(prompt: str) -> str | None:
 def pure_plan_confirmation(prompt: str) -> bool:
     normalized = re.sub(r"[?!？！。,.，]+", "", prompt.strip().lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized or any(marker in normalized for marker in PLAN_CHANGE_MARKERS):
+    if not normalized or contains_plan_change_marker(normalized):
         return False
     return any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_CONFIRM_PATTERNS)
 
 
+def contains_plan_change_marker(normalized: str) -> bool:
+    """Match English controls as words, never inside protocol identifiers."""
+    chinese = [
+        marker
+        for marker in PLAN_CHANGE_MARKERS
+        if marker not in ENGLISH_PLAN_CHANGE_MARKERS
+    ]
+    return any(marker in normalized for marker in chinese) or any(
+        re.search(rf"(?<![a-z0-9_]){re.escape(marker)}(?![a-z0-9_])", normalized, re.I)
+        for marker in ENGLISH_PLAN_CHANGE_MARKERS
+    )
+
+
 def plan_replan_request(prompt: str) -> bool:
     normalized = re.sub(r"\s+", " ", prompt.strip().lower())
-    return any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_REPLAN_PATTERNS)
+    for pattern in PLAN_REPLAN_PATTERNS:
+        if re.fullmatch(pattern, normalized, re.I):
+            return True
+        if re.fullmatch(
+            rf"(?:{pattern})(?:\s*[:：-]\s*|\s+|(?=[\u3400-\u9fff])).+",
+            normalized,
+            re.I,
+        ):
+            return True
+    return False
 
 
 def plan_details_request(prompt: str) -> bool:
@@ -10416,7 +10266,7 @@ def prompt_changes_pending_plan(prompt: str) -> bool:
     controls_stripped = re.sub(
         r"\b(?:do not|must not)\b\s+(?:(?:remove|change|modify|write)(?:\s+or\s+(?:remove|change|modify|write))*\s+(?:any\s+)?files?|start\s+(?:a\s+)?child)\b", "", controls_stripped, flags=re.I
     )
-    return any(marker in controls_stripped for marker in PLAN_CHANGE_MARKERS)
+    return contains_plan_change_marker(controls_stripped)
 
 
 def explicit_new_objective(prompt: str) -> bool:
@@ -10514,25 +10364,7 @@ def merge_followup_route(previous: dict[str, Any], current: dict[str, Any]) -> d
     prior = safe_route(previous)
     if not prior:
         return current
-    base = prior if ROUTE_RANK[prior["label"]] > ROUTE_RANK[current["label"]] else current
-    result = dict(base)
-    result["score"] = max(safe_int(prior.get("score")), safe_int(current.get("score")))
-    result["phase_hints"] = list(
-        dict.fromkeys([*as_list(prior.get("phase_hints")), *as_list(current.get("phase_hints"))])
-    )[:8]
-    lane_rank = {"none": 0, "sequential": 1, "possible": 2, "explicit": 3}
-    result["lane_signal"] = max(
-        (prior.get("lane_signal", "none"), current.get("lane_signal", "none")),
-        key=lambda value: lane_rank.get(str(value), 0),
-    )
-    result["recommended_agent_cap"] = max(
-        safe_int(prior.get("recommended_agent_cap")), safe_int(current.get("recommended_agent_cap"))
-    )
-    result["parallel_signal"] = bool(prior.get("parallel_signal") or current.get("parallel_signal"))
-    result["delegation_opt_out"] = bool(
-        prior.get("delegation_opt_out") or current.get("delegation_opt_out")
-    )
-    result["dependency_hint"] = current.get("dependency_hint") or prior.get("dependency_hint")
+    result = dict(current)
     for key in (
         "task_domain",
         "domain_confidence",
@@ -10552,131 +10384,16 @@ def merge_followup_route(previous: dict[str, Any], current: dict[str, Any]) -> d
     return decorate_route(result)
 
 
-def routing_context(classification: dict[str, Any], telemetry: dict[str, Any]) -> str:
-    label = str(classification.get("label") or "direct")
-    shape = str(classification.get("workflow_shape") or "direct")
-    order = ">".join(str(item) for item in as_list(classification.get("execution_order"))) or "work"
-    cap = min(max(safe_int(classification.get("recommended_agent_cap")), 0), 3)
-    if cap:
-        agents = f"Agents: cap={cap}; independent positive-net lanes only."
-    elif label in {"complex", "extensive"}:
-        agents = "Agents: local; serialize real conflicts."
-    else:
-        agents = "Agents: local."
+def authorization_context(classification: dict[str, Any]) -> str:
+    """Describe only Workflow Manager's non-native authorization decision."""
     domain = str(classification.get("task_domain") or "unknown")
     difficulty = str(classification.get("work_difficulty") or "unknown")
     profile = str(classification.get("model_profile") or "current")
-    profile_note = (
-        "explicit child override required"
-        if profile in {"work_executor_low_latest", "work_executor_highest_available"}
-        else "no parent switch"
-    )
     return (
-        f"Domain: {domain}/{difficulty} | profile={profile} ({profile_note}). "
-        f"Route: {label}/{shape}; order={order}. {agents} "
-        "Keep constraints and risk-based verification. Correct a recoverable problem once; if root cause stays "
-        "unknown or risk is critical, use one highest-available model at max for diagnosis, then resume the original execution."
+        f"Workflow Manager authorization: domain={domain}, difficulty={difficulty}, profile={profile}. "
+        "Codex owns ordinary execution, progress, recovery, compaction, and subagent scheduling."
     )
 
-
-def handle_coordination_user_prompt(payload: dict[str, Any], prompt: str) -> bool:
-    has_marker = COORDINATION_ENVELOPE_START in prompt
-    has_legacy = "<codex_delegation>" in prompt
-    if not has_marker and not has_legacy:
-        return False
-    envelope, error = (
-        parse_coordination_envelope(prompt)
-        if prompt.startswith(COORDINATION_ENVELOPE_START)
-        else (None, "coordination marker is mixed with prefixed content")
-    )
-    conflict = coordination_conflict_class(envelope) if envelope else None
-    session_id = str(payload.get("session_id") or "")
-    target_for_session = (
-        coordination_task_fingerprint_for_host(
-            session_id, envelope["target_host_fingerprint"]
-        )
-        if envelope and session_id
-        else None
-    )
-    valid = bool(
-        not has_legacy
-        and envelope
-        and not error
-        and target_for_session == envelope["target_task_fingerprint"]
-        and envelope["source_host_fingerprint"] == envelope["target_host_fingerprint"]
-        and envelope["source_task_fingerprint"] != envelope["target_task_fingerprint"]
-        and envelope["sender_resource_identity"] == envelope["target_resource_identity"]
-        and conflict
-    )
-    if valid and envelope:
-        current = snapshot_state(payload)
-        identity = coordination_notice_identity(envelope)
-        existing = next(
-            (
-                item
-                for item in current.get("coordination_inbound", [])
-                if item.get("notice_fingerprint") == identity["notice_fingerprint"]
-            ),
-            None,
-        )
-        blocks = [
-            item
-            for item in current.get("coordination_inbound", [])
-            if item.get("scope_fingerprint") == identity["scope_fingerprint"]
-            and item.get("transition") == "blocked"
-        ]
-        generation = safe_int(envelope.get("lease_generation"))
-        if envelope.get("transition") == "blocked" and not existing and blocks:
-            valid = generation > max(safe_int(item.get("lease_generation")) for item in blocks)
-        elif envelope.get("transition") == "released":
-            latest = max(blocks, key=lambda item: safe_int(item.get("lease_generation"))) if blocks else None
-            valid = bool(
-                latest
-                and generation == safe_int(latest.get("lease_generation"))
-                and latest.get("owner_fingerprint") == identity["owner_fingerprint"]
-                and latest.get("phase_fingerprint") == identity["phase_fingerprint"]
-            )
-
-    def update(state: dict[str, Any]) -> None:
-        if valid and envelope and conflict:
-            identity = coordination_notice_identity(envelope)
-            if not any(
-                item.get("notice_fingerprint") == identity["notice_fingerprint"]
-                for item in state.get("coordination_inbound", [])
-            ):
-                state.setdefault("coordination_inbound", []).append(
-                    {
-                        **identity,
-                        "resource_identity": envelope["sender_resource_identity"],
-                        "resource_kind": envelope["resource_kind"],
-                        "lease_generation": envelope["lease_generation"],
-                        "transition": envelope["transition"],
-                        "received_at": coordination_now(),
-                    }
-                )
-        else:
-            state.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": safe_label(payload.get("turn_id"), 120)
-                    if payload.get("turn_id")
-                    else None,
-                    "kind": "live_coordination_control",
-                    "action": "deny",
-                    "fingerprint": stable_hash(prompt),
-                }
-            )
-
-    mutate_state(payload, update)
-    emit_context(
-        "UserPromptSubmit",
-        (
-            "Workflow Manager recorded a bounded coordination fingerprint and left the task contract unchanged."
-            if valid
-            else "Workflow Manager ignored an invalid or mixed coordination control envelope and left the task contract unchanged."
-        ),
-    )
-    return True
 
 
 def user_prompt_submit(payload: dict[str, Any]) -> None:
@@ -10686,8 +10403,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     identity_preflight = bool(
         delegated_prompt is None and identity_preflight_prompt(prompt)
     )
-    if delegated_prompt is None and handle_coordination_user_prompt(payload, prompt):
-        return
     canonical_context_requested = bool(
         plan_details_request(prompt)
         or plan_replan_request(prompt)
@@ -10729,6 +10444,43 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
         )
     )
+    delegated_control_followup = bool(
+        delegated_prompt is not None
+        and previous.get("task_domain") == "work"
+        and (
+            previous.get("plan_state")
+            in {
+                "analyzing",
+                "plan_ready",
+                "awaiting_confirmation",
+                "confirmed",
+                "invalidated",
+            }
+            or previous.get("assessor_state")
+            in {
+                "spawn_required",
+                "spawn_pending",
+                "running",
+                "recovery_required",
+                "failed",
+            }
+            or previous.get("executor_state")
+            in {
+                "spawn_required",
+                "spawn_pending",
+                "running",
+                "verification_required",
+                "recovery_required",
+                "exhausted",
+            }
+        )
+        and re.search(
+            r"(?:\bbinding\b|\bassessor\b|\bexecutor\b|\brecovery\b|"
+            r"\bgeneration\b|\brevision\b|恢复|授权|允许|确认执行|修改计划|重新规划|作废)",
+            prompt,
+            re.I,
+        )
+    )
     causal_active = (
         _safe_causal_review(previous.get("causal_review")).get("state")
         in {"triage_required", "triaging"}
@@ -10763,6 +10515,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or active_plan
         or reference_changed
         or same_assessor_objective_retry
+        or delegated_control_followup
     )
     classification = classify_prompt(prompt)
     if requested_reference:
@@ -10849,11 +10602,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             if preference_changed and state.get("plan_state") == "confirmed":
                 reset_executor_binding(state)
                 state["execution_contract_id"] = execution_contract_id(state)
-                state["executor_state"] = (
-                    "local_running"
-                    if safe_route(state.get("last_route")).get("delegation_opt_out")
-                    else "spawn_required"
-                )
+                state["executor_state"] = "spawn_required"
                 state["model_profile"] = confirmed_executor_model_profile(state)
         if causal_report:
             baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
@@ -11020,19 +10769,18 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             not continuation or causal_report or reference_failure or replan or plan_changed
         )
         if assessor_needed:
-            local_simple = bool(
-                classification.get("work_difficulty") == "simple"
-                and classification.get("difficulty_confidence") == "high"
-                and not causal_report
-                and not reference_failure
+            hard_assessment = bool(
+                classification.get("work_difficulty") == "hard"
+                or causal_report
+                or reference_failure
             )
             state["assessor_generation"] = (
-                safe_int(state.get("assessor_generation"))
-                if local_simple
-                else max(safe_int(state.get("assessor_generation")), 0) + 1
+                max(safe_int(state.get("assessor_generation")), 0) + 1
+                if hard_assessment
+                else safe_int(state.get("assessor_generation"))
             )
-            state["assessor_binding_id"] = None if local_simple else assessor_binding_id(state)
-            state["assessor_state"] = "simple_complete" if local_simple else "spawn_required"
+            state["assessor_binding_id"] = assessor_binding_id(state) if hard_assessment else None
+            state["assessor_state"] = "spawn_required" if hard_assessment else "none"
             state["assessor_agent_id"] = None
             state["assessor_model"] = None
             state["assessor_reasoning_effort"] = None
@@ -11040,12 +10788,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["assessor_observed_effective"] = False
             state["assessor_observed_model"] = None
             state["assessor_observed_reasoning_effort"] = None
-            state["assessor_input_fingerprint"] = None if local_simple else state.get("objective", {}).get("fingerprint")
+            state["assessor_input_fingerprint"] = state.get("objective", {}).get("fingerprint") if hard_assessment else None
             state["assessor_fork_turns"] = None
             state["assessor_attempt"] = 0
-            if classification.get("delegation_opt_out"):
-                state["assessor_state"] = "failed"
-                state["assessor_failure_kind"] = "delegation_opt_out"
         elif classification.get("task_domain") == "daily" and not continuation:
             state["assessor_state"] = "none"
             state["assessor_binding_id"] = None
@@ -11082,8 +10827,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "task_domain",
             "work_difficulty",
             "difficulty_decision_id",
-            "delegation_gate",
-            "recommended_agent_cap",
         )
     )
     should_inject = (
@@ -11098,11 +10841,15 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or pending_plan
         or canonical_context_requested
         or (already_confirmed and pure_plan_confirmation(prompt))
-        or (classification["task_domain"] == "work" and (not continuation or route_changed))
+        or (
+            classification["task_domain"] == "work"
+            and classification.get("work_difficulty") == "hard"
+            and (not continuation or route_changed)
+        )
     )
     if not should_inject:
         return
-    context = routing_context(classification, telemetry)
+    context = authorization_context(classification)
     if identity_preflight:
         context += (
             " Host activation/identity preflight is local control-plane work: child Start=0. "
@@ -11158,23 +10905,13 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             f"fork_turns=1, and visible task_name={assessor_task}; include "
             f"assessor_binding_id={refreshed_for_assessor.get('assessor_binding_id')} "
             f"objective_fingerprint={refreshed_for_assessor.get('objective', {}).get('fingerprint')} and profile_resolution=highest_available. The self-contained child "
-            "contract is: assess Simple and directly solve+verify before WORK_ASSESSMENT; for Hard remain read-only, "
-            "return a detailed executable plan plus WORK_ASSESSMENT. The canonical plan must end with exactly one "
+            "contract is: remain read-only and return a detailed executable Hard plan plus WORK_ASSESSMENT. "
+            "The canonical plan must end with exactly one "
             "workflow-manager-execution-slices fenced JSON block (version 1, nonempty global_constraints, sequential "
             "s01..sNN, title string, and nonempty scope/acceptance/rollback/stop_conditions/expected_artifacts arrays), "
             "then end exactly 计划已就绪，等待确认后执行 after the protocol marker. "
             "The visible task name preserves state binding when V2 encrypts message before PreToolUse; record "
             "requested versus observed profile separately."
-        )
-    elif (
-        classification.get("task_domain") == "work"
-        and classification.get("work_difficulty") == "simple"
-        and classification.get("difficulty_confidence") == "high"
-        and refreshed_for_assessor.get("assessor_state") == "simple_complete"
-    ):
-        context += (
-            " High-confidence Simple work is local: child Start=0. Do not spawn an assessor or side lane; "
-            "perform the bounded change and required verification directly."
         )
     if causal_report:
         refreshed = snapshot_state(payload)
@@ -11250,7 +10987,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 "evidence, then end with exactly EXECUTION_REVIEW execution_contract_id="
                 f"{refreshed_for_assessor.get('execution_contract_id')} slice_id="
                 f"{(current_execution_slice(refreshed_for_assessor) or {}).get('id')} outcome=passed|failed. The Hook generates the "
-                "normalized evidence digest. Passed with bound verification evidence advances only this slice. If evidence instead proves a material "
+                "normalized evidence digest. That marker ends this parent turn; do not try to spawn the next slice before Stop seals it. "
+                "Passed with bound verification evidence advances only this slice. If evidence instead proves a material "
                 "verification failure on attempt one, the only recovery is a fresh evidence-bound "
                 "verification_failed v2 child; never follow up v1."
             )
@@ -11265,198 +11003,41 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     emit_context("UserPromptSubmit", context)
 
 
-def operation_is_recent(operation: dict[str, Any]) -> bool:
-    try:
-        timestamp = datetime.fromisoformat(str(operation.get("at"))).timestamp()
-        return 0 <= time.time() - timestamp <= DUPLICATE_TTL_SECONDS
-    except Exception:
-        return False
+def record_confirmed_executor_pretool(
+    payload: dict[str, Any], state: dict[str, Any], fingerprint: str
+) -> bool:
+    """Reserve only the plugin-specific confirmed executor handoff.
 
-
-
-def operation_failed(operation: dict[str, Any]) -> bool:
-    status_value = str(operation.get("status") or "").lower()
-    return status_value in ERROR_STATUSES or status_value.startswith("error")
-
-
-def change_epoch_probe_kind(payload: dict[str, Any], category: str) -> str | None:
-    """Classify only exact, read-only probes whose repetition has no new evidence value."""
-    command = extract_command(payload).lower()
-    tool = normalized_key(payload.get("tool_name"))
-    if "viewimage" in tool or "screenshot" in tool:
-        return "visual"
-    if category in {"analysis", "research", "evidence"} and not command_mutates_files(command):
-        return "search" if re.search(r"\b(?:rg|grep|find|search)\b", command) else "read"
-    return None
-
-
-def runtime_route_escalation(state: dict[str, Any], current_category: str) -> dict[str, Any] | None:
-    current_label = str(state.get("last_route", {}).get("label") or "direct")
-    if ROUTE_RANK.get(current_label, 0) >= ROUTE_RANK["complex"]:
-        return None
-    relevant = {
-        "analysis",
-        "build_package",
-        "delivery_device",
-        "evidence",
-        "git",
-        "implementation",
-        "research",
-        "verification",
-    }
-    categories = {
-        str(item.get("category"))
-        for item in state.get("operations", [])[-16:]
-        if str(item.get("category")) in relevant
-    }
-    if current_category in relevant:
-        categories.add(current_category)
-    recent_errors = sum(
-        1
-        for item in state.get("operations", [])[-10:]
-        if str(item.get("status") or "").startswith("error")
-    )
-    if len(categories) < 3 and recent_errors < 2:
-        return None
-    sequential = categories and categories <= {"build_package", "delivery_device", "evidence", "verification"}
-    return decorate_route({
-        "label": "complex",
-        "score": max(safe_int(state.get("last_route", {}).get("score")), 2),
-        "future_token_range": "15k-50k",
-        "recommended_agent_cap": 0 if sequential else 2,
-        "parallel_signal": False,
-        "lane_signal": "sequential" if sequential else "possible",
-        "phase_hints": sorted(categories)[:8],
-        "dependency_hint": "shared_artifact_or_device" if sequential else None,
-        "route_source": "runtime",
-        "at": utc_now(),
-    })
-
-
-def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fingerprint: str, *, assessor_safe_side_lane: bool = False) -> bool:
+    Ordinary subagent scheduling belongs to Codex and passes through untouched.
+    """
     if not is_subagent_spawn_tool(payload):
         return False
-
-    caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
-    # Child-origin mutation would split ownership, but a read-only child may use
-    # the same route/cap checks as the parent.  Modern hosts already expose the
-    # full collaboration tree, so a blanket nested-child denial only created
-    # avoidable retries without adding an authorization boundary.
-    if caller and not subagent_request_is_read_only(payload):
-        def record_child_origin_guard(current: dict[str, Any]) -> None:
-            current.setdefault("guards", []).append({
-                "at": utc_now(),
-                "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
-                "kind": "child_origin_spawn", "action": "deny", "fingerprint": fingerprint,
-            })
-
-        mutate_state(payload, record_child_origin_guard)
-        emit_pretool_deny(
-            "Subagent spawn denied: a child may delegate only a read-only, non-overlapping lane; mutation remains with the parent owner."
-        )
-        return True
-
     executor_request, _ = confirmed_executor_request(payload, state)
-    route_value = state.get("last_route")
-    route_known = isinstance(route_value, dict) and bool(route_value)
-    route = safe_route(route_value)
-    gate = str(route.get("delegation_gate") or "closed")
-    cap = safe_int(route.get("recommended_agent_cap"))
-    if assessor_safe_side_lane:
-        route_known = True
-        gate = "audit"
-        cap = max(cap, 1)
-    if executor_request and state.get("executor_state") in {
-        "spawn_required",
-        "verification_required",
-        "recovery_required",
-    }:
-        # This is a sequential model-profile handoff, not an extra parallel lane. It still has a
-        # strict singleton contract, but must not be blocked by a shared-device route cap of zero.
-        route_known = True
-        gate = "open"
-        cap = 1
-    reaudited = (
-        not executor_request
-        and gate == "closed"
-        and request_supports_delegation_reaudit(payload, route)
-    )
-    if reaudited:
-        gate = "audit"
-        cap = 1
-    active = [] if executor_request else [
-        (group.get("start") or group.get("request"))
-        for group in subagent_lifecycle_groups(state)
-        if group.get("state") in {"pending", "result_pending", "live"}
-        and isinstance(group.get("start") or group.get("request"), dict)
-        and not (
-            assessor_safe_side_lane
-            and (group.get("start") or group.get("request") or {}).get("role")
-            == "high_assessor"
-        )
-    ]
-    task_name, scope_fingerprint = subagent_request_fields(payload)
-    duplicate_scope = any(
-        (task_name and item.get("task_name") == task_name)
-        or (scope_fingerprint and item.get("scope_fingerprint") == scope_fingerprint)
-        for item in active
-    )
-
-    deny_kind = None
-    deny_reason = None
-    if not route_known:
-        deny_kind = "subagent_route_missing"
-        deny_reason = (
-            "Subagent spawn denied before start: no persisted route is available. Restore or resubmit the "
-            "current objective before delegating."
-        )
-    elif gate == "closed":
-        deny_kind = "subagent_gate"
-        deny_reason = (
-            "Subagent spawn denied before start: the delegation gate is closed by the current route "
-            "(for example, focused work, dependency ordering, or a shared resource). Keep this work serialized."
-        )
-    elif duplicate_scope:
-        deny_kind = "subagent_duplicate"
-        deny_reason = "Subagent spawn denied before start: an active agent already owns the same task name or scope."
-    elif len(active) >= cap:
-        deny_kind = "subagent_cap"
-        deny_reason = f"Subagent spawn denied before start: active={len(active)}, cap={cap}; reuse or stop a lane first."
-    if deny_reason:
-        def record_guard(current: dict[str, Any]) -> None:
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
-                    "kind": deny_kind,
-                    "action": "deny",
-                    "fingerprint": fingerprint,
-                }
-            )
-
-        mutate_state(payload, record_guard)
-        emit_pretool_deny(deny_reason)
-        return True
+    if not executor_request:
+        return False
 
     def record_request(current: dict[str, Any]) -> None:
         options = subagent_request_options(payload)
+        task_name, scope_fingerprint = subagent_request_fields(payload)
         identity = current.setdefault("identity_evidence", {})
-        # Persist a digest of the requested override only.  It is intentionally
-        # distinct from SubagentStart's host echo below.
         identity["requested_profile"] = stable_hash(
-            canonical_json({"model": safe_label(options.get("model"), 80), "reasoning_effort": safe_label(options.get("reasoning_effort"), 24), "fork_turns": str(options.get("fork_turns") or "")}), 32
+            canonical_json(
+                {
+                    "model": safe_label(options.get("model"), 80),
+                    "reasoning_effort": safe_label(options.get("reasoning_effort"), 24),
+                    "fork_turns": str(options.get("fork_turns") or ""),
+                }
+            ),
+            32,
         )
         verification_recovery = executor_verification_recovery_pending(current)
-        verification_evidence = verification_recovery_evidence_digest(
-            task_name, current
-        )
+        verification_evidence = verification_recovery_evidence_digest(task_name, current)
         recovery_from = (
             "verification_failed"
-            if executor_request and verification_recovery
+            if verification_recovery
             else (
                 current.get("executor_failure_kind")
-                if executor_request
-                and current.get("executor_state") == "recovery_required"
+                if current.get("executor_state") == "recovery_required"
                 and current.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
                 else None
             )
@@ -11464,12 +11045,14 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
         attempt = min(
             max(safe_int(current.get("executor_attempt")), 0) + 1,
             MAX_EXECUTOR_ATTEMPTS,
-        ) if executor_request else 0
+        )
         current.setdefault("subagents", []).append(
             {
                 "at": utc_now(),
                 "event": "request",
-                "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+                "turn_id": safe_label(payload.get("turn_id"), 120)
+                if payload.get("turn_id")
+                else None,
                 "agent_id": None,
                 "agent_type": None,
                 "task_name": task_name,
@@ -11480,338 +11063,70 @@ def handle_subagent_pretool(payload: dict[str, Any], state: dict[str, Any], fing
                 "status": "pending",
                 "requested": True,
                 "host_accepted": None,
-                "request_gate": gate,
+                "request_gate": "contract",
                 "request_visibility": subagent_request_visibility(payload),
-                "request_cap": cap,
-                "reaudited": reaudited,
-                "role": "confirmed_executor" if executor_request else "lane",
-                "contract_id": current.get("execution_contract_id") if executor_request else None,
-                "slice_id": (
-                    (current_execution_slice(current) or {}).get("id")
-                    if executor_request
-                    else None
-                ),
-                "slice_contract_id": (
-                    slice_contract_id(current) if executor_request else None
-                ),
-                "model": safe_label(options.get("model"), 80) if options.get("model") else None,
-                "reasoning_effort": (
-                    safe_label(options.get("reasoning_effort"), 24)
-                    if options.get("reasoning_effort")
-                    else None
-                ),
+                "request_cap": 1,
+                "reaudited": False,
+                "role": "confirmed_executor",
+                "contract_id": current.get("execution_contract_id"),
+                "slice_id": (current_execution_slice(current) or {}).get("id"),
+                "slice_contract_id": slice_contract_id(current),
+                "model": safe_label(options.get("model"), 80),
+                "reasoning_effort": safe_label(options.get("reasoning_effort"), 24),
                 "fork_turns": options.get("fork_turns"),
                 "attempt": attempt,
                 "recovery_from": recovery_from,
             }
         )
-        if executor_request:
-            if verification_recovery:
-                review = _safe_executor_review(current.get("executor_review"))
-                review["status"] = "recovery_started"
-                review["review_evidence_digest"] = verification_evidence
-                review["at"] = utc_now()
-                current["executor_review"] = review
-                baseline = _safe_execution_baseline(
-                    current.get("last_execution_baseline")
-                ) or build_execution_baseline(current)
-                if baseline:
-                    baseline["acceptance_status"] = "failed"
-                    current["last_execution_baseline"] = baseline
-            current["executor_state"] = "spawn_pending"
-            current["executor_attempt"] = attempt
-            current["executor_failure_kind"] = recovery_from
-            current["executor_model"] = safe_label(options.get("model"), 80)
-            current["executor_reasoning_effort"] = safe_label(
-                options.get("reasoning_effort"), 24
+        if verification_recovery:
+            review = _safe_executor_review(current.get("executor_review"))
+            review["status"] = "recovery_started"
+            review["review_evidence_digest"] = verification_evidence
+            review["at"] = utc_now()
+            current["executor_review"] = review
+            baseline = _safe_execution_baseline(
+                current.get("last_execution_baseline")
+            ) or build_execution_baseline(current)
+            if baseline:
+                baseline["acceptance_status"] = "failed"
+                current["last_execution_baseline"] = baseline
+        current["executor_state"] = "spawn_pending"
+        current["executor_attempt"] = attempt
+        current["executor_failure_kind"] = recovery_from
+        current["executor_model"] = safe_label(options.get("model"), 80)
+        current["executor_reasoning_effort"] = safe_label(
+            options.get("reasoning_effort"), 24
+        )
+        current["executor_fork_turns"] = str(options.get("fork_turns"))
+        current["model_profile"] = confirmed_executor_model_profile(current)
+        stall = _safe_stall(current.get("stall"))
+        if stall.get("state") == "resume_required":
+            correction = re.search(
+                r"material_correction\s*[:=]\s*(.{8,}?)(?=\s+stall_id=|$)",
+                subagent_request_text(payload),
+                re.I,
             )
-            current["executor_fork_turns"] = str(options.get("fork_turns"))
-            current["model_profile"] = confirmed_executor_model_profile(current)
-            stall = _safe_stall(current.get("stall"))
-            if stall.get("state") == "resume_required":
-                correction = re.search(
-                    r"material_correction\s*[:=]\s*(.{8,}?)(?=\s+stall_id=|$)",
-                    subagent_request_text(payload),
-                    re.I,
-                )
-                stall["state"] = "resuming"
-                stall["correction_digest"] = stable_hash(correction.group(1), 32) if correction else None
-                stall["at"] = utc_now()
-                current["stall"] = stall
+            stall["state"] = "resuming"
+            stall["correction_digest"] = (
+                stable_hash(correction.group(1), 32) if correction else None
+            )
+            stall["at"] = utc_now()
+            current["stall"] = stall
 
     mutate_state(payload, record_request)
-    if executor_request:
-        preference = safe_session_execution_preference(state.get("session_execution_preference"))
-        profile_text = (
-            "highest_available model/reasoning request"
-            if preference == "highest_throughout"
-            else "lower-tier model and medium reasoning request"
-        )
-        emit_context(
-            "PreToolUse",
-            f"Confirmed-plan executor request accepted: the explicit {profile_text}, non-full-history fork, "
-            "exact execution contract, exclusive ownership, and acceptance markers match. This records a "
-            "requested profile, not proof that the child started or that the host applied it; wait for a matching "
-            "SubagentStart. The "
-            "parent remains coordinator/reviewer and must not perform the executor's mutation.",
-        )
-    elif reaudited:
-        emit_context(
-            "PreToolUse",
-            "Delegation re-audit accepted one positive-utility side lane: its prompt proves that the child is "
-            "independent, ready now, and either read-only or the exclusive write owner. Shared build/device work "
-            "remains with the parent. Keep the canonical task_name schema-safe; describe the "
-            "child's purpose concisely in Chinese in user-facing updates.",
-        )
-    elif route_known and gate == "audit":
-        emit_context(
-            "PreToolUse",
-            "Delegation gate is audit: this spawn is within the ceiling; proceed when expected wall-clock benefit "
-            "exceeds coordination/collision cost. The lane may read, write, test, research, or review when it is "
-            "ready and has non-overlapping ownership. Keep the canonical task_name schema-safe and use a concise "
-            "Chinese purpose summary in user-facing updates.",
-        )
+    preference = safe_session_execution_preference(state.get("session_execution_preference"))
+    profile_text = (
+        "highest_available model/reasoning request"
+        if preference == "highest_throughout"
+        else "lower-tier model and medium reasoning request"
+    )
+    emit_context(
+        "PreToolUse",
+        f"Confirmed-plan executor request accepted: the explicit {profile_text}, fork_turns=1, "
+        "execution contract, current slice, ownership, and acceptance markers match. This is "
+        "requested/host-accepted evidence only; wait for a matching full Start observation.",
+    )
     return True
-
-
-def _record_coordination_guard(
-    payload: dict[str, Any], fingerprint: str, kind: str = "live_coordination"
-) -> None:
-    def update(state: dict[str, Any]) -> None:
-        state.setdefault("guards", []).append(
-            {
-                "at": utc_now(),
-                "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
-                "kind": kind,
-                "action": "deny",
-                "fingerprint": fingerprint,
-            }
-        )
-
-    mutate_state(payload, update)
-
-
-def handle_coordination_pretool(
-    payload: dict[str, Any], state: dict[str, Any], fingerprint: str
-) -> bool:
-    if not is_send_message_to_thread_tool(payload):
-        return False
-    message = coordination_control_text(payload)
-    if message is None:
-        return False
-    if message.startswith("<codex_delegation>"):
-        _record_coordination_guard(payload, fingerprint, "legacy_coordination")
-        emit_pretool_deny(
-            "Workflow Manager blocked legacy <codex_delegation> coordination. Call list_threads first, then send "
-            "one complete WORKFLOW_COORDINATION_V1 envelope only to a fresh active target."
-        )
-        return True
-    if not message.startswith(COORDINATION_ENVELOPE_START):
-        return False
-
-    fields, fields_error = coordination_send_fields(payload)
-    envelope, envelope_error = parse_coordination_envelope(message)
-    if fields_error or envelope_error or not fields or not envelope:
-        _record_coordination_guard(payload, fingerprint)
-        emit_pretool_deny(
-            f"Workflow Manager blocked invalid coordination envelope: {fields_error or envelope_error}. "
-            "Call list_threads and send only the exact bounded WORKFLOW_COORDINATION_V1 contract."
-        )
-        return True
-    actual_task = coordination_task_fingerprint(fields["thread_id"], fields["host_id"])
-    actual_host = coordination_host_fingerprint(fields["host_id"])
-    session_id = payload.get("session_id")
-    source_task = coordination_task_fingerprint(session_id, fields["host_id"])
-    if (
-        not isinstance(session_id, str)
-        or not session_id
-        or len(session_id.encode("utf-8", errors="replace")) > COORDINATION_ID_MAX_BYTES
-        or envelope["source_host_fingerprint"] != actual_host
-        or envelope["source_task_fingerprint"] != source_task
-        or envelope["source_task_fingerprint"] == envelope["target_task_fingerprint"]
-    ):
-        _record_coordination_guard(payload, fingerprint)
-        emit_pretool_deny(
-            "Workflow Manager blocked coordination because source must bind the current session on the target host, "
-            "and source/target must be different tasks on that same host."
-        )
-        return True
-    if envelope["target_task_fingerprint"] != actual_task or envelope["target_host_fingerprint"] != actual_host:
-        _record_coordination_guard(payload, fingerprint)
-        emit_pretool_deny(
-            "Workflow Manager blocked coordination because the envelope target fingerprints do not bind the actual "
-            "threadId/hostId. Call list_threads again and rebuild the envelope from the exact active peer."
-        )
-        return True
-    if envelope["sender_resource_identity"] != envelope["target_resource_identity"]:
-        _record_coordination_guard(payload, fingerprint)
-        emit_pretool_deny(
-            "Workflow Manager blocked coordination because sender/target resource identities differ; unrelated "
-            "resources do not justify a cross-task notification."
-        )
-        return True
-    conflict = coordination_conflict_class(envelope)
-    if not conflict:
-        _record_coordination_guard(payload, fingerprint)
-        emit_pretool_deny(
-            "Workflow Manager blocked coordination because the declared stages are compatible with the resource kind; "
-            "do not notify a peer without a real conflicting stage."
-        )
-        return True
-    identity = coordination_notice_identity(envelope)
-    request_fingerprint = stable_hash(f"workflow-coordination-request-v1\0{fingerprint}", 32)
-    decision: dict[str, Any] = {}
-
-    def reserve_pending(current: dict[str, Any]) -> None:
-        def deny(reason: str) -> None:
-            decision.update({"allowed": False, "reason": reason})
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": safe_label(payload.get("turn_id"), 120)
-                    if payload.get("turn_id")
-                    else None,
-                    "kind": "live_coordination",
-                    "action": "deny",
-                    "fingerprint": fingerprint,
-                }
-            )
-
-        activities = current.get("coordination_activity", [])
-        source_snapshot = next(
-            (
-                item
-                for item in activities
-                if item.get("task_fingerprint") == source_task
-                and item.get("host_fingerprint") == actual_host
-            ),
-            None,
-        )
-        target_snapshot = next(
-            (
-                item
-                for item in activities
-                if item.get("task_fingerprint") == actual_task
-                and item.get("host_fingerprint") == actual_host
-            ),
-            None,
-        )
-        if not source_snapshot or not coordination_snapshot_fresh(source_snapshot):
-            deny(
-                "Workflow Manager blocked coordination because the current session lacks a fresh list_threads "
-                "snapshot on the target's exact host. Call list_threads; the Hook cannot query host activity itself."
-            )
-            return
-        if source_snapshot.get("status") != "active":
-            deny(
-                f"Workflow Manager blocked coordination because the current session is not active "
-                f"(status={source_snapshot.get('status')}) on the target's exact host."
-            )
-            return
-        if not target_snapshot or not coordination_snapshot_fresh(target_snapshot):
-            deny(
-                "Workflow Manager blocked coordination without a fresh list_threads snapshot for this exact peer. "
-                "Call list_threads; the Hook cannot query host activity itself."
-            )
-            return
-        if target_snapshot.get("status") != "active":
-            deny(
-                f"Workflow Manager blocked coordination because the target is not active "
-                f"(status={target_snapshot.get('status')}); idle, notLoaded, completed, or missing peers must not be notified."
-            )
-            return
-
-        notices = current.setdefault("coordination_notices", [])
-        existing = next(
-            (item for item in reversed(notices) if item.get("notice_fingerprint") == identity["notice_fingerprint"]),
-            None,
-        )
-        if existing and any(
-            existing.get(key) != identity[key]
-            for key in ("owner_fingerprint", "scope_fingerprint", "phase_fingerprint")
-        ):
-            deny("Workflow Manager blocked coordination because the existing lease owner or phase does not match.")
-            return
-        scope_blocks = [
-            item
-            for item in notices
-            if item.get("scope_fingerprint") == identity["scope_fingerprint"]
-            and item.get("transition") == "blocked"
-        ]
-        generation = safe_int(envelope.get("lease_generation"))
-        if envelope.get("transition") == "blocked" and not existing and scope_blocks:
-            if generation <= max(safe_int(item.get("lease_generation")) for item in scope_blocks):
-                deny("Workflow Manager blocked coordination because a new blocked lease generation must increase monotonically.")
-                return
-        if envelope.get("transition") == "released":
-            latest = max(scope_blocks, key=lambda item: safe_int(item.get("lease_generation"))) if scope_blocks else None
-            if (
-                not latest
-                or latest.get("state") not in {"sent", "unconfirmed"}
-                or generation != safe_int(latest.get("lease_generation"))
-                or latest.get("owner_fingerprint") != identity["owner_fingerprint"]
-                or latest.get("phase_fingerprint") != identity["phase_fingerprint"]
-            ):
-                deny(
-                    "Workflow Manager blocked released coordination because it does not match the current blocked "
-                    "generation, owner, resource, and phase."
-                )
-                return
-        if existing and existing.get("state") in {"sent", "unconfirmed"}:
-            deny("Workflow Manager blocked coordination because this peer/resource/generation/transition notice was already sent or is otherwise terminal.")
-            return
-        if existing and existing.get("state") == "pending":
-            deny("Workflow Manager blocked coordination because the identical notice is already pending.")
-            return
-        if existing and (existing.get("state") == "exhausted" or safe_int(existing.get("attempt")) >= 2):
-            deny("Workflow Manager blocked coordination because the one normal retry is exhausted.")
-            return
-        if existing and existing.get("state") == "failed":
-            try:
-                failure_time = datetime.fromisoformat(str(existing.get("at") or ""))
-                source_time = datetime.fromisoformat(str(source_snapshot.get("observed_at") or ""))
-                target_time = datetime.fromisoformat(str(target_snapshot.get("observed_at") or ""))
-            except ValueError:
-                failure_time = source_time = target_time = datetime.min.replace(tzinfo=timezone.utc)
-            if min(source_time, target_time) <= failure_time:
-                deny(
-                    "Workflow Manager blocked the retry until a fresh successful list_threads snapshot is observed "
-                    "after the failed send."
-                )
-                return
-
-        attempt = 2 if existing and existing.get("state") == "failed" else 1
-        if existing:
-            notices.remove(existing)
-        notices.append(
-            {
-                **identity,
-                "resource_identity": envelope["sender_resource_identity"],
-                "resource_kind": envelope["resource_kind"],
-                "lease_generation": envelope["lease_generation"],
-                "transition": envelope["transition"],
-                "state": "pending",
-                "attempt": attempt,
-                "request_fingerprint": request_fingerprint,
-                "at": coordination_now(),
-            }
-        )
-        decision["allowed"] = True
-
-    if state_path(payload) is None:
-        emit_pretool_deny(
-            "Workflow Manager blocked coordination because an atomic session ledger is unavailable."
-        )
-        return True
-    _, changed = mutate_state(payload, reserve_pending)
-    if not changed or "allowed" not in decision:
-        emit_pretool_deny(
-            "Workflow Manager blocked coordination because the atomic session reservation was unavailable or already processed."
-        )
-    elif not decision["allowed"]:
-        emit_pretool_deny(str(decision.get("reason") or "Workflow Manager blocked coordination."))
-    return True
-
 
 STALL_DIAGNOSIS_REQUEST_RE = re.compile(
     r"^STALL_DIAGNOSIS_REQUEST stall_id=([0-9a-f]{32}) "
@@ -11962,7 +11277,28 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 f"({snapshot_failure}); mutation cannot fail open."
             )
             return
-    if handle_coordination_pretool(payload, state, fingerprint):
+    if (
+        is_subagent_spawn_tool(payload)
+        and "identity_preflight_not_work"
+        in as_list(state.get("difficulty_rule_codes"))
+    ):
+        def record_identity_preflight_guard(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "identity_preflight_child",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+
+        mutate_state(payload, record_identity_preflight_guard)
+        emit_pretool_deny(
+            "Workflow Manager blocked child spawn: the active identity preflight explicitly requires child Start=0."
+        )
         return
     terminal_followup = terminal_executor_followup_reason(payload, state)
     if terminal_followup:
@@ -11993,62 +11329,6 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             "high assessor and complete before recovery; exhausted stalls require replan."
         )
         return
-    if is_subagent_spawn_tool(payload) and protected_subagent_lifecycle_count(state) >= MAX_SUBAGENTS:
-        def record_lifecycle_overflow(current: dict[str, Any]) -> None:
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
-                    "kind": "subagent_lifecycle_overflow",
-                    "action": "deny",
-                    "fingerprint": fingerprint,
-                }
-            )
-
-        mutate_state(payload, record_lifecycle_overflow)
-        emit_pretool_deny(
-            "Subagent spawn denied: the protected lifecycle limit is reached; preserve pending, live, and current "
-            "bound assessor/executor records instead of dropping them."
-        )
-        return
-    if normalized_key(payload.get("tool_name")).endswith("followuptask") and state.get("assessor_state") in {"simple_execution_required", "recovery_required"}:
-        request = subagent_request_text(payload)
-        target = next((str(candidate.get("target") or "") for candidate in subagent_request_candidates(payload) if candidate.get("target")), "")
-        binding = str(state.get("assessor_binding_id") or "")
-        opaque_bound_target = opaque_v2_bound_assessor_target(payload, state)
-        solve = opaque_bound_target or bool(re.search(r"(?:solve|解决)", request, re.I))
-        verify = opaque_bound_target or bool(re.search(r"(?:verify|验证|测试)", request, re.I))
-        binding_marker = opaque_bound_target or f"assessor_binding_id={binding}" in request
-        target_matches = opaque_bound_target or target == str(state.get("assessor_agent_id") or "")
-        recovery_ok = state.get("assessor_state") != "recovery_required" or (
-            f"recovery_from={state.get('assessor_failure_kind')}" in request
-            and bool(re.search(r"material_correction\s*[:=]\s*\S.{7,}", request))
-            and safe_int(state.get("assessor_attempt")) < 2
-        )
-        if target_matches and binding and binding_marker and solve and verify and recovery_ok:
-            followup_decision = {"accepted": False}
-
-            def start_simple_execution(current: dict[str, Any]) -> None:
-                if current.get("assessor_state") not in {"simple_execution_required", "recovery_required"} or not append_result_pending_subagent(
-                    current,
-                    agent_id=(current.get("assessor_agent_id") if opaque_bound_target else target),
-                    request_fingerprint=fingerprint,
-                ):
-                    current.setdefault("guards", []).append(
-                        {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "subagent_lifecycle", "action": "deny", "fingerprint": fingerprint}
-                    )
-                    return
-                current["assessor_state"] = "simple_running"
-                if current.get("assessor_failure_kind") == "simple_execution_invalid":
-                    current["assessor_attempt"] = safe_int(current.get("assessor_attempt")) + 1
-                current["assessor_failure_kind"] = None
-                followup_decision["accepted"] = True
-            mutate_state(payload, start_simple_execution)
-            if not followup_decision["accepted"]:
-                emit_pretool_deny("Workflow Manager blocked duplicate or stale Simple assessor follow-up lifecycle.")
-            return
-        emit_pretool_deny("Workflow Manager blocked Simple assessor follow-up: target, binding, and solve/verify contract must match the original assessor.")
-        return
     if is_subagent_spawn_tool(payload):
         request_resolution = subagent_request_resolution(payload)
         assessor_intent = subagent_request_has_assessor_intent(payload)
@@ -12075,20 +11355,6 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             emit_pretool_deny(
                 f"Workflow Manager blocked assessor spawn: {assessor_reason or 'invalid assessor request'}."
             )
-            return
-        if request_resolution.get("error"):
-            emit_pretool_deny(
-                f"Workflow Manager blocked subagent spawn: {request_resolution['error']}; provide exactly one "
-                "bounded request leaf and do not split fields across wrappers."
-            )
-            return
-        route = safe_route(state.get("last_route"))
-        request_is_shared = request_touches_shared_resource(request_text)
-        if state.get("assessor_state") in {"spawn_required", "spawn_pending", "running", "recovery_required"} and route.get("delegation_gate") == "closed" and route.get("dependency_signal") in {"shared_resource", "ordered_shared"} and request_is_shared:
-            def record_shared_gate(current: dict[str, Any]) -> None:
-                current.setdefault("guards", []).append({"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "subagent_gate", "action": "deny", "fingerprint": fingerprint})
-            mutate_state(payload, record_shared_gate)
-            emit_pretool_deny("Workflow Manager blocked subagent spawn: delegation gate is closed by dependency/shared-resource policy.")
             return
     causal_block = causal_review_guard(payload, state)
     if causal_block:
@@ -12165,23 +11431,7 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
     if is_subagent_spawn_tool(payload):
         valid_executor, _ = confirmed_executor_request(payload, state)
         if valid_executor:
-            if handle_subagent_pretool(payload, state, fingerprint):
-                return
-        route = safe_route(state.get("last_route"))
-        gate = str(route.get("delegation_gate") or "closed")
-        assessor_safe_side_lane = bool(
-            state.get("assessor_state") == "running"
-            and subagent_request_is_read_only(payload)
-            and not request_touches_shared_resource(subagent_request_text(payload))
-            and not route.get("delegation_opt_out")
-        )
-        caller = next((safe_label(payload.get(key), 120) for key in ("agent_id", "subagent_id") if payload.get(key)), None)
-        assessor_safe_side_lane = assessor_safe_side_lane and caller != state.get("assessor_agent_id")
-        if gate == "closed":
-            if handle_subagent_pretool(payload, state, fingerprint, assessor_safe_side_lane=assessor_safe_side_lane):
-                return
-        elif subagent_request_is_read_only(payload):
-            if handle_subagent_pretool(payload, state, fingerprint, assessor_safe_side_lane=assessor_safe_side_lane):
+            if record_confirmed_executor_pretool(payload, state, fingerprint):
                 return
     blocked_action = plan_confirmation_guard(payload, state)
     if blocked_action:
@@ -12224,140 +11474,12 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         emit_pretool_deny(reason)
         return
 
-    if handle_subagent_pretool(payload, state, fingerprint):
-        return
-    current_category = command_category(payload)
-    duplicate = next(
-        (
-            op
-            for op in reversed(state.get("operations", []))
-            if op.get("fingerprint") == fingerprint
-            and op.get("status") in SUCCESS_STATUSES
-            and operation_is_recent(op)
-        ),
-        None,
-    )
-    turn_id = safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else "unknown"
-    failed_duplicate = next(
-        (
-            op
-            for op in reversed(state.get("operations", []))
-            if op.get("fingerprint") == fingerprint
-            and operation_failed(op)
-            and operation_is_recent(op)
-        ),
-        None,
-    )
-    failure_already_noticed = any(
-        item.get("kind") == "unchanged_failure"
-        and item.get("fingerprint") == fingerprint
-        and item.get("turn_id") == turn_id
-        for item in state.get("guards", [])
-    )
-    escalation = runtime_route_escalation(state, current_category)
-    escalation_already_noticed = any(
-        item.get("kind") == "runtime_escalation" and item.get("turn_id") == turn_id
-        for item in state.get("guards", [])
-    )
-    telemetry = latest_token_telemetry(payload) or safe_telemetry(state.get("telemetry"))
-    pressure = telemetry.get("pressure")
-    pressure_notices = [
-        kind
-        for threshold, kind in ((PRESSURE_CHECKPOINT_THRESHOLD, "pressure_70"),)
-        if isinstance(pressure, (int, float))
-        and pressure >= threshold
-        and not any(item.get("kind") == kind for item in state.get("guards", []))
-    ]
-    notify_escalation = bool(escalation and not escalation_already_noticed)
-    notify_failure = bool(failed_duplicate and not failure_already_noticed)
-    if not any((notify_escalation, notify_failure, pressure_notices)):
-        return
-
-    def update(current: dict[str, Any]) -> None:
-        if notify_escalation and escalation:
-            current["last_route"] = escalation
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": turn_id,
-                    "kind": "runtime_escalation",
-                    "action": "advise",
-                    "fingerprint": fingerprint,
-                }
-            )
-        if notify_failure:
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": turn_id,
-                    "kind": "unchanged_failure",
-                    "action": "advise",
-                    "fingerprint": fingerprint,
-                }
-            )
-        for kind in pressure_notices:
-            current.setdefault("guards", []).append(
-                {
-                    "at": utc_now(),
-                    "turn_id": turn_id,
-                    "kind": kind,
-                    "action": "advise",
-                    "fingerprint": None,
-                }
-            )
-        if telemetry:
-            current["telemetry"] = telemetry
-
-    _, changed = mutate_state(payload, update)
-    if not changed:
-        return
-    notices: list[str] = []
-    if notify_failure:
-        notices.append(
-            "This exact tool/input already failed. Preserve the first error and make one material correction now. "
-            "If the root cause is still unknown, the risk is critical, or that correction fails, call one "
-            "highest-available model with max reasoning for a bounded diagnosis, then resume the original execution."
-        )
-    if "pressure_70" in pressure_notices:
-        notices.append(
-            "Context crossed 70%: use native compaction/checkpoint once, retain current objective and acceptance "
-            "evidence, and continue without repeating completed work."
-        )
-    if notify_escalation and escalation:
-        phases = ",".join(escalation.get("phase_hints") or [])
-        order = " > ".join(escalation.get("execution_order") or [])
-        cap = safe_int(escalation.get("recommended_agent_cap"))
-        notices.append(
-            f"Runtime re-route: complex | observed={phases} | order={order} | agent_cap={cap}. "
-            "Audit for positive-net independent read/write/test/research/review lanes and continue useful parent "
-            "work. Serialize only conflicting build/deploy/device stages. Update: phase | done | next | blocker."
-        )
-    emit_context("PreToolUse", " ".join(notices))
+    # All remaining ordinary tool and subagent scheduling decisions are native
+    # Codex behavior.  The Hook is silent after its fixed safety/contract gates.
 def post_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     response = payload.get("tool_response")
     status_value = response_status(response)
-    coordination_activity = (
-        coordination_activity_from_response(response)
-        if is_list_threads_tool(payload)
-        else None
-    )
-    coordination_post: dict[str, str] | None = None
-    if is_send_message_to_thread_tool(payload):
-        fields, _ = coordination_send_fields(payload)
-        envelope, _ = parse_coordination_envelope(fields.get("message") if fields else None)
-        if fields and envelope:
-            coordination_post = coordination_notice_identity(envelope)
-            coordination_post["request_fingerprint"] = stable_hash(
-                f"workflow-coordination-request-v1\0{fingerprint}", 32
-            )
-    coordination_send_state = "unconfirmed"
-    if status_value.startswith("error") or status_value in ERROR_STATUSES:
-        coordination_send_state = "failed"
-    elif isinstance(response, dict):
-        explicit = str(response.get("status") or response.get("state") or "").strip().lower()
-        if explicit in {"ok", "accepted", "success"} or response.get("ok") is True or response.get("success") is True:
-            coordination_send_state = "sent"
     stall_followup_fingerprint = (
         stable_hash(f"stall-diagnosis-request-v1\0{fingerprint}", 32)
         if normalized_key(payload.get("tool_name")).endswith("followuptask")
@@ -12371,19 +11493,6 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     previous = snapshot_state(payload)
     telemetry = latest_token_telemetry(payload) or safe_telemetry(previous.get("telemetry"))
     oversized = output_needs_compaction(response_meta, telemetry)
-    epoch_before_event = safe_int(previous.get("change_epoch"))
-    prior_failures_same_epoch = sum(
-        1
-        for item in previous.get("operations", [])
-        if operation_failed(item)
-        and safe_int(item.get("change_epoch")) == epoch_before_event
-    )
-    difficulty_codes = set(as_list(previous.get("difficulty_rule_codes")))
-    immediate_high_recovery = bool(
-        "hard_unknown_root_cause" in difficulty_codes
-        or any(str(code).startswith("critical_") for code in difficulty_codes)
-    )
-    recovery_notice: dict[str, Any] = {}
     compacted = False
     budgeted = command_output_budget(payload, command, risk_kind) if command and risk_kind else False
     caller_id = next(
@@ -12394,29 +11503,17 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         ),
         None,
     )
+    tool_key = normalized_key(payload.get("tool_name"))
+    parent_child_collection = bool(
+        caller_id is None
+        and any(
+            marker in tool_key
+            for marker in ("waitagent", "listagents", "waitthreads")
+        )
+    )
+    runtime_delivery: dict[str, str] = {}
 
     def update(state: dict[str, Any]) -> None:
-        if coordination_activity is not None:
-            state["coordination_activity"] = coordination_activity
-        if coordination_post:
-            notice = next(
-                (
-                    item
-                    for item in reversed(state.get("coordination_notices", []))
-                    if item.get("notice_fingerprint") == coordination_post["notice_fingerprint"]
-                    and item.get("request_fingerprint") == coordination_post["request_fingerprint"]
-                    and item.get("state") == "pending"
-                ),
-                None,
-            )
-            if notice:
-                if coordination_send_state == "sent":
-                    notice["state"] = "sent"
-                elif coordination_send_state == "unconfirmed":
-                    notice["state"] = "unconfirmed"
-                else:
-                    notice["state"] = "exhausted" if safe_int(notice.get("attempt")) >= 2 else "failed"
-                notice["at"] = coordination_now()
         if stall_followup_fingerprint:
             stall = _safe_stall(state.get("stall"))
             if (
@@ -12473,6 +11570,15 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
                 "host_event_turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
                 "host_input_digest": host_input_digest,
+                "host_command_digest": (
+                    stable_hash(
+                        "host-operation-command-text-v1\0"
+                        + command.replace("\r\n", "\n").replace("\r", "\n"),
+                        32,
+                    )
+                    if command
+                    else None
+                ),
                 "tool": tool,
                 "fingerprint": fingerprint,
                 "status": status_value,
@@ -12480,7 +11586,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "plan_digest": active_plan_digest,
                 "execution_contract_id": (
                     state.get("execution_contract_id")
-                    if active_plan_digest and (active_executor_caller or parent_review_operation or state.get("executor_state") == "local_running")
+                    if active_plan_digest and (active_executor_caller or parent_review_operation)
                     else None
                 ),
                 "slice_id": (
@@ -12506,65 +11612,11 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             }
         )
         failed = status_value.startswith("error") or status_value in ERROR_STATUSES
-        if failed:
-            escalate = bool(immediate_high_recovery or prior_failures_same_epoch >= 1)
-            tier = "problem_escalation" if escalate else "problem_correction"
-            recovery_fingerprint = stable_hash(
-                f"workflow-manager-recovery-v1\0{epoch_before}\0{tier}", 32
-            )
-            already_noticed = any(
-                item.get("kind") == tier
-                and item.get("fingerprint") == recovery_fingerprint
-                for item in state.get("guards", [])
-            )
-            if not already_noticed:
-                state.setdefault("guards", []).append(
-                    {
-                        "at": utc_now(),
-                        "turn_id": safe_label(payload.get("turn_id"), 120)
-                        if payload.get("turn_id")
-                        else None,
-                        "kind": tier,
-                        "action": "advise",
-                        "fingerprint": recovery_fingerprint,
-                    }
-                )
-                recovery_notice.update(
-                    {
-                        "emit": True,
-                        "escalate": escalate,
-                        "epoch": epoch_before,
-                    }
-                )
-                if (
-                    escalate
-                    and state.get("task_domain") == "work"
-                    and state.get("objective", {}).get("fingerprint")
-                    and state.get("plan_state") != "confirmed"
-                    and state.get("assessor_state")
-                    not in {"spawn_required", "spawn_pending", "running", "simple_running"}
-                ):
-                    state["assessor_generation"] = max(
-                        safe_int(state.get("assessor_generation")), 0
-                    ) + 1
-                    state["assessor_binding_id"] = assessor_binding_id(state)
-                    state["assessor_input_fingerprint"] = state["objective"]["fingerprint"]
-                    state["assessor_state"] = "spawn_required"
-                    state["assessor_failure_kind"] = None
-                    state["model_profile"] = "work_assessment"
-                    recovery_notice["assessor_required"] = True
-        probe_kind = change_epoch_probe_kind(payload, category)
-        if probe_kind and not failed:
-            state.setdefault("change_epoch_ledger", []).append(
-                {"epoch": epoch_before, "fingerprint": fingerprint, "kind": probe_kind, "at": utc_now()}
-            )
-            state["change_epoch_ledger"] = state["change_epoch_ledger"][-MAX_CHANGE_EPOCH_LEDGER:]
         # Only a completed implementation, build artifact, or deployment moves
         # the freshness boundary. Failed/denied probes never manufacture a new
         # epoch and therefore cannot weaken acceptance.
         if not failed and category in {"implementation", "build_package", "delivery_device"}:
             state["change_epoch"] = min(epoch_before + 1, MAX_EVENT_COUNT)
-            state["change_epoch_ledger"] = []
         pending_spawn = next(
             (item for item in reversed(state.get("subagents", [])) if item.get("event") == "request" and item.get("request_fingerprint") == fingerprint),
             None,
@@ -12643,32 +11695,70 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         if telemetry:
             state["telemetry"] = telemetry
 
-    mutate_state(payload, update)
-    if recovery_notice.get("emit"):
-        if recovery_notice.get("assessor_required"):
-            refreshed = snapshot_state(payload)
-            emit_context(
-                "PostToolUse",
-                "A material correction has failed, or this problem has unknown/critical risk. Continue solving: "
-                "spawn exactly one highest-available Codex assessor at reasoning_effort=max and fork_turns=1 "
-                f"with task_name={bound_assessor_task_name(refreshed)}, "
-                f"assessor_binding_id={refreshed.get('assessor_binding_id')}, and "
-                f"objective_fingerprint={refreshed.get('objective', {}).get('fingerprint')}. "
-                "Ask it for a bounded diagnosis and correction; then resume the original execution. Do not report "
-                "a blocker unless the remaining condition is external and genuinely unrecoverable.",
-            )
-        elif recovery_notice.get("escalate"):
-            emit_context(
-                "PostToolUse",
-                "The correction failed or risk is critical. Use one highest-available model at max for a bounded "
-                "diagnosis, apply the correction, and resume. Stop only for a genuine external blocker.",
-            )
-        else:
-            emit_context(
-                "PostToolUse",
-                "Treat this as recoverable: preserve the first error, make one material correction now, and resume. "
-                "Do not convert it into a blocker without testing the correction.",
-            )
+        if parent_child_collection:
+            role: str | None = None
+            role_binding = ""
+            if state.get("executor_state") in {
+                "recovery_required",
+                "verification_required",
+                "exhausted",
+            } and state.get("executor_start_observed") in {
+                "full",
+                "partial",
+                "mismatch",
+            }:
+                role = "confirmed_executor"
+                role_binding = "\0".join(
+                    (
+                        str(state.get("execution_contract_id") or ""),
+                        str((current_execution_slice(state) or {}).get("id") or ""),
+                        str(safe_int(state.get("executor_attempt"))),
+                    )
+                )
+            elif state.get("assessor_state") in {
+                "hard_plan_ready",
+                "recovery_required",
+                "failed",
+            } and state.get("assessor_start_observed") in {
+                "full",
+                "partial",
+                "mismatch",
+            }:
+                role = "high_assessor"
+                role_binding = str(state.get("assessor_binding_id") or "")
+            if role and role_binding:
+                delivery_fingerprint = stable_hash(
+                    f"bound-runtime-truth-parent-v1\0{role}\0{role_binding}", 32
+                )
+                delivered = any(
+                    item.get("kind") == "bound_runtime_truth_parent_delivery"
+                    and item.get("fingerprint") == delivery_fingerprint
+                    for item in state.get("guards", [])
+                )
+                if not delivered:
+                    state.setdefault("guards", []).append(
+                        {
+                            "at": utc_now(),
+                            "turn_id": safe_label(payload.get("turn_id"), 120)
+                            if payload.get("turn_id")
+                            else None,
+                            "kind": "bound_runtime_truth_parent_delivery",
+                            "action": "advise",
+                            "fingerprint": delivery_fingerprint,
+                        }
+                    )
+                    runtime_delivery["role"] = role
+
+    updated_state, _ = mutate_state(payload, update)
+    if runtime_delivery.get("role"):
+        runtime_truth = bound_runtime_truth_summary(
+            updated_state, runtime_delivery["role"]
+        )
+        emit_context(
+            "PostToolUse",
+            f"Workflow Manager parent-visible {runtime_truth} Report these exact verified fields; when Start=full, "
+            "do not describe the runtime echo as absent or unavailable.",
+        )
     # Oversized results remain fully available to the host.  Persist bounded
     # metadata only; repeating an advisory after every large result was itself
     # a major source of context growth in long sessions.
@@ -12691,7 +11781,6 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
                 "telemetry": telemetry,
                 "objective_meta": state.get("objective", {}),
-                "current_stage": current_execution_stage(state),
                 "work_difficulty": state.get("work_difficulty", "unknown"),
                 "difficulty_decision_id": state.get("difficulty_decision_id"),
                 "plan_state": state.get("plan_state", "none"),
@@ -12731,22 +11820,6 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                 ),
                 "causal_review": _safe_causal_review(state.get("causal_review")),
                 "stall": _safe_stall(state.get("stall")),
-                "coordination_activity": [
-                    safe
-                    for raw in state.get("coordination_activity", [])
-                    if (safe := _safe_coordination_activity(raw)) is not None
-                ][:MAX_COORDINATION_ACTIVITY],
-                "coordination_notices": [
-                    safe
-                    for raw in state.get("coordination_notices", [])
-                    if (safe := _safe_coordination_notice(raw)) is not None
-                ][-MAX_COORDINATION_NOTICES:],
-                "coordination_inbound": [
-                    safe
-                    for raw in state.get("coordination_inbound", [])
-                    if (safe := _safe_coordination_inbound(raw)) is not None
-                ][-MAX_COORDINATION_INBOUND:],
-                "continuity": quality_continuity(state),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
                     op.get("fingerprint")
@@ -12958,8 +12031,8 @@ def host_evidence_digest(
 
 def executor_stall_id(state: dict[str, Any], failure_kind: str) -> str | None:
     objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
-    plan = _coordination_fp32(state.get("plan_digest"))
-    contract = _coordination_fp32(state.get("execution_contract_id"))
+    plan = _fingerprint32(state.get("plan_digest"))
+    contract = _fingerprint32(state.get("execution_contract_id"))
     attempt = min(max(safe_int(state.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS)
     if not objective or not plan or not contract or not attempt or failure_kind not in EXECUTOR_FAILURE_KINDS:
         return None
@@ -13110,6 +12183,9 @@ def subagent_start(payload: dict[str, Any]) -> None:
     request_fingerprint = request.get("request_fingerprint")
     executor_request = request.get("role") == "confirmed_executor"
     assessor_request = request.get("role") == "high_assessor"
+    if not executor_request and not assessor_request:
+        emit_continue()
+        return
     observed_model, observed_effort, observation_source = start_turn_observation(payload)
     observed_status = start_observation_status(
         observed_model, observed_effort, observation_source
@@ -13153,17 +12229,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
             canonical_handoff_error = error.code
         except OSError:
             canonical_handoff_error = "write_error"
-    active = active_agent_records(previous)
     objective_fingerprint = request.get("objective_fingerprint") or previous.get("objective", {}).get("fingerprint")
-    route = safe_route(previous.get("last_route"))
-    gate = str(request.get("request_gate") or route.get("delegation_gate") or "closed")
-    cap = safe_int(request.get("request_cap")) or safe_int(route.get("recommended_agent_cap"))
-    duplicate_scope = any(
-        (task_name and item.get("task_name") == task_name)
-        or (scope_fingerprint and item.get("scope_fingerprint") == scope_fingerprint)
-        for item in active
-    )
-    over_cap = len(active) >= cap
     decision: dict[str, Any] = {"accepted": False}
 
     def update(state: dict[str, Any]) -> None:
@@ -13236,7 +12302,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 "objective_fingerprint": objective_fingerprint,
                 "stale": False,
                 "status": "running",
-                "requested": True,
+                "requested": bool(bound_request),
                 "host_accepted": bound_request.get("host_accepted"),
                 "start_observed": observed_status,
                 "observation_source": observation_source,
@@ -13332,6 +12398,8 @@ def subagent_start(payload: dict[str, Any]) -> None:
             "A terminal agent stays terminal unless a newer persisted request explicitly binds a new generation.",
         )
         return
+    if not executor_request and not assessor_request:
+        return
     warnings: list[str] = []
     if decision.get("capability_notice"):
         warnings.append(
@@ -13351,7 +12419,12 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 warnings.append(
                     "Confirmed executor request and observed start profile match "
                     f"(model={refreshed.get('executor_observed_model')}, effort={refreshed.get('executor_observed_reasoning_effort')}, "
-                    f"source={refreshed.get('executor_observation_source')}). Execute only the bound plan and acceptance."
+                    f"source={refreshed.get('executor_observation_source')}). Execute only the bound plan and acceptance. "
+                    "Launch every potentially long-running verification inside a foreground deadline from process start, "
+                    "preserve both wrapper outer status and underlying inner exit, and close its process group before Stop. "
+                    "If you discover a reversible in-scope command-contract defect you introduced, such as a missing "
+                    "deadline or incomplete status capture, repair and rerun it in this same live ownership before returning; "
+                    "do not turn that correctable defect into a replacement-plan loop."
                 )
             else:
                 warnings.append(
@@ -13359,17 +12432,6 @@ def subagent_start(payload: dict[str, Any]) -> None:
                     f"model={refreshed.get('executor_observed_model')}, effort={refreshed.get('executor_observed_reasoning_effort')}, "
                     f"source={refreshed.get('executor_observation_source')}, state={refreshed.get('executor_start_observed')}; do not mutate."
                 )
-    if duplicate_scope and changed:
-        warnings.append("Existing active subagent already has the same task name or scope; reuse it or send one bounded follow-up.")
-    if over_cap and changed:
-        warnings.append(f"Subagent cap exceeded: active={len(active)}, cap={cap}; stop or reuse a lane before adding more.")
-    if gate == "closed" and changed:
-        warnings.append("Delegation gate is closed by dependency/shared-resource policy; keep the dependent work serialized.")
-    elif gate == "audit" and changed:
-        warnings.append(
-            "Delegation gate is audit: the cap is only a ceiling; use it for ready lanes with positive net "
-            "wall-clock benefit and clear non-overlapping ownership."
-        )
     warning_text = (" " + " ".join(warnings)) if warnings else ""
     private_handoff = ""
     if executor_request and canonical_body is not None and refreshed.get("executor_state") == "running":
@@ -13392,11 +12454,43 @@ def subagent_start(payload: dict[str, Any]) -> None:
         )
     emit_context(
         "SubagentStart",
-        "Workflow Manager subagent contract: stay inside the assigned scope, do not redo parent or sibling work, keep "
-        "raw logs out of the result, and return only decisive evidence, exact paths/identifiers, uncertainty, "
-        f"verification, and the next action. Use a concise Chinese purpose summary in user-facing updates."
-        f"{warning_text}{private_handoff}",
+        "Workflow Manager bound-role evidence: authorization depends on the recorded request, host acceptance, "
+        f"full Start observation, and exact contract identity.{warning_text}{private_handoff}",
     )
+def bound_runtime_truth_summary(state: dict[str, Any], role: str) -> str:
+    """Return the exact bound request/acceptance/Start facts for the parent."""
+    prefix = "assessor" if role == "high_assessor" else "executor"
+    contract_id = (
+        state.get("assessor_binding_id")
+        if prefix == "assessor"
+        else state.get("execution_contract_id")
+    )
+    request = next(
+        (
+            item
+            for item in reversed(state.get("subagents", []))
+            if item.get("event") == "request"
+            and item.get("role") == role
+            and item.get("contract_id") == contract_id
+        ),
+        {},
+    )
+    accepted = request.get("host_accepted")
+    accepted_text = "true" if accepted is True else "false" if accepted is False else "unknown"
+    requested_model = state.get(f"{prefix}_model") or request.get("model") or "absent"
+    requested_effort = state.get(f"{prefix}_reasoning_effort") or request.get("reasoning_effort") or "absent"
+    fork_turns = request.get("fork_turns") or state.get(f"{prefix}_fork_turns") or "absent"
+    observed_state = state.get(f"{prefix}_start_observed") or "absent"
+    observed_model = state.get(f"{prefix}_observed_model") or "absent"
+    observed_effort = state.get(f"{prefix}_observed_reasoning_effort") or "absent"
+    observation_source = state.get(f"{prefix}_observation_source") or "absent"
+    return (
+        f"{prefix} runtime truth: requested model={requested_model}, effort={requested_effort}, "
+        f"fork_turns={fork_turns}; host_accepted={accepted_text}; Start={observed_state}, "
+        f"observed model={observed_model}, effort={observed_effort}, source={observation_source}."
+    )
+
+
 def subagent_stop(payload: dict[str, Any]) -> None:
     result = payload.get("last_assistant_message")
     declared_status = str(payload.get("status") or "").strip().lower()
@@ -13440,6 +12534,12 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             None,
         )
         started = (result_group or {}).get("request")
+    if started is None and agent_id not in {
+        previous.get("assessor_agent_id"),
+        previous.get("executor_agent_id"),
+    }:
+        emit_continue()
+        return
     started_objective = str((started or {}).get("objective_fingerprint") or "")
     current_objective = str(previous.get("objective", {}).get("fingerprint") or "")
     stale = bool(started_objective and current_objective and started_objective != current_objective)
@@ -13449,21 +12549,37 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         previous_stall.get("state") == "diagnosing"
         and agent_id == previous.get("assessor_agent_id")
     )
-    assessor_agent = bool((started or {}).get("role") == "high_assessor") or bool(
-        previous.get("assessor_state") == "simple_running" and agent_id == previous.get("assessor_agent_id")
-    ) or stall_assessor
-    assessment = re.search(r"(?im)^\s*WORK_ASSESSMENT\s+binding_id=([0-9a-f]{32})\s+outcome=(simple|hard)\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
-    hard_plan_detailed = bool(len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", str(result or ""))) >= 2 and re.search(r"(?:验收|验证|test|verify|acceptance)", str(result or ""), re.I) and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", str(result or "")))
-    simple_execution = re.search(r"(?im)^\s*SIMPLE_EXECUTION\s+binding_id=([0-9a-f]{32})\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
+    assessor_agent = bool((started or {}).get("role") == "high_assessor") or stall_assessor
+    assessment = re.search(r"(?im)^\s*WORK_ASSESSMENT\s+binding_id=([0-9a-f]{32})\s+outcome=(hard)\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
+    derived_assessment_binding: str | None = None
+    derived_assessment_digest: str | None = None
+    if assessor_agent and assessment is None:
+        try:
+            derived_plan_body = sanitize_plan_artifact_body(result)
+            parse_execution_slice_manifest(derived_plan_body)
+        except PlanArtifactError:
+            pass
+        else:
+            if re.search(
+                r"计划已就绪，等待确认后执行[。.!！\s]*$",
+                str(result or ""),
+            ):
+                derived_assessment_binding = safe_fingerprint(
+                    previous.get("assessor_binding_id")
+                )
+                derived_assessment_digest = stable_hash(
+                    "workflow-manager-derived-assessment-v1\0" + derived_plan_body,
+                    32,
+                )
     stall_lines = [line for line in str(result or "").splitlines() if line.startswith("EXECUTION_STALL")]
     stall_matches = [match for line in stall_lines if (match := EXECUTION_STALL_RE.fullmatch(line))]
     execution_stall_intent = bool(stall_lines)
     execution_stall = stall_matches[0] if len(stall_lines) == len(stall_matches) == 1 else None
-    result_profile_v7 = str(previous.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
+    result_profile_current = str(previous.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
     execution_result, execution_result_body, execution_result_intent = _strict_terminal_marker(
         result,
         "EXECUTION_RESULT",
-        EXECUTION_RESULT_RE if result_profile_v7 else EXECUTION_RESULT_V6_RE,
+        EXECUTION_RESULT_RE if result_profile_current else EXECUTION_RESULT_V6_RE,
     )
     diagnosis_lines = [line for line in str(result or "").splitlines() if line.startswith("STALL_DIAGNOSIS")]
     diagnosis_matches = [match for line in diagnosis_lines if (match := STALL_DIAGNOSIS_RE.fullmatch(line))]
@@ -13500,13 +12616,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             execution_result
             and execution_result.group(1) == state.get("execution_contract_id")
             and (
-                not result_profile_v7
+                not result_profile_current
                 or execution_result.group(2) == (current_execution_slice(state) or {}).get("id")
             )
         )
         execution_result_outcome = (
             execution_result.group(3)
-            if execution_result and result_profile_v7
+            if execution_result and result_profile_current
             else execution_result.group(2) if execution_result else None
         )
         execution_result_succeeded = bool(
@@ -13546,20 +12662,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             current_turn = current_started.get("turn_id")
             exact_request = bool(payload_request and current_request and payload_request == current_request)
             exact_turn = bool(payload_turn and current_turn and payload_turn == current_turn)
-            bound_simple = bool(
-                current_result_group
-                and state.get("assessor_state") == "simple_running"
-                and agent_id == state.get("assessor_agent_id")
-                and simple_execution
-                and simple_execution.group(1) == state.get("assessor_binding_id")
-            )
             bound_stall = bool(
                 current_result_group
                 and _safe_stall(state.get("stall")).get("state") == "diagnosing"
                 and agent_id == state.get("assessor_agent_id")
                 and diagnosis_lines
             )
-            if not (exact_request or exact_turn or bound_simple or bound_stall):
+            if not (exact_request or exact_turn or bound_stall):
                 reason = "SubagentStop is ambiguous after agent_id reuse and requires generation reconciliation"
                 state.setdefault("guards", []).append(
                     {
@@ -13625,7 +12734,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 and (effective_started or {}).get("contract_id") == state.get("execution_contract_id")
                 and state.get("execution_contract_id") == execution_contract_id(state)
                 and (
-                    not result_profile_v7
+                    not result_profile_current
                     or (effective_started or {}).get("slice_id")
                     == (current_execution_slice(state) or {}).get("id")
                     and (effective_started or {}).get("slice_contract_id")
@@ -13749,29 +12858,26 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             state["stall"] = stall
             return
         if assessor_agent and state.get("assessor_agent_id") == agent_id:
-            if state.get("assessor_state") == "simple_running":
-                if successful and simple_execution and simple_execution.group(1) == state.get("assessor_binding_id"):
-                    state["assessor_state"] = "simple_complete"
-                    state["assessor_failure_kind"] = None
-                else:
-                    state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
-                    state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "simple_execution_invalid"
-                return
             mutated = any(item.get("assessor_binding_id") == state.get("assessor_binding_id") and item.get("category") in {"implementation", "build_package", "delivery_device", "git"} and item.get("status") in SUCCESS_STATUSES for item in state.get("operations", []))
-            valid = bool(not stale and successful and assessment and assessment.group(1) == state.get("assessor_binding_id"))
-            if assessment and assessment.group(2).lower() == "hard" and mutated:
+            assessment_binding = (
+                assessment.group(1) if assessment else derived_assessment_binding
+            )
+            assessment_digest = (
+                assessment.group(3) if assessment else derived_assessment_digest
+            )
+            valid = bool(
+                not stale
+                and successful
+                and assessment_binding
+                and assessment_digest
+                and assessment_binding == state.get("assessor_binding_id")
+            )
+            if assessment and mutated:
                 state["assessor_state"] = "failed"
                 state["assessor_failure_kind"] = "hard_mutation_before_confirmation"
             elif not valid:
                 state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
                 state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "assessment_result_invalid"
-            elif assessment.group(2).lower() == "simple":
-                state["assessor_state"] = "simple_execution_required"
-                state["work_difficulty"] = "simple"
-                state["difficulty_confidence"] = "high"
-                state["difficulty_rule_codes"] = ["assessor_simple"]
-                state["difficulty_decision_id"] = stable_hash(f"{state.get('assessor_binding_id')}\0{assessment.group(3)}", 24)
-                state["plan_state"] = "none"
             else:
                 detailed = bool(len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", str(result or ""))) >= 2 and re.search(r"(?:验收|验证|test|verify|acceptance)", str(result or ""), re.I) and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", str(result or "")))
                 if not detailed:
@@ -13782,7 +12888,9 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["work_difficulty"] = "hard"
                 state["difficulty_confidence"] = "high"
                 state["difficulty_rule_codes"] = ["assessor_hard"]
-                state["difficulty_decision_id"] = stable_hash(f"{state.get('assessor_binding_id')}\0{assessment.group(3)}", 24)
+                state["difficulty_decision_id"] = stable_hash(
+                    f"{state.get('assessor_binding_id')}\0{assessment_digest}", 24
+                )
                 state["plan_state"] = "analyzing"
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
@@ -13812,16 +12920,24 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             f"Workflow Manager treated this as a no-op terminal lifecycle event: {decision.get('reason') or 'state update unavailable'}.",
         )
         return
-    if stale:
+    if stale and (executor_agent or assessor_agent):
         emit_context(
             "SubagentStop",
             "Stale subagent result: the objective changed after this agent started. Use it only as verification; "
             "it must not drive mutation for the previous objective.",
         )
-    elif executor_agent and not decision.get("successful"):
+    elif assessor_agent:
+        runtime_truth = bound_runtime_truth_summary(updated_state, "high_assessor")
         emit_context(
             "SubagentStop",
-            "Confirmed executor failed. Return to the high-reasoning parent for one diagnosis. Do not repeat "
+            f"Workflow Manager {runtime_truth} Report these exact verified fields to the user; when Start=full, "
+            "do not describe the runtime echo as absent or unavailable.",
+        )
+    elif executor_agent and not decision.get("successful"):
+        runtime_truth = bound_runtime_truth_summary(updated_state, "confirmed_executor")
+        emit_context(
+            "SubagentStop",
+            f"Workflow Manager {runtime_truth} Confirmed executor failed. Return to the high-reasoning parent for one diagnosis. Do not repeat "
             "unchanged actions: either make a material correction and use the one remaining bounded executor "
             "attempt, or invalidate/replan when scope or acceptance changes.",
         )
@@ -13829,12 +12945,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         contract = updated_state.get("execution_contract_id")
         slice_item = current_execution_slice(updated_state) or {}
         slice_contract = slice_contract_id(updated_state)
+        runtime_truth = bound_runtime_truth_summary(updated_state, "confirmed_executor")
         emit_context(
             "SubagentStop",
-            "Executor self-report is only a candidate. The high-reasoning parent must independently inspect "
+            f"Workflow Manager {runtime_truth} Executor self-report is only a candidate. The high-reasoning parent must independently inspect "
             "the bounded artifacts and verification evidence. End the parent turn with exactly one line: "
             f"EXECUTION_REVIEW execution_contract_id={contract} slice_id={slice_item.get('id')} "
-            "outcome=passed|failed. The Hook generates and normalizes "
+            "outcome=passed|failed. This marker ends the parent turn; do not spawn the next slice before Stop seals it. The Hook generates and normalizes "
             "the evidence digest. Only passed with bound operation evidence advances the slice; a failed review may use one fresh, "
             "evidence-bound verification_failed v2 child and must never revive v1.",
         )
@@ -13863,15 +12980,14 @@ EXECUTION_REVIEW_V6_RE = re.compile(
 def stop(payload: dict[str, Any]) -> None:
     assistant_message = str(payload.get("last_assistant_message") or "")
     previous = snapshot_state(payload)
-    review_profile_v7 = (
+    review_profile_current = (
         str(previous.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
     )
     execution_review, execution_review_body, execution_review_intent = _strict_terminal_marker(
         assistant_message,
         "EXECUTION_REVIEW",
-        EXECUTION_REVIEW_RE if review_profile_v7 else EXECUTION_REVIEW_V6_RE,
+        EXECUTION_REVIEW_RE if review_profile_current else EXECUTION_REVIEW_V6_RE,
     )
-    local_execution = re.search(r"(?im)^\s*LOCAL_EXECUTION\s+execution_contract_id=([0-9a-f]{32})\s+outcome=(succeeded|failed)\s+evidence_digest=([0-9a-f]{32})\s*$", assistant_message)
     causal_match = CAUSAL_REVIEW_RESULT_RE.search(assistant_message)
     plan_ready = bool(
         len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", assistant_message)) >= 2
@@ -13889,7 +13005,7 @@ def stop(payload: dict[str, Any]) -> None:
         ):
             review = _safe_executor_review(state.get("executor_review"))
             contract_id = state.get("execution_contract_id")
-            profile_v7 = (
+            profile_current = (
                 str(state.get("execution_profile_version"))
                 == EXECUTION_PROFILE_VERSION
             )
@@ -13897,7 +13013,7 @@ def stop(payload: dict[str, Any]) -> None:
             current_slice_contract = slice_contract_id(state)
             review_outcome = (
                 execution_review.group(3)
-                if execution_review and profile_v7
+                if execution_review and profile_current
                 else execution_review.group(2) if execution_review else None
             )
             binding_valid = bool(
@@ -13905,11 +13021,11 @@ def stop(payload: dict[str, Any]) -> None:
                 and execution_review.group(1) == contract_id
                 and (
                     contract_id == execution_contract_id(state)
-                    if profile_v7
+                    if profile_current
                     else str(state.get("execution_profile_version")) in {"5", "6"}
                 )
                 and (
-                    not profile_v7
+                    not profile_current
                     or current_slice
                     and execution_review.group(2) == current_slice.get("id")
                     and review.get("slice_id") == current_slice.get("id")
@@ -13937,13 +13053,13 @@ def stop(payload: dict[str, Any]) -> None:
                         }
                     )
                 return
-            if not profile_v7:
+            if not profile_current:
                 # A durable Schema 23/profile 5 or 6 candidate is review-only
                 # compatibility. 1.0.42 could persist a migrated Schema 22
                 # candidate with profile 5 before the parent review arrived.
                 # Ignore its self-reported digest. A pass may seal the existing
                 # bounded baseline; a failure invalidates it and never grants a
-                # new v7 attempt budget.
+                # new current-profile attempt budget.
                 baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
                 baseline_bound = bool(
                     baseline
@@ -13951,8 +13067,8 @@ def stop(payload: dict[str, Any]) -> None:
                     and baseline.get("objective_fingerprint")
                     == state.get("objective", {}).get("fingerprint")
                     and baseline.get("plan_digest") == state.get("plan_digest")
-                    and _coordination_fp32(baseline.get("change_set_digest"))
-                    and _coordination_fp32(baseline.get("verification_digest"))
+                    and _fingerprint32(baseline.get("change_set_digest"))
+                    and _fingerprint32(baseline.get("verification_digest"))
                 )
                 legacy_digest = host_evidence_digest(
                     domain="parent-review-v1",
@@ -14194,29 +13310,8 @@ def stop(payload: dict[str, Any]) -> None:
                     state["stall"] = stall
             state["executor_review"] = review
             return
-        if state.get("plan_state") == "confirmed" and state.get("executor_state") == "local_running":
-            if local_execution and local_execution.group(1) == state.get("execution_contract_id"):
-                if local_execution.group(2) == "succeeded":
-                    bound_operations = [item for item in state.get("operations", []) if item.get("execution_contract_id") == state.get("execution_contract_id") and item.get("status") in SUCCESS_STATUSES]
-                    substantive_indexes = [index for index, item in enumerate(bound_operations) if item.get("category") in {"implementation", "build_package", "delivery_device", "evidence"}]
-                    verification_indexes = [index for index, item in enumerate(bound_operations) if item.get("category") == "verification"]
-                    if substantive_indexes and verification_indexes and max(verification_indexes) > min(substantive_indexes):
-                        state["executor_state"] = "succeeded"
-                        state["executor_failure_kind"] = None
-                        baseline = build_execution_baseline(state)
-                        if baseline:
-                            state["last_execution_baseline"] = baseline
-                            state["causal_review"] = _safe_causal_review(None)
-                    else:
-                        state["executor_state"] = "recovery_required"
-                        state["executor_failure_kind"] = "verification_failed"
-                else:
-                    state["executor_state"] = "recovery_required"
-                    state["executor_failure_kind"] = "executor_failed"
-                    state["model_profile"] = "current"
-            return
         review_state = _safe_causal_review(state.get("causal_review")).get("state")
-        if state.get("task_domain") == "work" and review_state not in {"triage_required", "triaging"} and state.get("assessor_state") not in {"hard_plan_ready", "simple_complete"} and state.get("assessor_failure_kind") != "delegation_opt_out":
+        if state.get("task_domain") == "work" and state.get("work_difficulty") == "hard" and review_state not in {"triage_required", "triaging"} and state.get("assessor_state") != "hard_plan_ready":
             return
         review = _safe_causal_review(state.get("causal_review"))
         if review.get("state") in {"triage_required", "triaging"}:
@@ -14377,6 +13472,8 @@ def main() -> int:
         if not isinstance(payload, dict):
             return 0
         event = str(payload.get("hook_event_name") or "")
+        # Independent observability is recorded before all business-state work.
+        record_dispatch_receipt(payload)
         refresh_related_states()
         handler = HANDLERS.get(event)
         if handler:

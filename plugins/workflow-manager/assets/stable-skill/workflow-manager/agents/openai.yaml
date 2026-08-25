@@ -1,6 +1,6 @@
 interface:
   display_name: "Workflow Manager"
-  short_description: "Protect reasoning quality while managing context and agents"
-  default_prompt: "Use $workflow-manager as a thin continuity and authorization layer: keep Simple and Focused work local, reserve highest-model assessment and strict confirmation for genuinely Hard work, preserve acceptance evidence and compaction continuity, and actively correct recoverable failures before reporting a blocker."
+  short_description: "Authorize Hard plans and verify runtime truth"
+  default_prompt: "Use $workflow-manager only for Hard authorization, canonical contracts, runtime-truth evidence, mounted-tree safety, and active-contract continuity; let current Codex own ordinary execution while preserving acceptance evidence and compaction continuity."
 policy:
   allow_implicit_invocation: true

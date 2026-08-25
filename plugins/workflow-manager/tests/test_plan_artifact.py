@@ -127,17 +127,20 @@ class PlanArtifactTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": f"{suffix}-objective",
-                "prompt": "修复 Android 设置与 SystemUI 跨模块故障，编译部署并完成 Unity 参考对齐验收",
+                "prompt": "排查设置与界面跨模块反复故障，根因未知；完成迁移、回滚与集成验收",
             },
             data=selected,
         )
         self.assertEqual(started.returncode, 0, started.stderr)
+        return self.start_bound_assessor(session, data=selected, suffix=suffix)
+
+    def start_bound_assessor(self, session: str, *, data: Path | None = None, suffix: str = "one") -> tuple[str, str]:
+        selected = data or self.data
         state = self.state(selected)
         binding = state["assessor_binding_id"]
         request = (
             f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
-            "profile_resolution=highest_available assess Simple directly solve and verify; "
-            "Hard read-only plan then confirmation"
+            "profile_resolution=highest_available Hard read-only plan then confirmation"
         )
         accepted = self.run_hook(
             {
@@ -215,24 +218,29 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.state(selected), message
 
-    def begin_parent_plan(self, session: str, *, data: Path | None = None) -> None:
+    def begin_hard_plan(self, session: str, *, data: Path | None = None) -> None:
         self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "parent-objective",
-                "prompt": "排查 Android 未知根因的跨 Settings/framework 故障并编译验证，但不要使用任何子智能体",
+                "prompt": "排查未知根因的跨模块反复故障，完成迁移、回滚与集成验收",
             },
             data=data,
         )
 
-    def accept_parent_plan(self, session: str, body: str, *, data: Path | None = None, run_id: str = "parent-stop") -> dict:
+    def accept_required_assessor_plan(self, session: str, body: str, *, data: Path | None = None, run_id: str = "assessor-stop") -> dict:
+        binding, agent_id = self.start_bound_assessor(
+            session, data=data, suffix=run_id
+        )
         result = self.run_hook(
             {
-                "hook_event_name": "Stop",
+                "hook_event_name": "SubagentStop",
                 "session_id": session,
                 "hook_run_id": run_id,
-                "last_assistant_message": body + "计划已就绪，等待确认后执行",
+                "agent_id": agent_id,
+                "status": "completed",
+                "last_assistant_message": self.assessor_result(binding, body),
             },
             data=data,
         )
@@ -300,8 +308,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c03_replans_append_complete_revisions_to_the_same_journal(self) -> None:
         session = "c03"
-        self.begin_parent_plan(session)
-        first = self.accept_parent_plan(session, self.hard_body("first"), run_id="first-plan")
+        self.begin_hard_plan(session)
+        first = self.accept_required_assessor_plan(session, self.hard_body("first"), run_id="first-plan")
         path = self.artifact_path(first)
         first_bytes = path.read_bytes()
 
@@ -313,7 +321,7 @@ class PlanArtifactTests(unittest.TestCase):
                 "prompt": "修改计划：保留原验收并增加 Windows 原生事务恢复验证",
             }
         )
-        second = self.accept_parent_plan(
+        second = self.accept_required_assessor_plan(
             session, self.hard_body("second"), run_id="second-plan"
         )
         self.assertEqual(self.artifact_path(second), path)
@@ -329,8 +337,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c04_external_edit_invalidates_confirmed_executor_before_mutation(self) -> None:
         session = "c04"
-        self.begin_parent_plan(session)
-        ready = self.accept_parent_plan(session, self.hard_body("bound"))
+        self.begin_hard_plan(session)
+        ready = self.accept_required_assessor_plan(session, self.hard_body("bound"))
         path = self.artifact_path(ready)
         self.run_hook(
             {
@@ -373,8 +381,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c06_hard_update_plan_cannot_create_split_brain_plan_storage(self) -> None:
         session = "c06"
-        self.begin_parent_plan(session)
-        self.accept_parent_plan(session, self.hard_body("canonical"))
+        self.begin_hard_plan(session)
+        self.accept_required_assessor_plan(session, self.hard_body("canonical"))
         result = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -417,9 +425,9 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c13_plan_details_and_resume_point_to_canonical_current_revision(self) -> None:
         session = "c13"
-        self.begin_parent_plan(session)
+        self.begin_hard_plan(session)
         sentinel = "canonical-view-body-sentinel-42"
-        ready = self.accept_parent_plan(session, self.hard_body(sentinel))
+        ready = self.accept_required_assessor_plan(session, self.hard_body(sentinel))
         artifact = ready["plan_artifact"]
         details = self.run_hook(
             {
@@ -454,8 +462,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c14_impossible_new_state_old_journal_combination_fails_closed(self) -> None:
         session = "c14"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         payload = {"hook_event_name": "SessionStart", "session_id": session}
         environment = patch.dict(
             os.environ,
@@ -504,8 +512,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c15_state_replace_then_failure_leaves_recoverable_new_new_transaction(self) -> None:
         session = "c15"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(stable)
         old_bytes = journal.read_bytes()
         payload = {
@@ -619,8 +627,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c08_oversized_revision_preserves_existing_journal_byte_for_byte(self) -> None:
         session = "c08"
-        self.begin_parent_plan(session)
-        persisted = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        persisted = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(persisted)
         before = journal.read_bytes()
         generation = persisted["plan_generation"]
@@ -714,8 +722,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c10_crash_recovery_accepts_only_old_old_or_new_new(self) -> None:
         session = "c10"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(stable)
         old_bytes = journal.read_bytes()
         payload = {"hook_event_name": "SessionStart", "session_id": session}
@@ -1022,8 +1030,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c19_plan_directory_fsync_failure_stays_old_authority_and_recovers(self) -> None:
         session = "c19"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(stable)
         old_bytes = journal.read_bytes()
         payload = {
@@ -1139,8 +1147,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c21_confirmation_rereads_journal_inside_state_mutation(self) -> None:
         session = "c21"
-        self.begin_parent_plan(session)
-        ready = self.accept_parent_plan(session, self.hard_body("confirm-race"))
+        self.begin_hard_plan(session)
+        ready = self.accept_required_assessor_plan(session, self.hard_body("confirm-race"))
         journal = self.artifact_path(ready)
         environment = patch.dict(
             os.environ,
@@ -1181,8 +1189,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c22_confirmation_rechecks_journal_after_state_commit(self) -> None:
         session = "c22"
-        self.begin_parent_plan(session)
-        ready = self.accept_parent_plan(session, self.hard_body("post-commit-race"))
+        self.begin_hard_plan(session)
+        ready = self.accept_required_assessor_plan(session, self.hard_body("post-commit-race"))
         journal = self.artifact_path(ready)
         environment = patch.dict(
             os.environ,
@@ -1224,8 +1232,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c23_append_rejects_in_place_edit_after_old_journal_read(self) -> None:
         session = "c23"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(stable)
         old_bytes = journal.read_bytes()
         external = b"EXTERNAL_IN_PLACE_EDIT\n"
@@ -1276,7 +1284,7 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c24_first_write_preserves_file_created_after_absence_check(self) -> None:
         session = "c24"
-        self.begin_parent_plan(session)
+        self.begin_hard_plan(session)
         payload = {
             "hook_event_name": "Stop",
             "session_id": session,
@@ -1478,8 +1486,8 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_c29_commit_unlink_preserves_backup_changed_after_byte_recheck(self) -> None:
         session = "c29"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(stable)
         payload = {
             "hook_event_name": "Stop",
@@ -1539,8 +1547,8 @@ class PlanArtifactTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX open-descriptor write race")
     def test_c30_commit_detects_write_through_open_fd_during_unlink(self) -> None:
         session = "c30"
-        self.begin_parent_plan(session)
-        stable = self.accept_parent_plan(session, self.hard_body("old"))
+        self.begin_hard_plan(session)
+        stable = self.accept_required_assessor_plan(session, self.hard_body("old"))
         journal = self.artifact_path(stable)
         payload = {
             "hook_event_name": "Stop",
@@ -1616,9 +1624,9 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertTrue(backups[0].read_bytes().endswith(external))
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
 
-    def test_m02_supported_parent_hard_plan_creates_markdown(self) -> None:
-        self.begin_parent_plan("m02")
-        state = self.accept_parent_plan("m02", self.hard_body("parent"))
+    def test_m02_required_assessor_hard_plan_creates_markdown(self) -> None:
+        self.begin_hard_plan("m02")
+        state = self.accept_required_assessor_plan("m02", self.hard_body("parent"))
         self.assertEqual(state["plan_artifact"]["write_status"], "written")
         self.assertIn("parent", self.artifact_path(state).read_text(encoding="utf-8"))
 
@@ -1784,17 +1792,18 @@ class PlanArtifactTests(unittest.TestCase):
 
     def test_m10_all_replans_remain_in_one_journal_and_user_file_is_preserved(self) -> None:
         session = "m10"
-        self.begin_parent_plan(session)
+        self.begin_hard_plan(session)
         for generation in range(1, 8):
             if generation > 1:
-                path = self.state_path()
-                state = json.loads(path.read_text(encoding="utf-8"))
-                state["plan_state"] = "analyzing"
-                state["plan_digest"] = None
-                state["plan_objective_fingerprint"] = None
-                state["plan_difficulty_decision_id"] = None
-                path.write_text(json.dumps(state), encoding="utf-8")
-            state = self.accept_parent_plan(session, self.hard_body(f"g{generation}"), run_id=f"plan-{generation}")
+                self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session,
+                        "hook_run_id": f"replan-{generation}",
+                        "prompt": "重新规划",
+                    }
+                )
+            state = self.accept_required_assessor_plan(session, self.hard_body(f"g{generation}"), run_id=f"plan-{generation}")
             if generation == 1:
                 session_dir = self.artifact_path(state).parent
                 (session_dir / f"hard-plan-g0000-{'0' * 32}.md").write_text("user file", encoding="utf-8")
@@ -1807,18 +1816,14 @@ class PlanArtifactTests(unittest.TestCase):
             7,
         )
 
-    def test_m11_lifecycle_status_tracks_confirmation_execution_and_success(self) -> None:
+    def test_m11_lifecycle_status_tracks_ready_and_confirmation(self) -> None:
         session = "m11"
-        self.begin_parent_plan(session)
-        ready = self.accept_parent_plan(session, self.hard_body("lifecycle"))
+        self.begin_hard_plan(session)
+        ready = self.accept_required_assessor_plan(session, self.hard_body("lifecycle"))
         self.assertEqual(ready["plan_artifact"]["lifecycle_status"], "ready")
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "confirm", "prompt": "确认按这个计划执行"})
-        executing = self.state()
-        self.assertEqual(executing["plan_artifact"]["lifecycle_status"], "executing")
-        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "write", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}, "tool_response": {"status": "completed"}})
-        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "verify", "tool_name": "exec_command", "tool_input": {"cmd": "python3 -m unittest -q"}, "tool_response": {"status": "completed"}})
-        self.run_hook({"hook_event_name": "Stop", "session_id": session, "hook_run_id": "done", "last_assistant_message": f"LOCAL_EXECUTION execution_contract_id={executing['execution_contract_id']} outcome=succeeded evidence_digest={'e' * 32}"})
-        self.assertEqual(self.state()["plan_artifact"]["lifecycle_status"], "succeeded")
+        confirmed = self.state()
+        self.assertEqual(confirmed["plan_artifact"]["lifecycle_status"], "confirmed")
 
     def test_m12_objective_change_invalidates_artifact_binding(self) -> None:
         state, _ = self.accept_assessor_plan("m12")
@@ -1923,13 +1928,9 @@ class PlanArtifactTests(unittest.TestCase):
     def test_s03_sanitizer_removes_bidi_all_protocol_markers_and_bounds_bytes(self) -> None:
         markers = (
             "WORK_ASSESSMENT binding_id=" + "a" * 32,
-            "SIMPLE_EXECUTION binding_id=" + "b" * 32,
-            "LOCAL_EXECUTION execution_contract_id=" + "c" * 32,
             "EXECUTION_STALL stall_id=" + "d" * 32,
             "STALL_DIAGNOSIS stall_id=" + "e" * 32,
             "CAUSAL_REVIEW baseline_id=" + "f" * 32,
-            "WORKFLOW_COORDINATION_V1",
-            "END_WORKFLOW_COORDINATION",
         )
         raw = "1. safe plan\n" + "\n".join(markers) + "\n\u202e\u2066hidden\u2069\n"
         body = HOOK.sanitize_plan_artifact_body(raw)
@@ -1954,30 +1955,6 @@ class PlanArtifactTests(unittest.TestCase):
                 )
         self.assertEqual(target.read_text(encoding="utf-8"), "old-content")
         self.assertEqual(list(directory.glob(".plan.md.*.tmp")), [])
-
-    def test_s05_concurrent_different_parent_plans_commit_only_one_generation(self) -> None:
-        session = "s05"
-        self.begin_parent_plan(session)
-
-        def invoke(label: str) -> subprocess.CompletedProcess[str]:
-            return self.run_hook(
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": session,
-                    "hook_run_id": f"stop-{label}",
-                    "last_assistant_message": self.hard_body(label) + "计划已就绪，等待确认后执行",
-                }
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(invoke, ("alpha", "beta")))
-        self.assertTrue(all(result.returncode == 0 for result in results))
-        state = self.state()
-        files = list((self.data / "plans").glob("*/*.md"))
-        self.assertEqual(state["plan_generation"], 1)
-        self.assertEqual(len(files), 1)
-        parsed = HOOK.parse_plan_journal(files[0].read_bytes())
-        self.assertEqual(parsed["current_revision_digest"], state["plan_digest"])
 
     @unittest.skipUnless(hasattr(os, "link") and hasattr(os, "symlink"), "link support required")
     def test_s06_retention_uses_generation_and_preserves_forged_links(self) -> None:
@@ -2063,8 +2040,9 @@ class PlanArtifactTests(unittest.TestCase):
         legacy["stall"]["execution_contract_id"] = legacy["execution_contract_id"]
         first = HOOK.normalize_state(legacy, payload)
         second = HOOK.normalize_state(first, payload)
-        for key in ("executor_state", "execution_contract_id", "executor_failure_kind", "stall", "coordination_activity", "plan_artifact"):
+        for key in ("executor_state", "execution_contract_id", "executor_failure_kind", "stall", "plan_artifact"):
             self.assertEqual(second[key], first[key])
+        self.assertNotIn("coordination_activity", first)
         self.assertEqual(first["plan_artifact"]["write_status"], "legacy_unavailable")
         self.assertEqual(first["plan_artifact"]["lifecycle_status"], "invalidated")
         self.assertEqual(first["plan_state"], "invalidated")

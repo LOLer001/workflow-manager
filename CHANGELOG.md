@@ -1,5 +1,19 @@
 # 更新记录
 
+## 1.0.46
+
+- Schema 升至 27、writer/manifest 升至 1.0.46、execution profile 升至 v10、stable-skill schema 升至 8；Schema 26 的 canonical Hard 计划、宿主生成证据和封存父审继续按严格迁移边界保留。
+- 按 Codex 当前官方能力重新划分职责：普通规划、进度、工具使用、错误恢复、压缩、模型选择和子智能体编排全部交回宿主；Workflow Manager 只保留 Hard 授权、canonical 合同、Start 运行时真值、父审证据与挂载树安全。
+- 删除通用 Direct/Focused/Complex/Extensive 路由提示、阶段顺序、agent cap、side-lane/child 嵌套规则、70% 压力提示、普通失败自动升档、通用 Start 结果格式和跨任务实时协调协议；旧状态中的对应字段迁移时丢弃，不再重新注入。
+- Daily 与全部非 Hard Work 直接使用原生 Codex，Workflow Manager 不再启动 Simple assessor；只有达到既有高门槛的 Hard 新目标才创建一个 `max` 评估者，确认后仍使用唯一当前切片 executor 与完整 Start 观测。
+- 删除 assessor 的旧 Simple 判定、二阶段 follow-up、`SIMPLE_EXECUTION` 结果和父任务 Hard 计划绕行；Hard assessor 现在只有一个只读计划协议，普通 child 的请求、Start、Stop 完全透传宿主且不进入插件账本。
+- 修复真实宿主已记录 `Start=full` 但父任务仍声称“未暴露运行时回显”的信息断层：bound SubagentStop 记录 requested、host accepted、Start 状态、观测 model/effort 与来源，并在父任务首次 wait/list 收割边界精确回传；assessor、executor、去重和非 Hard 静默均有回归锁定。
+- 适配 Codex 0.149 的新版宿主 rollout：不再要求整个 turn 只有一个 `exec`，改为按唯一 call id 与 command digest 逐链核对；支持 JSON 参数 `tools.exec_command({...})`、`item_completed/FileChange`，并从多次尝试中只回收当前 attempt/candidate。重复 id、重复 digest 或不唯一 FileChange 仍 fail-closed。
+- 明确父审时序：`EXECUTION_REVIEW` 只能作为结束 turn 的唯一末行，Stop 封存后再 resume 当前下一切片的最小 delta，避免同 turn 提前 spawn 与重复 marker。
+- confirmed Hard 的 SessionStart 不再重复注入完整 canonical 计划：Hook 内部仍校验完整 journal，只投影当前 slice、global constraints、contract/attempt/review 与 completed-prefix digest；定向回归限制该恢复上下文低于 6 KB。
+- SessionStart 只在存在活动 Hard/因果/参考合同时回放有界合同元数据；普通新任务与普通压缩恢复只得到一条短身份边界，不再重复完整工作流账本。
+- 新增“无 Workflow Manager / 1.0.45 / 精简 1.0.46”同题困难任务三臂模拟与宿主原生透传回归；正确性证据和强验收必须相同。固定样例的插件 `additionalContext` 从 1489 UTF-8 字节降至 543（约 63.5%），该数值不冒充真实 token。
+
 ## 1.0.45
 
 - Schema 升至 26、writer/manifest 升至 1.0.45、execution profile 升至 v9、stable-skill schema 升至 7、difficulty classifier 升至 v2；旧 1.0.44 状态按来源 Schema 保留严格 transcript/host evidence 迁移边界。
