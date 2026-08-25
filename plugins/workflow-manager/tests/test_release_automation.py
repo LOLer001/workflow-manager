@@ -99,6 +99,8 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertNotIn("Release v1.0.46 is forbidden", workflow)
         self.assertIn('previous_tag="v1.0.$((patch - 1))"', workflow)
         self.assertIn("Release sequence gap:", workflow)
+        self.assertIn('latest_flag="--latest=false"', workflow)
+        self.assertIn('repos/$GITHUB_REPOSITORY/releases/latest', workflow)
 
     def test_missing_or_empty_section_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

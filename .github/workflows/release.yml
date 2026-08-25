@@ -57,6 +57,12 @@ jobs:
                 exit 1
               fi
             fi
+            latest_flag="--latest"
+            latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+            if [[ "$latest_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+               [[ "$(printf '%s\n%s\n' "$latest_tag" "$tag" | sort -V | tail -n 1)" != "$tag" ]]; then
+              latest_flag="--latest=false"
+            fi
             manifest_version="$(git show "$tag:plugins/workflow-manager/.codex-plugin/plugin.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
             [[ "$manifest_version" == "$version" ]] || {
               echo "Tag $tag does not match plugin version $manifest_version" >&2
@@ -72,6 +78,7 @@ jobs:
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
+              "$latest_flag" \
               --title "Workflow Manager $version" \
               --notes-file "$notes"
           done

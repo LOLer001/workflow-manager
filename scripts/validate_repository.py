@@ -176,6 +176,8 @@ def main() -> int:
     assert "Release v1.0.46 is forbidden" not in release_workflow
     assert 'previous_tag="v1.0.$((patch - 1))"' in release_workflow
     assert "Release sequence gap:" in release_workflow
+    assert 'latest_flag="--latest=false"' in release_workflow
+    assert 'repos/$GITHUB_REPOSITORY/releases/latest' in release_workflow
     assert (ROOT / "scripts" / "extract_release_notes.py").is_file()
     generator = load_command_generator()
     assert (PLUGIN / "scripts" / "generate_hook_commands.py").is_file()

@@ -3,7 +3,7 @@
 ## 1.0.47
 
 - 保持 Schema 27、execution profile v10 与 stable-skill schema 8；新增私有、有界、无原始输入/输出的 Hook dispatch receipt，并让 trust doctor 分别报告配置与指定会话 dispatch 状态。
-- 发布工作流允许回填已有 CHANGELOG 且标签内 manifest 精确匹配的缺失版本，不再为 v1.0.46 设置特殊拒绝；Linux/Windows runner 均保持 Hook 入口后、业务 state 前的 receipt 语义。
+- 发布工作流允许回填已有 CHANGELOG 且标签内 manifest 精确匹配的缺失版本，不再为 v1.0.46 设置特殊拒绝；回填旧版本不会取代较新版本的 GitHub Latest 标记，Linux/Windows runner 均保持 Hook 入口后、业务 state 前的 receipt 语义。
 - 修复实机暴露的“发现问题只 fail-closed”循环：带说明的重规划句和“作废/修正版/写入”可直接触发 replan，活动 Hard 的 delegated recovery 不再误降为 Daily 并清空 binding。
 - 删除两项只增加额度、不增加信任的 assessor 格式门：绑定 Start/Stop 已证明身份且计划结构有效时，Hook 可生成 assessment digest；唯一尾部普通 `json` execution-slice manifest 会被严格校验并规范成 canonical fence，不再为补 marker/fence 重启最高模型。
 - confirmed executor 必须让长测从进程启动即进入前台 deadline，保留 outer/inner 终态并在 Stop 前收口；自身引入且可回滚的命令合同错误须在当前 live ownership 内立即修复重跑，不得升级成 replacement-plan 循环。
