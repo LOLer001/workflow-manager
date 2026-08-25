@@ -83,12 +83,22 @@ class ReleaseAutomationTests(unittest.TestCase):
             "1.0.19",
             "1.0.20",
             "1.0.44",
+            "1.0.46",
             "1.0.47",
         ):
             with self.subTest(version=version):
                 notes = MODULE.extract_release_notes(changelog, version)
                 self.assertTrue(notes.startswith("- "))
                 self.assertNotIn("## ", notes)
+
+    def test_release_workflow_does_not_special_case_a_missing_version(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('[[ "$tag" == "v1.0.46" ]]', workflow)
+        self.assertNotIn("Release v1.0.46 is forbidden", workflow)
+        self.assertIn('previous_tag="v1.0.$((patch - 1))"', workflow)
+        self.assertIn("Release sequence gap:", workflow)
 
     def test_missing_or_empty_section_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

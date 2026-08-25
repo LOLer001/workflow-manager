@@ -38,10 +38,6 @@ jobs:
           fi
 
           for tag in "${tags[@]}"; do
-            if [[ "$tag" == "v1.0.46" ]]; then
-              echo "Release v1.0.46 is forbidden" >&2
-              exit 1
-            fi
             [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
               echo "Unsupported release tag: $tag" >&2
               exit 1
@@ -53,6 +49,14 @@ jobs:
             fi
 
             version="${tag#v}"
+            IFS=. read -r major minor patch <<<"$version"
+            if [[ "$major" == "1" && "$minor" == "0" && "$patch" -gt 44 ]]; then
+              previous_tag="v1.0.$((patch - 1))"
+              if ! gh release view "$previous_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "Release sequence gap: publish $previous_tag before $tag" >&2
+                exit 1
+              fi
+            fi
             manifest_version="$(git show "$tag:plugins/workflow-manager/.codex-plugin/plugin.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
             [[ "$manifest_version" == "$version" ]] || {
               echo "Tag $tag does not match plugin version $manifest_version" >&2
