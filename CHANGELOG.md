@@ -1,5 +1,30 @@
 # 更新记录
 
+## 1.0.47
+
+- 保持 Schema 27、execution profile v10 与 stable-skill schema 8；新增私有、有界、无原始输入/输出的 Hook dispatch receipt，并让 trust doctor 分别报告配置与指定会话 dispatch 状态。
+- 发布工作流拒绝创建或回填 v1.0.46；Linux/Windows runner 均保持 Hook 入口后、业务 state 前的 receipt 语义。
+- 修复实机暴露的“发现问题只 fail-closed”循环：带说明的重规划句和“作废/修正版/写入”可直接触发 replan，活动 Hard 的 delegated recovery 不再误降为 Daily 并清空 binding。
+- 删除两项只增加额度、不增加信任的 assessor 格式门：绑定 Start/Stop 已证明身份且计划结构有效时，Hook 可生成 assessment digest；唯一尾部普通 `json` execution-slice manifest 会被严格校验并规范成 canonical fence，不再为补 marker/fence 重启最高模型。
+- confirmed executor 必须让长测从进程启动即进入前台 deadline，保留 outer/inner 终态并在 Stop 前收口；自身引入且可回滚的命令合同错误须在当前 live ownership 内立即修复重跑，不得升级成 replacement-plan 循环。
+- 修复稳定 Skill 更新只覆盖不删除的问题：安装器现在记录逐文件摘要，并只删除与历史发布字节完全一致的退休受管引用；用户新增、修改、链接或未知文件保留。由此清除会让新任务继续读取旧 agent lifecycle/实时协调规则的残留文件。
+- 修复真实父审已完成却因 Desktop Stop 漏字段被覆盖为 `verification_failed` 的循环：resume 只在同 session rollout 的唯一精确 review、匹配 `task_complete`、全部 bound structured verification 成功且无后续 mutation 时直接自愈封存；多条验收命令不再被“必须恰好一条 exec”的旧桥拒绝。已封存前序切片的 child Stop 状态遗漏也通过唯一 full-Start owner、精确 succeeded result、父审和无冲突写操作保守补齐，不启动第三个 executor。
+- 修复自愈后的状态查询因 repair 标识符包含 `_change_` 而被误判为“修改计划”、清空已封存合同并请求新 assessor 的问题：英文计划变更词改为单词边界匹配，完成态状态/证据查询保持原 `succeeded/passed`，真实范围变更仍会使旧授权失效。
+
+## 1.0.46
+
+- Schema 升至 27、writer/manifest 升至 1.0.46、execution profile 升至 v10、stable-skill schema 升至 8；Schema 26 的 canonical Hard 计划、宿主生成证据和封存父审继续按严格迁移边界保留。
+- 按 Codex 当前官方能力重新划分职责：普通规划、进度、工具使用、错误恢复、压缩、模型选择和子智能体编排全部交回宿主；Workflow Manager 只保留 Hard 授权、canonical 合同、Start 运行时真值、父审证据与挂载树安全。
+- 删除通用 Direct/Focused/Complex/Extensive 路由提示、阶段顺序、agent cap、side-lane/child 嵌套规则、70% 压力提示、普通失败自动升档、通用 Start 结果格式和跨任务实时协调协议；旧状态中的对应字段迁移时丢弃，不再重新注入。
+- Daily 与全部非 Hard Work 直接使用原生 Codex，Workflow Manager 不再启动 Simple assessor；只有达到既有高门槛的 Hard 新目标才创建一个 `max` 评估者，确认后仍使用唯一当前切片 executor 与完整 Start 观测。
+- 删除 assessor 的旧 Simple 判定、二阶段 follow-up、`SIMPLE_EXECUTION` 结果和父任务 Hard 计划绕行；Hard assessor 现在只有一个只读计划协议，普通 child 的请求、Start、Stop 完全透传宿主且不进入插件账本。
+- 修复真实宿主已记录 `Start=full` 但父任务仍声称“未暴露运行时回显”的信息断层：bound SubagentStop 记录 requested、host accepted、Start 状态、观测 model/effort 与来源，并在父任务首次 wait/list 收割边界精确回传；assessor、executor、去重和非 Hard 静默均有回归锁定。
+- 适配 Codex 0.149 的新版宿主 rollout：不再要求整个 turn 只有一个 `exec`，改为按唯一 call id 与 command digest 逐链核对；支持 JSON 参数 `tools.exec_command({...})`、`item_completed/FileChange`，并从多次尝试中只回收当前 attempt/candidate。重复 id、重复 digest 或不唯一 FileChange 仍 fail-closed。
+- 明确父审时序：`EXECUTION_REVIEW` 只能作为结束 turn 的唯一末行，Stop 封存后再 resume 当前下一切片的最小 delta，避免同 turn 提前 spawn 与重复 marker。
+- confirmed Hard 的 SessionStart 不再重复注入完整 canonical 计划：Hook 内部仍校验完整 journal，只投影当前 slice、global constraints、contract/attempt/review 与 completed-prefix digest；定向回归限制该恢复上下文低于 6 KB。
+- SessionStart 只在存在活动 Hard/因果/参考合同时回放有界合同元数据；普通新任务与普通压缩恢复只得到一条短身份边界，不再重复完整工作流账本。
+- 新增“无 Workflow Manager / 1.0.45 / 精简 1.0.46”同题困难任务三臂模拟与宿主原生透传回归；正确性证据和强验收必须相同。固定样例的插件 `additionalContext` 从 1489 UTF-8 字节降至 543（约 63.5%），该数值不冒充真实 token。
+
 ## 1.0.45
 
 - Schema 升至 26、writer/manifest 升至 1.0.45、execution profile 升至 v9、stable-skill schema 升至 7、difficulty classifier 升至 v2；旧 1.0.44 状态按来源 Schema 保留严格 transcript/host evidence 迁移边界。

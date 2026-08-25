@@ -38,6 +38,10 @@ jobs:
           fi
 
           for tag in "${tags[@]}"; do
+            if [[ "$tag" == "v1.0.46" ]]; then
+              echo "Release v1.0.46 is forbidden" >&2
+              exit 1
+            fi
             [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
               echo "Unsupported release tag: $tag" >&2
               exit 1

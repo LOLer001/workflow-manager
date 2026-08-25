@@ -4,7 +4,7 @@ set -eu
 source_file="$PLUGIN_ROOT/scripts/orchestrator_hook.py"
 
 run_direct() {
-    exec env PYTHONDONTWRITEBYTECODE=1 python3 -B "$source_file"
+    exec env PYTHONDONTWRITEBYTECODE=1 WORKFLOW_MANAGER_RUNNER_KIND=posix_direct python3 -B "$source_file"
 }
 
 [ -f "$source_file" ] || exit 0
@@ -83,4 +83,4 @@ for old_cache_dir in "$cache_root"/*; do
     rm -rf -- "$old_cache_dir" 2>/dev/null || true
 done
 
-exec env PYTHONDONTWRITEBYTECODE=1 python3 -B "$cached_file"
+exec env PYTHONDONTWRITEBYTECODE=1 WORKFLOW_MANAGER_RUNNER_KIND=posix_cached python3 -B "$cached_file"

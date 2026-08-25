@@ -1,23 +1,23 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.45",
-  "description": "Quality-first, context-efficient workflow management with daily/work and simple/hard routing, confirmed plans, compaction recovery, and dynamic subagent orchestration.",
+  "version": "1.0.47",
+  "description": "A lean Hard-work authorization and runtime-evidence layer for current Codex.",
   "author": {
     "name": "Cong"
   },
   "interface": {
     "displayName": "Workflow Manager",
-    "shortDescription": "Classify work, gate hard plans, and protect reasoning quality.",
-    "longDescription": "A thin continuity and authorization layer: keeps Simple and Focused work local, reserves highest-model assessment and strict confirmation for genuinely Hard work, and preserves runtime identity, evidence, and compaction continuity.",
+    "shortDescription": "Authorize Hard plans and verify runtime truth.",
+    "longDescription": "Adds only narrow Hard-work confirmation, canonical contracts, runtime-truth evidence, and mounted-tree safety while leaving ordinary execution to current Codex.",
     "developerName": "Cong",
     "category": "Productivity",
     "capabilities": [
       "Interactive"
     ],
     "defaultPrompt": [
-      "Use $workflow-manager as a thin continuity and authorization layer; do not repeat host-native guidance.",
-      "Keep Simple/Focused local. Hard needs one critical signal or two strong groups including diagnosis, scope, or continuity.",
-      "Preserve acceptance. Correct once; for unknown, critical, or repeated failure use one highest-available model at max."
+      "Use $workflow-manager only for Hard authorization, canonical contracts, runtime truth, and mounted-tree safety.",
+      "Leave ordinary planning, progress, recovery, compaction, model choice, and subagent orchestration to current Codex.",
+      "Hard needs a critical signal or two strong groups; repair reproduced in-scope reversible defects in the earliest live ownership."
     ],
     "brandColor": "#0F766E",
     "screenshots": []

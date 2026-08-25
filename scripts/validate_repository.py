@@ -20,10 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_NAME = "workflow-manager"
 PLUGIN = ROOT / "plugins" / PLUGIN_NAME
 EXPECTED_VERSION_MATRIX = {
-    "1.0.45": {
-        "schema": 26,
-        "execution_profile": "9",
-        "stable_skill_schema": 7,
+    "1.0.47": {
+        "schema": 27,
+        "execution_profile": "10",
+        "stable_skill_schema": 8,
     }
 }
 
@@ -172,6 +172,7 @@ def main() -> int:
     assert 'tags:' in release_workflow and 'workflow_dispatch:' in release_workflow
     assert 'gh release create "$tag"' in release_workflow
     assert '--verify-tag' in release_workflow
+    assert 'v1.0.46' in release_workflow and 'forbidden' in release_workflow
     assert (ROOT / "scripts" / "extract_release_notes.py").is_file()
     generator = load_command_generator()
     assert (PLUGIN / "scripts" / "generate_hook_commands.py").is_file()
