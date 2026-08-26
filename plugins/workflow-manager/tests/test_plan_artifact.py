@@ -2101,11 +2101,12 @@ class PlanArtifactTests(unittest.TestCase):
         for generation in range(1, 9):
             digest = f"{generation:032x}"
             candidate = directory / f"hard-plan-g{generation:04d}-{digest}.md"
-            candidate.write_text(
-                f"{HOOK.LEGACY_PLAN_ARTIFACT_OWNER}\n"
-                f"generation: {generation}\n"
-                f"plan_digest: {digest}\n-->\n",
-                encoding="utf-8",
+            candidate.write_bytes(
+                (
+                    f"{HOOK.LEGACY_PLAN_ARTIFACT_OWNER}\n"
+                    f"generation: {generation}\n"
+                    f"plan_digest: {digest}\n-->\n"
+                ).encode("utf-8")
             )
             if generation == 1:
                 hard = directory / f"hard-plan-g9998-{'8' * 32}.md"
@@ -2130,21 +2131,7 @@ class PlanArtifactTests(unittest.TestCase):
             for candidate in directory.iterdir()
             if (metadata := HOOK._owned_plan_artifact(candidate)) is not None
         )
-        probes = []
-        for candidate in directory.iterdir():
-            info = candidate.lstat()
-            probes.append(
-                {
-                    "name": candidate.name,
-                    "mode": int(info.st_mode),
-                    "nlink": int(info.st_nlink),
-                    "ino": int(info.st_ino),
-                    "attributes": int(getattr(info, "st_file_attributes", 0)),
-                    "reparse": int(getattr(info, "st_reparse_tag", 0)),
-                    "owned": HOOK._owned_plan_artifact(candidate),
-                }
-            )
-        self.assertEqual(generations, [3, 4, 5, 6, 7, 8], probes)
+        self.assertEqual(generations, [3, 4, 5, 6, 7, 8])
 
     def test_s07_schema17_migration_is_idempotent_and_preserves_continuity(self) -> None:
         payload = {"session_id": "s07"}

@@ -2,7 +2,7 @@
 
 ## 1.0.48
 
-- Windows CI 固定使用 `actions/setup-python` 提供的 Python 3.14 并启用 UTF-8，不再由 `py -3` 绕开已声明解释器、在中文隐私夹具上触发 cp1252 写入失败和逐项 10 秒等待；完整原生 Windows 套件与验收范围保持不变。
+- Windows CI 固定使用 `actions/setup-python` 提供的 Python 3.12 并启用 UTF-8，不再由 `py -3` 绕开已声明解释器、在中文隐私夹具上触发 cp1252 写入失败和逐项 10 秒等待；Windows 文件安全夹具先 canonicalize 临时根并以二进制 LF 写入，产品的 canonical-path 与 canonical-byte 拒绝边界保持不变。
 - execution-slice manifest 改为可选增强：parent 的普通原生计划无需 JSON/fence/固定结尾；缺省时完整计划投影为一个逻辑 slice，显式 manifest 则使用 196608-byte / 1024-node 总预算且无独立 slice/list 上限。正常计划可由模型选择 3–5 slice，长计划按预算扩展，预算不足只能停止或拆分而不能降低验收。
 - 补丁 reconciliation 同时支持 legacy 唯一成功 `patch_apply_end` 与当前宿主精确空 `{}` 成功回执；同 turn 多次补丁只按唯一 call id、唯一字面 digest、唯一回执和宿主 operation 顺序一一绑定，重复、额外 sibling、拒绝或歧义仍保持 unknown，不从 `FileChange` 推断成功。Desktop 仅遗漏通用 status 时，精确绑定 executor/contract/slice/input/command/turn 的 PostToolUse 改动可由后续独立 parent verification 封存，不再强制 recovery child。缓存清理明确保留当前版本及紧邻的 1.0.47 回滚缓存。
 - Workflow Manager 插件/Hook/Skill 的版本化生产发布作为窄 Hard 分类；普通介绍与聊天不受影响。
