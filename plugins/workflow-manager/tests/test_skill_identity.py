@@ -161,6 +161,7 @@ class SkillIdentityTests(unittest.TestCase):
         workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
         self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', workflow)
         self.assertIn('PYTHONUTF8: "1"', workflow)
+        self.assertIn('python-version: "3.14"', workflow)
         self.assertIn("python -B scripts/validate_repository.py", workflow)
         self.assertIn("python -B -m unittest discover", workflow)
         self.assertNotIn("py -3 -B scripts/validate_repository.py", workflow)
