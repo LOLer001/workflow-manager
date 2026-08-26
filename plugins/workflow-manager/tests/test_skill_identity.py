@@ -160,10 +160,11 @@ class SkillIdentityTests(unittest.TestCase):
     def test_ci_runs_python_without_bytecode_on_linux_and_windows(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
         self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', workflow)
+        self.assertIn('PYTHONUTF8: "1"', workflow)
         self.assertIn("python -B scripts/validate_repository.py", workflow)
         self.assertIn("python -B -m unittest discover", workflow)
-        self.assertIn("py -3 -B scripts/validate_repository.py", workflow)
-        self.assertIn("py -3 -B -m unittest discover", workflow)
+        self.assertNotIn("py -3 -B scripts/validate_repository.py", workflow)
+        self.assertNotIn("py -3 -B -m unittest discover", workflow)
 
 
 if __name__ == "__main__":

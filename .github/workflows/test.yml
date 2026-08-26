@@ -9,6 +9,7 @@ permissions:
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUTF8: "1"
 
 jobs:
   linux:
@@ -36,7 +37,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Validate repository
-        run: py -3 -B scripts/validate_repository.py
+        run: python -B scripts/validate_repository.py
       - name: Run full native Windows suite
         working-directory: plugins/workflow-manager
-        run: py -3 -B -m unittest discover -s tests -p "test_*.py" -v
+        run: python -B -m unittest discover -s tests -p "test_*.py" -v

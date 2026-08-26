@@ -185,6 +185,7 @@ Windows 原生测试：
 ```powershell
 Set-Location plugins/workflow-manager
 $env:PYTHONDONTWRITEBYTECODE = "1"
+$env:PYTHONUTF8 = "1"
 py -3 -B -m unittest discover -s tests -p "test_*.py" -v
 ```
 
