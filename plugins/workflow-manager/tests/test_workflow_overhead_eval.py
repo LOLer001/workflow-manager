@@ -16,6 +16,24 @@ def context_metrics(events: list[dict[str, str]], field: str) -> dict[str, int]:
     }
 
 
+def trace_metrics(events: list[dict[str, str]]) -> dict[str, int]:
+    return {
+        "child_starts": sum(event.get("kind") == "child_start" for event in events),
+        "additional_context_bytes": sum(
+            len(event.get("additional_context", "").encode("utf-8")) for event in events
+        ),
+        # The frozen trace has no artifact/test payload. The narrow observable
+        # proxy for preserved strong acceptance is the number of bound Hard
+        # executor checkpoints; it deliberately makes no runtime-token claim.
+        "strong_acceptance_checkpoints": sum(
+            event.get("kind") == "child_start"
+            and event.get("case") == "hard"
+            and event.get("role") == "executor"
+            for event in events
+        ),
+    }
+
+
 class AndroidNativeDemoAggregateAuditTests(unittest.TestCase):
     def test_fixture_is_anonymous_and_does_not_claim_marginal_tokens(self) -> None:
         fixture = json.loads(
@@ -34,6 +52,32 @@ class AndroidNativeDemoAggregateAuditTests(unittest.TestCase):
 
 
 class WorkflowOverheadABTests(unittest.TestCase):
+    def test_v1043_frozen_trace_meets_current_production_ab_thresholds(self) -> None:
+        fixture = json.loads(
+            (FIXTURE_DIR / "v1043_frozen_trace.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(fixture["fixture_version"], 1)
+        self.assertEqual(fixture["writer_version"], "1.0.43")
+        self.assertIn("Frozen compatibility trace", fixture["boundary"])
+        self.assertIn("not real token usage", fixture["boundary"])
+
+        old = trace_metrics(fixture["old_events"])
+        current = trace_metrics(fixture["new_events"])
+        child_reduction = 1 - current["child_starts"] / old["child_starts"]
+        context_reduction = 1 - (
+            current["additional_context_bytes"] / old["additional_context_bytes"]
+        )
+
+        self.assertGreaterEqual(child_reduction, 0.60)
+        self.assertGreaterEqual(context_reduction, 0.50)
+        self.assertGreaterEqual(
+            current["strong_acceptance_checkpoints"],
+            old["strong_acceptance_checkpoints"],
+        )
+        self.assertEqual(
+            sum(event.get("case") == "simple" for event in fixture["new_events"]), 0
+        )
+
     def test_lean_policy_removes_native_duplicates_without_lowering_evidence(self) -> None:
         fixture = json.loads(
             (FIXTURE_DIR / "workflow_overhead_ab.json").read_text(encoding="utf-8")

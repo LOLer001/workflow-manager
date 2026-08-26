@@ -1,31 +1,45 @@
 ---
 name: workflow-manager
-description: Hard-work authorization, canonical execution contracts, runtime-truth evidence, and mounted-tree safety for Codex.
+description: Minimal Hard-work authorization, host-runtime evidence, and mounted-tree safety for Codex.
 ---
 
 # Workflow Manager
 
-Workflow Manager is an authorization and evidence layer, not a second task runner. Current Codex owns ordinary planning, progress, tool use, error recovery, compaction, model selection, and subagent orchestration. Do not restate or override those host-native behaviors.
+Workflow Manager is a narrow authorization and evidence layer, not a second task runner. Current Codex owns planning, decomposition, progress judgment, normal recovery, compaction, model choice, and subagent scheduling. Do not make model prose, task naming, list shape, phase count, elapsed time, or output formatting into workflow gates.
 
-## When it applies
+## Route narrowly
 
-1. Daily requests and non-Hard engineering work use native Codex directly. Workflow Manager emits no route, phase, agent-cap, pressure, retry, or progress advice for them.
-2. Work is **Hard** only for one critical signal (production/irreversible/security/full-system delivery/host-continuity acceptance), or at least two independent strong signal groups where one is unknown-cause, cross-scope, or continuity. Build/deploy/device work, many phases, shared resources, length, or ambiguity alone is not Hard.
-3. Ambiguous work starts with native bounded diagnosis. Promote only after evidence crosses the Hard threshold. Read [work routing](references/work-routing.md).
+- Daily and non-Hard engineering work run natively. High-confidence Simple work has `Start=0`: no assessor and no executor created by this plugin.
+- Treat work as Hard only with high confidence: one critical production, irreversible, security, full-system, or host-continuity risk; or two independent strong signal groups where one is unknown-cause, cross-scope, or continuity. Build/deploy/device work, task length, multiple steps, shared resources, or ambiguity alone are not Hard.
+- If uncertain, begin with bounded native read-only diagnosis and promote only when evidence crosses that threshold. See [work routing](references/work-routing.md).
 
-## Hard authorization
+## Keep only irreducible gates
 
-- A new Hard objective gets one bound highest-available assessor at `max`; use `ultra` only for an explicit `highest_throughout` session policy. The assessor is read-only and produces the canonical detailed plan ending `计划已就绪，等待确认后执行`.
-- Before strict confirmation, allow evidence collection but deny mutation, build, deploy, and write-authority children. Store each full plan revision in the private canonical journal; external drift invalidates authorization.
-- Use 1..6 manifest slices, normally 1..3. Confirmation authorizes one current-slice mutation owner. The default executor requests the newest available lower tier at `medium`, `fork_turns=1`; `highest_throughout` keeps the bound highest profile.
-- PreTool records the request, PostTool records host acceptance, and Start must fully observe official model plus same-turn host effort. Never infer runtime identity from request fields or child prose.
-- Record those exact facts at the bound SubagentStop and return them at the parent's first wait/list collection boundary. When the verified Start is `full`, the parent must report it and must not call the runtime echo absent or unavailable.
-- Executor output is only a candidate. Parent review must bind structured host evidence and the current slice before advancing. One materially corrected fresh recovery is allowed; never revive a terminal executor or weaken acceptance. Read [confirmed execution](references/confirmed-execution.md).
-- Fix a reproduced, in-scope, reversible defect inside the earliest current ownership instead of using `fail-closed` as a substitute for repair. If the cause is unclear, use the highest available read-only diagnosis, then give the current live owner the bounded correction. Stop only for a changed objective, unsafe/unrecoverable state, unavailable authority, or failed strong acceptance; never spend a new plan/child merely to repair protocol spelling that the Hook can validate and canonicalize safely.
+1. **Host truth.** A bound child needs one unique PreTool request, matching PostTool acceptance with `host_accepted=true`, and one unique full Start. Request, acceptance, Start, and flattened state must agree on objective/contract, sequence, model, effort, and `fork_turns=1`. Missing, unknown, or rejected host acceptance is `model_unavailable`; other lifecycle conflicts are `start_mismatch`. Never infer these facts from child prose or flattened fields alone.
+2. **Authorization scope.** Strict confirmation binds only the normalized objective plus explicit acceptance, risk category, and irreversible external action. Plan prose, layout, slice count, and manifest digest are not user authority. Same-envelope repair, autosplit, verification, recovery, and compaction successors inherit confirmation.
+3. **Mutation ownership.** At most one live writer for a Hard contract. Children never nest, terminal children never revive, and parent/child writers never overlap.
+4. **External safety.** Preserve mounted-tree Git restrictions and require explicit authority for a materially new irreversible external action.
 
-## Continuity and fixed boundaries
+Everything else is advisory. Let the model decide whether a plan needs one step or many, whether work is progressing, how to diagnose a failure, and how to present results. Byte/node budgets protect state capacity; they do not lower acceptance or impose item-count caps.
 
-- Native summaries own ordinary compaction continuity. Replay Workflow Manager metadata or canonical plan text only while a live Hard, causal-review, or reference-acceptance contract exists.
-- Same-task acceptance regressions use [regression continuity](references/regression-continuity.md); explicit fidelity work uses [reference acceptance](references/reference-acceptance.md). Bound executor stalls use [stall recovery](references/stall-recovery.md).
-- Never run Git from CIFS, Samba, UNC, DrvFS, or another mounted working tree. Use an authoritative native Linux clone or remote Git.
-- User instructions, safety, project-local skills, and required acceptance take precedence. A requested model/profile is not proven until host acceptance and a full Start observation agree.
+## Hard flow
+
+- Request one highest-available read-only assessor at `max`, `fork_turns=1`; only explicit whole-session `highest_throughout` uses `ultra`. Its safe ASCII `task_name` is an opaque host label, not an encoded contract.
+- The assessor may answer with any nonempty bounded native result. No `WORK_ASSESSMENT`, JSON fence, fixed keywords, closing sentence, or minimum prose length is required. The host-bound lifecycle proves provenance; the parent model judges the content and writes one nonempty bounded native plan.
+- Store the complete bounded parent plan in the private canonical journal. A machine-readable slice manifest is optional. If absent, the Hook treats the native plan as one logical execution slice; if present, it may expand within the total 196608-byte / 1024-node budget with no independent list or slice cap. A normal model-generated plan may still choose 3–5 slices.
+- Before confirmation, permit read-only diagnosis but deny mutation. A pure confirmation that arrives after assessor completion but before parent Stop is stored only as a digest receipt; preserve Hard/repair state and automatically bind it after the matching trusted revision commits. Do not ask the user to repeat it.
+- The default confirmed executor uses a current lower-tier model at `medium`, `fork_turns=1`. Explicit `highest_throughout` uses highest available at `ultra`. The Hook privately supplies the verified plan and current contract at Start; request prose and task name carry no authority.
+- Executor output is a candidate. Ordinary native prose is valid; `EXECUTION_RESULT` is optional. Explicit malformed marker intent fails closed. Advance only with host-recorded bounded verification and parent review of the current contract. Parent review may also be native prose; `EXECUTION_REVIEW` is optional. Strong acceptance evidence is never optional.
+
+## Recovery and liveness
+
+- Failure, stall, incomplete, and verification recovery all use the same host-truth path. With a valid original assessor lifecycle, recovery uses `gpt-5.6-sol`, `max`, `fork_turns=1`; `highest_throughout` remains highest plus `ultra`.
+- Recovery state is advisory to native model judgment: the parent may diagnose, verify, replan, or finish without manufacturing another turn. Only when the model chooses a fresh recovery child, bind the Hook's digest-only failure/evidence facts to the diagnosed root cause and material correction. Reject only an unchanged child replay of the same failure fingerprint with no new evidence, root cause, or correction. Different fingerprints and genuine evidence/correction may continue for three or more monotonic sequences while byte/node budgets permit. Never use a fixed attempt ceiling.
+- A live assessor has no total wall-clock deadline. At 600 seconds observe activity; exactly 1200 seconds remains live. Strictly after 1200 seconds without progress, diagnose, unblock, or split the current step. Do not turn elapsed time into `assessment_timeout`, `blocked`, or exhausted. See [assessment liveness](references/assessment-liveness.md).
+
+## Continuity and safety
+
+- Native summaries own ordinary compaction continuity. Replay plugin metadata or plan text only for a live Hard, causal-review, or reference-acceptance contract.
+- A same-session trusted rollout may reconcile a missed parent Stop and later pure confirmation, but only with matching session/cwd/objective evidence; persist digests, never user or plan prose in state.
+- Never run Git from CIFS, Samba, UNC, DrvFS, or another mounted working tree. Use an authoritative native Linux clone or supported remote Git path.
+- User instructions, project-local skills, safety, and acceptance requirements take precedence. Read [confirmed execution](references/confirmed-execution.md) only when operating a confirmed Hard contract.

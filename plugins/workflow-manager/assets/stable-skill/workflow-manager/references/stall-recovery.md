@@ -1,31 +1,13 @@
-# Confirmed-execution stall recovery
+# Stall and typed recovery
 
-Use this reference only after a confirmed Hard plan has one live bound slice executor. It extends the single invocable `workflow-manager` Skill; it is not a second Skill.
+Use recovery only for a current confirmed Hard contract with a terminal prior writer or a host-proven stalled owner. Ordinary model judgment decides whether the next useful action is diagnosis, a changed method, or a bounded split; elapsed time and prose formatting never create a failure by themselves.
 
-## Trigger on strong evidence, not every error
+The Hook derives failure fingerprint and evidence digest from the current request/Post/full Start, terminal facts, operation ledger, and parent review. The parent adds a diagnosed root cause and material correction. Persist only digests.
 
-Ordinary error handling belongs to native Codex and does not enter this protocol. Use this reference only after a live confirmed-Hard executor produces the exact bound stall evidence below.
+Recovery uses the current highest available `gpt-5.6-sol`, `max`, `fork_turns=1`; explicit whole-session `highest_throughout` remains highest plus `ultra`. Any safe ASCII task name is valid and carries no authorization semantics.
 
-Escalate only when the live bound executor has a current typed failure, cannot make progress within the confirmed contract, stops mutation, and ends with exactly one independent line:
+Before reserving a fresh child, atomically reject the same failure fingerprint only when there is no new evidence, progress, root cause, or material correction. Different fingerprints or a genuine evidence/correction delta may advance the positive monotonic sequence. There is no fixed attempt ceiling; three or more distinct failures remain recoverable within bounded state byte/node budget.
 
-`EXECUTION_STALL contract_id=<32hex> failure_kind=<typed-kind> evidence_digest=<32hex>`
+Native nonempty result and review prose are sufficient when the separately bound host evidence is current. `EXECUTION_STALL`, `STALL_DIAGNOSIS`, `EXECUTION_RESULT`, and `EXECUTION_REVIEW` remain optional compatibility markers; explicit malformed or conflicting intent fails closed, while their absence does not create another child or confirmation.
 
-The Hook first verifies the canonical journal and slice manifest, then binds the stall to the current objective, revision/journal/manifest digests, global contract, current slice/token, accepted-prefix chain, executor attempt, and failure kind. Wrong caller/status/contract/type, embedded or duplicate markers, external journal drift, or a second stall on the same slice exhausts or invalidates the route instead of opening a loop.
-
-## One high-tier read-only diagnosis
-
-Reuse the original objective-bound high assessor with one exact `followup_task`; do not create another diagnostician. Bind `stall_id`, assessor binding, objective fingerprint, execution contract, and `mode=read_only`. Until diagnosis completes, block executor recovery, parent/old-executor mutation, builds, deployment, device actions, and unrelated agent creation.
-
-Validation and pending reservation are one state-lock transaction: concurrent identical follow-ups yield exactly one delivery. An explicit delivery error permits one normal retry; a second explicit error exhausts. An unknown host response may already have delivered the task, so treat it as unconfirmed diagnosing, never automatic failure/retry, and accept only the bound assessor's later result.
-
-The assessor rereads the canonical current revision and ends with one exact line containing the current stall/binding/plan/contract and `outcome=resume|replan` plus a remediation digest. It remains read-only:
-
-- `resume` means the remedy stays within the confirmed objective, plan, ownership, acceptance, and rollback. Store only its digest.
-- `replan` means scope, ordering, risk, or acceptance must change. Invalidate the old plan/executor contract, append one complete replacement revision to the same session journal, and return to strict user confirmation.
-- Missing, malformed, stale, failed, or mismatched diagnosis exhausts; never infer success from prose.
-
-## Resume the prior execution profile
-
-For `resume`, the recovery request must bind the exact stall/remediation, canonical journal/manifest digests, current slice/token, and accepted-prefix chain; require rereading only the bound plan context; name the typed failure; and provide a substantive correction. Restore the profile that was bound before the stall: normally lower-tier+medium; if the user explicitly enabled whole-session `highest_throughout`, restore that highest profile instead of silently downgrading. Host acceptance/echo rules remain unchanged.
-
-Successful resumed implementation creates only a current-slice candidate; the stall resolves after the parent independently verifies it and returns exact final `EXECUTION_REVIEW execution_contract_id=<32hex> slice_id=sNN outcome=passed`. Parent review failure exhausts attempt two. Any resumed execution failure is likewise terminal and never launches a second high diagnosis. Compaction/resume and Schema migration retain only bounded fingerprints, enums, attempts, profile, timestamps, review, slice/token, accepted-prefix, and canonical bindings—never raw errors, prompts, commands, plans, or child results.
+Never revive a terminal child, use follow-up as a substitute for a fresh lifecycle, nest recovery under an executor, overlap the sole writer, repeat an unchanged failed method, expand the authorization envelope, or weaken acceptance. A recovered result is still only a candidate until independent parent verification passes.

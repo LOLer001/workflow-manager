@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.47",
+  "version": "1.0.48",
   "description": "A lean Hard-work authorization and runtime-evidence layer for current Codex.",
   "author": {
     "name": "Cong"
@@ -15,9 +15,9 @@
       "Interactive"
     ],
     "defaultPrompt": [
-      "Use $workflow-manager only for Hard authorization, canonical contracts, runtime truth, and mounted-tree safety.",
-      "Leave ordinary planning, progress, recovery, compaction, model choice, and subagent orchestration to current Codex.",
-      "Hard needs a critical signal or two strong groups; repair reproduced in-scope reversible defects in the earliest live ownership."
+      "Use $workflow-manager only for minimal Hard authorization, host truth, one-writer ownership, and external safety.",
+      "Leave plans, task names, progress, recovery method, compaction, model judgment, and scheduling to current Codex.",
+      "Hard needs a critical signal or two strong groups; formatting, counts, and elapsed time are never separate gates."
     ],
     "brandColor": "#0F766E",
     "screenshots": []

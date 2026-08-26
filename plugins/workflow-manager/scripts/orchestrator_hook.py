@@ -23,17 +23,17 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 27
-WRITER_VERSION = "1.0.47"
-DOMAIN_CLASSIFIER_VERSION = "1"
-DIFFICULTY_CLASSIFIER_VERSION = "2"
+SCHEMA_VERSION = 28
+WRITER_VERSION = "1.0.48"
+DOMAIN_CLASSIFIER_VERSION = "2"
+DIFFICULTY_CLASSIFIER_VERSION = "3"
 EXECUTION_PROFILE_VERSION = "10"
 # The assessor is the hard-work safety gate: use the highest generally exposed
 # effort (max); ultra is reserved for the explicit whole-session policy.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
 HIGHEST_SESSION_REASONING_EFFORT = "ultra"
 STABLE_SKILL_NAME = "workflow-manager"
-STABLE_SKILL_SCHEMA = 8
+STABLE_SKILL_SCHEMA = 9
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
 # 1.0.46 removed these generic workflow references from the bundled Skill, but
 # the old updater only overlaid current files.  Delete a retired path only when
@@ -70,6 +70,7 @@ MAX_GUARDS = 32
 MAX_PROCESSED_RUNS = 128
 MAX_DUPLICATE_NOTICES = 64
 MAX_STATE_BYTES = 1024 * 1024
+MAX_STATE_NODES = 16_384
 MAX_PLAN_REVISION_BYTES = 960 * 1024
 MAX_PLAN_JOURNAL_BYTES = 10 * 1024 * 1024
 # Compatibility alias for callers that inspected the v1 mirror limit.  Since Schema 20
@@ -83,7 +84,6 @@ TRANSCRIPT_TAIL_BYTES = 1024 * 1024
 # that do not dispatch the declared Pre/PostCompact hooks.  Keep this bounded:
 # an oversized or non-regular file is not evidence.
 HOST_ROLLOUT_RECONCILE_BYTES = 4 * 1024 * 1024
-LOCK_TIMEOUT_SECONDS = 0.75
 DUPLICATE_TTL_SECONDS = 15 * 60
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_MAX_SESSION_FILES = 200
@@ -122,7 +122,6 @@ EXECUTOR_REVIEW_STATUSES = {
     "exhausted",
 }
 EXECUTOR_FAILURE_KINDS = {
-    "protocol_missing_model",
     "model_unavailable",
     "invalid_spawn_config",
     "spawn_failed",
@@ -133,8 +132,12 @@ EXECUTOR_FAILURE_KINDS = {
     "build_failed",
     "deploy_failed",
     "verification_failed",
+    "incomplete_execution",
 }
-MAX_EXECUTOR_ATTEMPTS = 2
+# Executor and assessor sequence values are monotonic identities, never retry
+# budgets.  Persistence byte/node budgets are the only generic growth bound.
+RECOVERY_EXECUTOR_MODEL = "gpt-5.6-sol"
+RECOVERY_EXECUTOR_REASONING_EFFORT = "max"
 STALL_STATES = {
     "none",
     "diagnosis_required",
@@ -149,8 +152,16 @@ STALL_RESUME_PROFILES = {
     "work_executor_low_latest",
     "work_executor_highest_available",
 }
-MAX_STALL_DIAGNOSIS_ATTEMPTS = 2
 ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "hard_plan_ready", "recovery_required", "failed"}
+ASSESSMENT_WAIT_SECONDS = 600
+ASSESSMENT_IDLE_SECONDS = 1200
+
+
+def _empty_assessment_liveness() -> dict[str, Any]:
+    """Bound progress facts for the one live Hard assessor (never transcript text)."""
+    return {"binding_id": None, "agent_id": None, "attempt": 0, "progress_digest": None,
+            "last_progress_at": None, "last_observed_at": None, "unblock": "none",
+            "unblock_at": None, "recovery_from": None}
 CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
 CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
@@ -185,7 +196,29 @@ PLAN_ARTIFACT_WARNING_CODES = {
     "transaction_incomplete",
     "transaction_recovery_failed",
     "execution_slices_invalid",
+    "manifest_invalid",
+    "manifest_too_large",
+    "manifest_too_many_nodes",
+    "global_constraints_invalid",
+    "slice_invalid",
+    "slice_id_invalid",
+    "field_invalid",
+    "field_too_large",
+    "manifest_fence_missing",
+    "manifest_fence_ambiguous",
+    "manifest_fence_not_tail",
+    "manifest_json_invalid",
+    "manifest_duplicate_key",
+    "manifest_root_type_invalid",
+    "manifest_root_shape_invalid",
+    "manifest_version_invalid",
+    "slice_count_invalid",
+    "slice_shape_invalid",
+    "field_type_invalid",
+    "field_empty",
+    "field_control_invalid",
 }
+PLAN_ARTIFACT_DIAGNOSTIC_CODES = PLAN_ARTIFACT_WARNING_CODES
 LEGACY_PLAN_ARTIFACT_OWNER = "<!-- workflow-manager-plan-artifact:v1"
 PLAN_ARTIFACT_OWNER = LEGACY_PLAN_ARTIFACT_OWNER
 PLAN_JOURNAL_OWNER = "<!-- workflow-manager-plan-journal:v2"
@@ -201,9 +234,19 @@ PLAN_ARTIFACT_NAME_RE = re.compile(
 PLAN_TRANSACTION_MARKER_NAME = ".hard-plan.md.transaction.json"
 MAX_PLAN_TRANSACTION_MARKER_BYTES = 4096
 EXECUTION_SLICE_SCHEMA = 1
-MAX_EXECUTION_SLICES = 6
-MAX_SLICE_LIST_ITEMS = 8
-MAX_SLICE_TEXT_BYTES = 240
+# Execution manifests are bounded by canonical bytes and nodes, not an
+# arbitrary semantic item count.
+# The execution manifest is an authority boundary.  These are byte budgets on
+# canonical JSON, not character counts, so escaping and separators are charged.
+MAX_EXECUTION_MANIFEST_BYTES = 196_608
+MAX_EXECUTION_MANIFEST_NODES = 1_024
+MAX_GLOBAL_CONSTRAINTS_BYTES = 32_768
+MAX_SLICE_BYTES = 49_152
+MAX_SLICE_TITLE_BYTES = 1_024
+MAX_SLICE_SCOPE_BYTES = 16_384
+MAX_SLICE_ACCEPTANCE_BYTES = 16_384
+MAX_SLICE_SMALL_LIST_BYTES = 8_192
+MAX_SLICE_TEXT_BYTES = 16_384
 EVIDENCE_DIGEST_PROFILE = "workflow-manager-host-evidence-v1"
 EVIDENCE_DIGEST_SOURCE = "host_normalized"
 
@@ -251,6 +294,93 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _liveness_now() -> float:
+    """One wall clock only for elapsed observations; rollback never manufactures idleness."""
+    return time.time()
+
+
+def _safe_assessment_liveness(value: Any) -> dict[str, Any]:
+    base = _empty_assessment_liveness()
+    if not isinstance(value, dict):
+        return base
+    base["binding_id"] = safe_fingerprint(value.get("binding_id")) or None
+    base["agent_id"] = safe_label(value.get("agent_id"), 120) if value.get("agent_id") else None
+    base["attempt"] = safe_sequence(value.get("attempt"))
+    base["progress_digest"] = safe_fingerprint(value.get("progress_digest")) or None
+    for key in ("last_progress_at", "last_observed_at", "unblock_at"):
+        raw = value.get(key)
+        base[key] = float(raw) if isinstance(raw, (int, float)) and raw >= 0 else None
+    base["unblock"] = value.get("unblock") if value.get("unblock") in {"none", "pending", "delivered", "failed", "unknown"} else "none"
+    base["recovery_from"] = safe_label(value.get("recovery_from"), 48) if value.get("recovery_from") else None
+    return base
+
+
+def assessment_liveness_tick(state: dict[str, Any], *, now: float | None = None,
+                             progress_digest: str | None = None) -> str | None:
+    """Advance the assessor liveness state without treating polls as progress.
+
+    A digest is accepted only from the current binding, current live agent and
+    current attempt.  The function intentionally has no total wall-clock
+    deadline: a 600s tick is merely an observation, exactly 1200s is still
+    live, and only strictly later time starts the one bounded unblock path.
+    """
+    if state.get("assessor_state") != "running":
+        return None
+    current = _safe_assessment_liveness(state.get("assessment_liveness"))
+    binding, agent = state.get("assessor_binding_id"), state.get("assessor_agent_id")
+    attempt = safe_int(state.get("assessor_attempt"))
+    observed = _liveness_now() if now is None else now
+    if not isinstance(observed, (int, float)):
+        return None
+    if (current["binding_id"], current["agent_id"], current["attempt"]) != (binding, agent, attempt):
+        # Migration/restart re-anchors at the first current observation and
+        # therefore cannot retroactively create an idle timeout.
+        current = _empty_assessment_liveness()
+        current.update({"binding_id": binding, "agent_id": agent, "attempt": attempt,
+                        "last_progress_at": observed, "last_observed_at": observed})
+        state["assessment_liveness"] = current
+        return None
+    prior_observed = current.get("last_observed_at")
+    if prior_observed is not None and observed < prior_observed:
+        observed = prior_observed
+    current["last_observed_at"] = observed
+    digest = safe_fingerprint(progress_digest)
+    if digest and digest != current.get("progress_digest"):
+        current["progress_digest"] = digest
+        current["last_progress_at"] = observed
+        current["unblock"] = "none"
+        current["unblock_at"] = None
+        state["assessment_liveness"] = current
+        return "progress"
+    last_progress = current.get("last_progress_at")
+    if last_progress is None:
+        current["last_progress_at"] = observed
+        state["assessment_liveness"] = current
+        return None
+    idle = observed - last_progress
+    if idle <= ASSESSMENT_IDLE_SECONDS:
+        state["assessment_liveness"] = current
+        return "observe" if idle >= ASSESSMENT_WAIT_SECONDS else None
+    if current["unblock"] == "none":
+        current["unblock"] = "pending"
+        current["unblock_at"] = observed
+        state["assessment_liveness"] = current
+        return "unblock_required"
+    # The caller must record delivery and prove the old child has stopped. A
+    # later observation may open one fresh, non-overlapping sequence; there is
+    # no semantic v1/v2 retry ceiling.
+    if current["unblock"] == "delivered" and observed - float(current["unblock_at"] or observed) > ASSESSMENT_WAIT_SECONDS:
+        live = any(item.get("agent_id") == agent for item in active_agent_records(state))
+        if not live:
+            state["assessor_state"] = "recovery_required"
+            state["assessor_failure_kind"] = "assessment_stalled"
+            current["recovery_from"] = "assessment_stalled"
+            state["assessment_liveness"] = current
+            return "recovery_required"
+    state["assessment_liveness"] = current
+    return "observe"
+
+
 def stable_hash(value: Any, length: int = 16) -> str:
     if isinstance(value, bytes):
         raw = value
@@ -282,24 +412,42 @@ def _empty_execution_slices() -> dict[str, Any]:
     }
 
 
-def _bounded_manifest_string(value: Any) -> str | None:
+def _manifest_json_bytes(value: Any) -> int:
+    return len(canonical_json(value).encode("utf-8"))
+
+
+def _manifest_node_count(value: Any) -> int:
+    if isinstance(value, dict):
+        return 1 + sum(1 + _manifest_node_count(item) for item in value.values())
+    if isinstance(value, list):
+        return 1 + sum(_manifest_node_count(item) for item in value)
+    return 1
+
+
+def _bounded_manifest_string(value: Any, *, path: str, limit: int = MAX_SLICE_TEXT_BYTES) -> str:
     if not isinstance(value, str):
-        return None
+        raise PlanArtifactError("field_type_invalid", path=path)
     normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if (
-        not normalized
-        or len(normalized.encode("utf-8", errors="replace")) > MAX_SLICE_TEXT_BYTES
-        or any(ord(character) < 32 and character not in {"\n", "\t"} for character in normalized)
-    ):
-        return None
+    if not normalized:
+        raise PlanArtifactError("field_empty", path=path)
+    if any(ord(character) < 32 and character not in {"\n", "\t"} for character in normalized):
+        raise PlanArtifactError("field_control_invalid", path=path)
+    actual = _manifest_json_bytes(normalized)
+    if actual > limit:
+        raise PlanArtifactError("field_too_large", path=path, actual=actual, limit=limit, unit="bytes")
     return normalized
 
 
-def _bounded_manifest_list(value: Any) -> list[str] | None:
-    if not isinstance(value, list) or not 1 <= len(value) <= MAX_SLICE_LIST_ITEMS:
-        return None
-    result = [_bounded_manifest_string(item) for item in value]
-    return [str(item) for item in result] if all(item is not None for item in result) else None
+def _bounded_manifest_list(value: Any, *, path: str, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        raise PlanArtifactError("field_type_invalid", path=path)
+    if not value:
+        raise PlanArtifactError("field_empty", path=path)
+    typed = [_bounded_manifest_string(item, path=f"{path}[{index}]", limit=limit) for index, item in enumerate(value)]
+    actual = _manifest_json_bytes(typed)
+    if actual > limit:
+        raise PlanArtifactError("field_too_large", path=path, actual=actual, limit=limit, unit="bytes")
+    return typed
 
 
 def _strict_json_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -334,47 +482,61 @@ EXECUTION_SLICE_FIELDS = (
 def parse_execution_slice_manifest(plan_body: str) -> dict[str, Any]:
     """Strictly parse the single machine-readable execution-slice block."""
     normalized = str(plan_body or "").replace("\r\n", "\n").replace("\r", "\n")
-    intents = EXECUTION_SLICES_FENCE_INTENT_RE.findall(normalized)
-    matches = EXECUTION_SLICES_FENCE_RE.findall(normalized)
-    if len(intents) != 1 or len(matches) != 1:
-        raise PlanArtifactError("execution_slices_invalid")
+    intents = list(EXECUTION_SLICES_FENCE_INTENT_RE.finditer(normalized))
+    matches = list(EXECUTION_SLICES_FENCE_RE.finditer(normalized))
+    if not intents:
+        raise PlanArtifactError("manifest_fence_missing", path="manifest")
+    if len(intents) != 1:
+        raise PlanArtifactError("manifest_fence_ambiguous", path="manifest", actual=len(intents), limit=1, unit="items")
+    if len(matches) != 1:
+        raise PlanArtifactError("manifest_fence_not_tail", path="manifest")
     try:
-        decoded = json.loads(matches[0], object_pairs_hook=_strict_json_object_pairs)
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise PlanArtifactError("execution_slices_invalid") from error
-    if not isinstance(decoded, dict) or set(decoded) != {"version", "global_constraints", "slices"}:
-        raise PlanArtifactError("execution_slices_invalid")
+        decoded = json.loads(matches[0].group(1), object_pairs_hook=_strict_json_object_pairs)
+    except ValueError as error:
+        code = "manifest_duplicate_key" if "duplicate JSON key" in str(error) else "manifest_json_invalid"
+        raise PlanArtifactError(code, path="manifest") from error
+    except (TypeError, json.JSONDecodeError) as error:
+        raise PlanArtifactError("manifest_json_invalid", path="manifest") from error
+    if not isinstance(decoded, dict):
+        raise PlanArtifactError("manifest_root_type_invalid", path="manifest")
+    if set(decoded) != {"version", "global_constraints", "slices"}:
+        raise PlanArtifactError("manifest_root_shape_invalid", path="manifest")
     if decoded.get("version") != EXECUTION_SLICE_SCHEMA:
-        raise PlanArtifactError("execution_slices_invalid")
-    global_constraints = _bounded_manifest_list(decoded.get("global_constraints"))
+        raise PlanArtifactError("manifest_version_invalid", path="version")
+    global_constraints = _bounded_manifest_list(decoded.get("global_constraints"), path="global_constraints", limit=MAX_GLOBAL_CONSTRAINTS_BYTES)
     raw_slices = decoded.get("slices")
-    if (
-        global_constraints is None
-        or not isinstance(raw_slices, list)
-        or not 1 <= len(raw_slices) <= MAX_EXECUTION_SLICES
-    ):
-        raise PlanArtifactError("execution_slices_invalid")
+    if not isinstance(raw_slices, list) or not raw_slices:
+        raise PlanArtifactError("slice_count_invalid", path="slices", actual=len(raw_slices) if isinstance(raw_slices, list) else None, limit=1, unit="items")
     canonical_slices: list[dict[str, Any]] = []
     expected_keys = {"id", *EXECUTION_SLICE_FIELDS}
     for index, raw in enumerate(raw_slices, start=1):
         expected_id = f"s{index:02d}"
-        if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("id") != expected_id:
-            raise PlanArtifactError("execution_slices_invalid")
-        title = _bounded_manifest_string(raw.get("title"))
-        if title is None:
-            raise PlanArtifactError("execution_slices_invalid")
+        if not isinstance(raw, dict) or set(raw) != expected_keys:
+            raise PlanArtifactError("slice_shape_invalid", path=f"slices[{index}]")
+        if raw.get("id") != expected_id:
+            raise PlanArtifactError("slice_id_invalid", path=f"slices[{index}].id", actual=index + 1, unit="items")
+        title = _bounded_manifest_string(raw.get("title"), path=f"slices[{index}].title", limit=MAX_SLICE_TITLE_BYTES)
         item: dict[str, Any] = {"id": expected_id, "title": title}
+        field_limits = {"scope": MAX_SLICE_SCOPE_BYTES, "acceptance": MAX_SLICE_ACCEPTANCE_BYTES,
+                        "rollback": MAX_SLICE_SMALL_LIST_BYTES, "stop_conditions": MAX_SLICE_SMALL_LIST_BYTES,
+                        "expected_artifacts": MAX_SLICE_SMALL_LIST_BYTES}
         for field in EXECUTION_SLICE_FIELDS[1:]:
-            values = _bounded_manifest_list(raw.get(field))
-            if values is None:
-                raise PlanArtifactError("execution_slices_invalid")
+            values = _bounded_manifest_list(raw.get(field), path=f"slices[{index}].{field}", limit=field_limits[field])
             item[field] = values
+        if _manifest_json_bytes(item) > MAX_SLICE_BYTES:
+            raise PlanArtifactError("field_too_large", path=f"slices[{index}]", actual=_manifest_json_bytes(item), limit=MAX_SLICE_BYTES, unit="bytes")
         canonical_slices.append(item)
     canonical_manifest = {
         "global_constraints": global_constraints,
         "slices": canonical_slices,
         "version": EXECUTION_SLICE_SCHEMA,
     }
+    manifest_bytes = _manifest_json_bytes(canonical_manifest)
+    if manifest_bytes > MAX_EXECUTION_MANIFEST_BYTES:
+        raise PlanArtifactError("manifest_too_large", path="manifest", actual=manifest_bytes, limit=MAX_EXECUTION_MANIFEST_BYTES, unit="bytes")
+    manifest_nodes = _manifest_node_count(canonical_manifest)
+    if manifest_nodes > MAX_EXECUTION_MANIFEST_NODES:
+        raise PlanArtifactError("manifest_too_many_nodes", path="manifest", actual=manifest_nodes, limit=MAX_EXECUTION_MANIFEST_NODES, unit="nodes")
     manifest_digest = stable_hash(
         "workflow-manager-execution-slices-v1\0" + canonical_json(canonical_manifest),
         32,
@@ -392,6 +554,8 @@ def parse_execution_slice_manifest(plan_body: str) -> dict[str, Any]:
             {
                 **item,
                 "slice_digest": slice_digest,
+                "checklist_digest": stable_hash("workflow-manager-slice-checklist-v1\0" + canonical_json(item["acceptance"]), 32),
+                "required_count": len(item["acceptance"]),
                 "status": "pending",
                 "completion_digest": None,
                 "review_digest": None,
@@ -413,6 +577,57 @@ def parse_execution_slice_manifest(plan_body: str) -> dict[str, Any]:
         ),
         "items": items,
     }
+
+
+def execution_slice_manifest_for_plan(plan_body: str) -> dict[str, Any]:
+    """Use an optional structured manifest, otherwise one native plan slice.
+
+    Current Codex models already own planning and decomposition. The plugin
+    therefore treats the dedicated JSON fence as an optional projection, not a
+    second plan-quality gate. A plain native plan is bound as one logical slice
+    while its complete body remains authoritative in the private journal.
+    """
+    try:
+        return parse_execution_slice_manifest(plan_body)
+    except PlanArtifactError:
+        # Absence means native planning. Explicit malformed manifest intent is
+        # contradictory data and must not be silently reinterpreted.
+        if EXECUTION_SLICES_FENCE_INTENT_RE.search(str(plan_body or "")):
+            raise
+        plan_reference = stable_hash(str(plan_body or ""), 16)
+        implicit = {
+            "version": EXECUTION_SLICE_SCHEMA,
+            "global_constraints": [
+                "Follow the confirmed objective, explicit acceptance, risk category, and irreversible-action boundary."
+            ],
+            "slices": [
+                {
+                    "id": "s01",
+                    "title": "Execute and verify the confirmed native plan",
+                    "scope": [
+                        f"Use private canonical plan revision {plan_reference} as the complete execution scope."
+                    ],
+                    "acceptance": [
+                        "Satisfy the explicit acceptance in the authorization envelope and canonical plan."
+                    ],
+                    "rollback": [
+                        "Use the reversible rollback appropriate to the confirmed plan and current evidence."
+                    ],
+                    "stop_conditions": [
+                        "Stop for an authorization-boundary change, an irreversible action not already authorized, or failed strong acceptance."
+                    ],
+                    "expected_artifacts": [
+                        "The artifacts and verification evidence required by the confirmed native plan."
+                    ],
+                }
+            ],
+        }
+        projected = (
+            "```workflow-manager-execution-slices\n"
+            + canonical_json(implicit)
+            + "\n```\n"
+        )
+        return parse_execution_slice_manifest(projected)
 
 
 def normalize_execution_slice_manifest_fence(plan_body: str) -> str:
@@ -463,7 +678,7 @@ def _safe_execution_slices(value: Any) -> dict[str, Any]:
         or not manifest_digest
         or not global_digest
         or not isinstance(raw_items, list)
-        or not 1 <= count == len(raw_items) <= MAX_EXECUTION_SLICES
+        or count < 1 or count != len(raw_items)
         or not 1 <= current_index <= count + 1
         or not completed_chain
     ):
@@ -473,7 +688,9 @@ def _safe_execution_slices(value: Any) -> dict[str, Any]:
         if not isinstance(raw, dict) or raw.get("id") != f"s{index:02d}":
             return empty
         slice_digest = _fingerprint32(raw.get("slice_digest"))
-        if not slice_digest:
+        checklist_digest = _fingerprint32(raw.get("checklist_digest"))
+        required_count = safe_int(raw.get("required_count"))
+        if not slice_digest or (checklist_digest is not None and required_count < 1):
             return empty
         status = raw.get("status") if raw.get("status") in {"pending", "passed"} else "pending"
         completion = _fingerprint32(raw.get("completion_digest"))
@@ -491,6 +708,8 @@ def _safe_execution_slices(value: Any) -> dict[str, Any]:
             {
                 "id": raw["id"],
                 "slice_digest": slice_digest,
+                "checklist_digest": checklist_digest,
+                "required_count": required_count if checklist_digest else 0,
                 "status": status,
                 "completion_digest": completion if status == "passed" else None,
                 "review_digest": review if status == "passed" else None,
@@ -545,6 +764,8 @@ def persisted_execution_slices(parsed: dict[str, Any], plan_digest: str) -> dict
             {
                 "id": item["id"],
                 "slice_digest": item["slice_digest"],
+                "checklist_digest": item["checklist_digest"],
+                "required_count": item["required_count"],
                 "status": "pending",
                 "completion_digest": None,
                 "review_digest": None,
@@ -681,12 +902,12 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
         and safe_int(slices.get("count")) > 0
     ):
         return None
-    preference = safe_session_execution_preference(
-        state.get("session_execution_preference")
-    )
     profile_version = safe_label(
         state.get("execution_profile_version") or EXECUTION_PROFILE_VERSION,
         16,
+    )
+    preference = safe_session_execution_preference(
+        state.get("session_execution_preference")
     )
     material = (
         f"{profile_version}\0{preference}\0{objective}\0{difficulty}"
@@ -822,6 +1043,8 @@ def _empty_executor_review() -> dict[str, Any]:
         "candidate_result_fingerprint": None,
         "candidate_agent_fingerprint": None,
         "candidate_evidence_digest": None,
+        "child_summary_digest": None,
+        "parent_summary_digest": None,
         "review_evidence_digest": None,
         "digest_profile": None,
         "digest_source": None,
@@ -850,15 +1073,9 @@ def _safe_executor_review(item: Any) -> dict[str, Any]:
             "execution_contract_id": (
                 fp32(item.get("execution_contract_id"))
             ),
-            "slice_id": (
-                safe_label(item.get("slice_id"), 3)
-                if re.fullmatch(r"s(?:0[1-9]|[12][0-9]|3[0-2])", str(item.get("slice_id") or ""))
-                else None
-            ),
+            "slice_id": safe_slice_id(item.get("slice_id")),
             "slice_contract_id": fp32(item.get("slice_contract_id")),
-            "attempt": min(
-                max(safe_int(item.get("attempt")), 0), MAX_EXECUTOR_ATTEMPTS
-            ),
+            "attempt": safe_sequence(item.get("attempt")),
             "candidate_result_fingerprint": (
                 fp32(item.get("candidate_result_fingerprint"))
             ),
@@ -868,6 +1085,8 @@ def _safe_executor_review(item: Any) -> dict[str, Any]:
             "candidate_evidence_digest": (
                 fp32(item.get("candidate_evidence_digest"))
             ),
+            "child_summary_digest": fp32(item.get("child_summary_digest")),
+            "parent_summary_digest": fp32(item.get("parent_summary_digest")),
             "review_evidence_digest": (
                 fp32(item.get("review_evidence_digest"))
             ),
@@ -991,13 +1210,15 @@ def _legacy_candidate_executor_review(
 
 def reset_executor_binding(state: dict[str, Any], *, preserve_failure: bool = False) -> None:
     failure = state.get("executor_failure_kind") if preserve_failure else None
-    attempt = safe_int(state.get("executor_attempt")) if preserve_failure else 0
+    sequence = safe_sequence(state.get("executor_attempt"))
     state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
     state["executor_state"] = "recovery_required" if failure else "none"
     state["execution_contract_id"] = None
     state["executor_agent_id"] = None
-    state["executor_attempt"] = min(max(attempt, 0), MAX_EXECUTOR_ATTEMPTS)
+    state["executor_attempt"] = sequence
     state["executor_failure_kind"] = failure if failure in EXECUTOR_FAILURE_KINDS else None
+    state["pending_recovery_facts"] = None
+    state["pending_recovery_reservation"] = None
     state["executor_model"] = None
     state["executor_reasoning_effort"] = None
     state["executor_fork_turns"] = None
@@ -1025,32 +1246,1322 @@ def requested_assessor_reasoning_effort(state: dict[str, Any]) -> str:
 
 
 def highest_execution_model(state: dict[str, Any]) -> str | None:
-    """Resolve the bound same-tier request without claiming host availability."""
-    candidates = (
-        state.get("assessor_observed_model")
-        if state.get("assessor_observed_effective")
-        else None,
-        state.get("assessor_model"),
-        state.get("model"),
-    )
-    for candidate in candidates:
-        model = safe_label(candidate, 80) if candidate else ""
-        if model and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
-            return model
-    return None
+    """Return only the model proved by the original assessor lifecycle."""
+    lifecycle, _ = original_assessor_lifecycle(state)
+    return str(lifecycle.get("model") or "") or None
 
 
 def highest_execution_effort(state: dict[str, Any]) -> str | None:
-    effort = str(state.get("assessor_reasoning_effort") or "").lower()
+    lifecycle, _ = original_assessor_lifecycle(state)
+    effort = str(lifecycle.get("reasoning_effort") or "").lower()
     return effort if effort in {"high", "xhigh", "max", "ultra"} else None
 
 
-def confirmed_executor_model_profile(state: dict[str, Any]) -> str:
-    if safe_session_execution_preference(
+def original_assessor_lifecycle(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Resolve the one request/PostToolUse/full-Start assessor lifecycle.
+
+    Flat fields are cross-checks only.  They never manufacture a missing
+    request, host acceptance, or Start observation.
+    """
+    binding = _fingerprint32(state.get("assessor_binding_id"))
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    attempt = safe_sequence(state.get("assessor_attempt"))
+    if not binding or not objective or attempt <= 0:
+        return {}, "start_mismatch"
+    records = [item for item in as_list(state.get("subagents")) if isinstance(item, dict)]
+    requests = [
+        item
+        for item in records
+        if item.get("event") == "request"
+        and item.get("role") == "high_assessor"
+        and item.get("requested") is True
+        and not item.get("agent_id")
+        and item.get("contract_id") == binding
+        and item.get("objective_fingerprint") == objective
+        and safe_sequence(item.get("attempt")) == attempt
+    ]
+    if len(requests) != 1:
+        return {}, "start_mismatch"
+    request = requests[0]
+    if (
+        request.get("host_acceptance_conflict")
+        or (
+            request.get("host_acceptance_fingerprint")
+            and request.get("host_acceptance_fingerprint")
+            != request.get("request_fingerprint")
+        )
+    ):
+        return {}, "start_mismatch"
+    if (
+        request.get("host_acceptance_source") != "PostToolUse"
+        or request.get("host_accepted") is not True
+        or request.get("host_acceptance_status") not in SUCCESS_STATUSES | {"running"}
+        or not request.get("host_acceptance_fingerprint")
+        or not _fingerprint32(request.get("host_acceptance_receipt_digest"))
+    ):
+        return {}, "model_unavailable"
+    starts = [
+        item
+        for item in records
+        if item.get("event") == "start"
+        and item.get("role") == "high_assessor"
+        and item.get("requested") is True
+        and item.get("contract_id") == binding
+        and item.get("objective_fingerprint") == objective
+        and safe_sequence(item.get("attempt")) == attempt
+    ]
+    if len(starts) != 1:
+        return {}, "start_mismatch"
+    started = starts[0]
+    model = safe_label(request.get("model"), 80)
+    effort = safe_label(request.get("reasoning_effort"), 24).lower()
+    fork = str(request.get("fork_turns") or "")
+    flat_matches = bool(
+        state.get("assessor_binding_id") == binding
+        and state.get("objective", {}).get("fingerprint") == objective
+        and safe_sequence(state.get("assessor_attempt")) == attempt
+        and state.get("assessor_model") == model
+        and str(state.get("assessor_reasoning_effort") or "").lower() == effort
+        and str(state.get("assessor_fork_turns") or "") == fork
+        and state.get("assessor_observed_effective") is True
+        and state.get("assessor_start_observed") == "full"
+        and state.get("assessor_observed_model") == model
+        and str(state.get("assessor_observed_reasoning_effort") or "").lower()
+        == effort
+    )
+    start_matches = bool(
+        started.get("start_observed") == "full"
+        and started.get("host_accepted") is True
+        and started.get("request_fingerprint") == request.get("request_fingerprint")
+        and started.get("model") == model
+        and str(started.get("reasoning_effort") or "").lower() == effort
+        and str(started.get("fork_turns") or "") == fork == "1"
+        and started.get("agent_id")
+        and started.get("observation_source")
+        and (
+            not state.get("assessor_agent_id")
+            or state.get("assessor_agent_id") == started.get("agent_id")
+        )
+    )
+    if (
+        not flat_matches
+        or not start_matches
+        or not model
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model)
+        or effort not in {"high", "xhigh", "max", "ultra"}
+    ):
+        return {}, "start_mismatch"
+    return {
+        "binding_id": binding,
+        "objective_fingerprint": objective,
+        "attempt": attempt,
+        "model": model,
+        "reasoning_effort": effort,
+        "fork_turns": fork,
+        "request_fingerprint": request.get("request_fingerprint"),
+        "agent_id": started.get("agent_id"),
+    }, None
+
+
+def original_assessor_result_receipt(state: dict[str, Any]) -> str | None:
+    """Resolve one terminal, nonempty result for the proven assessor lifecycle.
+
+    This receipt contains only bounded metadata already persisted by the Hook.
+    It can restore parent plan composition after a format-only assessor failure,
+    but it cannot authorize execution without a verified canonical manifest.
+    """
+    lifecycle, error = original_assessor_lifecycle(state)
+    if error:
+        return None
+    stops = [
+        item
+        for item in as_list(state.get("subagents"))
+        if isinstance(item, dict)
+        and item.get("event") == "stop"
+        and item.get("role") == "high_assessor"
+        and item.get("agent_id") == lifecycle.get("agent_id")
+        and item.get("contract_id") == lifecycle.get("binding_id")
+        and item.get("objective_fingerprint")
+        == lifecycle.get("objective_fingerprint")
+        and safe_sequence(item.get("attempt")) == lifecycle.get("attempt")
+        and item.get("model") == lifecycle.get("model")
+        and str(item.get("reasoning_effort") or "").lower()
+        == lifecycle.get("reasoning_effort")
+        and str(item.get("fork_turns") or "") == lifecycle.get("fork_turns")
+    ]
+    if len(stops) != 1:
+        return None
+    stopped = stops[0]
+    result_meta = safe_metadata(stopped.get("result_meta"))
+    result_fingerprint = safe_fingerprint(result_meta.get("fingerprint"))
+    result_length = safe_int(result_meta.get("length"))
+    if (
+        stopped.get("stale")
+        or stopped.get("status") not in {"completed", "unknown"}
+        or not result_fingerprint
+        or result_length <= 0
+        or result_length > MAX_PLAN_REVISION_BYTES
+    ):
+        return None
+    return stable_hash(
+        "workflow-manager-native-assessor-stop-receipt-v1\0"
+        + canonical_json(
+            {
+                "agent": stable_hash(str(lifecycle.get("agent_id")), 32),
+                "attempt": lifecycle.get("attempt"),
+                "binding": lifecycle.get("binding_id"),
+                "objective": lifecycle.get("objective_fingerprint"),
+                "result_fingerprint": result_fingerprint,
+                "result_length": result_length,
+            }
+        ),
+        32,
+    )
+
+
+def restore_native_executor_review_candidate(
+    state: dict[str, Any], payload: dict[str, Any] | None = None
+) -> bool:
+    """Repair a format-only incomplete result from persisted host evidence."""
+    if (
+        state.get("plan_state") != "confirmed"
+        or state.get("executor_state") != "recovery_required"
+        or state.get("executor_failure_kind") != "incomplete_execution"
+        or state.get("execution_contract_id") != execution_contract_id(state)
+    ):
+        return False
+    if payload and payload.get("session_id"):
+        # Resolve the exact current child rollout by its persisted Start
+        # identity and validate its parent-session metadata. This lets a hot
+        # update repair current Desktop's compact `{}` patch receipts without
+        # persisting a transcript path or trusting child prose.
+        reconcile_current_executor_rollout_on_resume(payload, state)
+    item = current_execution_slice(state) or {}
+    evidence = slice_operation_evidence(state)
+    if not evidence.get("verification_evidence"):
+        return False
+    stops = [
+        record
+        for record in as_list(state.get("subagents"))
+        if isinstance(record, dict)
+        and record.get("event") == "stop"
+        and record.get("role") == "confirmed_executor"
+        and record.get("contract_id") == state.get("execution_contract_id")
+        and record.get("slice_id") == item.get("id")
+        and record.get("slice_contract_id") == slice_contract_id(state)
+        and safe_sequence(record.get("attempt"))
+        == safe_sequence(state.get("executor_attempt"))
+        and record.get("execution_result_contract_match") is True
+        and record.get("execution_result_outcome") == "succeeded"
+        and _fingerprint32(record.get("execution_result_evidence_digest"))
+    ]
+    if len(stops) != 1:
+        return False
+    stopped = stops[0]
+    result_meta = safe_metadata(stopped.get("result_meta"))
+    result_fingerprint = safe_fingerprint(result_meta.get("fingerprint"))
+    if not result_fingerprint or not stopped.get("agent_id"):
+        return False
+    child_summary = _acceptance_summary_digest("", state)
+    if not child_summary:
+        return False
+    state["executor_state"] = "verification_required"
+    state["executor_agent_id"] = None
+    state["executor_failure_kind"] = None
+    state["executor_review"] = _safe_executor_review(
+        {
+            "status": "review_required",
+            "execution_contract_id": state.get("execution_contract_id"),
+            "slice_id": item.get("id"),
+            "slice_contract_id": slice_contract_id(state),
+            "attempt": state.get("executor_attempt"),
+            "candidate_result_fingerprint": stable_hash(
+                "workflow-manager-persisted-result-v1\0" + result_fingerprint,
+                32,
+            ),
+            "candidate_agent_fingerprint": stable_hash(
+                str(stopped.get("agent_id")), 32
+            ),
+            "candidate_evidence_digest": stopped.get(
+                "execution_result_evidence_digest"
+            ),
+            "child_summary_digest": child_summary,
+            "review_evidence_digest": None,
+            "digest_profile": EVIDENCE_DIGEST_PROFILE,
+            "digest_source": EVIDENCE_DIGEST_SOURCE,
+            "terminal_status": stopped.get("terminal_status"),
+            "terminal_status_source": stopped.get("terminal_status_source"),
+            "at": utc_now(),
+        }
+    )
+    baseline = _safe_execution_baseline(
+        state.get("last_execution_baseline")
+    ) or build_execution_baseline(state)
+    if baseline:
+        baseline["acceptance_status"] = "incomplete"
+        state["last_execution_baseline"] = baseline
+    state["model_profile"] = "work_assessment"
+    return True
+
+
+def executor_is_typed_recovery(
+    state: dict[str, Any], request: dict[str, Any] | None = None
+) -> bool:
+    if isinstance(request, dict):
+        # A persisted request is the sequence authority.  Do not let the
+        # temporary fail-closed state created by a Start-before-Post ordering
+        # retroactively turn a normal lower-tier request into typed recovery.
+        return request.get("recovery_from") in EXECUTOR_FAILURE_KINDS
+    return bool(
+        state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
+        and state.get("executor_state")
+        in {"recovery_required", "spawn_pending", "running"}
+        and safe_sequence(state.get("executor_attempt")) > 0
+    )
+
+
+def expected_executor_profile(
+    state: dict[str, Any], request: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    preference = safe_session_execution_preference(
         state.get("session_execution_preference")
-    ) == "highest_throughout":
-        return "work_executor_highest_available"
-    return "work_executor_low_latest"
+    )
+    if preference == "highest_throughout":
+        lifecycle, error = original_assessor_lifecycle(state)
+        return {
+            "profile": "work_executor_highest_available",
+            "model": lifecycle.get("model"),
+            "reasoning_effort": HIGHEST_SESSION_REASONING_EFFORT,
+            "error": error,
+        }
+    if executor_is_typed_recovery(state, request):
+        _, error = original_assessor_lifecycle(state)
+        return {
+            "profile": "work_executor_highest_available",
+            "model": RECOVERY_EXECUTOR_MODEL,
+            "reasoning_effort": RECOVERY_EXECUTOR_REASONING_EFFORT,
+            "error": error,
+        }
+    return {
+        "profile": "work_executor_low_latest",
+        "model": None,
+        "reasoning_effort": "medium",
+        "error": None,
+    }
+
+
+def _restore_mapping_values(target: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    for key, value in snapshot.items():
+        target[key] = value
+
+
+def verified_current_execution_handoff(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> tuple[str | None, str | None, str | None]:
+    """Read and bind the current slice from the trusted private journal."""
+    try:
+        candidate_body = _read_verified_current_plan_revision(state, payload)
+        candidate_digest = stable_hash(candidate_body, 32)
+        artifact = _safe_plan_artifact(state.get("plan_artifact"))
+        if candidate_digest != artifact.get("current_revision_digest"):
+            raise PlanArtifactError("content_drift")
+        parsed_slices = execution_slice_manifest_for_plan(candidate_body)
+        persisted_slices = _safe_execution_slices(state.get("execution_slices"))
+        current_slice = current_execution_slice(state)
+        current_index = safe_int(persisted_slices.get("current_index"))
+        if (
+            parsed_slices.get("manifest_digest")
+            != persisted_slices.get("manifest_digest")
+            or parsed_slices.get("global_constraints_digest")
+            != persisted_slices.get("global_constraints_digest")
+            or not current_slice
+            or current_index <= 0
+            or current_index > len(parsed_slices.get("items", []))
+            or parsed_slices["items"][current_index - 1]["slice_digest"]
+            != current_slice.get("slice_digest")
+        ):
+            raise PlanArtifactError("content_drift")
+        contract_id = _fingerprint32(state.get("execution_contract_id"))
+        objective = safe_fingerprint(
+            state.get("objective", {}).get("fingerprint")
+        )
+        plan_digest = _fingerprint32(state.get("plan_digest"))
+        current_slice_id = parsed_slices["items"][current_index - 1]["id"]
+        if not contract_id or not objective or not plan_digest:
+            raise PlanArtifactError("content_drift")
+        handoff = {
+            "execution_contract_id": contract_id,
+            "objective_fingerprint": objective,
+            "plan_digest": plan_digest,
+            "plan_generation": safe_int(state.get("plan_generation")),
+            "slice_contract_id": slice_contract_id(state),
+        }
+        if EXECUTION_SLICES_FENCE_INTENT_RE.search(candidate_body):
+            handoff["global_constraints"] = parsed_slices["global_constraints"]
+            handoff["slice"] = {
+                key: parsed_slices["items"][current_index - 1][key]
+                for key in ("id", *EXECUTION_SLICE_FIELDS)
+            }
+        else:
+            handoff["slice_id"] = current_slice_id
+            handoff["canonical_plan"] = candidate_body
+        body = canonical_json(handoff) + "\n"
+        return body, candidate_digest, None
+    except PlanArtifactError as error:
+        return None, None, error.code
+    except OSError:
+        return None, None, "write_error"
+
+
+def reconcile_post_accepted_bound_start(
+    state: dict[str, Any], request: dict[str, Any], payload: dict[str, Any]
+) -> bool:
+    """Bind an exact full Start when its Post receipt becomes authoritative.
+
+    Hosts normally deliver PostToolUse before SubagentStart, but the two event
+    streams are not ordered by the Hook contract.  A Start observed while host
+    acceptance is missing remains fail-closed.  A read-only assessor can be
+    rebound after the matching receipt.  An executor can be rebound only when
+    its Start delivered a digest-bound canonical slice under mutation lock and
+    the same private journal is reverified inside this Post transition.
+    """
+    if (
+        not isinstance(request, dict)
+        or request.get("host_acceptance_source") != "PostToolUse"
+        or request.get("host_accepted") is not True
+        or request.get("host_acceptance_status") not in SUCCESS_STATUSES | {"running"}
+        or request.get("host_acceptance_fingerprint")
+        != request.get("request_fingerprint")
+    ):
+        return False
+    role = request.get("role")
+    if role not in {"high_assessor", "confirmed_executor"}:
+        return False
+    records = [item for item in as_list(state.get("subagents")) if isinstance(item, dict)]
+    matching_requests = [
+        item
+        for item in records
+        if item.get("event") == "request"
+        and item.get("role") == role
+        and item.get("request_fingerprint") == request.get("request_fingerprint")
+    ]
+    matching_starts = [
+        item
+        for item in records
+        if item.get("event") == "start"
+        and item.get("role") == role
+        and item.get("request_fingerprint") == request.get("request_fingerprint")
+    ]
+    if len(matching_requests) != 1 or matching_requests[0] is not request or len(matching_starts) != 1:
+        return False
+    started = matching_starts[0]
+    agent_id = safe_label(started.get("agent_id"), 120)
+    if (
+        not agent_id
+        or started.get("start_observed") != "full"
+        or not started.get("observation_source")
+        or any(
+            item.get("event") == "stop" and item.get("agent_id") == agent_id
+            for item in records
+        )
+    ):
+        return False
+
+    if role == "high_assessor":
+        if (
+            state.get("assessor_state") not in {"spawn_pending", "recovery_required"}
+            or state.get("assessor_failure_kind") not in {None, "model_unavailable"}
+            or state.get("assessor_agent_id") is not None
+            or state.get("assessor_observed_effective") is not False
+            or state.get("assessor_observed_model") != started.get("model")
+            or str(state.get("assessor_observed_reasoning_effort") or "").lower()
+            != str(started.get("reasoning_effort") or "").lower()
+            or state.get("assessor_start_observed") != started.get("start_observed")
+            or state.get("assessor_observation_source")
+            != started.get("observation_source")
+        ):
+            return False
+        flat_keys = (
+            "assessor_agent_id",
+            "assessor_observed_model",
+            "assessor_observed_reasoning_effort",
+            "assessor_start_observed",
+            "assessor_observation_source",
+            "assessor_observed_effective",
+            "assessor_state",
+            "assessor_failure_kind",
+            "assessment_liveness",
+        )
+        flat_before = {key: state.get(key) for key in flat_keys}
+        start_before = started.get("host_accepted")
+        started["host_accepted"] = True
+        state["assessor_agent_id"] = agent_id
+        state["assessor_observed_effective"] = True
+        lifecycle, error = original_assessor_lifecycle(state)
+        if error or lifecycle.get("agent_id") != agent_id:
+            started["host_accepted"] = start_before
+            _restore_mapping_values(state, flat_before)
+            return False
+        now = _liveness_now()
+        state["assessor_state"] = "running"
+        state["assessor_failure_kind"] = None
+        state["assessment_liveness"] = {
+            "binding_id": state.get("assessor_binding_id"),
+            "agent_id": agent_id,
+            "attempt": safe_sequence(state.get("assessor_attempt")),
+            "progress_digest": None,
+            "last_progress_at": now,
+            "last_observed_at": now,
+            "unblock": "none",
+            "unblock_at": None,
+            "recovery_from": None,
+        }
+        return True
+    if (
+        state.get("executor_state") != "recovery_required"
+        or state.get("executor_failure_kind") != "model_unavailable"
+        or state.get("executor_agent_id") is not None
+        or state.get("executor_observed_effective") is not False
+        or state.get("plan_state") != "confirmed"
+        or state.get("confirmed_plan_digest") != state.get("plan_digest")
+    ):
+        return False
+    handoff_body, handoff_digest, handoff_error = verified_current_execution_handoff(
+        state, payload
+    )
+    if (
+        handoff_error
+        or handoff_body is None
+        or handoff_digest != state.get("plan_digest")
+        or started.get("plan_handoff_digest") != handoff_digest
+        or started.get("plan_handoff_delivered") is not True
+        or started.get("plan_handoff_delivery_digest")
+        != stable_hash(handoff_body, 32)
+    ):
+        state["executor_failure_kind"] = "stale_contract"
+        return False
+    current_slice = current_execution_slice(state) or {}
+    profile = expected_executor_profile(state, request)
+    expected_effort = str(profile.get("reasoning_effort") or "").lower()
+    expected_model = safe_label(profile.get("model"), 80) if profile.get("model") else None
+    highest_profile = profile.get("profile") == "work_executor_highest_available"
+    exact = bool(
+        not profile.get("error")
+        and request.get("contract_id") == state.get("execution_contract_id")
+        and request.get("contract_id") == execution_contract_id(state)
+        and request.get("objective_fingerprint")
+        == state.get("objective", {}).get("fingerprint")
+        and request.get("slice_id") == current_slice.get("id")
+        and request.get("slice_contract_id") == slice_contract_id(state)
+        and safe_sequence(request.get("attempt"))
+        == safe_sequence(state.get("executor_attempt"))
+        and request.get("model") == state.get("executor_model")
+        and str(request.get("reasoning_effort") or "").lower() == expected_effort
+        and str(state.get("executor_reasoning_effort") or "").lower()
+        == expected_effort
+        and str(request.get("fork_turns") or "")
+        == str(state.get("executor_fork_turns") or "")
+        == "1"
+        and (not highest_profile or request.get("model") == expected_model)
+        and started.get("contract_id") == request.get("contract_id")
+        and started.get("objective_fingerprint") == request.get("objective_fingerprint")
+        and started.get("slice_id") == request.get("slice_id")
+        and started.get("slice_contract_id") == request.get("slice_contract_id")
+        and safe_sequence(started.get("attempt")) == safe_sequence(request.get("attempt"))
+        and started.get("task_name") == request.get("task_name")
+        and started.get("model") == request.get("model")
+        and str(started.get("reasoning_effort") or "").lower() == expected_effort
+        and str(started.get("fork_turns") or "") == "1"
+        and state.get("executor_observed_model") == started.get("model")
+        and str(state.get("executor_observed_reasoning_effort") or "").lower()
+        == expected_effort
+        and state.get("executor_start_observed") == "full"
+        and state.get("executor_observation_source") == started.get("observation_source")
+    )
+    other_live_writer = any(
+        group.get("state") == "live"
+        and group.get("agent_id") != agent_id
+        and isinstance(group.get("request"), dict)
+        and group["request"].get("role") == "confirmed_executor"
+        for group in subagent_lifecycle_groups(state)
+    )
+    if not exact or other_live_writer:
+        state["executor_failure_kind"] = "start_mismatch"
+        return False
+    started["host_accepted"] = True
+    state["executor_observed_effective"] = True
+    state["executor_state"] = "running"
+    state["executor_agent_id"] = agent_id
+    state["executor_failure_kind"] = None
+    return True
+
+
+def confirmed_executor_model_profile(state: dict[str, Any]) -> str:
+    return str(expected_executor_profile(state).get("profile"))
+
+
+def incomplete_execution_highest_recovery(state: dict[str, Any]) -> bool:
+    """Compatibility alias retained for callers; evidence is lifecycle-derived."""
+    return executor_is_typed_recovery(state)
+
+
+def _safe_authorization_scope(value: Any) -> dict[str, str | None]:
+    value = value if isinstance(value, dict) else {}
+    return {
+        key: _fingerprint32(value.get(key))
+        for key in (
+            "acceptance_digest",
+            "risk_category_digest",
+            "irreversible_action_digest",
+        )
+    }
+
+
+def _explicit_clause_digest(prompt: str, markers: tuple[str, ...], domain: str) -> str | None:
+    normalized = str(prompt or "").replace("\r\n", "\n").replace("\r", "\n")
+    clauses = [
+        re.sub(r"\s+", " ", clause).strip().lower()
+        for clause in re.split(r"[\n。；;]+", normalized[:65_536])
+        if clause.strip() and any(marker in clause.lower() for marker in markers)
+    ]
+    return (
+        stable_hash(f"workflow-manager-{domain}-v1\0" + canonical_json(clauses), 32)
+        if clauses
+        else None
+    )
+
+
+def authorization_scope_from_prompt(
+    prompt: str, previous: Any = None
+) -> dict[str, str | None]:
+    """Hash normalized explicit acceptance/risk/action clauses; retain no prose."""
+    prior = _safe_authorization_scope(previous)
+    acceptance = _explicit_clause_digest(
+        prompt,
+        ("acceptance", "acceptance criteria", "verify", "verification", "test", "验收", "验证", "测试"),
+        "acceptance-scope",
+    )
+    risk = _explicit_clause_digest(
+        prompt,
+        ("risk", "production", "security", "privacy", "credential", "destructive", "风险", "生产", "安全", "隐私", "凭据", "破坏"),
+        "risk-category",
+    )
+    irreversible = _explicit_clause_digest(
+        prompt,
+        ("irreversible", "publish", "release", "push", "deploy", "delete", "erase", "purchase", "不可逆", "发布", "推送", "部署", "删除", "销毁", "购买"),
+        "irreversible-action",
+    )
+    return {
+        "acceptance_digest": acceptance or prior.get("acceptance_digest"),
+        "risk_category_digest": risk or prior.get("risk_category_digest"),
+        "irreversible_action_digest": irreversible
+        or prior.get("irreversible_action_digest"),
+    }
+
+
+def authorization_envelope_digest(state: dict[str, Any]) -> str | None:
+    """Digest-only confirmation scope; never persist plan/prompt prose."""
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    if not objective:
+        return None
+    scope = _safe_authorization_scope(state.get("authorization_scope"))
+    return stable_hash(
+        "workflow-manager-authorization-envelope-v2\0"
+        + canonical_json({"v": 2, "objective": objective, **scope}),
+        32,
+    )
+
+
+def pending_confirmation_receipt_for_state(state: dict[str, Any]) -> str | None:
+    session = safe_fingerprint(state.get("session_fingerprint"))
+    binding = _fingerprint32(state.get("assessor_binding_id"))
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    envelope = authorization_envelope_digest(state)
+    if not session or not binding or not objective or not envelope:
+        return None
+    return stable_hash(
+        "workflow-manager-host-bound-pending-confirmation-v1\0"
+        + canonical_json(
+            {
+                "assessor_binding_id": binding,
+                "authorization_envelope": envelope,
+                "objective_fingerprint": objective,
+                "session_fingerprint": session,
+            }
+        ),
+        32,
+    )
+
+
+def _safe_authorization_envelope(value: Any) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    digest = _fingerprint32(value.get("digest"))
+    receipt = _fingerprint32(value.get("strict_confirm_receipt"))
+    return {
+        "digest": digest,
+        "strict_confirm_receipt": receipt,
+        "confirmation_count": safe_sequence(value.get("confirmation_count")),
+    } if digest and receipt else {"digest": None, "strict_confirm_receipt": None, "confirmation_count": 0}
+
+
+def recovery_fingerprint(
+    state: dict[str, Any], failure_kind: str, evidence_digest: str | None = None
+) -> str | None:
+    """A privacy-safe identity for a failed executor boundary."""
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    item = current_execution_slice(state) or {}
+    evidence = _fingerprint32(evidence_digest)
+    if not contract or failure_kind not in EXECUTOR_FAILURE_KINDS:
+        return None
+    return stable_hash(
+        "workflow-manager-recovery-failure-v3\0"
+        + canonical_json(
+            {
+                "v": 3,
+                "contract": contract,
+                "evidence": evidence,
+                "slice": item.get("id"),
+                "failure": failure_kind,
+            }
+        ),
+        32,
+    )
+
+
+def _safe_recovery_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    failure = value.get("failure_kind")
+    fingerprint = _fingerprint32(value.get("failure_fingerprint"))
+    correction = _fingerprint32(value.get("correction_digest"))
+    sequence = safe_sequence(value.get("sequence"))
+    if failure not in EXECUTOR_FAILURE_KINDS or not fingerprint or not correction or sequence <= 0:
+        return None
+    return {
+        "sequence": sequence,
+        "failure_kind": failure,
+        "failure_fingerprint": fingerprint,
+        "evidence_digest": _fingerprint32(value.get("evidence_digest")),
+        "progress_digest": _fingerprint32(value.get("progress_digest")),
+        "root_cause_digest": _fingerprint32(value.get("root_cause_digest")),
+        "correction_digest": correction,
+        "review_digest": _fingerprint32(value.get("review_digest")),
+    }
+
+
+def _normalized_recovery_digest(value: Any, domain: str) -> str | None:
+    """Normalize a visible 32/64-hex fact without retaining host output."""
+    token = safe_fingerprint(value)
+    if not token or len(token) not in {32, 64}:
+        return None
+    return token if len(token) == 32 else stable_hash(f"{domain}\0{token}", 32)
+
+
+def _recovery_lifecycle_projection(
+    state: dict[str, Any], event: str, contract: str, attempt: int
+) -> dict[str, Any] | None:
+    """Project one bounded host lifecycle record without child prose."""
+    record = next(
+        (
+            item
+            for item in reversed(as_list(state.get("subagents")))
+            if isinstance(item, dict)
+            and item.get("event") == event
+            and item.get("role") == "confirmed_executor"
+            and item.get("contract_id") == contract
+            and safe_sequence(item.get("attempt")) == attempt
+        ),
+        None,
+    )
+    if not record:
+        return None
+    record = _safe_subagent(record) or record
+    projection = {
+        key: record.get(key)
+        for key in (
+            "attempt",
+            "contract_id",
+            "evidence_digest_profile",
+            "evidence_digest_source",
+            "execution_result_contract_match",
+            "execution_result_evidence_digest",
+            "execution_result_outcome",
+            "fork_turns",
+            "host_acceptance_fingerprint",
+            "host_acceptance_receipt_digest",
+            "host_acceptance_source",
+            "host_acceptance_status",
+            "host_accepted",
+            "model",
+            "objective_fingerprint",
+            "observation_source",
+            "plan_handoff_delivery_digest",
+            "plan_handoff_digest",
+            "plan_handoff_delivered",
+            "reasoning_effort",
+            "recovery_from",
+            "request_fingerprint",
+            "slice_contract_id",
+            "slice_id",
+            "start_observed",
+            "status",
+            "terminal_status",
+            "terminal_status_source",
+        )
+        if record.get(key) is not None
+    }
+    if record.get("agent_id"):
+        projection["agent_fingerprint"] = stable_hash(
+            safe_label(record.get("agent_id"), 120), 32
+        )
+    result_meta = safe_metadata(record.get("result_meta"))
+    if result_meta:
+        projection["result_meta"] = result_meta
+    return projection
+
+
+def executor_recovery_evidence_digest(
+    state: dict[str, Any], failure_kind: str
+) -> str | None:
+    """Derive one digest from host-owned lifecycle, operation, and review facts."""
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    item = current_execution_slice(state) or {}
+    slice_id = safe_slice_id(item.get("id"))
+    slice_contract = _fingerprint32(slice_contract_id(state))
+    attempt = safe_sequence(state.get("executor_attempt"))
+    if not all((contract, objective, slice_id, slice_contract, attempt > 0)):
+        return None
+    operations: list[dict[str, Any]] = []
+    for operation in as_list(state.get("operations")):
+        safe_operation = _safe_operation(operation)
+        if not safe_operation or not (
+            safe_operation.get("execution_contract_id") == contract
+            and safe_operation.get("slice_id") == slice_id
+            and safe_operation.get("slice_contract_id") == slice_contract
+        ):
+            continue
+        projected = {
+            key: safe_operation.get(key)
+            for key in (
+                "category",
+                "host_event_turn_id",
+                "host_input_digest",
+                "status",
+                "tool",
+            )
+            if safe_operation.get(key) is not None
+        }
+        if safe_operation.get("executor_agent_id"):
+            projected["executor_agent_fingerprint"] = stable_hash(
+                safe_label(safe_operation.get("executor_agent_id"), 120), 32
+            )
+        operations.append(projected)
+    review = _safe_executor_review(state.get("executor_review"))
+    review_projection = {
+        key: review.get(key)
+        for key in (
+            "attempt",
+            "candidate_agent_fingerprint",
+            "candidate_evidence_digest",
+            "candidate_result_fingerprint",
+            "child_summary_digest",
+            "execution_contract_id",
+            "parent_summary_digest",
+            "review_evidence_digest",
+            "slice_contract_id",
+            "slice_id",
+            "status",
+        )
+        if review.get(key) is not None
+    }
+    stall = _safe_stall(state.get("stall"))
+    stall_projection = {
+        key: stall.get(key)
+        for key in (
+            "correction_digest",
+            "evidence_digest",
+            "failure_kind",
+            "remediation_digest",
+            "resume_profile",
+            "stall_id",
+            "state",
+        )
+        if stall.get(key) is not None
+    }
+    facts = {
+        "attempt": attempt,
+        "contract": contract,
+        "failure": failure_kind,
+        "lifecycles": {
+            event: _recovery_lifecycle_projection(
+                state, event, contract, attempt
+            )
+            for event in ("request", "start", "stop")
+        },
+        "objective": objective,
+        "operations": operations[-16:],
+        "plan_digest": _fingerprint32(state.get("plan_digest")),
+        "plan_generation": safe_int(state.get("plan_generation")),
+        "review": review_projection,
+        "slice": slice_id,
+        "slice_contract": slice_contract,
+        "stall": stall_projection,
+    }
+    return stable_hash(
+        "workflow-manager-executor-recovery-evidence-v1\0"
+        + canonical_json(facts),
+        32,
+    )
+
+
+def _safe_pending_recovery_facts(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    failure = value.get("failure_kind")
+    fingerprint = _fingerprint32(value.get("failure_fingerprint"))
+    evidence = _fingerprint32(value.get("evidence_digest"))
+    contract = _fingerprint32(value.get("execution_contract_id"))
+    objective = safe_fingerprint(value.get("objective_fingerprint"))
+    slice_id = safe_slice_id(value.get("slice_id"))
+    slice_contract = _fingerprint32(value.get("slice_contract_id"))
+    sequence = safe_sequence(value.get("sequence"))
+    if not all(
+        (
+            failure in EXECUTOR_FAILURE_KINDS,
+            fingerprint,
+            evidence,
+            contract,
+            objective,
+            slice_id,
+            slice_contract,
+            sequence > 0,
+        )
+    ):
+        return None
+    return {
+        "sequence": sequence,
+        "failure_kind": failure,
+        "failure_fingerprint": fingerprint,
+        "evidence_digest": evidence,
+        "execution_contract_id": contract,
+        "objective_fingerprint": objective,
+        "slice_id": slice_id,
+        "slice_contract_id": slice_contract,
+    }
+
+
+def _build_pending_recovery_facts(state: dict[str, Any]) -> dict[str, Any] | None:
+    failure = state.get("executor_failure_kind")
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    item = current_execution_slice(state) or {}
+    slice_id = safe_slice_id(item.get("id"))
+    slice_contract = _fingerprint32(slice_contract_id(state))
+    if not (
+        state.get("executor_state") == "recovery_required"
+        and failure in EXECUTOR_FAILURE_KINDS
+        and contract
+        and objective
+        and slice_id
+        and slice_contract
+    ):
+        return None
+    evidence = executor_recovery_evidence_digest(state, str(failure))
+    fingerprint = recovery_fingerprint(state, str(failure), evidence)
+    if not evidence or not fingerprint:
+        return None
+    return {
+        "sequence": next_sequence(state.get("executor_attempt")),
+        "failure_kind": failure,
+        "failure_fingerprint": fingerprint,
+        "evidence_digest": evidence,
+        "execution_contract_id": contract,
+        "objective_fingerprint": objective,
+        "slice_id": slice_id,
+        "slice_contract_id": slice_contract,
+    }
+
+
+def pending_recovery_facts_for_state(
+    state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return current host-issued recovery facts, never user or child prose."""
+    return _build_pending_recovery_facts(state)
+
+
+def recovery_reservation_context(state: dict[str, Any]) -> str | None:
+    facts = pending_recovery_facts_for_state(state)
+    if not facts:
+        return None
+    return (
+        "RECOVERY_CHILD_FACTS\n"
+        f"recovery_from={facts['failure_kind']}\n"
+        f"failure_fingerprint={facts['failure_fingerprint']}\n"
+        f"evidence_digest={facts['evidence_digest']}"
+    )
+
+
+def _safe_pending_recovery_reservation(value: Any) -> dict[str, Any] | None:
+    record = _safe_recovery_record(value)
+    if not record or not isinstance(value, dict):
+        return None
+    contract = _fingerprint32(value.get("execution_contract_id"))
+    objective = safe_fingerprint(value.get("objective_fingerprint")) or None
+    slice_id = safe_slice_id(value.get("slice_id"))
+    slice_contract = _fingerprint32(value.get("slice_contract_id"))
+    prompt_receipt = _fingerprint32(value.get("prompt_receipt"))
+    if not all((contract, objective, slice_id, slice_contract, prompt_receipt)):
+        return None
+    return {
+        **record,
+        "execution_contract_id": contract,
+        "objective_fingerprint": objective,
+        "slice_id": slice_id,
+        "slice_contract_id": slice_contract,
+        "prompt_receipt": prompt_receipt,
+    }
+
+
+def pending_recovery_reservation_for_state(
+    state: dict[str, Any], value: Any = None
+) -> dict[str, Any] | None:
+    reservation = _safe_pending_recovery_reservation(
+        state.get("pending_recovery_reservation") if value is None else value
+    )
+    current = current_execution_slice(state) or {}
+    facts = pending_recovery_facts_for_state(state)
+    if not reservation or not (
+        facts
+        and state.get("executor_state") == "recovery_required"
+        and reservation.get("failure_kind") == state.get("executor_failure_kind")
+        and reservation.get("failure_kind") == facts.get("failure_kind")
+        and reservation.get("failure_fingerprint")
+        == facts.get("failure_fingerprint")
+        and reservation.get("evidence_digest") == facts.get("evidence_digest")
+        and reservation.get("execution_contract_id")
+        == state.get("execution_contract_id")
+        and reservation.get("objective_fingerprint")
+        == state.get("objective", {}).get("fingerprint")
+        and reservation.get("slice_id") == current.get("id")
+        and reservation.get("slice_contract_id") == slice_contract_id(state)
+        and reservation.get("sequence") == next_sequence(state.get("executor_attempt"))
+    ):
+        return None
+    return reservation
+
+
+def safe_recovery_chain(value: Any) -> list[dict[str, Any]]:
+    return [
+        record
+        for item in as_list(value)
+        if (record := _safe_recovery_record(item)) is not None
+    ]
+
+
+def recovery_chain_allows(
+    state: dict[str, Any],
+    failure: str,
+    evidence: str | None,
+    correction: str | None,
+    root_cause: str | None,
+    progress: str | None = None,
+    review: str | None = None,
+    failure_fingerprint: str | None = None,
+) -> bool:
+    """Deny unchanged replay, not a numeric attempt count."""
+    fingerprint = _fingerprint32(failure_fingerprint) or recovery_fingerprint(
+        state, failure, evidence
+    )
+    if not fingerprint or not correction:
+        return False
+    evidence_digest = _fingerprint32(evidence)
+    progress_digest = _fingerprint32(progress)
+    correction_digest = _fingerprint32(correction) or stable_hash(correction, 32)
+    root_digest = _fingerprint32(root_cause) or (
+        stable_hash(root_cause, 32) if root_cause else None
+    )
+    review_digest = _fingerprint32(review)
+    for prior in reversed(safe_recovery_chain(state.get("recovery_chain"))):
+        if prior.get("failure_fingerprint") != fingerprint:
+            continue
+        return any(
+            current is not None and current != prior.get(key)
+            for key, current in (
+                ("evidence_digest", evidence_digest),
+                ("progress_digest", progress_digest),
+                ("root_cause_digest", root_digest),
+                ("correction_digest", correction_digest),
+                ("review_digest", review_digest),
+            )
+        )
+    return True
+
+
+def parse_pending_recovery_reservation(
+    prompt: str, state: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Bind visible recovery facts before Desktop encrypts a spawn message."""
+    if not re.search(r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]", prompt, re.I):
+        return None, None
+    if not (
+        state.get("plan_state") == "confirmed"
+        and state.get("executor_state") == "recovery_required"
+        and state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
+    ):
+        return None, "recovery reservation is not pending"
+    host_facts = pending_recovery_facts_for_state(state)
+    if not host_facts:
+        return None, "recovery reservation lacks host-issued failure evidence"
+    failures = re.findall(
+        r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]\s*([a-z_]+)\b",
+        prompt,
+        re.I,
+    )
+    failure = failures[0].lower() if len(set(failures)) == 1 and failures else None
+    if failure != state.get("executor_failure_kind"):
+        return None, "recovery failure no longer matches state"
+
+    def one_token(marker: str) -> str | None:
+        values = re.findall(marker, prompt, re.I)
+        return values[0].lower() if len(set(values)) == 1 and values else None
+
+    raw_failure_fingerprint = one_token(
+        r"(?:failure_fingerprint|failure-fingerprint|失败指纹)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+    )
+    raw_evidence = one_token(
+        r"(?:evidence_digest|evidence-digest|verification_evidence_digest|verification-evidence-digest)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+    )
+    raw_progress = one_token(
+        r"(?:progress_digest|progress-digest|进展摘要)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+    )
+    root_matches = re.findall(
+        r"(?:root_cause|root-cause|根因)\s*[:=：]\s*([^\n\r]{2,512})",
+        prompt,
+        re.I,
+    )
+    correction_matches = re.findall(
+        r"(?:material_correction|material-correction|实质修正)\s*[:=：]\s*([^\n\r]{8,2048})",
+        prompt,
+        re.I,
+    )
+    failure_fingerprint = _normalized_recovery_digest(
+        raw_failure_fingerprint, "workflow-manager-external-failure-v1"
+    )
+    evidence = _normalized_recovery_digest(
+        raw_evidence, "workflow-manager-external-evidence-v1"
+    )
+    progress = (
+        _normalized_recovery_digest(
+            raw_progress, "workflow-manager-external-progress-v1"
+        )
+        if raw_progress
+        else None
+    )
+    if not failure_fingerprint or not evidence:
+        return None, "recovery reservation requires one failure fingerprint and evidence digest"
+    if (
+        failure_fingerprint != host_facts.get("failure_fingerprint")
+        or evidence != host_facts.get("evidence_digest")
+    ):
+        return None, "recovery reservation no longer matches host-issued failure evidence"
+    if len(root_matches) != 1 or len(correction_matches) != 1:
+        return None, "recovery reservation requires one root cause and material correction"
+    root_digest = stable_hash(root_matches[0].strip(), 32)
+    correction_digest = stable_hash(correction_matches[0].strip(), 32)
+    bound_review = _fingerprint32(
+        _safe_executor_review(state.get("executor_review")).get(
+            "review_evidence_digest"
+        )
+    )
+    review = bound_review or stable_hash(
+        "workflow-manager-recovery-review-v1\0"
+        + canonical_json(
+            {
+                "correction": correction_digest,
+                "evidence": evidence,
+                "failure": failure,
+                "failure_fingerprint": failure_fingerprint,
+                "progress": progress,
+                "root": root_digest,
+            }
+        ),
+        32,
+    )
+    if not recovery_chain_allows(
+        state,
+        failure,
+        evidence,
+        correction_digest,
+        root_digest,
+        progress,
+        review,
+        failure_fingerprint,
+    ):
+        return None, (
+            "unchanged recovery replay requires new evidence, root cause, "
+            "progress, or material correction"
+        )
+    current = current_execution_slice(state) or {}
+    sequence = next_sequence(state.get("executor_attempt"))
+    receipt = stable_hash(
+        "workflow-manager-pending-recovery-reservation-v1\0"
+        + canonical_json(
+            {
+                "contract": state.get("execution_contract_id"),
+                "correction": correction_digest,
+                "evidence": evidence,
+                "failure": failure,
+                "failure_fingerprint": failure_fingerprint,
+                "objective": state.get("objective", {}).get("fingerprint"),
+                "progress": progress,
+                "review": review,
+                "root": root_digest,
+                "sequence": sequence,
+                "slice": current.get("id"),
+                "slice_contract": slice_contract_id(state),
+            }
+        ),
+        32,
+    )
+    return {
+        "sequence": sequence,
+        "failure_kind": failure,
+        "failure_fingerprint": failure_fingerprint,
+        "evidence_digest": evidence,
+        "progress_digest": progress,
+        "root_cause_digest": root_digest,
+        "correction_digest": correction_digest,
+        "review_digest": review,
+        "execution_contract_id": state.get("execution_contract_id"),
+        "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+        "slice_id": current.get("id"),
+        "slice_contract_id": slice_contract_id(state),
+        "prompt_receipt": receipt,
+    }, None
+
+
+def parse_recovery_contract(
+    request_text: str, state: dict[str, Any], *, opaque: bool = False
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse a typed recovery before any executor authority is changed."""
+    if opaque:
+        pending = pending_recovery_reservation_for_state(state)
+        if not pending:
+            return None, "opaque recovery requires a host-bound prompt reservation"
+        if not recovery_chain_allows(
+            state,
+            pending["failure_kind"],
+            pending.get("evidence_digest"),
+            pending.get("correction_digest"),
+            pending.get("root_cause_digest"),
+            pending.get("progress_digest"),
+            pending.get("review_digest"),
+            pending.get("failure_fingerprint"),
+        ):
+            return None, "opaque recovery reservation is an unchanged replay"
+        return {
+            key: pending.get(key)
+            for key in (
+                "sequence",
+                "failure_kind",
+                "failure_fingerprint",
+                "evidence_digest",
+                "progress_digest",
+                "root_cause_digest",
+                "correction_digest",
+                "review_digest",
+            )
+        }, None
+    failures = re.findall(
+        r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]\s*([a-z_]+)\b",
+        request_text,
+        re.I,
+    )
+    if len(failures) != 1 or failures[0] not in EXECUTOR_FAILURE_KINDS:
+        return None, "recovery request lacks one typed failure"
+    failure = failures[0]
+    if failure != state.get("executor_failure_kind"):
+        return None, "recovery failure no longer matches state"
+
+    def one_digest(pattern: str) -> str | None:
+        matches = re.findall(pattern, request_text, re.I)
+        return matches[0].lower() if len(set(matches)) == 1 and matches else None
+
+    failure_fingerprint = _normalized_recovery_digest(
+        one_digest(
+            r"(?:failure_fingerprint|failure-fingerprint|失败指纹)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+        ),
+        "workflow-manager-external-failure-v1",
+    ) or recovery_fingerprint(state, failure)
+    evidence = _normalized_recovery_digest(
+        one_digest(
+            r"(?:evidence_digest|evidence-digest|verification_evidence_digest|verification-evidence-digest)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+        ),
+        "workflow-manager-external-evidence-v1",
+    )
+    raw_progress = one_digest(
+        r"(?:progress_digest|progress-digest|进展摘要)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+    )
+    progress = (
+        _normalized_recovery_digest(
+            raw_progress, "workflow-manager-external-progress-v1"
+        )
+        if raw_progress
+        else None
+    )
+    root_matches = re.findall(
+        r"(?:root_cause|root-cause|根因)\s*[:=：]\s*([^\n\r]{2,512})",
+        request_text,
+        re.I,
+    )
+    correction_matches = re.findall(
+        r"(?:material_correction|material-correction|实质修正)\s*[:=：]\s*([^\n\r]{8,2048})",
+        request_text,
+        re.I,
+    )
+    if len(correction_matches) != 1:
+        return None, "recovery request lacks one material correction"
+    root_digest = stable_hash(root_matches[0].strip(), 32) if len(root_matches) == 1 else None
+    correction_digest = stable_hash(correction_matches[0].strip(), 32)
+    review_data = _safe_executor_review(state.get("executor_review"))
+    review_digest = _fingerprint32(review_data.get("review_evidence_digest")) or stable_hash(
+        "workflow-manager-recovery-review-v1\0"
+        + canonical_json(
+            {
+                "correction": correction_digest,
+                "evidence": evidence,
+                "failure": failure,
+                "failure_fingerprint": failure_fingerprint,
+                "progress": progress,
+                "root": root_digest,
+            }
+        ),
+        32,
+    )
+    if not recovery_chain_allows(
+        state,
+        failure,
+        evidence,
+        correction_digest,
+        root_digest,
+        progress,
+        review_digest,
+        failure_fingerprint,
+    ):
+        return None, "unchanged recovery replay requires new evidence, root cause, progress, or material correction"
+    return {
+        "sequence": next_sequence(state.get("executor_attempt")),
+        "failure_kind": failure,
+        "failure_fingerprint": failure_fingerprint,
+        "evidence_digest": _fingerprint32(evidence),
+        "progress_digest": _fingerprint32(progress),
+        "root_cause_digest": root_digest,
+        "correction_digest": correction_digest,
+        "review_digest": review_digest,
+    }, None
 
 
 def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
@@ -1066,6 +2577,85 @@ def initialize_confirmed_executor(state: dict[str, Any]) -> bool:
     state["execution_profile_version"] = EXECUTION_PROFILE_VERSION
     state["model_profile"] = confirmed_executor_model_profile(state)
     return True
+
+
+def trusted_plan_binding_valid(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    return bool(
+        state.get("plan_digest")
+        and state.get("plan_objective_fingerprint")
+        == state.get("objective", {}).get("fingerprint")
+        and state.get("plan_difficulty_decision_id")
+        == state.get("difficulty_decision_id")
+        and artifact.get("format_version") == 2
+        and artifact.get("write_status") == "written"
+        and artifact.get("relative_path")
+        and artifact.get("generation") == state.get("plan_generation")
+        and artifact.get("plan_digest")
+        == artifact.get("current_revision_digest")
+        == state.get("plan_digest")
+        and safe_fingerprint(artifact.get("journal_digest"))
+        and verify_plan_artifact(state, payload)
+    )
+
+
+def activate_trusted_plan(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    receipt: str,
+    increment_confirmation: bool,
+) -> bool:
+    """Bind confirmation to scope while execution remains revision-exact."""
+    envelope_digest = authorization_envelope_digest(state)
+    receipt_digest = _fingerprint32(receipt)
+    if not envelope_digest or not receipt_digest or not trusted_plan_binding_valid(state, payload):
+        return False
+    prior = _safe_authorization_envelope(state.get("authorization_envelope"))
+    count = (
+        next_sequence(prior.get("confirmation_count"))
+        if increment_confirmation and prior.get("digest") == envelope_digest
+        else 1
+        if increment_confirmation
+        else max(safe_sequence(prior.get("confirmation_count")), 1)
+    )
+    state["plan_state"] = "confirmed"
+    state["confirmed_plan_digest"] = state.get("plan_digest")
+    state["confirmed_at"] = utc_now()
+    state["authorization_envelope"] = {
+        "digest": envelope_digest,
+        "strict_confirm_receipt": receipt_digest,
+        "confirmation_count": count,
+    }
+    state["pending_confirmation_receipt"] = None
+    if initialize_confirmed_executor(state):
+        return True
+    state["plan_state"] = "invalidated"
+    state["confirmed_plan_digest"] = None
+    state["confirmed_at"] = None
+    return False
+
+
+def auto_confirm_trusted_plan(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Consume an early receipt or inherit an unchanged authorization envelope."""
+    expected = authorization_envelope_digest(state)
+    pending = _fingerprint32(state.get("pending_confirmation_receipt"))
+    if pending and pending == pending_confirmation_receipt_for_state(state):
+        return activate_trusted_plan(
+            state,
+            payload,
+            receipt=pending,
+            increment_confirmation=True,
+        )
+    envelope = _safe_authorization_envelope(state.get("authorization_envelope"))
+    if expected and envelope.get("digest") == expected and envelope.get("strict_confirm_receipt"):
+        return activate_trusted_plan(
+            state,
+            payload,
+            receipt=str(envelope["strict_confirm_receipt"]),
+            increment_confirmation=False,
+        )
+    return False
 
 
 def normalized_key(value: Any) -> str:
@@ -1158,6 +2748,16 @@ def safe_metadata(value: Any) -> dict[str, Any]:
     return result
 
 
+def metadata_is_exact_confirmation(value: Any) -> bool:
+    """Recognize the one canonical confirmation from digest-only metadata."""
+    observed = safe_metadata(value)
+    expected = text_metadata("确认执行")
+    return bool(
+        observed.get("fingerprint") == expected["fingerprint"]
+        and observed.get("length") == expected["length"]
+    )
+
+
 def as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -1167,6 +2767,43 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def safe_sequence(value: Any) -> int:
+    """Normalize a monotonic identity without imposing a retry-count cap."""
+    candidate = safe_int(value)
+    return candidate if candidate >= 0 else 0
+
+
+def next_sequence(value: Any) -> int:
+    return safe_sequence(value) + 1
+
+
+def safe_slice_id(value: Any) -> str | None:
+    candidate = str(value or "")
+    return (
+        candidate
+        if len(candidate.encode("utf-8")) <= 32
+        and re.fullmatch(r"s(?:0[1-9]|[1-9][0-9]+)", candidate)
+        else None
+    )
+
+
+def state_node_count(value: Any) -> int:
+    if isinstance(value, dict):
+        return 1 + sum(1 + state_node_count(item) for item in value.values())
+    if isinstance(value, list):
+        return 1 + sum(state_node_count(item) for item in value)
+    return 1
+
+
+def state_within_budget(value: dict[str, Any]) -> bool:
+    """Apply the same bounded-state contract before authority is reserved."""
+    try:
+        encoded = canonical_json(value).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    return len(encoded) <= MAX_STATE_BYTES and state_node_count(value) <= MAX_STATE_NODES
 
 
 def safe_telemetry(value: Any) -> dict[str, Any]:
@@ -1399,8 +3036,13 @@ def ensure_private_dir(path: Path) -> None:
 
 
 @contextmanager
-def state_lock(path: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[None]:
-    """Acquire a bounded cross-platform lock; never perform a read-modify-write unlocked."""
+def state_lock(path: Path, timeout: float | None = None) -> Iterator[None]:
+    """Serialize state changes without dropping normal events on contention.
+
+    Core lifecycle events wait for the process-owned OS lock. Explicit cleanup
+    and migration probes may still pass a finite or zero timeout because they
+    are opportunistic and never authorize work.
+    """
     lock_path = path.with_suffix(".lock")
     ensure_private_dir(lock_path.parent)
     handle = lock_path.open("a+b")
@@ -1409,7 +3051,11 @@ def state_lock(path: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[No
     except OSError:
         pass
     acquired = False
-    deadline = time.monotonic() + max(timeout, 0.0)
+    deadline = (
+        time.monotonic() + max(timeout, 0.0)
+        if timeout is not None
+        else None
+    )
     try:
         if handle.tell() == 0:
             handle.write(b"0")
@@ -1420,15 +3066,24 @@ def state_lock(path: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[No
                 if os.name == "nt":
                     import msvcrt
 
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(
+                        handle.fileno(),
+                        msvcrt.LK_LOCK if timeout is None else msvcrt.LK_NBLCK,
+                        1,
+                    )
                 else:
                     import fcntl
 
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_EX
+                        if timeout is None
+                        else fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
                 acquired = True
                 break
             except OSError:
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     break
                 time.sleep(0.025)
         if not acquired:
@@ -1771,8 +3426,8 @@ def _safe_stall(item: Any) -> dict[str, Any]:
         "correction_digest": _fingerprint32(item.get("correction_digest")),
         "failure_kind": item.get("failure_kind") if item.get("failure_kind") in EXECUTOR_FAILURE_KINDS else None,
         "resume_profile": item.get("resume_profile") if item.get("resume_profile") in STALL_RESUME_PROFILES else None,
-        "executor_attempt": min(max(safe_int(item.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS),
-        "diagnosis_attempt": min(max(safe_int(item.get("diagnosis_attempt")), 0), MAX_STALL_DIAGNOSIS_ATTEMPTS),
+        "executor_attempt": safe_sequence(item.get("executor_attempt")),
+        "diagnosis_attempt": safe_sequence(item.get("diagnosis_attempt")),
         "at": str(item.get("at") or "")[:40] or None,
     }
     required = (
@@ -1823,6 +3478,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "assessor_observation_source": None,
         "assessor_fork_turns": None,
         "assessor_attempt": 0,
+        "assessment_liveness": _empty_assessment_liveness(),
         "plan_state": "none",
         "plan_generation": 0,
         "plan_digest": None,
@@ -1838,6 +3494,12 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "executor_agent_id": None,
         "executor_attempt": 0,
         "executor_failure_kind": None,
+        "authorization_scope": _safe_authorization_scope(None),
+        "authorization_envelope": _safe_authorization_envelope(None),
+        "pending_confirmation_receipt": None,
+        "recovery_chain": [],
+        "pending_recovery_facts": None,
+        "pending_recovery_reservation": None,
         "executor_model": None,
         "executor_reasoning_effort": None,
         "executor_fork_turns": None,
@@ -1938,18 +3600,14 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "host_input_digest": safe_fingerprint(item.get("host_input_digest")) or None,
         "host_command_digest": safe_fingerprint(item.get("host_command_digest")) or None,
         "legacy_host_input_digest": safe_fingerprint(item.get("legacy_host_input_digest")) or None,
-        "reconciliation_source": item.get("reconciliation_source") if item.get("reconciliation_source") in {"legacy_unique_turn_patch_event_v1", "host_rollout_exact_patch_digest_v1", "host_rollout_exact_command_text_v1", "host_rollout_unique_file_change_v1"} else None,
+        "reconciliation_source": item.get("reconciliation_source") if item.get("reconciliation_source") in {"legacy_unique_turn_patch_event_v1", "host_rollout_exact_patch_digest_v1", "host_rollout_exact_patch_receipt_v2", "host_posttool_patch_receipt_v2", "host_rollout_exact_command_text_v1"} else None,
         "tool": safe_label(item.get("tool"), 120),
         "fingerprint": fingerprint[:64],
         "status": status_value,
         "category": safe_label(item.get("category"), 32) if item.get("category") else "other",
         "plan_digest": plan_digest,
         "execution_contract_id": contract_id,
-        "slice_id": (
-            safe_label(item.get("slice_id"), 3)
-            if re.fullmatch(r"s(?:0[1-9]|[12][0-9]|3[0-2])", str(item.get("slice_id") or ""))
-            else None
-        ),
+        "slice_id": safe_slice_id(item.get("slice_id")),
         "slice_contract_id": _fingerprint32(item.get("slice_contract_id")),
         "assessor_binding_id": safe_fingerprint(item.get("assessor_binding_id")) or None,
         "executor_agent_id": (
@@ -2042,6 +3700,11 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         ),
         "host_acceptance_status": safe_label(item.get("host_acceptance_status"), 32) if item.get("host_acceptance_status") else None,
         "host_acceptance_source": safe_label(item.get("host_acceptance_source"), 32) if item.get("host_acceptance_source") else None,
+        "host_acceptance_fingerprint": safe_fingerprint(item.get("host_acceptance_fingerprint")) or None,
+        "host_acceptance_receipt_digest": _fingerprint32(
+            item.get("host_acceptance_receipt_digest")
+        ),
+        "host_acceptance_conflict": bool(item.get("host_acceptance_conflict")),
         "start_observed": item.get("start_observed") if item.get("start_observed") in {"full", "partial", "absent", "mismatch"} else None,
         "observation_source": safe_label(item.get("observation_source"), 80) if item.get("observation_source") else None,
         "scope_fingerprint": safe_label(item.get("scope_fingerprint"), 64) if item.get("scope_fingerprint") else None,
@@ -2049,7 +3712,7 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         "objective_fingerprint": objective_fingerprint or None,
         "stale": bool(item.get("stale")),
         "request_gate": item.get("request_gate")
-        if item.get("request_gate") in {"audit", "open"}
+        if item.get("request_gate") in {"audit", "open", "contract"}
         else None,
         "request_visibility": item.get("request_visibility")
         if item.get("request_visibility") in {"plaintext", "opaque_v2"}
@@ -2058,11 +3721,7 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         "reaudited": bool(item.get("reaudited")),
         "role": role,
         "contract_id": contract_id,
-        "slice_id": (
-            safe_label(item.get("slice_id"), 3)
-            if re.fullmatch(r"s(?:0[1-9]|[12][0-9]|3[0-2])", str(item.get("slice_id") or ""))
-            else None
-        ),
+        "slice_id": safe_slice_id(item.get("slice_id")),
         "slice_contract_id": _fingerprint32(item.get("slice_contract_id")),
         "model": safe_label(item.get("model"), 80) if item.get("model") else None,
         "reasoning_effort": (
@@ -2071,13 +3730,17 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
             else None
         ),
         "fork_turns": fork_turns or None,
-        "attempt": min(max(safe_int(item.get("attempt")), 0), MAX_EXECUTOR_ATTEMPTS),
+        "attempt": safe_sequence(item.get("attempt")),
         "recovery_from": (
             item.get("recovery_from")
             if item.get("recovery_from") in EXECUTOR_FAILURE_KINDS
             else None
         ),
         "plan_handoff_digest": safe_fingerprint(item.get("plan_handoff_digest")) or None,
+        "plan_handoff_delivery_digest": _fingerprint32(
+            item.get("plan_handoff_delivery_digest")
+        ),
+        "plan_handoff_delivered": bool(item.get("plan_handoff_delivered")),
         "execution_result_contract_match": (
             bool(item.get("execution_result_contract_match"))
             if item.get("execution_result_contract_match") is not None
@@ -2359,6 +4022,7 @@ def empty_plan_artifact() -> dict[str, Any]:
         "lifecycle_status": "none",
         "write_status": "none",
         "warning_code": "none",
+        "diagnostic": None,
         "created_at": None,
         "updated_at": None,
     }
@@ -2398,6 +4062,7 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
             "lifecycle_status": item.get("lifecycle_status") if item.get("lifecycle_status") in PLAN_ARTIFACT_LIFECYCLE_STATUSES else "none",
             "write_status": item.get("write_status") if item.get("write_status") in PLAN_ARTIFACT_WRITE_STATUSES else "none",
             "warning_code": item.get("warning_code") if item.get("warning_code") in PLAN_ARTIFACT_WARNING_CODES else "none",
+            "diagnostic": _safe_plan_artifact_diagnostic(item.get("diagnostic")),
             "created_at": str(item.get("created_at"))[:40] if item.get("created_at") else None,
             "updated_at": str(item.get("updated_at"))[:40] if item.get("updated_at") else None,
         }
@@ -2498,6 +4163,37 @@ def sanitize_plan_artifact_body(value: Any) -> str:
     if len(body.encode("utf-8")) > MAX_PLAN_REVISION_BYTES:
         raise PlanArtifactError("revision_too_large")
     return body
+
+
+def canonical_plan_message_ready(value: Any) -> bool:
+    """Accept a bounded native parent plan without a plugin prose protocol."""
+    try:
+        body = sanitize_plan_artifact_body(value)
+    except PlanArtifactError:
+        return False
+    # Content quality belongs to the parent model and the user's confirmation.
+    # The Hook only needs a nonempty bounded revision; an arbitrary prose-length
+    # threshold would be a second planning gate with no host-trust value.
+    return bool(body.strip())
+
+
+def native_assessor_result_digest(value: Any) -> str | None:
+    """Bind a current-model read-only assessment without a plugin prose DSL.
+
+    The assessor result is evidence for the parent, never execution authority.
+    The host-bound assessor lifecycle and terminal status establish provenance;
+    the model, not keyword matching, judges the assessment content. The parent
+    still owns the only plan artifact that can unlock an executor.
+    """
+    source = str(value or "").strip()
+    size = len(source.encode("utf-8"))
+    if not 0 < size <= MAX_PLAN_REVISION_BYTES:
+        return None
+    if re.search(r"(?i)\bWORK_ASSESSMENT\b", source):
+        return None
+    if EXECUTION_SLICES_FENCE_INTENT_RE.search(source):
+        return None
+    return stable_hash("workflow-manager-native-assessor-result-v1\0" + source, 32)
 
 
 def _plan_artifact_body(document: str) -> str | None:
@@ -2657,9 +4353,39 @@ def append_plan_journal_revision(
 
 
 class PlanArtifactError(OSError):
-    def __init__(self, code: str) -> None:
+    """A public plan failure is a bounded diagnostic, never source content."""
+    def __init__(self, code: str, *, path: str | None = None, actual: int | None = None,
+                 limit: int | None = None, unit: str | None = None,
+                 recoverability: str = "repair_required") -> None:
         super().__init__(code)
-        self.code = code if code in PLAN_ARTIFACT_WARNING_CODES else "write_error"
+        self.code = code if code in PLAN_ARTIFACT_DIAGNOSTIC_CODES else "write_error"
+        safe_path = path if isinstance(path, str) and (
+            path in {"manifest", "global_constraints", "slice", "slices", "title", "scope", "acceptance", "rollback", "stop_conditions", "expected_artifacts", "journal", "revision", "version"}
+            or re.fullmatch(r"slices\[(?:0|[1-9][0-9]{0,5})\](?:\.(?:id|title|scope|acceptance|rollback|stop_conditions|expected_artifacts)(?:\[(?:0|[1-9][0-9]{0,5})\])?)?", path)
+        ) else None
+        self.metadata = {
+            "code": self.code,
+            "path": safe_path,
+            "actual": actual if isinstance(actual, int) and 0 <= actual <= 2**31 - 1 else None,
+            "limit": limit if isinstance(limit, int) and 0 <= limit <= 2**31 - 1 else None,
+            "unit": unit if unit in {"bytes", "nodes", "items"} else None,
+            "recoverability": recoverability if recoverability in {"repair_required", "retryable", "terminal"} else "repair_required",
+        }
+        # Keep a hard, future-proof ceiling even if this structure grows.
+        if len(canonical_json(self.metadata).encode("utf-8")) > 512:
+            self.metadata = {"code": self.code, "path": None, "actual": None, "limit": None,
+                             "unit": None, "recoverability": "repair_required"}
+
+
+def _safe_plan_artifact_diagnostic(value: Any) -> dict[str, Any] | None:
+    """Keep only the fixed public error shape; never persist exception text."""
+    if not isinstance(value, dict):
+        return None
+    return PlanArtifactError(
+        str(value.get("code") or "write_error"),
+        path=value.get("path"), actual=value.get("actual"), limit=value.get("limit"),
+        unit=value.get("unit"), recoverability=value.get("recoverability", "repair_required"),
+    ).metadata
 
 
 class PlanTransactionPendingError(PlanArtifactError):
@@ -4753,7 +6479,7 @@ def write_plan_artifact(
     failure["updated_at"] = now
     try:
         body = sanitize_plan_artifact_body(message)
-        execution_slices = parse_execution_slice_manifest(body)
+        execution_slices = execution_slice_manifest_for_plan(body)
         objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
         difficulty = safe_fingerprint(state.get("difficulty_decision_id"))
         if not objective or not difficulty:
@@ -4923,9 +6649,11 @@ def write_plan_artifact(
             else "write_failed"
         )
         failure["warning_code"] = error.code
+        failure["diagnostic"] = error.metadata
     except OSError:
         failure["write_status"] = "write_failed"
         failure["warning_code"] = "write_error"
+        failure["diagnostic"] = PlanArtifactError("write_error").metadata
     state["plan_artifact"] = failure
     return False
 
@@ -4979,7 +6707,7 @@ def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> bool
             and str(state.get("execution_profile_version"))
             == EXECUTION_PROFILE_VERSION
         ):
-            parsed_manifest = parse_execution_slice_manifest(
+            parsed_manifest = execution_slice_manifest_for_plan(
                 str(parsed["revisions"][-1]["body"])
             )
             persisted = _safe_execution_slices(state.get("execution_slices"))
@@ -5084,7 +6812,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
         "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
         "plan_state": item.get("plan_state")
         if item.get("plan_state")
-        in {"none", "analyzing", "plan_ready", "awaiting_confirmation", "confirmed", "invalidated"}
+        in {"none", "analyzing", "plan_ready", "awaiting_confirmation", "confirmed", "invalidated", "repair_required"}
         else "none",
         "plan_generation": max(safe_int(item.get("plan_generation")), 0),
         "plan_digest": plan_digest,
@@ -5103,9 +6831,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             else "none"
         ),
         "execution_contract_id": safe_fingerprint(item.get("execution_contract_id")) or None,
-        "executor_attempt": min(
-            max(safe_int(item.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS
-        ),
+        "executor_attempt": safe_sequence(item.get("executor_attempt")),
         "executor_failure_kind": (
             item.get("executor_failure_kind")
             if item.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
@@ -5237,7 +6963,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["plan_state"] = (
         plan_state
         if plan_state
-        in {"none", "analyzing", "plan_ready", "awaiting_confirmation", "confirmed", "invalidated"}
+        in {"none", "analyzing", "plan_ready", "awaiting_confirmation", "confirmed", "invalidated", "repair_required"}
         else "none"
     )
     base["plan_generation"] = max(safe_int(value.get("plan_generation")), 0)
@@ -5304,16 +7030,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         source_schema >= 23
         and source_contract
         and source_executor_review.get("execution_contract_id") == source_contract
-        and (
-            source_executor_review.get("attempt")
-            == min(
-                max(safe_int(value.get("executor_attempt")), 0),
-                MAX_EXECUTOR_ATTEMPTS,
-            )
-            or source_executor_review.get("status") == "recovery_started"
-            and source_executor_review.get("attempt") == 1
-            and safe_int(value.get("executor_attempt")) == 2
-        )
+        and source_executor_review.get("attempt")
+        == safe_sequence(value.get("executor_attempt"))
         and source_executor_review.get("status")
         in {"review_required", "recovery_started", "failed", "exhausted"}
         and value.get("executor_state") in {"verification_required", "exhausted"}
@@ -5322,7 +7040,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     # baseline-sealed contract keeps the profile it actually executed under;
     # rewriting it to v6 would either invent evidence or reopen finished work.
     # The one Schema 22 succeeded+incomplete shape is not sealed: preserve its
-    # real v5 contract as a review candidate so a fresh v2 can repair it.
+    # real v5 contract as a review candidate so a typed successor can repair it.
     base["execution_profile_version"] = (
         source_profile
         if sealed_historical_success
@@ -5345,9 +7063,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if value.get("executor_agent_id")
         else None
     )
-    base["executor_attempt"] = min(
-        max(safe_int(value.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS
-    )
+    base["executor_attempt"] = safe_sequence(value.get("executor_attempt"))
     base["executor_failure_kind"] = (
         None
         if legacy_verification_pending
@@ -5370,7 +7086,24 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["assessor_reasoning_effort"] = safe_label(value.get("assessor_reasoning_effort"), 24) if value.get("assessor_reasoning_effort") else None
     base["assessor_input_fingerprint"] = safe_fingerprint(value.get("assessor_input_fingerprint")) or None
     base["assessor_fork_turns"] = str(value.get("assessor_fork_turns")) if value.get("assessor_fork_turns") is not None else None
-    base["assessor_attempt"] = min(max(safe_int(value.get("assessor_attempt")), 0), 2)
+    base["assessor_attempt"] = safe_sequence(value.get("assessor_attempt"))
+    base["authorization_scope"] = _safe_authorization_scope(
+        value.get("authorization_scope")
+    )
+    base["authorization_envelope"] = _safe_authorization_envelope(value.get("authorization_envelope"))
+    base["pending_confirmation_receipt"] = _fingerprint32(
+        value.get("pending_confirmation_receipt")
+    )
+    base["recovery_chain"] = safe_recovery_chain(value.get("recovery_chain"))
+    base["pending_recovery_facts"] = _safe_pending_recovery_facts(
+        value.get("pending_recovery_facts")
+    )
+    base["pending_recovery_reservation"] = _safe_pending_recovery_reservation(
+        value.get("pending_recovery_reservation")
+    )
+    # Schema 27 did not persist progress liveness. Re-anchor the still-live
+    # assessor on its first v28 observation; do not infer elapsed idle time.
+    base["assessment_liveness"] = _safe_assessment_liveness(value.get("assessment_liveness"))
     base["executor_model"] = (
         safe_label(value.get("executor_model"), 80) if value.get("executor_model") else None
     )
@@ -5451,6 +7184,16 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["plan_state"] = "awaiting_confirmation"
         base["confirmed_plan_digest"] = None
         base["confirmed_at"] = None
+    pending_receipt = _fingerprint32(base.get("pending_confirmation_receipt"))
+    if pending_receipt and pending_receipt != pending_confirmation_receipt_for_state(base):
+        base["pending_confirmation_receipt"] = None
+    if base["plan_state"] == "confirmed":
+        envelope = _safe_authorization_envelope(base.get("authorization_envelope"))
+        if envelope.get("digest") != authorization_envelope_digest(base):
+            base["plan_state"] = "awaiting_confirmation"
+            base["confirmed_plan_digest"] = None
+            base["confirmed_at"] = None
+            base["authorization_envelope"] = _safe_authorization_envelope(None)
 
     if (
         (source_schema == 23 or source_profile == "7")
@@ -5471,6 +7214,19 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_review"] = _empty_executor_review()
         base["assessor_state"] = "hard_plan_ready"
         base["model_profile"] = "work_assessment"
+    # Highest-profile contract identity depends on the original assessor's
+    # request/Post/Start lifecycle. Normalize that evidence before computing
+    # the expected execution contract; flat assessor fields must not stand in
+    # for the three host records during a reload.
+    contract_subagents = [
+        item
+        for raw in as_list(value.get("subagents"))
+        if (item := _safe_subagent(raw)) is not None
+    ]
+    if source_schema < 19:
+        for item in contract_subagents:
+            item["request_visibility"] = None
+    base["subagents"] = retained_subagent_records(base, contract_subagents)
     expected_contract = (
         source_contract
         if sealed_historical_success or legacy_verification_pending or review_profile_continuity
@@ -5493,7 +7249,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["execution_contract_id"] = expected_contract
         base["executor_state"] = "spawn_required"
         base["executor_agent_id"] = None
-        base["executor_attempt"] = 0
+        base["executor_attempt"] = safe_sequence(base.get("executor_attempt"))
         base["executor_failure_kind"] = None
         base["executor_model"] = None
         base["executor_reasoning_effort"] = None
@@ -5503,8 +7259,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     elif base["plan_state"] == "confirmed":
         base["model_profile"] = (
             "work_assessment"
-            if base["executor_state"]
-            in {"verification_required", "recovery_required", "exhausted"}
+            if base["executor_state"] in {"verification_required", "exhausted"}
             else confirmed_executor_model_profile(base)
         )
     elif (
@@ -5523,7 +7278,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["execution_contract_id"] = None
         base["executor_state"] = "none"
         base["executor_agent_id"] = None
-        base["executor_attempt"] = 0
+        base["executor_attempt"] = safe_sequence(base.get("executor_attempt"))
         base["executor_failure_kind"] = None
         base["executor_model"] = None
         base["executor_reasoning_effort"] = None
@@ -5559,11 +7314,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and base.get("executor_state") == "succeeded"
         and baseline.get("acceptance_status") != "passed"
     ):
-        base["executor_state"] = (
-            "recovery_required"
-            if safe_int(base.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS
-            else "exhausted"
-        )
+        base["executor_state"] = "recovery_required"
         base["executor_agent_id"] = None
         base["executor_failure_kind"] = "verification_failed"
         base["executor_review"] = _empty_executor_review()
@@ -5579,11 +7330,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             and review.get("candidate_evidence_digest")
         )
         if not review_bound:
-            base["executor_state"] = (
-                "recovery_required"
-                if base.get("executor_attempt", 0) < MAX_EXECUTOR_ATTEMPTS
-                else "exhausted"
-            )
+            base["executor_state"] = "recovery_required"
             base["executor_failure_kind"] = "verification_failed"
             base["executor_review"] = _empty_executor_review()
         base["model_profile"] = "work_assessment"
@@ -5617,10 +7364,36 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         item for raw in as_list(value.get("subagents"))
         if (item := _safe_subagent(raw)) is not None
     ]
-    if safe_int(value.get("schema_version")) < 19:
+    if source_schema < 19:
         for item in safe_subagents:
             item["request_visibility"] = None
     base["subagents"] = retained_subagent_records(base, safe_subagents)
+    if (
+        source_schema == SCHEMA_VERSION
+        and source_writer == WRITER_VERSION
+        and base.get("task_domain") == "work"
+        and base.get("work_difficulty") == "hard"
+        and base.get("plan_state") in {"analyzing", "repair_required"}
+        and base.get("assessor_state") == "recovery_required"
+        and base.get("assessor_failure_kind") == "assessment_result_invalid"
+        and original_assessor_result_receipt(base)
+    ):
+        # A previous 1.0.48 process could misclassify a current-model native
+        # assessment as invalid solely because it omitted the plugin's prose
+        # marker. Restore only the proven request/Post/full-Start/Stop
+        # lifecycle. Execution still needs the parent's strict manifest.
+        base["assessor_state"] = "hard_plan_ready"
+        base["assessor_failure_kind"] = None
+        base["model_profile"] = "work_assessment"
+        latest_prompt = (
+            base["prompts"][-1] if as_list(base.get("prompts")) else {}
+        )
+        if metadata_is_exact_confirmation(latest_prompt.get("prompt_meta")):
+            receipt = pending_confirmation_receipt_for_state(base)
+            if receipt:
+                base["pending_confirmation_receipt"] = receipt
+    if source_schema == SCHEMA_VERSION and source_writer == WRITER_VERSION:
+        restore_native_executor_review_candidate(base, payload)
     base["change_epoch"] = min(max(safe_int(value.get("change_epoch")), 0), MAX_EVENT_COUNT)
     raw_identity = value.get("identity_evidence") if isinstance(value.get("identity_evidence"), dict) else {}
     base["identity_evidence"] = {
@@ -5659,7 +7432,11 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         in {"plan_ready", "awaiting_confirmation", "confirmed"}
     ):
         invalidate_plan_authority(base, warning_code="legacy_unavailable")
-    if source_writer != WRITER_VERSION:
+    if source_writer != WRITER_VERSION and not (
+        source_schema == 27 and base.get("assessor_state") == "running"
+        and base.get("assessor_binding_id") and base.get("assessor_agent_id")
+        and base.get("assessor_observed_effective")
+    ):
         # Opaque lifecycle/request records are evidence from the old writer, not
         # authority for a resumed task. Preserve canonical plans and completed
         # baselines, but remove transient caches and rebind unfinished assessment.
@@ -5690,6 +7467,12 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             base["assessor_binding_id"] = None
             base["assessor_input_fingerprint"] = None
             base["assessor_state"] = "none"
+    elif source_schema == 27:
+        # v27's active assessor remains the sole owner; v28 intentionally
+        # starts its elapsed clock at the next observation.
+        base["assessment_liveness"] = _empty_assessment_liveness()
+    base["pending_recovery_facts"] = pending_recovery_facts_for_state(base)
+    base["pending_recovery_reservation"] = pending_recovery_reservation_for_state(base)
     sync_plan_artifact_lifecycle(base)
     base["schema_version"] = SCHEMA_VERSION
     base["writer_version"] = WRITER_VERSION
@@ -5714,6 +7497,11 @@ def load_state(path: Path | None, payload: dict[str, Any]) -> dict[str, Any]:
             else 0
         )
         state = normalize_state(decoded, payload)
+        state["_normalized_state_changed"] = bool(
+            isinstance(decoded, dict)
+            and json.dumps(decoded, ensure_ascii=False, sort_keys=True)
+            != json.dumps(state, ensure_ascii=False, sort_keys=True)
+        )
         state["_source_schema_version"] = source_schema
         if source_schema < SCHEMA_VERSION and isinstance(decoded, dict):
             state["_legacy_plan_state"] = decoded.get("plan_state")
@@ -5787,6 +7575,10 @@ def trim_state(state: dict[str, Any]) -> None:
     state["guards"] = list(state.get("guards", []))[-MAX_GUARDS:]
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
     state["duplicate_notices"] = list(state.get("duplicate_notices", []))[-MAX_DUPLICATE_NOTICES:]
+    state["pending_recovery_facts"] = pending_recovery_facts_for_state(state)
+    state["pending_recovery_reservation"] = pending_recovery_reservation_for_state(
+        state
+    )
 
 
 def increment_event_count(state: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -5832,6 +7624,127 @@ def debug_persistence(
     )
 
 
+def _rollout_user_message(record: dict[str, Any]) -> str | None:
+    if record.get("type") != "response_item":
+        return None
+    value = record.get("payload")
+    if not isinstance(value, dict) or value.get("type") != "message" or value.get("role") != "user":
+        return None
+    parts = []
+    for item in as_list(value.get("content")):
+        if not isinstance(item, dict) or item.get("type") not in {"input_text", "text"}:
+            continue
+        if isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "\n".join(parts) if parts else None
+
+
+def reconcile_missed_parent_controls_from_rollout(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> bool:
+    """Recover a missed parent plan/confirmation from same-session host truth.
+
+    Desktop may start a delegated follow-up immediately after ``task_complete``
+    and omit the corresponding Stop/UserPrompt hook deliveries. The rollout is
+    already the host's durable lifecycle record, so use it as one bounded
+    continuity bridge instead of requiring the user to repeat confirmation or
+    encoding more semantics into task names.
+    """
+    if not (
+        state.get("task_domain") == "work"
+        and state.get("work_difficulty") == "hard"
+        and state.get("assessor_state") == "hard_plan_ready"
+        and state.get("plan_state")
+        in {"analyzing", "repair_required", "awaiting_confirmation"}
+    ):
+        return False
+    session_id = safe_label(payload.get("session_id"), 120)
+    if not session_id or state.get("session_fingerprint") != stable_hash(session_id):
+        return False
+    records = read_host_rollout_records(payload.get("transcript_path"))
+    if not records:
+        return False
+    metas = [
+        item.get("payload")
+        for item in records
+        if item.get("type") == "session_meta"
+        and isinstance(item.get("payload"), dict)
+    ]
+    if len(metas) != 1:
+        return False
+    meta = metas[0]
+    if meta.get("id") != session_id or meta.get("session_id") != session_id:
+        return False
+    if state.get("cwd_fingerprint") and stable_hash(meta.get("cwd")) != state.get("cwd_fingerprint"):
+        return False
+
+    confirmations: list[int] = []
+    plans: list[tuple[int, str, str | None]] = []
+    for index, record in enumerate(records):
+        user_text = _rollout_user_message(record)
+        if user_text is not None:
+            delegated = codex_delegation_input(user_text)
+            if pure_plan_confirmation(delegated if delegated is not None else user_text):
+                confirmations.append(index)
+        value = record.get("payload")
+        if (
+            record.get("type") == "event_msg"
+            and isinstance(value, dict)
+            and value.get("type") == "task_complete"
+        ):
+            message = value.get("last_agent_message")
+            if isinstance(message, str) and canonical_plan_message_ready(message):
+                plans.append(
+                    (
+                        index,
+                        message,
+                        safe_label(value.get("turn_id"), 120)
+                        if value.get("turn_id")
+                        else None,
+                    )
+                )
+    if not plans:
+        return False
+    confirmed_plans = [
+        item for item in plans if any(position > item[0] for position in confirmations)
+    ]
+    plan_index, plan_message, plan_turn = (confirmed_plans or plans)[-1]
+    has_confirmation = any(position > plan_index for position in confirmations)
+    changed = False
+    if has_confirmation:
+        receipt = pending_confirmation_receipt_for_state(state)
+        if receipt:
+            state["pending_confirmation_receipt"] = receipt
+            changed = True
+    if state.get("plan_state") in {"analyzing", "repair_required"}:
+        state["confirmed_plan_digest"] = None
+        state["confirmed_at"] = None
+        reset_executor_binding(state)
+        state["plan_state"] = "analyzing"
+        if write_plan_artifact(state, payload, plan_message):
+            state["plan_state"] = "awaiting_confirmation"
+            changed = True
+        else:
+            state["plan_state"] = "repair_required"
+            return True
+    if has_confirmation and state.get("plan_state") == "awaiting_confirmation":
+        changed = auto_confirm_trusted_plan(state, payload) or changed
+    if changed:
+        state.setdefault("guards", []).append(
+            {
+                "at": utc_now(),
+                "turn_id": plan_turn,
+                "kind": "host_rollout_parent_control_reconciled",
+                "action": "advise",
+                "fingerprint": stable_hash(
+                    f"host-rollout-parent-control-v1\0{session_id}\0{plan_turn}\0{has_confirmation}",
+                    32,
+                ),
+            }
+        )
+    return changed
+
+
 def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
     """Read state under the writer lock so Windows can atomically replace the JSON file."""
     path = state_path(payload)
@@ -5859,6 +7772,9 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
             source_schema = safe_int(
                 state.pop("_source_schema_version", SCHEMA_VERSION)
             )
+            normalized_state_changed = bool(
+                state.pop("_normalized_state_changed", False)
+            )
             before = json.dumps(state, ensure_ascii=False, sort_keys=True)
             canonical_current_body: str | None = None
             state["_defer_plan_transaction"] = True
@@ -5868,6 +7784,8 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
                         state, payload, source_schema
                     )
                 artifact_valid = verify_plan_artifact(state, payload)
+                if reconcile_missed_parent_controls_from_rollout(payload, state):
+                    artifact_valid = verify_plan_artifact(state, payload)
                 if payload.get("_read_canonical_plan_body") and artifact_valid:
                     canonical_current_body = _read_verified_current_plan_revision(
                         state, payload
@@ -5877,7 +7795,7 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
             pending = state.pop("_plan_transaction", None)
             after = json.dumps(state, ensure_ascii=False, sort_keys=True)
             try:
-                if after != before or pending is not None:
+                if normalized_state_changed or after != before or pending is not None:
                     atomic_write(path, state)
             except Exception:
                 if pending is not None:
@@ -5977,6 +7895,7 @@ def mutate_state(
             source_schema = safe_int(
                 state.pop("_source_schema_version", SCHEMA_VERSION)
             )
+            state.pop("_normalized_state_changed", None)
             if payload.get("cwd"):
                 state["cwd_fingerprint"] = stable_hash(payload.get("cwd"))
             current_root = current_plugin_root_fingerprint()
@@ -6153,7 +8072,7 @@ def cleanup_old_plugin_versions(
         ):
             return 0
         current = tuple(int(part) for part in match.groups())
-        older: list[Path] = []
+        older: list[tuple[tuple[int, int, int], Path]] = []
         for candidate in root.parent.iterdir():
             version_match = re.fullmatch(semver_pattern, candidate.name)
             if not version_match:
@@ -6165,9 +8084,14 @@ def cleanup_old_plugin_versions(
             if version > current:
                 return 0
             if version < current:
-                older.append(candidate)
+                older.append((version, candidate))
+        # Keep the immediately preceding official release for live task
+        # rollback.  Do not touch links, future versions, or non-semver names.
+        keep = max(older, default=None, key=lambda item: item[0])
         removed = 0
-        for candidate in older:
+        for version, candidate in older:
+            if keep is not None and candidate == keep[1]:
+                continue
             try:
                 shutil.rmtree(candidate)
                 removed += 1
@@ -6530,6 +8454,28 @@ def literal_exec_command_source(source: str) -> tuple[str, str] | None:
     return command, cwd
 
 
+def literal_apply_patch_source(source: str) -> str | None:
+    """Parse one inert literal ``tools.apply_patch`` call without eval."""
+    if source.count("tools.apply_patch(") != 1:
+        return None
+    direct = re.search(
+        r'tools\.apply_patch\(\s*("(?:[^"\\]|\\.)*")\s*\)', source, re.S
+    )
+    bound = re.search(
+        r'const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+        r'("(?:[^"\\]|\\.)*")\s*;[\s\S]*?'
+        r'tools\.apply_patch\(\s*\1\s*\)',
+        source,
+    )
+    if bool(direct) == bool(bound):
+        return None
+    try:
+        value = json.loads(direct.group(1) if direct else bound.group(2))
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
 def host_exec_output_status(output: Any) -> str:
     """Preserve an exact structured exit code inside the host exec wrapper."""
     structured_statuses: list[str] = []
@@ -6557,6 +8503,49 @@ def host_exec_output_status(output: Any) -> str:
     if any(status.startswith("error") for status in structured_statuses):
         return "error"
     return response_status(output)
+
+
+def host_apply_patch_receipt_success(response: Any) -> bool:
+    """Recognize only the current supported empty patch receipt shape."""
+    if response == {}:
+        return True
+    if not isinstance(response, list) or len(response) != 2:
+        return False
+    first, second = response
+    if not (
+        isinstance(first, dict)
+        and isinstance(first.get("text"), str)
+        and first.get("type") in {"input_text", "text"}
+        and first["text"].startswith("Script completed\nWall time ")
+        and first["text"].endswith("\nOutput:\n")
+        and isinstance(second, dict)
+        and isinstance(second.get("text"), str)
+        and second.get("type") in {"input_text", "text"}
+    ):
+        return False
+    try:
+        return json.loads(second["text"]) == {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def apply_patch_response_status(response: Any) -> str:
+    """Resolve the tool-specific empty receipt without weakening generic tools."""
+    generic = response_status(response)
+    if generic.startswith("error") or generic == "running":
+        return generic
+    if host_apply_patch_receipt_success(response):
+        return "ok"
+    if isinstance(response, dict) and generic == "ok" and (
+        isinstance(response.get("exit_code"), int)
+        or str(response.get("status") or response.get("state") or "")
+        .strip()
+        .lower()
+        in {"complete", "completed", "done", "ok", "success", "succeeded"}
+        or response.get("isError") is False
+    ):
+        return "ok"
+    return "unknown"
 
 
 def transcript_turn_structured_exec_results(
@@ -6643,9 +8632,8 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
     # templates, or evaluation are accepted.
     patch_sources: list[tuple[str, str]] = []
     turn_events: list[dict[str, Any]] = []
-    calls: dict[str, str] = {}
-    call_count = 0
-    outputs: dict[str, Any] = {}
+    call_counts: dict[str, int] = {}
+    outputs: dict[str, list[Any]] = {}
     for raw in read_transcript_tail(payload.get("transcript_path")):
         try:
             item = json.loads(raw); event = item.get("payload") or {}
@@ -6653,44 +8641,88 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
                 continue
             turn_events.append(event)
             if event.get("type") == "custom_tool_call" and event.get("name") == "exec":
-                call_count += 1
-                calls[str(event.get("call_id") or "")] = str(event.get("input") or "")
-                source = str(event.get("input") or "")
-                direct = re.search(r"tools\.apply_patch\(\s*(\"(?:[^\"\\]|\\.)*\")\s*\)", source, re.S)
-                bound = re.search(r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\"(?:[^\"\\]|\\.)*\")\s*;[\s\S]*?tools\.apply_patch\(\s*\1\s*\)", source)
-                literal = direct.group(1) if direct else bound.group(2) if bound else None
-                if literal:
-                    patch_sources.append((str(event.get("call_id") or ""), json.loads(literal)))
+                call_id = str(event.get("call_id") or "")
+                call_counts[call_id] = call_counts.get(call_id, 0) + 1
+                patch_source = literal_apply_patch_source(str(event.get("input") or ""))
+                if patch_source is not None:
+                    patch_sources.append((call_id, patch_source))
             elif event.get("type") == "custom_tool_call_output":
-                outputs[str(event.get("call_id") or "")] = event.get("output")
+                outputs.setdefault(str(event.get("call_id") or ""), []).append(
+                    event.get("output")
+                )
         except Exception:
             continue
-    patch_ops = [op for op in state.get("operations", []) if (op.get("status") == "unknown" or (op.get("status") in SUCCESS_STATUSES and not op.get("reconciliation_source"))) and op.get("host_event_turn_id") == turn_id and op.get("host_input_digest")]
-    if len(patch_sources) == 1:
-        patch_call_id, patch_source = patch_sources[0]
+    all_turn_patch_ops = [
+        op
+        for op in state.get("operations", [])
+        if normalized_key(op.get("tool")) == "applypatch"
+        and op.get("host_event_turn_id") == turn_id
+        and op.get("host_input_digest")
+    ]
+    patch_ops = [
+        op
+        for op in all_turn_patch_ops
+        if op.get("status") == "unknown"
+        or (
+            op.get("status") in SUCCESS_STATUSES
+            and not op.get("reconciliation_source")
+        )
+    ]
+    patch_digest_counts: dict[str, int] = {}
+    for _, patch_source in patch_sources:
+        digest = host_patch_digest(patch_source)
+        patch_digest_counts[digest] = patch_digest_counts.get(digest, 0) + 1
+    ordered_receipt_binding = bool(
+        len(patch_sources) == len(all_turn_patch_ops) > 0
+        and len({call_id for call_id, _ in patch_sources}) == len(patch_sources)
+        and len({host_patch_digest(source) for _, source in patch_sources})
+        == len(patch_sources)
+        and len({op.get("fingerprint") for op in all_turn_patch_ops})
+        == len(all_turn_patch_ops)
+        and len({op.get("host_input_digest") for op in all_turn_patch_ops})
+        == len(all_turn_patch_ops)
+        and all(
+            op.get("executor_agent_id")
+            and op.get("execution_contract_id") == state.get("execution_contract_id")
+            and op.get("slice_id") == (current_execution_slice(state) or {}).get("id")
+            and op.get("slice_contract_id") == slice_contract_id(state)
+            for op in all_turn_patch_ops
+        )
+    )
+    for patch_index, (patch_call_id, patch_source) in enumerate(patch_sources):
+        if (
+            not patch_call_id
+            or call_counts.get(patch_call_id) != 1
+            or len(outputs.get(patch_call_id, [])) != 1
+        ):
+            continue
         patch_digest = host_patch_digest(patch_source)
+        if patch_digest_counts.get(patch_digest) != 1:
+            continue
         matches = [op for op in patch_ops if op.get("host_input_digest") == patch_digest]
+        ordered_receipt_match = False
+        if not matches and ordered_receipt_binding:
+            ordered = all_turn_patch_ops[patch_index]
+            if ordered in patch_ops:
+                matches = [ordered]
+                ordered_receipt_match = True
         exact_patch_match = bool(matches)
         current = current_execution_slice(state) or {}
         call_index = next((index for index, event in enumerate(turn_events) if event.get("type") == "custom_tool_call" and event.get("call_id") == patch_call_id), -1)
         output_index = next((index for index, event in enumerate(turn_events[call_index + 1 :], call_index + 1) if event.get("type") == "custom_tool_call_output" and event.get("call_id") == patch_call_id), -1)
-        successes = [
+        if call_index < 0 or output_index <= call_index:
+            continue
+        patch_events = [
             event
             for event in turn_events[call_index + 1 : output_index]
+            if event.get("type") == "patch_apply_end"
+        ]
+        successes = [
+            event
+            for event in patch_events
             if (
-                event.get("type") == "patch_apply_end"
-                and event.get("success") is True
+                event.get("success") is True
                 and str(event.get("status") or "").lower() == "completed"
-            )
-            or (
-                event.get("type") == "item_completed"
-                and isinstance(event.get("item"), dict)
-                and event["item"].get("type") == "FileChange"
-                and str(event["item"].get("status") or "").lower()
-                == "completed"
-                and isinstance(event["item"].get("changes"), dict)
-                and bool(event["item"]["changes"])
-                and not str(event["item"].get("stderr") or "").strip()
             )
         ]
         if not matches and (
@@ -6703,28 +8735,28 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
                 matches[0]["legacy_host_input_digest"] = matches[0].get("host_input_digest")
                 matches[0]["host_input_digest"] = patch_digest
                 matches[0]["reconciliation_source"] = "legacy_unique_turn_patch_event_v1"
-        if not matches and len(successes) == 1 and successes[0].get("type") == "item_completed":
-            current_host_shape = [
-                op
-                for op in patch_ops
-                if normalized_key(op.get("tool")) == "applypatch"
-                and op.get("executor_agent_id")
-                and op.get("execution_contract_id") == state.get("execution_contract_id")
-                and op.get("slice_id") == current.get("id")
-                and op.get("slice_contract_id") == slice_contract_id(state)
-            ]
-            if len(current_host_shape) == 1:
-                matches = current_host_shape
-                matches[0]["legacy_host_input_digest"] = matches[0].get("host_input_digest")
-                matches[0]["host_input_digest"] = patch_digest
-                matches[0]["reconciliation_source"] = "host_rollout_unique_file_change_v1"
         if len(matches) == 1:
-            # Host event is authoritative only when exactly one bounded success
-            # event is present in this turn; missing/ambiguous remains unknown.
-            if len(successes) == 1:
-                matches[0]["status"] = "ok"; matches[0]["category"] = "implementation"
-                if exact_patch_match:
-                    matches[0]["reconciliation_source"] = "host_rollout_exact_patch_digest_v1"
+            legacy_success = len(patch_events) == len(successes) == 1
+            current_receipt = bool(
+                not patch_events
+                and host_apply_patch_receipt_success(
+                    outputs[patch_call_id][0]
+                )
+            )
+            if legacy_success or current_receipt:
+                if ordered_receipt_match:
+                    matches[0]["legacy_host_input_digest"] = matches[0].get(
+                        "host_input_digest"
+                    )
+                    matches[0]["host_input_digest"] = patch_digest
+                matches[0]["status"] = "ok"
+                matches[0]["category"] = "implementation"
+                if exact_patch_match or ordered_receipt_match:
+                    matches[0]["reconciliation_source"] = (
+                        "host_rollout_exact_patch_digest_v1"
+                        if legacy_success and exact_patch_match
+                        else "host_rollout_exact_patch_receipt_v2"
+                    )
     payload_cwd = str(payload.get("cwd") or "")
     for digest, status, command in transcript_turn_structured_exec_results(
         payload.get("transcript_path"), turn_id
@@ -6743,7 +8775,10 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
         candidates = [
             op
             for op in state.get("operations", [])
-            if op.get("status") == "unknown"
+            if (
+                op.get("status") == "unknown"
+                or op.get("status") in SUCCESS_STATUSES
+            )
             and op.get("host_event_turn_id") == turn_id
             and (
                 op.get("host_input_digest") == digest
@@ -6761,7 +8796,7 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
         if op.get("host_input_digest") != digest:
             op["legacy_host_input_digest"] = op.get("host_input_digest")
             op["host_input_digest"] = digest
-            op["reconciliation_source"] = "host_rollout_exact_command_text_v1"
+        op["reconciliation_source"] = "host_rollout_exact_command_text_v1"
         op["host_command_digest"] = command_digest
         op["status"] = status
         op["category"] = command_category({"tool_name": op.get("tool")}, command)
@@ -6940,9 +8975,27 @@ def reconcile_current_executor_rollout_on_resume(payload: dict[str, Any], state:
     records = read_host_rollout_records(candidates[0]); metas=[x.get("payload") for x in records if x.get("type")=="session_meta" and isinstance(x.get("payload"),dict)]
     parent_session = safe_label(payload.get("session_id"), 120) if payload.get("session_id") else None
     if len(metas) != 1 or metas[0].get("id") != agent or not parent_session or metas[0].get("session_id") != parent_session: return
-    for op in state.get("operations", []):
-        if isinstance(op,dict) and op.get("status")=="unknown" and op.get("executor_agent_id")==agent and op.get("execution_contract_id")==contract and op.get("slice_id")==current.get("id") and op.get("host_event_turn_id") and op.get("host_input_digest"):
-            reconcile_unknown_operations_from_transcript({"turn_id":op["host_event_turn_id"],"transcript_path":str(candidates[0])},state)
+    turn_ids = dict.fromkeys(
+        str(op["host_event_turn_id"])
+        for op in state.get("operations", [])
+        if isinstance(op, dict)
+        and op.get("executor_agent_id") == agent
+        and op.get("execution_contract_id") == contract
+        and op.get("slice_id") == current.get("id")
+        and op.get("host_event_turn_id")
+        and op.get("host_input_digest")
+        and (
+            op.get("status") == "unknown"
+            or (
+                op.get("status") in SUCCESS_STATUSES
+                and not op.get("reconciliation_source")
+            )
+        )
+    )
+    for turn_id in turn_ids:
+        reconcile_unknown_operations_from_transcript(
+            {"turn_id": turn_id, "transcript_path": str(candidates[0])}, state
+        )
 
 
 def transcript_has_exact_compaction_gate(path_value: Any, session_id: str, window_number: int, slice_id: str) -> bool:
@@ -7011,14 +9064,31 @@ def resume_compaction_gate_misclassification_once(payload: dict[str, Any], state
     for item in state.get("subagents", []):
         if isinstance(item, dict) and item.get("role") == "high_assessor" and item.get("objective_fingerprint") == objective["fingerprint"] and item.get("contract_id"):
             assessor_groups.setdefault(str(item["contract_id"]), []).append(item)
-    valid_assessors = []
+    valid_assessors: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for binding, items in assessor_groups.items():
         requests = [item for item in items if item.get("event") == "request"]
         starts = [item for item in items if item.get("event") == "start"]
         if len(requests) != 1 or len(starts) != 1:
             continue
         request, started = requests[0], starts[0]
-        if not (request.get("host_accepted") is True and started.get("start_observed") == "full" and request.get("attempt") == 1 and request.get("fork_turns") == "1" and request.get("model") and request.get("reasoning_effort")):
+        attempt = safe_sequence(request.get("attempt"))
+        probe = json.loads(json.dumps(state))
+        probe.update({
+            "objective": objective,
+            "assessor_binding_id": binding,
+            "assessor_attempt": attempt,
+            "assessor_agent_id": None,
+            "assessor_model": request.get("model"),
+            "assessor_reasoning_effort": request.get("reasoning_effort"),
+            "assessor_fork_turns": request.get("fork_turns"),
+            "assessor_observed_effective": True,
+            "assessor_observed_model": started.get("model"),
+            "assessor_observed_reasoning_effort": started.get("reasoning_effort"),
+            "assessor_start_observed": "full",
+            "assessor_observation_source": started.get("observation_source"),
+        })
+        _, lifecycle_error = original_assessor_lifecycle(probe)
+        if lifecycle_error:
             continue
         valid_assessors.append((binding, request, started))
     if len(valid_assessors) != 1:
@@ -7034,13 +9104,16 @@ def resume_compaction_gate_misclassification_once(payload: dict[str, Any], state
         "plan_artifact": _safe_plan_artifact(checkpoint.get("plan_artifact")),
         "execution_slices": snapshot_slices, "execution_profile_version": checkpoint.get("execution_profile_version"),
         "execution_contract_id": contract, "executor_state": "spawn_required", "executor_agent_id": None,
-        "executor_attempt": safe_int(checkpoint.get("executor_attempt")), "executor_failure_kind": None,
-        "model_profile": confirmed_executor_model_profile(candidate),
-        "assessor_generation": 1, "assessor_binding_id": assessor_binding, "assessor_state": "hard_plan_ready", "assessor_attempt": 1,
+        "executor_attempt": safe_sequence(checkpoint.get("executor_attempt")), "executor_failure_kind": None,
+        "assessor_generation": max(safe_sequence(state.get("assessor_generation")), 1), "assessor_binding_id": assessor_binding, "assessor_state": "hard_plan_ready", "assessor_attempt": safe_sequence(assessor_request.get("attempt")),
         "assessor_agent_id": None, "assessor_model": assessor_request["model"], "assessor_reasoning_effort": assessor_request["reasoning_effort"], "assessor_fork_turns": "1",
         "assessor_input_fingerprint": objective["fingerprint"], "assessor_failure_kind": None, "assessor_observed_effective": True,
         "assessor_observed_model": assessor_started.get("model") or assessor_request["model"], "assessor_observed_reasoning_effort": assessor_started.get("reasoning_effort") or assessor_request["reasoning_effort"], "assessor_start_observed": "full", "assessor_observation_source": assessor_started.get("observation_source"),
     })
+    lifecycle, lifecycle_error = original_assessor_lifecycle(candidate)
+    if lifecycle_error or lifecycle.get("binding_id") != assessor_binding:
+        return False
+    candidate["model_profile"] = confirmed_executor_model_profile(candidate)
     if not verify_plan_artifact(candidate, payload) or execution_contract_id(candidate) != contract:
         return False
     candidate.setdefault("guards", []).append({"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "compaction_gate_resume_repair", "action": "advise", "fingerprint": fingerprint})
@@ -7191,9 +9264,9 @@ def resume_completed_parent_review_once(
         and state.get("executor_state") == "recovery_required"
         and state.get("executor_failure_kind") == "verification_failed"
         and str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
-        and safe_int(state.get("executor_attempt")) == 1
+        and safe_sequence(state.get("executor_attempt")) > 0
         and review.get("status") == "failed"
-        and review.get("attempt") == 1
+        and review.get("attempt") == safe_sequence(state.get("executor_attempt"))
         and contract
         and contract == execution_contract_id(state)
         and current
@@ -7379,9 +9452,9 @@ def resume_failed_review_evidence_once(payload: dict[str, Any], state: dict[str,
     if not (
         state.get("executor_state") == "recovery_required"
         and state.get("executor_failure_kind") == "verification_failed"
-        and safe_int(state.get("executor_attempt")) == 1
+        and safe_sequence(state.get("executor_attempt")) > 0
         and review.get("status") == "failed"
-        and review.get("attempt") == 1
+        and review.get("attempt") == safe_sequence(state.get("executor_attempt"))
         and contract
         and current
         and current.get("status") == "pending"
@@ -7435,7 +9508,7 @@ def resume_failed_review_evidence_once(payload: dict[str, Any], state: dict[str,
 
 def resume_failed_parent_probe_once(state: dict[str, Any], payload: dict[str, Any] | None = None) -> bool:
     review=_safe_executor_review(state.get("executor_review")); current=current_execution_slice(state) or {}; contract=state.get("execution_contract_id"); evidence=review.get("review_evidence_digest")
-    if not (state.get("executor_state")=="recovery_required" and state.get("executor_failure_kind")=="verification_failed" and safe_int(state.get("executor_attempt"))==1 and review.get("status")=="failed" and review.get("attempt")==1 and evidence and review.get("candidate_result_fingerprint") and review.get("candidate_evidence_digest") and current.get("status")=="pending" and safe_fingerprint(contract) and contract==execution_contract_id(state) and review.get("execution_contract_id")==contract and review.get("slice_id")==current.get("id") and review.get("slice_contract_id")==slice_contract_id(state)):
+    if not (state.get("executor_state")=="recovery_required" and state.get("executor_failure_kind")=="verification_failed" and safe_sequence(state.get("executor_attempt"))>0 and review.get("status")=="failed" and review.get("attempt")==safe_sequence(state.get("executor_attempt")) and evidence and review.get("candidate_result_fingerprint") and review.get("candidate_evidence_digest") and current.get("status")=="pending" and safe_fingerprint(contract) and contract==execution_contract_id(state) and review.get("execution_contract_id")==contract and review.get("slice_id")==current.get("id") and review.get("slice_contract_id")==slice_contract_id(state)):
         return False
     fp=stable_hash(str(evidence),32); guards=state.setdefault("guards",[])
     if any(g.get("kind")=="parent_review_probe_correction" and g.get("fingerprint")==fp for g in guards if isinstance(g,dict)): return False
@@ -7562,6 +9635,7 @@ DAILY_EXACT_PATTERNS = (
     ("daily_chat", r"^(?:你好|您好|嗨|hello|hi|聊聊|陪我聊天|谢谢|早上好|晚上好)[!！。,.，\s]*$"),
 )
 WORK_STRONG_PATTERNS = (
+    ("work_workflow_manager_maintenance", r"(?:workflow[ -]?manager|工作流管理器).{0,80}(?:修复|fix|测试|test|版本|release|发布|publish|代码)"),
     ("work_device_customization", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:定制|需求|适配|开发|修改|实现)"),
     ("work_device_bug", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:bug|问题|异常|故障|崩溃|重启|修复|排查|诊断)"),
     (
@@ -7685,6 +9759,15 @@ def classify_task_domain(prompt: str) -> dict[str, Any]:
 
 CRITICAL_HARD_PATTERNS = (
     (
+        "critical_workflow_manager_versioned_release",
+        r"(?:workflow[ -]?manager|工作流管理器).{0,120}(?:插件|plugin|hook|skill).{0,120}"
+        r"(?:发布|publish|release).{0,48}(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)"
+        r"|(?:发布|publish|release).{0,120}(?:workflow[ -]?manager|工作流管理器).{0,120}"
+        r"(?:插件|plugin|hook|skill).{0,48}(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)"
+        r"|(?:workflow[ -]?manager|工作流管理器).{0,120}(?:发布|publish|release).{0,48}"
+        r"(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)",
+    ),
+    (
         "critical_irreversible_or_production",
         r"(?:生产发布|production\s+(?:release|deployment)|不可逆|irreversible|"
         r"数据丢失|data\s+loss|安全漏洞|security\s+(?:incident|vulnerability)|"
@@ -7699,6 +9782,12 @@ CRITICAL_HARD_PATTERNS = (
         "critical_host_continuity",
         r"(?:host\s+compaction|真实(?:宿主)?压缩|压缩).{0,96}"
         r"(?:same[- ]session|同一会话|同会话|resume|恢复)",
+    ),
+    (
+        "critical_host_lifecycle_acceptance",
+        r"(?:(?:hard|困难|复杂).{0,64}(?:宿主|host).{0,64}(?:验收|acceptance)|"
+        r"(?:宿主|host).{0,64}(?:验收|acceptance).{0,64}(?:hard|困难|复杂)|"
+        r"host[- ](?:lifecycle|continuity)[- ]acceptance)",
     ),
 )
 HARD_WORK_PATTERNS = (
@@ -7739,10 +9828,19 @@ def classify_work_difficulty(
         confidence = "high"
         rule_codes = ["daily_not_applicable"]
     else:
+        # Explicitly declaring that no irreversible action exists is scope
+        # metadata, not evidence of irreversible risk.
+        critical_text = re.sub(
+            r"(?:irreversible[_ -]?action|不可逆(?:外部)?动作)\s*[:=：]\s*"
+            r"(?:none|no|false|无|否|不适用|n/?a)(?=$|[\s,;，；])",
+            "",
+            lower,
+            flags=re.I,
+        )
         critical_codes = [
             code
             for code, pattern in CRITICAL_HARD_PATTERNS
-            if re.search(pattern, lower, re.I)
+            if re.search(pattern, critical_text, re.I)
         ]
         hard_codes = [
             code for code, pattern in HARD_WORK_PATTERNS if re.search(pattern, lower, re.I)
@@ -8174,9 +10272,7 @@ SUBAGENT_REQUEST_ALIASES = {
 
 def assessor_task_name_has_intent(value: Any) -> bool:
     normalized = normalized_key(value)
-    return normalized == "highassessor" or bool(
-        re.fullmatch(r"highassessor[0-9a-f]{48}v1", normalized)
-    )
+    return normalized == "highassessor" or normalized.startswith("highassessor")
 
 
 def _json_container_text(value: str) -> bool:
@@ -8410,82 +10506,64 @@ def subagent_request_visibility(payload: dict[str, Any]) -> str:
 
 def bound_assessor_task_name(state: dict[str, Any]) -> str | None:
     binding = safe_fingerprint(state.get("assessor_binding_id"))
-    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
-    if not binding or len(binding) != 32 or not objective or len(objective) != 16:
+    if not binding or len(binding) != 32:
         return None
-    return f"high_assessor_{binding}_{objective}_v1"
+    if state.get("assessor_state") in {"spawn_pending", "running"}:
+        reserved = [
+            item
+            for item in as_list(state.get("subagents"))
+            if isinstance(item, dict)
+            and item.get("event") == "request"
+            and item.get("role") == "high_assessor"
+            and item.get("contract_id") == binding
+            and safe_sequence(item.get("attempt"))
+            == safe_sequence(state.get("assessor_attempt"))
+            and item.get("task_name")
+        ]
+        if len(reserved) == 1:
+            return safe_label(reserved[0]["task_name"], 120)
+    sequence = (
+        safe_sequence(state.get("assessor_attempt"))
+        if state.get("assessor_state") in {"spawn_pending", "running"}
+        else next_sequence(state.get("assessor_attempt"))
+    )
+    return f"assessor_{binding[:12]}_q{sequence}"
+
+
+def executor_request_sequence(state: dict[str, Any]) -> int:
+    current = safe_sequence(state.get("executor_attempt"))
+    return (
+        current
+        if state.get("executor_state") in {"spawn_pending", "running"} and current > 0
+        else next_sequence(current)
+    )
 
 
 def bound_executor_task_name(state: dict[str, Any]) -> str | None:
     contract = safe_fingerprint(state.get("execution_contract_id"))
     if not contract or len(contract) != 32:
         return None
-    if str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION:
-        item = current_execution_slice(state)
-        token = slice_task_token(state)
-        if not item or not token:
-            return None
-        prefix = f"confirmed_executor_{contract}_{item['id']}_{token}"
-        review = _safe_executor_review(state.get("executor_review"))
-        verification_recovery = bool(
-            safe_int(state.get("executor_attempt")) == 1
-            and review.get("execution_contract_id") == contract
-            and review.get("slice_id") == item["id"]
-            and review.get("slice_contract_id") == slice_contract_id(state)
-            and review.get("attempt") == 1
-            and (
-                state.get("executor_state") == "verification_required"
-                and review.get("status") == "review_required"
-                or state.get("executor_state") == "recovery_required"
-                and state.get("executor_failure_kind") == "verification_failed"
-                and review.get("status") == "failed"
-            )
-        )
-        if verification_recovery:
-            review_digest = review.get("review_evidence_digest")
-            return (
-                f"{prefix}_vf_{review_digest}_v2"
-                if review_digest
-                else None
-            )
-        failure = (
-            safe_label(state.get("executor_failure_kind"), 48)
-            if state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
-            else ""
-        )
-        if state.get("executor_state") == "recovery_required" and safe_int(state.get("executor_attempt")) == 1 and failure:
-            return f"{prefix}_{failure}_v2"
-        return f"{prefix}_v1"
-    review = _safe_executor_review(state.get("executor_review"))
-    verification_recovery = bool(
-        safe_int(state.get("executor_attempt")) == 1
-        and review.get("execution_contract_id") == contract
-        and review.get("attempt") == 1
-        and (
-            state.get("executor_state") == "verification_required"
-            and review.get("status") == "review_required"
-            or state.get("executor_state") == "recovery_required"
-            and state.get("executor_failure_kind") == "verification_failed"
-            and review.get("status") == "failed"
-        )
+    if state.get("executor_state") in {"spawn_pending", "running"}:
+        reserved = [
+            item
+            for item in as_list(state.get("subagents"))
+            if isinstance(item, dict)
+            and item.get("event") == "request"
+            and item.get("role") == "confirmed_executor"
+            and item.get("contract_id") == contract
+            and safe_sequence(item.get("attempt"))
+            == safe_sequence(state.get("executor_attempt"))
+            and item.get("task_name")
+        ]
+        if len(reserved) == 1:
+            return safe_label(reserved[0]["task_name"], 120)
+    sequence = executor_request_sequence(state)
+    prefix = (
+        "recovery"
+        if state.get("executor_state") == "recovery_required"
+        else "executor"
     )
-    if verification_recovery:
-        evidence = review.get("review_evidence_digest") or "<32hex>"
-        return (
-            f"confirmed_executor_{contract}_verification_failed_{evidence}_v2"
-        )
-    failure = (
-        safe_label(state.get("executor_failure_kind"), 48)
-        if state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
-        else ""
-    )
-    attempt = safe_int(state.get("executor_attempt"))
-    recovery_v2 = (
-        state.get("executor_state") == "recovery_required" and attempt == 1
-    ) or (state.get("executor_state") == "spawn_pending" and attempt == 2)
-    if failure and recovery_v2:
-        return f"confirmed_executor_{contract}_{failure}_v2"
-    return f"confirmed_executor_{contract}_v1"
+    return f"{prefix}_{contract[:12]}_q{sequence}"
 
 
 def verification_recovery_evidence_digest(
@@ -8494,16 +10572,10 @@ def verification_recovery_evidence_digest(
     contract = safe_fingerprint(state.get("execution_contract_id"))
     if not task_name or not contract or len(contract) != 32:
         return None
-    if str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION:
-        review = _safe_executor_review(state.get("executor_review"))
-        digest = _fingerprint32(review.get("review_evidence_digest"))
-        expected = bound_executor_task_name(state)
-        return digest if digest and task_name == expected else None
-    match = re.fullmatch(
-        rf"confirmed_executor_{re.escape(contract)}_verification_failed_([0-9a-f]{{32}})_v2",
-        task_name,
-    )
-    return match.group(1) if match else None
+    review = _safe_executor_review(state.get("executor_review"))
+    digest = _fingerprint32(review.get("review_evidence_digest"))
+    expected = bound_executor_task_name(state)
+    return digest if digest and task_name == expected else None
 
 
 def executor_verification_recovery_pending(state: dict[str, Any]) -> bool:
@@ -8511,9 +10583,9 @@ def executor_verification_recovery_pending(state: dict[str, Any]) -> bool:
     contract = safe_fingerprint(state.get("execution_contract_id"))
     if (
         not contract
-        or safe_int(state.get("executor_attempt")) != 1
+        or safe_sequence(state.get("executor_attempt")) <= 0
         or review.get("execution_contract_id") != contract
-        or review.get("attempt") != 1
+        or review.get("attempt") != safe_sequence(state.get("executor_attempt"))
         or not review.get("candidate_result_fingerprint")
         or not review.get("candidate_evidence_digest")
     ):
@@ -8527,9 +10599,7 @@ def executor_verification_recovery_pending(state: dict[str, Any]) -> bool:
         ):
             return False
     return bool(
-        state.get("executor_state") == "verification_required"
-        and review.get("status") == "review_required"
-        or state.get("executor_state") == "recovery_required"
+        state.get("executor_state") == "recovery_required"
         and state.get("executor_failure_kind") == "verification_failed"
         and review.get("status") == "failed"
         and review.get("review_evidence_digest")
@@ -8537,8 +10607,9 @@ def executor_verification_recovery_pending(state: dict[str, Any]) -> bool:
 
 
 def executor_recovery_has_fresh_child_boundary(state: dict[str, Any]) -> bool:
-    """Require ordinary attempt-one executors to become terminal before fresh v2."""
-    if safe_int(state.get("executor_attempt")) != 1:
+    """Require the immediately prior sequence to be terminal before recovery."""
+    sequence = safe_sequence(state.get("executor_attempt"))
+    if sequence <= 0:
         return False
     if executor_verification_recovery_pending(state):
         # Schema upgrades intentionally discard transient lifecycle caches. The
@@ -8555,15 +10626,19 @@ def executor_recovery_has_fresh_child_boundary(state: dict[str, Any]) -> bool:
             str(state.get("execution_profile_version")) != EXECUTION_PROFILE_VERSION
             or group["request"].get("slice_contract_id") == slice_contract_id(state)
         )
-        and safe_int(group["request"].get("attempt")) == 1
+        and safe_sequence(group["request"].get("attempt")) == sequence
     ]
     if any(group.get("state") in {"live", "result_pending"} for group in matching):
         return False
     if any(group.get("state") == "terminal" for group in matching):
         return True
-    # A rejected spawn has no child to terminate. Its persisted failed request is
-    # nevertheless a complete attempt boundary and recovery still needs fresh v2.
-    return state.get("executor_failure_kind") == "spawn_failed"
+    # A rejected spawn has no child to terminate. Its explicit rejected Post is
+    # nevertheless a complete sequence boundary.
+    return any(
+        isinstance(group.get("request"), dict)
+        and group["request"].get("host_accepted") is False
+        for group in matching
+    )
 
 
 def opaque_v2_bound_assessor_target(payload: dict[str, Any], state: dict[str, Any]) -> bool:
@@ -8599,243 +10674,99 @@ def subagent_request_options(payload: dict[str, Any]) -> dict[str, str | None]:
     return result
 
 
-def confirmed_executor_request(payload: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
+def confirmed_executor_request(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> tuple[bool, str | None]:
+    """Validate only host-visible fields that current profile v10 cannot infer."""
+
+    if str(state.get("execution_profile_version")) != EXECUTION_PROFILE_VERSION:
+        return False, "missing current execution profile"
     resolution = subagent_request_resolution(payload)
     if resolution.get("error"):
         return False, f"executor {resolution['error']}"
-    contract_id = str(state.get("execution_contract_id") or "")
-    profile_current = str(state.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
-    current_slice = current_execution_slice(state)
-    current_slice_contract = slice_contract_id(state)
-    request = subagent_request_text(payload)
-    if not contract_id or not request or (profile_current and (not current_slice or not current_slice_contract)):
-        return False, "missing execution contract"
+    if (
+        state.get("plan_state") != "confirmed"
+        or state.get("confirmed_plan_digest") != state.get("plan_digest")
+        or state.get("execution_contract_id") != execution_contract_id(state)
+        or state.get("executor_state") not in {"spawn_required", "recovery_required"}
+        or not current_execution_slice(state)
+    ):
+        return False, "missing confirmed execution contract"
+
+    candidates = subagent_request_candidates(payload)
+    raw_task_name = candidates[0].get("task_name") if candidates else None
+    if not isinstance(raw_task_name, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}", raw_task_name
+    ):
+        return False, "executor requires one safe ASCII task_name"
+
     options = subagent_request_options(payload)
-    task_name, _ = subagent_request_fields(payload)
-    visibility = subagent_request_visibility(payload)
-    opaque_v2 = visibility == "opaque_v2"
-    verification_recovery = executor_verification_recovery_pending(state)
-    verification_evidence = verification_recovery_evidence_digest(task_name, state)
-    if verification_recovery:
-        review = _safe_executor_review(state.get("executor_review"))
-        caller_id = next(
-            (
-                safe_label(payload.get(key), 120)
-                for key in ("agent_id", "subagent_id")
-                if payload.get(key)
-            ),
-            None,
-        )
-        if caller_id:
-            return False, "verification recovery must be dispatched by the parent reviewer"
-        if not verification_evidence:
-            return False, "verification recovery requires the evidence-bound visible v2 task_name"
-        if (
-            review.get("review_evidence_digest")
-            and verification_evidence != review.get("review_evidence_digest")
-        ):
-            return False, "verification recovery evidence no longer matches the pending review"
-    elif task_name != bound_executor_task_name(state):
-        return False, "executor requires the exact visible attempt-bound task_name"
     model = str(options.get("model") or "").strip()
     effort = str(options.get("reasoning_effort") or "").strip().lower()
-    fork_turns = str(options.get("fork_turns") or "").strip().lower()
-    preference = safe_session_execution_preference(
-        state.get("session_execution_preference")
-    )
-    contract_marker = opaque_v2 or bool(
-        re.search(
-            rf"(?:execution_contract_id|execution-contract-id|执行合同)\s*[:=：]\s*{re.escape(contract_id)}\b",
-            request,
-            re.I,
-        )
-    )
-    slice_marker = not profile_current or opaque_v2 or bool(
-        re.search(
-            rf"(?:slice_id|slice-id|执行切片)\s*[:=：]\s*{re.escape(str((current_slice or {}).get('id') or ''))}\b",
-            request,
-            re.I,
-        )
-        and re.search(
-            rf"(?:slice_contract_id|slice-contract-id|切片合同)\s*[:=：]\s*{re.escape(str(current_slice_contract or ''))}\b",
-            request,
-            re.I,
-        )
-    )
-    plan_marker = opaque_v2 or str(state.get("plan_digest") or "") in request
-    generation_marker = opaque_v2 or bool(
-        re.search(
-            rf"(?:plan_generation|plan-generation|计划代次)\s*[:=：]\s*{safe_int(state.get('plan_generation'))}\b",
-            request,
-            re.I,
-        )
-    )
-    artifact = _safe_plan_artifact(state.get("plan_artifact"))
-    canonical_marker = opaque_v2 or bool(
-        artifact.get("relative_path")
-        and str(artifact.get("relative_path")) in request
-        and artifact.get("current_revision_digest")
-        and str(artifact.get("current_revision_digest")) in request
-        and artifact.get("journal_digest")
-        and str(artifact.get("journal_digest")) in request
-        and (
-            re.search(r"\b(?:read|reread|load)\b.{0,48}\bcanonical\b", request, re.I)
-            or any(term in request for term in ("重读权威计划", "读取权威计划", "从权威文档加载"))
-        )
-    )
-    exclusive_scope = opaque_v2 or bool(
-        re.search(r"\b(?:exclusive (?:owner|executor)|only executor)\b", request, re.I)
-        or any(term in request for term in ("唯一执行者", "独占执行", "独占修改"))
-    )
-    acceptance = opaque_v2 or bool(
-        re.search(r"\b(?:acceptance|verification|verify|test)\b", request, re.I)
-        or any(term in request for term in ("验收", "验证", "测试"))
-    )
-    result_contract = opaque_v2 or bool(
-        re.search(
-            (
-                rf"(?m)^EXECUTION_RESULT execution_contract_id={re.escape(contract_id)} "
-                rf"slice_id={re.escape(str((current_slice or {}).get('id') or ''))} "
-                r"outcome=succeeded\|failed$"
-                if profile_current
-                else rf"(?m)^EXECUTION_RESULT execution_contract_id={re.escape(contract_id)} "
-                r"outcome=succeeded\|failed evidence_digest=<32hex>$"
-            ),
-            request,
-        )
-    )
-    if state.get("executor_state") == "recovery_required" or verification_recovery:
-        if not executor_recovery_has_fresh_child_boundary(state):
-            return False, "executor recovery requires the prior child to be terminal before fresh v2"
-        stall = _safe_stall(state.get("stall"))
-        if stall.get("state") not in {"none", "resume_required"}:
-            return False, "stall diagnosis must complete before executor recovery"
-        if stall.get("state") == "resume_required":
-            if (
-                f"stall_id={stall.get('stall_id')}" not in request
-                or f"remediation_digest={stall.get('remediation_digest')}" not in request
-            ):
-                return False, "stall recovery lacks the bound stall_id and remediation_digest"
-            if stall.get("resume_profile") != confirmed_executor_model_profile(state):
-                return False, "stall recovery profile no longer matches the bound session policy"
-        failure_kind = (
-            "verification_failed"
-            if verification_recovery
-            else str(state.get("executor_failure_kind") or "")
-        )
-        recovery_marker = opaque_v2 or bool(
-            failure_kind
-            and re.search(
-                rf"(?:recovery_from|recovery-from|恢复自)\s*[:=：]\s*{re.escape(failure_kind)}\b",
-                request,
-                re.I,
-            )
-        )
-        correction_marker = opaque_v2 or bool(
-            re.search(
-                r"(?:material_correction|material-correction|实质修正)\s*[:=：]\s*.{8,}",
-                request,
-                re.I,
-            )
-        )
-        if not recovery_marker or not correction_marker:
-            return False, "recovery request lacks the typed failure and a material correction"
-        if verification_recovery and not opaque_v2:
-            evidence_marker = re.search(
-                r"(?:verification_evidence_digest|verification-evidence-digest)"
-                r"\s*[:=：]\s*([0-9a-f]{32})\b",
-                request,
-                re.I,
-            )
-            if (
-                not evidence_marker
-                or evidence_marker.group(1) != verification_evidence
-            ):
-                return False, "verification recovery lacks the task-bound review evidence digest"
-    if not model:
-        return False, "model_unavailable"
+    fork_turns = str(options.get("fork_turns") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
-        return False, "invalid executor model identifier"
-    if preference == "highest_throughout":
-        expected_model = highest_execution_model(state)
-        expected_effort = highest_execution_effort(state)
-        if not opaque_v2 and "profile_resolution=highest_available" not in request:
-            return False, "highest executor requires profile_resolution=highest_available"
-        if not expected_model or not expected_effort:
-            return False, "model_unavailable"
-        if safe_label(model, 80) != expected_model:
-            return False, "executor model must match the bound highest-tier model"
-        if effort != expected_effort:
-            return False, "reasoning_effort must match the bound highest assessor request"
-    else:
-        current_model = str(state.get("model") or "").strip()
-        if current_model and safe_label(model, 80) == safe_label(current_model, 80):
-            return False, "executor model is not a lower-tier override"
-        if effort != "medium":
-            return False, "reasoning_effort must be medium"
+        return False, "model_unavailable"
     if fork_turns != "1":
         return False, "every bound executor requires fork_turns=1"
-    if not contract_marker or not slice_marker or not plan_marker or not generation_marker:
-        return False, "executor request is not bound to the exact confirmed plan"
-    if not canonical_marker:
-        return False, "executor must load the exact current revision from the canonical journal"
-    if not exclusive_scope or not acceptance:
-        return False, "executor request must declare exclusive execution ownership and acceptance"
-    if not result_contract:
-        return False, "executor request must require the exact bound EXECUTION_RESULT contract"
+
+    recovery = state.get("executor_state") == "recovery_required"
+    if recovery:
+        if not executor_recovery_has_fresh_child_boundary(state):
+            return False, "executor recovery requires a terminal prior sequence"
+        if not pending_recovery_reservation_for_state(state):
+            inline_recovery, inline_error = parse_recovery_contract(
+                subagent_request_text(payload),
+                state,
+                opaque=subagent_request_visibility(payload) == "opaque_v2",
+            )
+            if not inline_recovery:
+                return False, inline_error or "recovery facts are incomplete"
+
+    profile = expected_executor_profile(state)
+    if profile.get("error"):
+        return False, str(profile["error"])
+    if profile.get("profile") == "work_executor_highest_available":
+        if (
+            model != str(profile.get("model") or "")
+            or effort != str(profile.get("reasoning_effort") or "")
+        ):
+            return False, "executor profile does not match the typed recovery/session policy"
+    elif model == RECOVERY_EXECUTOR_MODEL or effort != "medium":
+        return False, "normal executor requires a lower-tier model at medium"
     return True, None
 
 
-def confirmed_assessor_request(payload: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
+def confirmed_assessor_request(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> tuple[bool, str | None]:
+    """Treat assessor prose and task naming as opaque; validate host profile only."""
+
+    if str(state.get("execution_profile_version")) != EXECUTION_PROFILE_VERSION:
+        return False, "missing current assessment profile"
     resolution = subagent_request_resolution(payload)
     if resolution.get("error"):
         return False, f"assessor {resolution['error']}"
-    binding = str(state.get("assessor_binding_id") or "")
-    request = subagent_request_text(payload)
-    options = subagent_request_options(payload)
-    task_name, _ = subagent_request_fields(payload)
-    visibility = subagent_request_visibility(payload)
-    opaque_v2 = visibility == "opaque_v2"
-    if not binding or not request:
-        return False, "missing assessor binding"
-    if safe_int(state.get("assessor_attempt")) >= 2:
-        return False, "assessor retry exhausted"
     if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
         return False, "duplicate assessor"
-    objective = str(state.get("objective", {}).get("fingerprint") or "")
-    if opaque_v2:
-        if task_name != bound_assessor_task_name(state):
-            return False, "opaque V2 assessor requires the exact visible task_name binding"
-        if state.get("assessor_state") == "recovery_required":
-            return False, "opaque V2 assessor recovery requires a fresh objective binding"
-    else:
-        if not re.search(rf"assessor_binding_id\s*[:=]\s*{re.escape(binding)}\b", request):
-            return False, "assessor binding mismatch"
-        if "profile_resolution=highest_available" not in request:
-            return False, "assessor profile resolution mismatch"
-        if not objective or not re.search(rf"objective_fingerprint\s*[:=]\s*{re.escape(objective)}\b", request):
-            return False, "assessor objective mismatch"
-    raw_model = str(options.get("model") or "").strip()
-    model = safe_label(raw_model, 80)
-    if not raw_model or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model):
-        return False, "assessor requires explicit highest model and effort"
-    expected_effort = requested_assessor_reasoning_effort(state)
-    if str(options.get("reasoning_effort") or "").lower() != expected_effort:
-        return False, "assessor reasoning_effort must match the bound highest available policy"
-    fork = str(options.get("fork_turns") or "").lower()
-    if fork != "1":
+
+    candidates = subagent_request_candidates(payload)
+    raw_task_name = candidates[0].get("task_name") if candidates else None
+    if not isinstance(raw_task_name, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}", raw_task_name
+    ):
+        return False, "assessor requires one safe ASCII task_name"
+
+    options = subagent_request_options(payload)
+    model = str(options.get("model") or "").strip()
+    if model != RECOVERY_EXECUTOR_MODEL:
+        return False, "assessor requires the current highest available model"
+    if (
+        str(options.get("reasoning_effort") or "").lower()
+        != requested_assessor_reasoning_effort(state)
+    ):
+        return False, "assessor reasoning_effort does not match session policy"
+    if str(options.get("fork_turns") or "") != "1":
         return False, "every bound assessor requires fork_turns=1"
-    hard_contract = opaque_v2 or bool(re.search(r"(?:hard.{0,48}(?:read[- ]only|plan|confirmation|只读|计划|确认)|hard.{0,48}(?:plan|只读|计划).{0,48}(?:read[- ]only|confirmation|只读|确认))", request, re.I))
-    if not hard_contract:
-        return False, "assessor request lacks the read-only Hard planning contract"
-    if state.get("assessor_state") == "recovery_required":
-        failure = safe_label(state.get("assessor_failure_kind"), 48)
-        if (
-            not failure
-            or f"recovery_from={failure}" not in request
-            or not re.search(r"material_correction\s*[:=]\s*\S.{7,}", request)
-        ):
-            return False, "assessor recovery lacks typed cause or material correction"
     return True, None
 
 
@@ -9041,13 +10972,11 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
         valid, reason = confirmed_executor_request(payload, state)
         if valid and state.get("executor_state") in {
             "spawn_required",
-            "verification_required",
             "recovery_required",
         }:
             return None
         if valid and state.get("executor_state") not in {
             "spawn_required",
-            "verification_required",
             "recovery_required",
         }:
             return "duplicate confirmed executor"
@@ -9407,6 +11336,31 @@ def command_category(payload: dict[str, Any], command: str | None = None) -> str
         return "delivery_device"
     if any(re.search(r"(?i)\b(?:pytest|unittest|ctest|go\s+test|cargo\s+test|npm\s+test)\b", candidate) for candidate in detections):
         return "verification"
+    # Current Codex commonly runs a repository-local verifier directly rather
+    # than through a test framework.  Its successful host exit is verification
+    # evidence when the command is read-only and the executed program itself
+    # (not a quoted ``-c`` body or a file inspected by sed/rg) has an explicit
+    # verify/validate/check/acceptance/regression identity.
+    custom_verifier = re.compile(
+        r"(?i)\b(?:python(?:3(?:\.\d+)*)?|node|bash|sh|ruby|perl)\b\s+"
+        r"(?:(?:-(?!c(?:\s|$))[A-Za-z]+)\s+)*"
+        r"(?:-m\s+)?[^\s;&|]*"
+        r"(?:verify|validate|check|acceptance|regression)"
+        r"[^\s;&|]*"
+    )
+    if (
+        value
+        and not command_mutates_files(value)
+        and not any(
+            re.search(
+                r"(?i)(?:^|[;&|]\s*)(?:adb(?:\.exe)?|fastboot|flash)\b",
+                candidate,
+            )
+            for candidate in detections
+        )
+        and any(custom_verifier.search(candidate) for candidate in detections)
+    ):
+        return "verification"
     # Parent acceptance commonly combines only shell predicates and byte-level
     # readers.  It is verification only when the complete command remains
     # read-only; a write/build/device command must retain its stronger class.
@@ -9735,6 +11689,289 @@ def response_status(response: Any) -> str:
     return "unknown"
 
 
+def _structured_spawn_task_receipt(response: Any, depth: int = 0) -> str | None:
+    """Return only a host-structured spawn task receipt.
+
+    Current Codex hosts may complete ``spawn_agent`` with a compact
+    ``{"task_name":"/root/<name>"}`` result and no generic ``status`` field.
+    That object is an explicit PostToolUse receipt, but arbitrary prose or a
+    nested command-output string is not.  Keep the accepted envelope narrow so
+    child text can never manufacture host acceptance.
+    """
+    if depth > 5:
+        return None
+    if isinstance(response, str):
+        stripped = response.strip()
+        if not _json_container_text(stripped):
+            return None
+        try:
+            return _structured_spawn_task_receipt(json.loads(stripped), depth + 1)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if isinstance(response, (list, tuple)):
+        if len(response) != 1:
+            return None
+        return _structured_spawn_task_receipt(response[0], depth + 1)
+    if not isinstance(response, dict):
+        return None
+    direct = [
+        value for key, value in response.items() if normalized_key(key) == "taskname"
+    ]
+    if len(direct) == 1 and isinstance(direct[0], str) and direct[0]:
+        return safe_label(direct[0], 240)
+    if direct:
+        return None
+    if normalized_key(response.get("type")) in {"text", "inputtext", "outputtext"}:
+        text_value = response.get("text")
+        if isinstance(text_value, str):
+            return _structured_spawn_task_receipt(text_value, depth + 1)
+    content = response.get("content")
+    if isinstance(content, (dict, list, tuple, str)):
+        return _structured_spawn_task_receipt(content, depth + 1)
+    return None
+
+
+def _spawn_envelope_has_field(
+    response: Any,
+    normalized_names: set[str],
+    depth: int = 0,
+    _budget: list[int] | None = None,
+) -> bool:
+    # This is a rejection-side ambiguity scan, not an acceptance parser.  It
+    # deliberately walks every bounded container branch so a success marker
+    # cannot hide a conflicting task receipt in a sibling/wrapper.  Exhausting
+    # the bound is ambiguous and therefore returns True (fail closed).
+    budget = _budget if _budget is not None else [128]
+    if depth > 8 or budget[0] <= 0:
+        return True
+    budget[0] -= 1
+    if isinstance(response, str):
+        stripped = response.strip()
+        if not _json_container_text(stripped):
+            return False
+        try:
+            return _spawn_envelope_has_field(
+                json.loads(stripped), normalized_names, depth + 1, budget
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if isinstance(response, (list, tuple)):
+        if len(response) > 32:
+            return True
+        return any(
+            _spawn_envelope_has_field(item, normalized_names, depth + 1, budget)
+            for item in response
+        )
+    if not isinstance(response, dict):
+        return False
+    if len(response) > 32:
+        return True
+    if any(normalized_key(key) in normalized_names for key in response):
+        return True
+    return any(
+        _spawn_envelope_has_field(value, normalized_names, depth + 1, budget)
+        for value in response.values()
+    )
+
+
+def _spawn_task_receipt_inventory(
+    response: Any,
+    depth: int = 0,
+    _budget: list[int] | None = None,
+    _result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect every bounded task_name occurrence for uniqueness checks."""
+    budget = _budget if _budget is not None else [128]
+    result = _result if _result is not None else {
+        "count": 0,
+        "values": [],
+        "ambiguous": False,
+    }
+    if depth > 8 or budget[0] <= 0:
+        result["ambiguous"] = True
+        return result
+    budget[0] -= 1
+    if isinstance(response, str):
+        stripped = response.strip()
+        if not _json_container_text(stripped):
+            return result
+        try:
+            return _spawn_task_receipt_inventory(
+                json.loads(stripped), depth + 1, budget, result
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return result
+    if isinstance(response, (list, tuple)):
+        if len(response) > 32:
+            result["ambiguous"] = True
+            return result
+        for item in response:
+            _spawn_task_receipt_inventory(item, depth + 1, budget, result)
+        return result
+    if not isinstance(response, dict):
+        return result
+    if len(response) > 32:
+        result["ambiguous"] = True
+        return result
+    for key, value in response.items():
+        if normalized_key(key) == "taskname":
+            result["count"] = min(safe_int(result.get("count")) + 1, 3)
+            if isinstance(value, str) and value:
+                result.setdefault("values", []).append(safe_label(value, 240))
+        _spawn_task_receipt_inventory(value, depth + 1, budget, result)
+    return result
+
+
+def _spawn_envelope_has_conflicting_signal(
+    response: Any, depth: int = 0, _budget: list[int] | None = None
+) -> bool:
+    """Reject a success envelope containing any bounded contradictory signal."""
+    budget = _budget if _budget is not None else [128]
+    if depth > 8 or budget[0] <= 0:
+        return True
+    budget[0] -= 1
+    if isinstance(response, str):
+        stripped = response.strip()
+        if not _json_container_text(stripped):
+            return False
+        try:
+            return _spawn_envelope_has_conflicting_signal(
+                json.loads(stripped), depth + 1, budget
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if isinstance(response, (list, tuple)):
+        if len(response) > 32:
+            return True
+        return any(
+            _spawn_envelope_has_conflicting_signal(item, depth + 1, budget)
+            for item in response
+        )
+    if not isinstance(response, dict):
+        return False
+    if len(response) > 32:
+        return True
+    for key, value in response.items():
+        normalized = normalized_key(key)
+        if normalized in {"status", "state"}:
+            status = str(value or "").strip().lower()
+            if status not in (
+                SUCCESS_STATUSES
+                | RUNNING_STATUSES
+                | {"complete", "completed", "done", "success", "succeeded"}
+            ):
+                return True
+        elif normalized in {"error", "iserror"}:
+            if value is not False and value is not None:
+                return True
+        elif normalized in {"success", "ok"}:
+            if value is not True:
+                return True
+        elif normalized == "exitcode":
+            if not isinstance(value, int) or isinstance(value, bool) or value != 0:
+                return True
+    return any(
+        _spawn_envelope_has_conflicting_signal(value, depth + 1, budget)
+        for value in response.values()
+    )
+
+
+def _spawn_task_receipt_matches(receipt: str | None, requested: str | None) -> bool:
+    requested = safe_label(requested, 120) if requested else None
+    receipt = safe_label(receipt, 240) if receipt else None
+    if not requested or not receipt:
+        return False
+    if receipt == requested:
+        return True
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", requested):
+        return False
+    return receipt == f"/root/{requested}"
+
+
+def spawn_response_status(response: Any, requested_task_name: str | None) -> str:
+    """Resolve a spawn PostToolUse without weakening generic response parsing."""
+    explicit = _response_status_explicit(response)
+    receipt = _structured_spawn_task_receipt(response)
+    task_inventory = _spawn_task_receipt_inventory(response)
+    task_present = bool(
+        safe_int(task_inventory.get("count")) or task_inventory.get("ambiguous")
+    )
+    inventory_values = as_list(task_inventory.get("values"))
+    task_unique_match = bool(
+        not task_inventory.get("ambiguous")
+        and safe_int(task_inventory.get("count")) == 1
+        and len(inventory_values) == 1
+        and _spawn_task_receipt_matches(inventory_values[0], requested_task_name)
+    )
+    task_matches = bool(
+        task_unique_match
+        and _spawn_task_receipt_matches(receipt, requested_task_name)
+    )
+    conflicting_signal = _spawn_envelope_has_conflicting_signal(response)
+    if explicit and explicit.startswith("error"):
+        return explicit
+    if explicit:
+        return (
+            explicit
+            if not conflicting_signal and (not task_present or task_unique_match)
+            else "unknown"
+        )
+    # A generic session_id means a long-running command to response_status;
+    # it is not a spawn receipt.  Likewise, a present but unknown status/state
+    # must not be rescued by an otherwise plausible task name.
+    if isinstance(response, dict):
+        signal_keys = {
+            "status", "state", "success", "ok", "error", "iserror", "exitcode"
+        }
+        if isinstance(response.get("content"), list) and response.get("isError") is False:
+            return (
+                "ok"
+                if not conflicting_signal and (not task_present or task_unique_match)
+                else "unknown"
+            )
+        if _spawn_envelope_has_field(response, signal_keys):
+            return "unknown"
+    return "ok" if task_matches else "unknown"
+
+
+def spawn_acceptance_receipt_digest(
+    response: Any, requested_task_name: str | None, status: str
+) -> str:
+    receipt = _structured_spawn_task_receipt(response)
+    inventory = _spawn_task_receipt_inventory(response)
+    values = as_list(inventory.get("values"))
+    unique_receipt = (
+        values[0]
+        if not inventory.get("ambiguous")
+        and safe_int(inventory.get("count")) == 1
+        and len(values) == 1
+        else None
+    )
+    return stable_hash(
+        "workflow-manager-spawn-post-receipt-v1\0"
+        + canonical_json(
+            {
+                "status": safe_label(status, 32),
+                "task_match": bool(
+                    unique_receipt
+                    and _spawn_task_receipt_matches(
+                        receipt, requested_task_name
+                    )
+                    and _spawn_task_receipt_matches(
+                        unique_receipt, requested_task_name
+                    )
+                ),
+                "task_receipt_digest": stable_hash(unique_receipt, 32)
+                if unique_receipt
+                else None,
+                "task_receipt_count": safe_int(inventory.get("count")),
+                "task_receipt_ambiguous": bool(inventory.get("ambiguous")),
+            }
+        ),
+        32,
+    )
+
+
 def emit_context(event: str, text: str) -> None:
     print(
         json.dumps(
@@ -9754,6 +11991,19 @@ def emit_continue() -> None:
     print(json.dumps({"continue": True}))
 
 
+def emit_stop_block(reason: str) -> None:
+    """Return the strict Codex Stop schema and feed one continuation turn."""
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": str(reason or "").strip(),
+            },
+            ensure_ascii=True,
+        )
+    )
+
+
 def current_slice_resume_delta(
     state: dict[str, Any], canonical_body: str
 ) -> dict[str, Any] | None:
@@ -9765,7 +12015,7 @@ def current_slice_resume_delta(
     ):
         return None
     try:
-        parsed = parse_execution_slice_manifest(canonical_body)
+        parsed = execution_slice_manifest_for_plan(canonical_body)
     except PlanArtifactError:
         return None
     persisted = _safe_execution_slices(state.get("execution_slices"))
@@ -10115,8 +12365,8 @@ def is_control_followup(prompt: str) -> bool:
 
 
 PLAN_CONFIRM_PATTERNS = (
-    r"确认执行",
-    r"确认按(?:这个|上述|该|此|新)计划执行",
+    r"(?:严格)?确认执行",
+    r"(?:严格)?确认按(?:这个|上述|该|此|新)计划执行",
     r"同意按(?:这个|上述|该|此|新)计划执行",
     r"按(?:这个|上述|该|此|新)计划执行",
     r"开始执行(?:这个|上述|该|此|新)计划",
@@ -10152,6 +12402,21 @@ PLAN_REPLAN_PATTERNS = (
     r"replan",
     r"revise (?:this|the) plan",
 )
+
+
+def _normalized_control_candidate(prompt: str) -> str:
+    """Normalize only a compact, single-line control candidate.
+
+    This deliberately is not a general HTML or Markdown normalizer: protocol
+    bodies and code blocks must remain opaque to control recognition.
+    """
+    raw = str(prompt or "")
+    if not raw or len(raw.encode("utf-8")) > 512 or "\n" in raw or "\r" in raw:
+        return ""
+    value = re.sub(r"(?:&#(?:32|x20);|&nbsp;)", " ", raw, flags=re.I).strip()
+    if len(value) >= 2 and value.startswith("`") and value.endswith("`") and value.count("`") == 2:
+        value = value[1:-1]
+    return re.sub(r"[ \t]+", " ", value).strip().lower()
 
 
 def session_execution_preference_directive(prompt: str) -> str | None:
@@ -10203,7 +12468,7 @@ def session_execution_preference_directive(prompt: str) -> str | None:
 
 
 def pure_plan_confirmation(prompt: str) -> bool:
-    normalized = re.sub(r"[?!？！。,.，]+", "", prompt.strip().lower())
+    normalized = re.sub(r"[?!？！。,.，]+", "", _normalized_control_candidate(prompt))
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized or contains_plan_change_marker(normalized):
         return False
@@ -10224,7 +12489,9 @@ def contains_plan_change_marker(normalized: str) -> bool:
 
 
 def plan_replan_request(prompt: str) -> bool:
-    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    normalized = _normalized_control_candidate(prompt)
+    if re.search(r"\b(?:is|was|are|means|mean|described|explained)\b", normalized, re.I):
+        return False
     for pattern in PLAN_REPLAN_PATTERNS:
         if re.fullmatch(pattern, normalized, re.I):
             return True
@@ -10238,7 +12505,7 @@ def plan_replan_request(prompt: str) -> bool:
 
 
 def plan_details_request(prompt: str) -> bool:
-    normalized = re.sub(r"[?!？！。,.，:：]+", "", prompt.strip().lower())
+    normalized = re.sub(r"[?!？！。,.，:：]+", "", _normalized_control_candidate(prompt))
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return bool(
         re.fullmatch(
@@ -10413,6 +12680,23 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         snapshot_payload["_read_canonical_plan_body"] = True
     previous = snapshot_state(snapshot_payload)
     canonical_current_body = previous.pop("_canonical_current_body", None)
+    recovery_marker_present = bool(
+        re.search(
+            r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]",
+            prompt,
+            re.I,
+        )
+    )
+    recovery_control_followup = bool(
+        recovery_marker_present
+        and previous.get("plan_state") == "confirmed"
+        and previous.get("executor_state") == "recovery_required"
+    )
+    pending_recovery_record, pending_recovery_error = (
+        parse_pending_recovery_reservation(prompt, previous)
+        if recovery_marker_present
+        else (None, None)
+    )
     same_assessor_objective_retry = bool(
         previous.get("task_domain") == "work"
         and previous.get("objective", {}).get("fingerprint") == stable_hash(prompt)
@@ -10423,15 +12707,27 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     preference_changed = preference_directive not in {None, previous.get("session_execution_preference", "default")}
     requested_reference = reference_requested(prompt)
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
-    pending_plan = previous.get("plan_state") in {"plan_ready", "awaiting_confirmation"}
-    active_plan = pending_plan or previous.get("plan_state") == "confirmed"
+    confirmable_pending = previous.get("plan_state") == "awaiting_confirmation"
+    repair_pending = previous.get("plan_state") == "repair_required"
+    early_confirmation = bool(
+        pure_plan_confirmation(prompt)
+        and previous.get("task_domain") == "work"
+        and previous.get("work_difficulty") == "hard"
+        and previous.get("plan_state") in {"analyzing", "repair_required"}
+        and previous.get("assessor_state")
+        in {"spawn_pending", "running", "hard_plan_ready"}
+        and previous.get("assessor_binding_id")
+        and previous.get("objective", {}).get("fingerprint")
+    )
+    pending_plan = confirmable_pending
+    active_plan = confirmable_pending or repair_pending or previous.get("plan_state") == "confirmed"
     explicit_new = explicit_new_objective(prompt)
     failed_assessor_replan = bool(
         previous.get("assessor_state") in {"recovery_required", "failed"}
         and plan_replan_request(prompt)
         and previous.get("objective", {}).get("fingerprint") != stable_hash(prompt)
     )
-    new_objective = bool(
+    new_objective = False if recovery_control_followup else bool(
         failed_assessor_replan
         or (
             explicit_new
@@ -10497,11 +12793,17 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     )
     reference_failure = acceptance_miss or (reference_rejection and not causal_report)
     already_confirmed = previous.get("plan_state") == "confirmed"
-    confirmed_plan = pending_plan and pure_plan_confirmation(prompt)
-    replan = active_plan and not causal_active and plan_replan_request(prompt)
+    confirmed_plan = confirmable_pending and pure_plan_confirmation(prompt)
+    replan = (
+        active_plan
+        and not causal_active
+        and not recovery_control_followup
+        and plan_replan_request(prompt)
+    )
     plan_changed = (
         active_plan
         and not causal_active
+        and not recovery_control_followup
         and not causal_report
         and not acceptance_miss
         and not new_objective
@@ -10516,6 +12818,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or reference_changed
         or same_assessor_objective_retry
         or delegated_control_followup
+        or early_confirmation
+        or recovery_control_followup
     )
     classification = classify_prompt(prompt)
     if requested_reference:
@@ -10532,9 +12836,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         )
     if continuation and not causal_report and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
-    if pending_plan and pure_plan_confirmation(prompt):
+    if (confirmable_pending or early_confirmation) and pure_plan_confirmation(prompt):
         classification["difficulty_decision_id"] = previous.get("difficulty_decision_id")
         classification["work_difficulty"] = previous.get("work_difficulty", "hard")
+        classification["task_domain"] = previous.get("task_domain", "work")
     if causal_active and not new_objective:
         classification["model_profile"] = "work_assessment"
     elif (
@@ -10545,9 +12850,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and not plan_changed
         and not new_objective
     ):
-        classification["model_profile"] = previous.get(
-            "model_profile", "work_executor_low_latest"
-        )
+        classification["model_profile"] = confirmed_executor_model_profile(previous)
     if causal_report:
         classification["model_profile"] = "work_assessment"
     if reference_failure:
@@ -10578,6 +12881,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
 
     def update(state: dict[str, Any]) -> None:
         prompt_meta = text_metadata(prompt)
+        prior_authorization_digest = authorization_envelope_digest(state)
         if identity_preflight and state.get("assessor_state") in {
             "spawn_pending",
             "running",
@@ -10638,6 +12942,23 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             }
         elif not continuation or not state.get("objective"):
             state["objective"] = {**prompt_meta, "updated_at": utc_now()}
+        if not continuation or not state.get("authorization_scope"):
+            state["authorization_scope"] = authorization_scope_from_prompt(prompt)
+        elif plan_changed or acceptance_miss:
+            state["authorization_scope"] = authorization_scope_from_prompt(
+                prompt, state.get("authorization_scope")
+            )
+        current_authorization_digest = authorization_envelope_digest(state)
+        if (
+            prior_authorization_digest
+            and current_authorization_digest != prior_authorization_digest
+        ):
+            state["authorization_envelope"] = _safe_authorization_envelope(None)
+            state["pending_confirmation_receipt"] = None
+        if early_confirmation:
+            state["pending_confirmation_receipt"] = (
+                pending_confirmation_receipt_for_state(state)
+            )
         reference = _safe_reference_acceptance(state.get("reference_acceptance"))
         if requested_reference:
             # Keep only fingerprints/enumerations: never retain media, raw prompt, frames, or observations.
@@ -10693,9 +13014,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if causal_report or reference_failure or (causal_active and not new_objective):
             state["model_profile"] = "work_assessment"
         elif already_confirmed and continuation and not plan_changed and not new_objective:
-            state["model_profile"] = (
-                confirmed_executor_model_profile(state) if preference_changed else previous.get("model_profile", "work_executor_low_latest")
-            )
+            state["model_profile"] = confirmed_executor_model_profile(state)
         objective_fingerprint = state.get("objective", {}).get("fingerprint")
         if causal_report:
             # Freeze the old plan/contract for comparison. The causal guard allows only
@@ -10715,31 +13034,21 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 state["last_execution_baseline"]["acceptance_status"] = "failed"
             state["model_profile"] = "work_assessment"
         elif confirmed_plan:
-            artifact = _safe_plan_artifact(state.get("plan_artifact"))
-            binding_valid = bool(
-                state.get("plan_state") == "awaiting_confirmation"
-                and state.get("plan_digest")
-                and state.get("plan_objective_fingerprint") == objective_fingerprint
-                and state.get("plan_difficulty_decision_id")
-                == state.get("difficulty_decision_id")
-                and artifact.get("format_version") == 2
-                and artifact.get("write_status") == "written"
-                and artifact.get("relative_path")
-                and artifact.get("generation") == state.get("plan_generation")
-                and artifact.get("plan_digest")
-                == artifact.get("current_revision_digest")
-                == state.get("plan_digest")
-                and safe_fingerprint(artifact.get("journal_digest"))
+            envelope_digest = authorization_envelope_digest(state)
+            strict_receipt = (
+                stable_hash(
+                    f"strict-confirm-v2\0{envelope_digest}\0{prompt_meta.get('fingerprint')}\0host_bound",
+                    32,
+                )
+                if envelope_digest
+                else ""
             )
-            if binding_valid and verify_plan_artifact(state, payload):
-                state["plan_state"] = "confirmed"
-                state["confirmed_plan_digest"] = state.get("plan_digest")
-                state["confirmed_at"] = utc_now()
-                if not initialize_confirmed_executor(state):
-                    state["plan_state"] = "invalidated"
-                    state["confirmed_plan_digest"] = None
-                    state["confirmed_at"] = None
-            else:
+            if not activate_trusted_plan(
+                state,
+                payload,
+                receipt=strict_receipt,
+                increment_confirmation=True,
+            ):
                 state["plan_state"] = "invalidated"
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
@@ -10765,6 +13074,31 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
             state["causal_review"] = _safe_causal_review(None)
             state["last_execution_baseline"] = {}
+        if recovery_control_followup:
+            state["pending_recovery_reservation"] = (
+                pending_recovery_reservation_for_state(
+                    state, pending_recovery_record
+                )
+                if pending_recovery_record
+                else None
+            )
+            state["model_profile"] = confirmed_executor_model_profile(state)
+            if pending_recovery_error or not state["pending_recovery_reservation"]:
+                state.setdefault("guards", []).append(
+                    {
+                        "at": utc_now(),
+                        "turn_id": safe_label(payload.get("turn_id"), 120)
+                        if payload.get("turn_id")
+                        else None,
+                        "kind": "recovery_reservation",
+                        "action": "deny",
+                        "fingerprint": stable_hash(
+                            "workflow-manager-recovery-reservation-deny-v1\0"
+                            + str(pending_recovery_error or "stale binding"),
+                            32,
+                        ),
+                    }
+                )
         assessor_needed = classification.get("task_domain") == "work" and (
             not continuation or causal_report or reference_failure or replan or plan_changed
         )
@@ -10836,11 +13170,20 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or reference_failure
         or causal_active
         or confirmed_plan
+        or early_confirmation
         or replan
         or plan_changed
         or pending_plan
+        or repair_pending
         or canonical_context_requested
+        or recovery_marker_present
         or (already_confirmed and pure_plan_confirmation(prompt))
+        or (
+            already_confirmed
+            and continuation
+            and previous.get("executor_state")
+            in {"spawn_required", "recovery_required", "verification_required"}
+        )
         or (
             classification["task_domain"] == "work"
             and classification.get("work_difficulty") == "hard"
@@ -10900,18 +13243,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             else "default second-highest reasoning tier"
         )
         context += (
-            " Work requires one high-tier assessor before execution. Spawn exactly one child with the host's highest "
-            f"available Codex model and reasoning_effort={assessor_effort} ({assessor_effort_policy}), explicit model/effort, positive "
-            f"fork_turns=1, and visible task_name={assessor_task}; include "
-            f"assessor_binding_id={refreshed_for_assessor.get('assessor_binding_id')} "
-            f"objective_fingerprint={refreshed_for_assessor.get('objective', {}).get('fingerprint')} and profile_resolution=highest_available. The self-contained child "
-            "contract is: remain read-only and return a detailed executable Hard plan plus WORK_ASSESSMENT. "
-            "The canonical plan must end with exactly one "
-            "workflow-manager-execution-slices fenced JSON block (version 1, nonempty global_constraints, sequential "
-            "s01..sNN, title string, and nonempty scope/acceptance/rollback/stop_conditions/expected_artifacts arrays), "
-            "then end exactly 计划已就绪，等待确认后执行 after the protocol marker. "
-            "The visible task name preserves state binding when V2 encrypts message before PreToolUse; record "
-            "requested versus observed profile separately."
+            " Hard work needs one read-only high-tier assessment before mutation. Spawn one child with the host's "
+            f"highest available Codex model, reasoning_effort={assessor_effort} ({assessor_effort_policy}), "
+            f"fork_turns=1, and any concise safe ASCII task_name (suggestion: {assessor_task}). "
+            "Let the assessor judge objective/scope, acceptance, risk, rollback, and stop conditions natively. "
+            "After it returns, the parent presents one ordinary human-readable plan; no plugin marker, JSON fence, "
+            "fixed wording, or task-name encoding is required."
         )
     if causal_report:
         refreshed = snapshot_state(payload)
@@ -10945,27 +13282,25 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     elif confirmed_plan:
         executor_task = bound_executor_task_name(refreshed_for_assessor)
         context += (
-            " Confirmation authorizes only the private canonical handoff: matching SubagentStart must first "
-            "verify the current revision from the trusted plugin-data journal and will receive that exact body "
-            "through additional context. The canonical relative_path is plugin-data-root-relative metadata, "
-            "never a cwd/workspace path; failed read or digest drift must not unlock mutation."
+            " Confirmation is bound. The Hook will privately deliver the verified native plan to the one executor; "
+            "task_name is only an opaque host label and does not carry authorization."
         )
         if refreshed_for_assessor.get("session_execution_preference") == "highest_throughout":
             context += (
-                " Confirmed plan binding is valid. Before mutation, spawn exactly one exclusive executor with "
-                "profile_resolution=highest_available, the bound assessor/current highest-tier model, the same "
-                f"requested reasoning_effort as the bound assessor, fork_turns=1, and visible task_name={executor_task}. Bind the exact "
-                "execution contract, current slice contract, ownership, and acceptance. This is a request contract, not proof "
-                "that the host applied the override; wait for matching SubagentStart metadata."
+                " Spawn one executor with the bound highest model, ultra reasoning, fork_turns=1, and any safe "
+                f"ASCII task_name (suggestion: {executor_task})."
             )
         else:
             context += (
-                " Confirmed plan binding is valid. The parent remains the high-reasoning coordinator; before any "
-                "mutation, spawn exactly one exclusive confirmed-plan executor using the newest actually available "
-                f"lower-tier Codex model, reasoning_effort=medium, fork_turns=1, and visible task_name={executor_task}. Bind its "
-                "request to execution_contract_id, plan_digest, plan_generation, current slice_id/slice_contract_id, scope, and "
-                "acceptance. Do not claim a model switch until the host accepts that explicit spawn override."
+                " Spawn one executor with a current lower-tier Codex model, reasoning_effort=medium, fork_turns=1, "
+                f"and any safe ASCII task_name (suggestion: {executor_task})."
             )
+    elif early_confirmation:
+        context += (
+            " Early host-bound confirmation receipt recorded for the current objective and assessor binding. "
+            "Keep the pending plan or repair intact; the receipt will be consumed automatically only after the "
+            "matching canonical revision commits and verifies. The user does not need to repeat confirmation."
+        )
     elif replan or plan_changed:
         context += " Pending plan invalidated by changed constraints; re-analyze and present a replacement plan before mutation."
     elif already_confirmed and not plan_changed and not new_objective:
@@ -10975,29 +13310,44 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "state instead of treating this follow-up as a new confirmation or redoing completed work."
         )
         if refreshed_for_assessor.get("executor_state") == "recovery_required":
-            context += (
-                " A terminal executor must never receive followup_task. After one material correction, use the "
-                "only remaining attempt by spawning a fresh child with visible task_name="
-                f"{bound_executor_task_name(refreshed_for_assessor)}, the same contract/profile, typed "
-                "recovery_from, and fork_turns=1."
+            pending = pending_recovery_reservation_for_state(
+                refreshed_for_assessor
             )
+            if pending:
+                context += (
+                    " A fresh recovery child is already host-bound if native diagnosis chooses that path; use "
+                    f"model={RECOVERY_EXECUTOR_MODEL}, reasoning_effort={RECOVERY_EXECUTOR_REASONING_EFFORT}, "
+                    "fork_turns=1 and any safe ASCII task_name. Parent-side diagnosis or verification may instead "
+                    "finish without a child. Never follow up a terminal child."
+                )
+            else:
+                host_recovery = recovery_reservation_context(
+                    refreshed_for_assessor
+                )
+                context += (
+                    " Choose natively between parent verification, further diagnosis, replanning, or one fresh child; "
+                    "recovery state does not require another model turn by itself. No reservation is needed for "
+                    "parent-side work or completion. Only if a fresh child is chosen, bind the Hook-issued facts "
+                    "below to the diagnosed root cause and material correction; the child inherits the current "
+                    "authorization envelope without another confirmation."
+                )
+                if host_recovery:
+                    context += f"\n{host_recovery}"
+                if pending_recovery_error:
+                    context += f" The submitted reservation was rejected: {pending_recovery_error}."
         elif refreshed_for_assessor.get("executor_state") == "verification_required":
             context += (
-                " Executor completion is only a candidate. Independently inspect the artifacts and acceptance "
-                "evidence, then end with exactly EXECUTION_REVIEW execution_contract_id="
-                f"{refreshed_for_assessor.get('execution_contract_id')} slice_id="
-                f"{(current_execution_slice(refreshed_for_assessor) or {}).get('id')} outcome=passed|failed. The Hook generates the "
-                "normalized evidence digest. That marker ends this parent turn; do not try to spawn the next slice before Stop seals it. "
-                "Passed with bound verification evidence advances only this slice. If evidence instead proves a material "
-                "verification failure on attempt one, the only recovery is a fresh evidence-bound "
-                "verification_failed v2 child; never follow up v1."
+                " Executor completion is only a candidate. Independently inspect the artifacts and run the acceptance "
+                "verification, then report the result naturally. Host-recorded verification plus parent Stop seals the "
+                "review; EXECUTION_REVIEW is optional. A material failure uses a fresh typed child and never revives a terminal child."
             )
     elif classification.get("work_difficulty") == "hard" and not pending_plan:
         context += (
-            " Hard work: use the highest available model/reasoning for analysis; present a detailed file/method, "
-            "build/deploy, verification, risk, and rollback plan ending with '计划已就绪，等待确认后执行'. "
-            "Do not mutate, build, or deploy before strict confirmation."
+            " Hard work: use the high-tier assessment, then present one ordinary plan covering scope, verification, "
+            "risk, and rollback. Do not mutate before confirmation."
         )
+    elif repair_pending:
+        context += " Canonical plan repair is pending; confirmation or clarification cannot unlock execution. Explicitly replan to request one new assessor."
     elif pending_plan and not confirmed_plan:
         context += " Awaiting strict plan confirmation; answer plan questions but do not mutate, build, or deploy."
     emit_context("UserPromptSubmit", context)
@@ -11006,47 +13356,67 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
 def record_confirmed_executor_pretool(
     payload: dict[str, Any], state: dict[str, Any], fingerprint: str
 ) -> bool:
-    """Reserve only the plugin-specific confirmed executor handoff.
-
-    Ordinary subagent scheduling belongs to Codex and passes through untouched.
-    """
+    """Atomically reserve one contract-bound executor sequence."""
     if not is_subagent_spawn_tool(payload):
         return False
     executor_request, _ = confirmed_executor_request(payload, state)
     if not executor_request:
         return False
+    decision: dict[str, Any] = {"accepted": False, "reason": "stale executor request"}
 
-    def record_request(current: dict[str, Any]) -> None:
+    def reserve(current: dict[str, Any]) -> None:
+        valid, reason = confirmed_executor_request(payload, current)
+        if not valid:
+            decision["reason"] = reason or "executor request no longer matches state"
+            return
+        if any(
+            group.get("state") in {"pending", "result_pending", "live"}
+            and isinstance(group.get("request"), dict)
+            and group["request"].get("role") == "confirmed_executor"
+            for group in subagent_lifecycle_groups(current)
+        ):
+            decision["reason"] = "one confirmed executor is already pending or live"
+            return
+
         options = subagent_request_options(payload)
         task_name, scope_fingerprint = subagent_request_fields(payload)
-        identity = current.setdefault("identity_evidence", {})
+        visibility = subagent_request_visibility(payload)
+        recovery_from = (
+            current.get("executor_failure_kind")
+            if current.get("executor_state") == "recovery_required"
+            and current.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
+            else None
+        )
+        recovery_record: dict[str, Any] | None = None
+        if recovery_from:
+            recovery_record = pending_recovery_reservation_for_state(current)
+            recovery_error = None
+            if recovery_record is None:
+                recovery_record, recovery_error = parse_recovery_contract(
+                    subagent_request_text(payload),
+                    current,
+                    opaque=visibility == "opaque_v2",
+                )
+            if not recovery_record:
+                decision["reason"] = recovery_error or "invalid recovery contract"
+                return
+
+        sequence = next_sequence(current.get("executor_attempt"))
+        candidate = json.loads(canonical_json(current))
+        identity = candidate.setdefault("identity_evidence", {})
         identity["requested_profile"] = stable_hash(
             canonical_json(
                 {
                     "model": safe_label(options.get("model"), 80),
-                    "reasoning_effort": safe_label(options.get("reasoning_effort"), 24),
+                    "reasoning_effort": safe_label(
+                        options.get("reasoning_effort"), 24
+                    ),
                     "fork_turns": str(options.get("fork_turns") or ""),
                 }
             ),
             32,
         )
-        verification_recovery = executor_verification_recovery_pending(current)
-        verification_evidence = verification_recovery_evidence_digest(task_name, current)
-        recovery_from = (
-            "verification_failed"
-            if verification_recovery
-            else (
-                current.get("executor_failure_kind")
-                if current.get("executor_state") == "recovery_required"
-                and current.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
-                else None
-            )
-        )
-        attempt = min(
-            max(safe_int(current.get("executor_attempt")), 0) + 1,
-            MAX_EXECUTOR_ATTEMPTS,
-        )
-        current.setdefault("subagents", []).append(
+        candidate.setdefault("subagents", []).append(
             {
                 "at": utc_now(),
                 "event": "request",
@@ -11058,73 +13428,93 @@ def record_confirmed_executor_pretool(
                 "task_name": task_name,
                 "scope_fingerprint": scope_fingerprint,
                 "request_fingerprint": fingerprint,
-                "objective_fingerprint": current.get("objective", {}).get("fingerprint"),
+                "objective_fingerprint": candidate.get("objective", {}).get(
+                    "fingerprint"
+                ),
                 "stale": False,
                 "status": "pending",
                 "requested": True,
                 "host_accepted": None,
                 "request_gate": "contract",
-                "request_visibility": subagent_request_visibility(payload),
+                "request_visibility": visibility,
                 "request_cap": 1,
                 "reaudited": False,
                 "role": "confirmed_executor",
-                "contract_id": current.get("execution_contract_id"),
-                "slice_id": (current_execution_slice(current) or {}).get("id"),
-                "slice_contract_id": slice_contract_id(current),
+                "contract_id": candidate.get("execution_contract_id"),
+                "slice_id": (current_execution_slice(candidate) or {}).get("id"),
+                "slice_contract_id": slice_contract_id(candidate),
                 "model": safe_label(options.get("model"), 80),
-                "reasoning_effort": safe_label(options.get("reasoning_effort"), 24),
+                "reasoning_effort": safe_label(
+                    options.get("reasoning_effort"), 24
+                ),
                 "fork_turns": options.get("fork_turns"),
-                "attempt": attempt,
+                "attempt": sequence,
                 "recovery_from": recovery_from,
             }
         )
-        if verification_recovery:
-            review = _safe_executor_review(current.get("executor_review"))
+        if recovery_record:
+            recovery_record["sequence"] = sequence
+            candidate["recovery_chain"] = [
+                *safe_recovery_chain(candidate.get("recovery_chain")),
+                recovery_record,
+            ]
+            candidate["pending_recovery_reservation"] = None
+        if executor_verification_recovery_pending(candidate):
+            review = _safe_executor_review(candidate.get("executor_review"))
             review["status"] = "recovery_started"
-            review["review_evidence_digest"] = verification_evidence
             review["at"] = utc_now()
-            current["executor_review"] = review
+            candidate["executor_review"] = review
             baseline = _safe_execution_baseline(
-                current.get("last_execution_baseline")
-            ) or build_execution_baseline(current)
+                candidate.get("last_execution_baseline")
+            ) or build_execution_baseline(candidate)
             if baseline:
                 baseline["acceptance_status"] = "failed"
-                current["last_execution_baseline"] = baseline
-        current["executor_state"] = "spawn_pending"
-        current["executor_attempt"] = attempt
-        current["executor_failure_kind"] = recovery_from
-        current["executor_model"] = safe_label(options.get("model"), 80)
-        current["executor_reasoning_effort"] = safe_label(
+                candidate["last_execution_baseline"] = baseline
+        candidate["executor_state"] = "spawn_pending"
+        candidate["executor_attempt"] = sequence
+        candidate["executor_failure_kind"] = recovery_from
+        candidate["executor_model"] = safe_label(options.get("model"), 80)
+        candidate["executor_reasoning_effort"] = safe_label(
             options.get("reasoning_effort"), 24
         )
-        current["executor_fork_turns"] = str(options.get("fork_turns"))
-        current["model_profile"] = confirmed_executor_model_profile(current)
-        stall = _safe_stall(current.get("stall"))
+        candidate["executor_fork_turns"] = str(options.get("fork_turns"))
+        candidate["model_profile"] = confirmed_executor_model_profile(candidate)
+        stall = _safe_stall(candidate.get("stall"))
         if stall.get("state") == "resume_required":
-            correction = re.search(
-                r"material_correction\s*[:=]\s*(.{8,}?)(?=\s+stall_id=|$)",
-                subagent_request_text(payload),
-                re.I,
-            )
             stall["state"] = "resuming"
             stall["correction_digest"] = (
-                stable_hash(correction.group(1), 32) if correction else None
+                recovery_record.get("correction_digest")
+                if recovery_record
+                else None
             )
             stall["at"] = utc_now()
-            current["stall"] = stall
+            candidate["stall"] = stall
+        if not state_within_budget(candidate):
+            decision["reason"] = (
+                "state byte/node budget cannot reserve another recovery; split or stop"
+            )
+            return
+        current.clear()
+        current.update(candidate)
+        decision["accepted"] = True
+        decision["profile"] = candidate.get("model_profile")
 
-    mutate_state(payload, record_request)
-    preference = safe_session_execution_preference(state.get("session_execution_preference"))
+    mutate_state(payload, reserve)
+    if not decision["accepted"]:
+        emit_pretool_deny(
+            "Workflow Manager blocked executor reservation: "
+            f"{decision['reason']}. Diagnose or use new evidence/root cause/material correction before replay."
+        )
+        return True
     profile_text = (
-        "highest_available model/reasoning request"
-        if preference == "highest_throughout"
+        "highest_available gpt-5.6-sol/max recovery request"
+        if decision.get("profile") == "work_executor_highest_available"
         else "lower-tier model and medium reasoning request"
     )
     emit_context(
         "PreToolUse",
-        f"Confirmed-plan executor request accepted: the explicit {profile_text}, fork_turns=1, "
-        "execution contract, current slice, ownership, and acceptance markers match. This is "
-        "requested/host-accepted evidence only; wait for a matching full Start observation.",
+        f"Executor request reserved with the {profile_text} and fork_turns=1. task_name/prose are opaque; "
+        "authority still requires the matching host acceptance and full Start before mutation.",
     )
     return True
 
@@ -11160,8 +13550,6 @@ def handle_stall_diagnosis_pretool(
         )
     elif stall.get("state") != "diagnosis_required":
         reason = reason or "stall diagnosis is not awaiting delivery"
-    elif safe_int(stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS:
-        reason = reason or "stall diagnosis delivery retry is exhausted"
     elif not marker:
         reason = reason or "stall diagnosis marker is missing or malformed"
     elif target != str(state.get("assessor_agent_id") or ""):
@@ -11192,7 +13580,6 @@ def handle_stall_diagnosis_pretool(
         if (
             current_stall.get("state") != "diagnosis_required"
             or current_stall.get("stall_id") != stall.get("stall_id")
-            or safe_int(current_stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS
         ):
             current.setdefault("guards", []).append(
                 {"at": utc_now(), "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "kind": "stall_diagnosis", "action": "deny", "fingerprint": fingerprint}
@@ -11246,9 +13633,8 @@ def terminal_executor_followup_reason(
         }
         if target in identities or visible_target in identities:
             return (
-                "terminal confirmed executor follow-up is forbidden; terminal v1 cannot be revived. "
-                f"Spawn a fresh child with visible task_name={bound_executor_task_name(state)} and the "
-                "current contract, failure kind, attempt, and material correction"
+                "terminal confirmed executor follow-up is forbidden; a terminal child cannot be revived. "
+                "Use a fresh parent-spawned child after diagnosis and a host-bound recovery reservation"
             )
     return None
 
@@ -11277,6 +13663,33 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 f"({snapshot_failure}); mutation cannot fail open."
             )
             return
+    nested_caller = next(
+        (
+            safe_label(payload.get(key), 120)
+            for key in ("agent_id", "subagent_id")
+            if payload.get(key)
+        ),
+        None,
+    )
+    if is_subagent_spawn_tool(payload) and nested_caller:
+        def record_nested_guard(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "child_nesting",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+
+        mutate_state(payload, record_nested_guard)
+        emit_pretool_deny(
+            "Workflow Manager blocked child nesting: only the parent may dispatch a bound child."
+        )
+        return
     if (
         is_subagent_spawn_tool(payload)
         and "identity_preflight_not_work"
@@ -11331,27 +13744,109 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         return
     if is_subagent_spawn_tool(payload):
         request_resolution = subagent_request_resolution(payload)
-        assessor_intent = subagent_request_has_assessor_intent(payload)
+        # While a Hard assessment is due, every parent spawn is either that
+        # assessor or an unauthorized early child. This state fact is simpler
+        # and more reliable than guessing intent from encrypted prose/name.
+        causal_active = _safe_causal_review(state.get("causal_review")).get(
+            "state"
+        ) in {"triage_required", "triaging"}
+        assessor_intent = bool(
+            not causal_active
+            and (
+                state.get("assessor_state")
+                in {"spawn_required", "recovery_required"}
+                or subagent_request_has_assessor_intent(payload)
+            )
+        )
         assessor_ok, assessor_reason = confirmed_assessor_request(payload, state)
+        if causal_active:
+            assessor_ok = False
         if assessor_ok:
+            assessor_decision: dict[str, Any] = {
+                "accepted": False,
+                "reason": "stale assessor request",
+            }
+
             def record_assessor(current: dict[str, Any]) -> None:
+                current_valid, current_reason = confirmed_assessor_request(
+                    payload, current
+                )
+                if not current_valid:
+                    assessor_decision["reason"] = (
+                        current_reason or "assessor request no longer matches state"
+                    )
+                    return
+                if any(
+                    group.get("state") in {"pending", "result_pending", "live"}
+                    and isinstance(group.get("request"), dict)
+                    and group["request"].get("role") == "high_assessor"
+                    for group in subagent_lifecycle_groups(current)
+                ):
+                    assessor_decision["reason"] = (
+                        "one high assessor is already pending or live"
+                    )
+                    return
                 options = subagent_request_options(payload)
                 task_name, scope_fingerprint = subagent_request_fields(payload)
-                current["assessor_state"] = "spawn_pending"
-                current["assessor_attempt"] = safe_int(current.get("assessor_attempt")) + 1
-                current["assessor_model"] = safe_label(options.get("model"), 80)
-                current["assessor_reasoning_effort"] = safe_label(options.get("reasoning_effort"), 24)
-                current["assessor_fork_turns"] = options.get("fork_turns")
-                current.setdefault("subagents", []).append({"at": utc_now(), "event": "request", "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None, "task_name": task_name, "scope_fingerprint": scope_fingerprint, "status": "pending", "requested": True, "host_accepted": None, "request_gate": "open", "request_visibility": subagent_request_visibility(payload), "request_cap": 1, "role": "high_assessor", "contract_id": current.get("assessor_binding_id"), "request_fingerprint": fingerprint, "objective_fingerprint": current.get("objective", {}).get("fingerprint"), "model": current["assessor_model"], "reasoning_effort": current["assessor_reasoning_effort"], "fork_turns": current["assessor_fork_turns"], "attempt": current["assessor_attempt"]})
+                sequence = next_sequence(current.get("assessor_attempt"))
+                candidate = json.loads(canonical_json(current))
+                candidate["assessor_state"] = "spawn_pending"
+                candidate["assessor_attempt"] = sequence
+                candidate["assessor_model"] = safe_label(
+                    options.get("model"), 80
+                )
+                candidate["assessor_reasoning_effort"] = safe_label(
+                    options.get("reasoning_effort"), 24
+                )
+                candidate["assessor_fork_turns"] = options.get("fork_turns")
+                candidate["assessment_liveness"] = _empty_assessment_liveness()
+                candidate.setdefault("subagents", []).append(
+                    {
+                        "at": utc_now(),
+                        "event": "request",
+                        "turn_id": safe_label(payload.get("turn_id"), 120)
+                        if payload.get("turn_id")
+                        else None,
+                        "task_name": task_name,
+                        "scope_fingerprint": scope_fingerprint,
+                        "status": "pending",
+                        "requested": True,
+                        "host_accepted": None,
+                        "request_gate": "open",
+                        "request_visibility": subagent_request_visibility(payload),
+                        "request_cap": 1,
+                        "role": "high_assessor",
+                        "contract_id": candidate.get("assessor_binding_id"),
+                        "request_fingerprint": fingerprint,
+                        "objective_fingerprint": candidate.get("objective", {}).get(
+                            "fingerprint"
+                        ),
+                        "model": candidate["assessor_model"],
+                        "reasoning_effort": candidate[
+                            "assessor_reasoning_effort"
+                        ],
+                        "fork_turns": candidate["assessor_fork_turns"],
+                        "attempt": sequence,
+                    }
+                )
+                if not state_within_budget(candidate):
+                    assessor_decision["reason"] = (
+                        "state byte/node budget cannot reserve another assessor sequence"
+                    )
+                    return
+                current.clear()
+                current.update(candidate)
+                assessor_decision["accepted"] = True
+
             mutate_state(payload, record_assessor)
+            if not assessor_decision["accepted"]:
+                emit_pretool_deny(
+                    "Workflow Manager blocked assessor reservation: "
+                    f"{assessor_decision['reason']}."
+                )
             return
         request_text = subagent_request_text(payload)
         if assessor_intent:
-            if assessor_reason == "assessor retry exhausted":
-                def exhaust_assessor(current: dict[str, Any]) -> None:
-                    current["assessor_state"] = "failed"
-                    current["assessor_failure_kind"] = "retry_exhausted"
-                mutate_state(payload, exhaust_assessor)
             emit_pretool_deny(
                 f"Workflow Manager blocked assessor spawn: {assessor_reason or 'invalid assessor request'}."
             )
@@ -11400,20 +13895,16 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                     "fingerprint": fingerprint,
                 }
             )
-            if is_subagent_spawn_tool(payload):
-                if current.get("executor_state") == "spawn_required":
-                    current["executor_failure_kind"] = (
-                        "model_unavailable"
-                        if executor_block == "model_unavailable"
-                        else "invalid_spawn_config"
-                    )
-                    current["model_profile"] = "work_assessment"
+            # A rejected request is not an executor lifecycle event. Keep the
+            # current sequence, failure identity, and profile unchanged.
 
         mutate_state(payload, record_executor_guard)
-        if safe_session_execution_preference(state.get("session_execution_preference")) == "highest_throughout":
+        expected_profile = expected_executor_profile(state)
+        if expected_profile.get("profile") == "work_executor_highest_available":
             profile_instruction = (
-                "Use profile_resolution=highest_available and explicitly request the bound assessor/current "
-                "highest-tier model plus the exact bound assessor reasoning_effort"
+                "Use profile_resolution=highest_available and explicitly request "
+                f"model={expected_profile.get('model')} with reasoning_effort="
+                f"{expected_profile.get('reasoning_effort')}"
             )
         else:
             profile_instruction = (
@@ -11422,10 +13913,8 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             )
         emit_pretool_deny(
             f"Workflow Manager blocked {executor_block}: this confirmed hard-work plan requires exactly one "
-            f"contract-bound executor. {profile_instruction} with visible task_name={bound_executor_task_name(state)}, "
-            "fork_turns=1, and "
-            "include the exact execution_contract_id, plan_digest, plan_generation, current slice_id and "
-            "slice_contract_id, exclusive scope, and acceptance. The Hook did not switch the parent and cannot prove host support."
+            f"executor. {profile_instruction}, fork_turns=1, and use any safe ASCII task_name. "
+            "The Hook supplies the private plan/contract after the host accepts the spawn."
         )
         return
     if is_subagent_spawn_tool(payload):
@@ -11451,8 +13940,7 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         mutate_state(payload, record_plan_guard)
         emit_pretool_deny(
             f"Workflow Manager blocked {blocked_action}: this hard work plan is not strictly confirmed. "
-            "Continue read-only analysis or evidence collection, present the detailed plan ending with "
-            "'计划已就绪，等待确认后执行', and wait for a pure confirmation bound to the current plan."
+            "Continue read-only analysis or present an ordinary plan, then wait for confirmation."
         )
         return
     guard = command_guard(payload)
@@ -11479,7 +13967,16 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
 def post_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     response = payload.get("tool_response")
-    status_value = response_status(response)
+    tool_key = normalized_key(payload.get("tool_name"))
+    status_value = (
+        apply_patch_response_status(response)
+        if tool_key == "applypatch"
+        else response_status(response)
+    )
+    requested_spawn_task_name: str | None = None
+    if is_subagent_spawn_tool(payload):
+        requested_spawn_task_name, _ = subagent_request_fields(payload)
+        status_value = spawn_response_status(response, requested_spawn_task_name)
     stall_followup_fingerprint = (
         stable_hash(f"stall-diagnosis-request-v1\0{fingerprint}", 32)
         if normalized_key(payload.get("tool_name")).endswith("followuptask")
@@ -11503,7 +14000,6 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         ),
         None,
     )
-    tool_key = normalized_key(payload.get("tool_name"))
     parent_child_collection = bool(
         caller_id is None
         and any(
@@ -11512,8 +14008,28 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         )
     )
     runtime_delivery: dict[str, str] = {}
+    liveness_delivery: dict[str, str] = {}
 
     def update(state: dict[str, Any]) -> None:
+        # A parent wait/list is an observation only.  A child may explicitly
+        # attach a bounded progress digest, but status/running/parent polling
+        # and stale events never reset the idle clock.
+        progress = None
+        if caller_id and caller_id == state.get("assessor_agent_id"):
+            candidate = payload.get("assessment_progress_digest")
+            progress = candidate if isinstance(candidate, str) else None
+        action = assessment_liveness_tick(state, progress_digest=progress)
+        if action in {"unblock_required", "recovery_required"}:
+            liveness_delivery["action"] = action
+        liveness = _safe_assessment_liveness(state.get("assessment_liveness"))
+        if (
+            caller_id is None and tool_key.endswith("followuptask")
+            and liveness.get("unblock") == "pending"
+            and liveness.get("agent_id") == state.get("assessor_agent_id")
+        ):
+            liveness["unblock"] = "failed" if status_value in ERROR_STATUSES or status_value.startswith("error") else "delivered"
+            liveness["unblock_at"] = _liveness_now()
+            state["assessment_liveness"] = liveness
         if stall_followup_fingerprint:
             stall = _safe_stall(state.get("stall"))
             if (
@@ -11535,11 +14051,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                             "attempt": state.get("assessor_attempt"),
                         }
                     )
-                    if safe_int(stall.get("diagnosis_attempt")) >= MAX_STALL_DIAGNOSIS_ATTEMPTS:
-                        stall["state"] = "exhausted"
-                        state["executor_state"] = "exhausted"
-                    else:
-                        stall["state"] = "diagnosis_required"
+                    stall["state"] = "diagnosis_required"
                 else:
                     stall["state"] = "diagnosing"
                 stall["at"] = utc_now()
@@ -11554,10 +14066,31 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         active_executor_caller = bool(
             caller_id and caller_id == state.get("executor_agent_id")
         )
+        recoverable_parent_candidate = bool(
+            state.get("executor_state") == "recovery_required"
+            and state.get("executor_failure_kind") == "incomplete_execution"
+            and any(
+                record.get("event") == "stop"
+                and record.get("role") == "confirmed_executor"
+                and record.get("contract_id") == state.get("execution_contract_id")
+                and record.get("slice_id") == (current_execution_slice(state) or {}).get("id")
+                and record.get("slice_contract_id") == slice_contract_id(state)
+                and safe_sequence(record.get("attempt"))
+                == safe_sequence(state.get("executor_attempt"))
+                and record.get("execution_result_contract_match") is True
+                and record.get("execution_result_outcome") == "succeeded"
+                and _fingerprint32(record.get("execution_result_evidence_digest"))
+                for record in as_list(state.get("subagents"))
+                if isinstance(record, dict)
+            )
+        )
         parent_review_operation = bool(
             active_plan_digest
             and caller_id is None
-            and state.get("executor_state") == "verification_required"
+            and (
+                state.get("executor_state") == "verification_required"
+                or recoverable_parent_candidate
+            )
             and category in {"verification", "evidence"}
             and not command_mutates_files(command or "")
             and not command_risk_kind(payload, command or "")
@@ -11577,6 +14110,12 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                         32,
                     )
                     if command
+                    else None
+                ),
+                "reconciliation_source": (
+                    "host_posttool_patch_receipt_v2"
+                    if tool_key == "applypatch"
+                    and host_apply_patch_receipt_success(response)
                     else None
                 ),
                 "tool": tool,
@@ -11624,32 +14163,67 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         # PreToolUse is only a request reservation.  A matching PostToolUse is
         # the sole host-acceptance signal and remains separate from Start.
         if pending_spawn:
-            pending_spawn["host_accepted"] = not (
-                status_value.startswith("error") or status_value in ERROR_STATUSES
+            accepted_value = (
+                True
+                if status_value in SUCCESS_STATUSES | {"running"}
+                else False
+                if status_value.startswith("error") or status_value in ERROR_STATUSES
+                else None
             )
-            pending_spawn["host_acceptance_status"] = status_value
-            pending_spawn["host_acceptance_source"] = "PostToolUse"
-            pending_spawn["host_accepted_at"] = utc_now()
+            receipt_digest = spawn_acceptance_receipt_digest(
+                response,
+                pending_spawn.get("task_name") or requested_spawn_task_name,
+                status_value,
+            )
+            prior_post = pending_spawn.get("host_acceptance_source") == "PostToolUse"
+            idempotent = bool(
+                prior_post
+                and not pending_spawn.get("host_acceptance_conflict")
+                and pending_spawn.get("host_acceptance_receipt_digest")
+                == receipt_digest
+                and pending_spawn.get("host_accepted") is accepted_value
+                and pending_spawn.get("host_acceptance_status") == status_value
+            )
+            if prior_post and not idempotent:
+                pending_spawn["host_accepted"] = None
+                pending_spawn["host_acceptance_status"] = "conflict"
+                pending_spawn["host_acceptance_conflict"] = True
+                if pending_spawn.get("role") == "high_assessor":
+                    state["assessor_state"] = "recovery_required"
+                    state["assessor_failure_kind"] = "start_mismatch"
+                    state["assessor_agent_id"] = None
+                    state["assessor_observed_effective"] = False
+                elif pending_spawn.get("role") == "confirmed_executor":
+                    state["executor_state"] = "recovery_required"
+                    state["executor_failure_kind"] = "start_mismatch"
+                    state["executor_agent_id"] = None
+                    state["executor_observed_effective"] = False
+            elif not prior_post:
+                pending_spawn["host_accepted"] = accepted_value
+                pending_spawn["host_acceptance_status"] = status_value
+                pending_spawn["host_acceptance_source"] = "PostToolUse"
+                pending_spawn["host_acceptance_fingerprint"] = fingerprint
+                pending_spawn["host_acceptance_receipt_digest"] = receipt_digest
+                pending_spawn["host_acceptance_conflict"] = False
+                pending_spawn["host_accepted_at"] = utc_now()
+            if (
+                not pending_spawn.get("host_acceptance_conflict")
+                and pending_spawn.get("host_accepted") is True
+                and reconcile_post_accepted_bound_start(
+                    state, pending_spawn, payload
+                )
+                and pending_spawn.get("role") == "confirmed_executor"
+            ):
+                runtime_delivery["late_executor"] = "rebound"
         if failed and pending_spawn and pending_spawn.get("role") == "high_assessor" and state.get("assessor_state") == "spawn_pending":
             if safe_int(pending_spawn.get("attempt")) == safe_int(state.get("assessor_attempt")):
-                state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
-                state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "spawn_failed"
+                state["assessor_state"] = "recovery_required"
+                state["assessor_failure_kind"] = "model_unavailable"
         if failed and pending_spawn and pending_spawn.get("role") == "confirmed_executor" and state.get("executor_state") == "spawn_pending":
             if safe_int(pending_spawn.get("attempt")) == safe_int(state.get("executor_attempt")):
-                state["executor_state"] = "exhausted" if safe_int(state.get("executor_attempt")) >= MAX_EXECUTOR_ATTEMPTS else "recovery_required"
-                state["executor_failure_kind"] = "spawn_failed"
+                state["executor_state"] = "recovery_required"
+                state["executor_failure_kind"] = "model_unavailable"
                 state["model_profile"] = "work_assessment"
-                if state["executor_state"] == "exhausted":
-                    state["executor_review"] = _safe_executor_review(
-                        {
-                            "status": "exhausted",
-                            "execution_contract_id": state.get(
-                                "execution_contract_id"
-                            ),
-                            "attempt": state.get("executor_attempt"),
-                            "at": utc_now(),
-                        }
-                    )
         executor_operation = bool(
             caller_id
             and caller_id == state.get("executor_agent_id")
@@ -11666,11 +14240,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             state["executor_failure_kind"] = failure_by_category.get(
                 category, "executor_failed"
             )
-            state["executor_state"] = (
-                "recovery_required"
-                if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS
-                else "exhausted"
-            )
+            state["executor_state"] = "recovery_required"
             state["model_profile"] = "work_assessment"
         stall = _safe_stall(state.get("stall"))
         resumed_failure = bool(
@@ -11687,10 +14257,10 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             )
         )
         if resumed_failure:
-            stall["state"] = "exhausted"
+            stall["state"] = "diagnosis_required"
             stall["at"] = utc_now()
             state["stall"] = stall
-            state["executor_state"] = "exhausted"
+            state["executor_state"] = "recovery_required"
             state["model_profile"] = "work_assessment"
         if telemetry:
             state["telemetry"] = telemetry
@@ -11750,6 +14320,21 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                     runtime_delivery["role"] = role
 
     updated_state, _ = mutate_state(payload, update)
+    if liveness_delivery.get("action") == "unblock_required":
+        emit_context(
+            "PostToolUse",
+            "Workflow Manager assessor liveness: the current bound sequence has no new progress digest for strictly more than 1200 seconds. Deliver one idempotent diagnosis/unblock request to the live assessor; polling alone is not progress and no successor may overlap it.",
+        )
+    elif liveness_delivery.get("action") == "recovery_required":
+        emit_context(
+            "PostToolUse",
+            "Workflow Manager assessor liveness: the delivered unblock received a further 600-second observation without progress and the prior Stop is verified. Start one materially corrected non-overlapping successor with any safe ASCII task_name.",
+        )
+    if runtime_delivery.get("late_executor"):
+        emit_context(
+            "PostToolUse",
+            "Workflow Manager accepted the one exact late spawn receipt, reverified the private canonical journal, and unlocked the already delivered digest-bound executor slice. The request, Post receipt, full Start, model, effort, fork, sequence, objective, contract, and current slice now agree.",
+        )
     if runtime_delivery.get("role"):
         runtime_truth = bound_runtime_truth_summary(
             updated_state, runtime_delivery["role"]
@@ -11871,13 +14456,58 @@ EXECUTION_STALL_RE = re.compile(
 )
 EXECUTION_RESULT_RE = re.compile(
     r"^EXECUTION_RESULT execution_contract_id=([0-9a-f]{32}) "
-    r"slice_id=(s(?:0[1-9]|[12][0-9]|3[0-2])) "
+    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) "
     r"outcome=(succeeded|failed)$"
 )
 EXECUTION_RESULT_V6_RE = re.compile(
     r"^EXECUTION_RESULT execution_contract_id=([0-9a-f]{32}) "
     r"outcome=(succeeded|failed) evidence_digest=([0-9a-f]{32})$"
 )
+EXECUTION_ACCEPTANCE_SUMMARY_RE = re.compile(
+    r"^EXECUTION_ACCEPTANCE_SUMMARY execution_contract_id=([0-9a-f]{32}) "
+    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) checklist_digest=([0-9a-f]{32}) "
+    r"required=([0-9]{1,10}) completed=([0-9]{1,10}) pending=([0-9]{1,10})$"
+)
+
+
+def _bound_acceptance_summary(body: str, state: dict[str, Any]) -> bool:
+    """Accept exactly one bounded summary immediately before the result marker."""
+    item = current_execution_slice(state) or {}
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    lines = [line for line in str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()]
+    matches = [EXECUTION_ACCEPTANCE_SUMMARY_RE.fullmatch(line) for line in lines]
+    matches = [match for match in matches if match]
+    if len(matches) != 1 or not lines or not EXECUTION_ACCEPTANCE_SUMMARY_RE.fullmatch(lines[-1]):
+        return False
+    match = matches[0]
+    required, completed, pending = (int(match.group(i)) for i in (4, 5, 6))
+    return bool(
+        contract and match.group(1) == contract and match.group(2) == item.get("id")
+        and match.group(3) == item.get("checklist_digest") and required == safe_int(item.get("required_count"))
+        and completed + pending == required and completed == required and pending == 0
+    )
+
+
+def _acceptance_summary_digest(body: str, state: dict[str, Any]) -> str | None:
+    """Bind the canonical checklist without requiring child prose repetition."""
+    item = current_execution_slice(state) or {}
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    if not contract or not item.get("id") or not item.get("checklist_digest"):
+        return None
+    explicit = _bound_acceptance_summary(body, state)
+    return stable_hash(
+        "workflow-manager-child-candidate-checklist-v2\0"
+        + canonical_json(
+            {
+                "checklist_digest": item.get("checklist_digest"),
+                "contract": contract,
+                "required": safe_int(item.get("required_count")),
+                "slice": item.get("id"),
+                "source": "explicit" if explicit else "canonical_manifest",
+            }
+        ),
+        32,
+    )
 STALL_DIAGNOSIS_RE = re.compile(
     r"^STALL_DIAGNOSIS stall_id=([0-9a-f]{32}) assessor_binding_id=([0-9a-f]{32}) "
     r"outcome=(resume|replan) plan_digest=([0-9a-f]{32}) "
@@ -11931,12 +14561,28 @@ def slice_operation_evidence(state: dict[str, Any]) -> dict[str, Any]:
         "delivery_device",
     }
     verification = {"verification", "evidence"}
-    successful_change_indexes = [
+    # PostToolUse is itself host evidence that the bound operation completed.
+    # Some Desktop builds return an opaque tool response, so an accepted
+    # mutation can retain status=unknown even though its exact input, command,
+    # turn, executor, contract and slice are all host-bound.  Treat that narrow
+    # shape as change evidence; the independent parent verification below is
+    # still required before the slice can pass.
+    host_recorded_change_indexes = [
         index
         for index, item in enumerate(operations)
-        if item.get("category") in changes and item.get("status") in SUCCESS_STATUSES
+        if item.get("category") in changes
+        and (
+            item.get("status") in SUCCESS_STATUSES
+            or (
+                item.get("status") == "unknown"
+                and item.get("executor_agent_id")
+                and _fingerprint32(item.get("host_input_digest"))
+                and _fingerprint32(item.get("host_command_digest"))
+                and item.get("host_event_turn_id")
+            )
+        )
     ]
-    last_change = max(successful_change_indexes, default=-1)
+    last_change = max(host_recorded_change_indexes, default=-1)
     successful_verification_indexes = [
         index
         for index, item in enumerate(operations)
@@ -11965,7 +14611,7 @@ def slice_operation_evidence(state: dict[str, Any]) -> dict[str, Any]:
         for item in operations
     ]
     return {
-        "change_evidence": bool(successful_change_indexes),
+        "change_evidence": bool(host_recorded_change_indexes),
         "verification_evidence": bool(successful_verification_indexes),
         "parent_review_evidence": bool(successful_parent_review_indexes),
         "operation_digest": stable_hash(
@@ -12033,7 +14679,7 @@ def executor_stall_id(state: dict[str, Any], failure_kind: str) -> str | None:
     objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
     plan = _fingerprint32(state.get("plan_digest"))
     contract = _fingerprint32(state.get("execution_contract_id"))
-    attempt = min(max(safe_int(state.get("executor_attempt")), 0), MAX_EXECUTOR_ATTEMPTS)
+    attempt = safe_sequence(state.get("executor_attempt"))
     if not objective or not plan or not contract or not attempt or failure_kind not in EXECUTOR_FAILURE_KINDS:
         return None
     return stable_hash(
@@ -12059,10 +14705,8 @@ def record_explicit_executor_stall(
     )
     if not stall_id or not contract_current or repeated:
         if repeated:
-            prior["state"] = "exhausted"
-            prior["at"] = utc_now()
             state["stall"] = prior
-        state["executor_state"] = "exhausted"
+        state["executor_state"] = "recovery_required"
         state["model_profile"] = "work_assessment"
         return False
     state["stall"] = _safe_stall(
@@ -12125,6 +14769,89 @@ def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> 
     return (executor_pending or assessor_pending or candidates)[-1]
 
 
+def unique_bound_start_request(
+    state: dict[str, Any], role: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the one pending request that is wholly bound to current state.
+
+    A request reservation is deliberately not authority.  In particular, do
+    not reconstruct a request from the flat executor/assessor fields: the
+    persisted request, its matching PostToolUse acceptance, and Start are
+    three separate host facts.
+    """
+    role_candidates = [
+        group.get("request") for group in subagent_lifecycle_groups(state)
+        if group.get("state") == "pending"
+        and isinstance(group.get("request"), dict)
+        and group["request"].get("role") == role
+    ]
+    if len(role_candidates) == 1:
+        acceptance = role_candidates[0]
+        if (
+            acceptance.get("host_acceptance_conflict")
+            or (
+                acceptance.get("host_acceptance_fingerprint")
+                and acceptance.get("host_acceptance_fingerprint")
+                != acceptance.get("request_fingerprint")
+            )
+        ):
+            return acceptance, "mismatch"
+        if (
+            acceptance.get("host_acceptance_source") != "PostToolUse"
+            or acceptance.get("host_accepted") is not True
+            or acceptance.get("host_acceptance_status")
+            not in SUCCESS_STATUSES | {"running"}
+            or not acceptance.get("host_acceptance_fingerprint")
+            or not _fingerprint32(
+                acceptance.get("host_acceptance_receipt_digest")
+            )
+        ):
+            return acceptance, "model_unavailable"
+    candidates = role_candidates
+    if role == "high_assessor":
+        candidates = [
+            item for item in candidates
+            if state.get("assessor_state") == "spawn_pending"
+            and item.get("contract_id") == state.get("assessor_binding_id")
+            and item.get("objective_fingerprint")
+            == state.get("objective", {}).get("fingerprint")
+            and item.get("model") == state.get("assessor_model")
+            and item.get("reasoning_effort") == state.get("assessor_reasoning_effort")
+            and str(item.get("fork_turns")) == str(state.get("assessor_fork_turns"))
+            and safe_int(item.get("attempt")) == safe_int(state.get("assessor_attempt"))
+        ]
+    elif role == "confirmed_executor":
+        candidates = [
+            item for item in candidates
+            if state.get("executor_state") == "spawn_pending"
+            and item.get("contract_id") == state.get("execution_contract_id")
+            and item.get("contract_id") == execution_contract_id(state)
+            and item.get("objective_fingerprint")
+            == state.get("objective", {}).get("fingerprint")
+            and item.get("slice_id") == (current_execution_slice(state) or {}).get("id")
+            and item.get("slice_contract_id") == slice_contract_id(state)
+            and item.get("model") == state.get("executor_model")
+            and item.get("reasoning_effort") == state.get("executor_reasoning_effort")
+            and str(item.get("fork_turns")) == str(state.get("executor_fork_turns"))
+            and safe_int(item.get("attempt")) == safe_int(state.get("executor_attempt"))
+            and item.get("task_name") == bound_executor_task_name(state)
+        ]
+    else:
+        return None, "unknown bound role"
+    if len(candidates) != 1:
+        # Preserve a sole original request long enough to record the exact
+        # flat-state conflict as start_mismatch.  Multiple candidates remain
+        # ambiguous and never select an authority-bearing request.
+        if not candidates and len(role_candidates) == 1:
+            return role_candidates[0], "mismatch"
+        return None, "ambiguous" if candidates or len(role_candidates) > 1 else "missing"
+    request = candidates[0]
+    # These are written solely by the matching PostToolUse transition.  A
+    # request field, Start payload, child prose, or a flat state value cannot
+    # substitute for them.
+    return request, None
+
+
 def subagent_start_conflict_reason(
     state: dict[str, Any], agent_id: str, request: dict[str, Any]
 ) -> str | None:
@@ -12133,44 +14860,18 @@ def subagent_start_conflict_reason(
     groups = subagent_lifecycle_groups(state)
     if any(group.get("state") == "live" and group.get("agent_id") == agent_id for group in groups):
         return "duplicate SubagentStart for an already-live agent"
-    if (
-        request.get("role") == "confirmed_executor"
-        and safe_int(request.get("attempt")) == 2
+    if request.get("role") == "confirmed_executor" and any(
+        group.get("state") == "live"
+        and isinstance(group.get("request"), dict)
+        and group["request"].get("role") == "confirmed_executor"
+        for group in groups
     ):
-        contract = safe_fingerprint(request.get("contract_id"))
-        reused_terminal = any(
-            group.get("state") == "terminal"
-            and group.get("agent_id") == agent_id
-            and isinstance(group.get("request"), dict)
-            and group["request"].get("role") == "confirmed_executor"
-            and group["request"].get("contract_id") == contract
-            and group["request"].get("slice_contract_id")
-            == request.get("slice_contract_id")
-            and safe_int(group["request"].get("attempt")) == 1
-            for group in groups
-        )
-        review = _safe_executor_review(state.get("executor_review"))
-        reused_review_candidate = bool(
-            review.get("execution_contract_id") == contract
-            and review.get("slice_contract_id") == request.get("slice_contract_id")
-            and review.get("candidate_agent_fingerprint")
-            == stable_hash(agent_id, 32)
-        )
-        if reused_terminal or reused_review_candidate:
-            return "fresh v2 confirmed executor cannot reuse the terminal v1 agent_id"
+        return "a confirmed executor already owns the one live writer slot"
     terminal = [
         group for group in groups
         if group.get("state") == "terminal" and group.get("agent_id") == agent_id
     ]
-    if not terminal:
-        return None
-    request_group = next(
-        (group for group in groups if group.get("state") == "pending" and group.get("request") is request),
-        None,
-    )
-    if not request_group or safe_int(request_group.get("first_index")) <= safe_int(terminal[-1].get("last_index")):
-        return "late SubagentStart cannot revive a terminal agent without a newer bound request"
-    return None
+    return "a terminal child identity cannot be revived" if terminal else None
 
 
 def subagent_start(payload: dict[str, Any]) -> None:
@@ -12195,53 +14896,36 @@ def subagent_start(payload: dict[str, Any]) -> None:
     canonical_handoff_error: str | None = None
     canonical_handoff_digest: str | None = None
     if executor_request:
-        try:
-            candidate_body = _read_verified_current_plan_revision(previous, payload)
-            candidate_digest = stable_hash(candidate_body, 32)
-            artifact = _safe_plan_artifact(previous.get("plan_artifact"))
-            if candidate_digest != artifact.get("current_revision_digest"):
-                raise PlanArtifactError("content_drift")
-            parsed_slices = parse_execution_slice_manifest(candidate_body)
-            persisted_slices = _safe_execution_slices(previous.get("execution_slices"))
-            current_slice = current_execution_slice(previous)
-            if (
-                parsed_slices.get("manifest_digest")
-                != persisted_slices.get("manifest_digest")
-                or parsed_slices.get("global_constraints_digest")
-                != persisted_slices.get("global_constraints_digest")
-                or not current_slice
-                or parsed_slices["items"][persisted_slices["current_index"] - 1]["slice_digest"]
-                != current_slice.get("slice_digest")
-            ):
-                raise PlanArtifactError("content_drift")
-            canonical_body = canonical_json(
-                {
-                    "global_constraints": parsed_slices["global_constraints"],
-                    "slice": {
-                        key: parsed_slices["items"][persisted_slices["current_index"] - 1][key]
-                        for key in ("id", *EXECUTION_SLICE_FIELDS)
-                    },
-                    "slice_contract_id": slice_contract_id(previous),
-                }
-            ) + "\n"
-            canonical_handoff_digest = candidate_digest
-        except PlanArtifactError as error:
-            canonical_handoff_error = error.code
-        except OSError:
-            canonical_handoff_error = "write_error"
+        (
+            canonical_body,
+            canonical_handoff_digest,
+            canonical_handoff_error,
+        ) = verified_current_execution_handoff(previous, payload)
     objective_fingerprint = request.get("objective_fingerprint") or previous.get("objective", {}).get("fingerprint")
     decision: dict[str, Any] = {"accepted": False}
 
     def update(state: dict[str, Any]) -> None:
         agent_id = safe_label(payload.get("agent_id"), 120)
-        bound_request = pending_subagent_request(state, payload) or {}
+        bound_request, binding_error = unique_bound_start_request(
+            state, "confirmed_executor" if executor_request else "high_assessor"
+        )
+        bound_request = bound_request or {}
         bound_request_fingerprint = safe_fingerprint(bound_request.get("request_fingerprint"))
         conflict = (
             "persisted SubagentStart request was already consumed or no longer matches"
             if expected_request_fingerprint
             and bound_request_fingerprint != expected_request_fingerprint
-            else subagent_start_conflict_reason(state, agent_id, bound_request)
+            else (
+                "SubagentStart has no unique fully-bound request"
+                if binding_error in {"missing", "ambiguous"}
+                else None
+            )
         )
+        if not conflict:
+            # A missing/rejected Post acceptance is recorded as a typed
+            # capability failure below, rather than silently treated as a
+            # profile conflict.  It still never becomes a running role.
+            conflict = subagent_start_conflict_reason(state, agent_id, bound_request)
         if conflict:
             state.setdefault("guards", []).append(
                 {
@@ -12256,18 +14940,26 @@ def subagent_start(payload: dict[str, Any]) -> None:
             return
         decision["accepted"] = True
         request_contract = bound_request.get("contract_id")
-        highest = safe_session_execution_preference(
-            state.get("session_execution_preference")
-        ) == "highest_throughout"
-        expected_model = highest_execution_model(state) if highest else None
-        expected_effort = highest_execution_effort(state) if highest else "medium"
+        executor_profile = expected_executor_profile(state, bound_request)
+        expected_model = (
+            safe_label(executor_profile.get("model"), 80)
+            if executor_profile.get("model")
+            else None
+        )
+        expected_effort = str(
+            executor_profile.get("reasoning_effort") or ""
+        ).lower()
+        highest_profile = (
+            executor_profile.get("profile")
+            == "work_executor_highest_available"
+        )
         echoed_model = payload_model
         echoed_effort = observed_effort
         identity = state.setdefault("identity_evidence", {})
         identity["start_echo_profile"] = stable_hash(
             canonical_json({"model": observed_model, "reasoning_effort": observed_effort, "source": observation_source}), 32
         ) if observed_model or observed_effort else None
-        contract_matches = bool(
+        contract_ready = bool(
             executor_request
             and canonical_body is not None
             and canonical_handoff_digest == state.get("plan_digest")
@@ -12280,8 +14972,9 @@ def subagent_start(payload: dict[str, Any]) -> None:
             and bound_request.get("slice_contract_id") == slice_contract_id(state)
             and bound_request.get("model") == state.get("executor_model")
             and bound_request.get("reasoning_effort") == expected_effort
-            and (not highest or bound_request.get("model") == expected_model)
-            and bound_request.get("host_accepted") is True
+            and (not highest_profile or bound_request.get("model") == expected_model)
+            and not executor_profile.get("error")
+            and not bound_request.get("host_acceptance_conflict")
             and observed_status == "full"
             and echoed_model == bound_request.get("model")
             and observed_model == echoed_model
@@ -12289,6 +14982,19 @@ def subagent_start(payload: dict[str, Any]) -> None:
             and bound_request.get("fork_turns") == state.get("executor_fork_turns")
             and safe_int(bound_request.get("attempt")) == safe_int(state.get("executor_attempt"))
         )
+        contract_matches = bool(
+            contract_ready and bound_request.get("host_accepted") is True
+        )
+        locked_handoff = bool(
+            contract_ready
+            and binding_error == "model_unavailable"
+            and bound_request.get("host_accepted") is None
+            and not bound_request.get("host_acceptance_source")
+            and not bound_request.get("host_acceptance_status")
+            and not bound_request.get("host_acceptance_fingerprint")
+        )
+        decision["locked_handoff"] = locked_handoff
+        handoff_delivered = bool(contract_matches or locked_handoff)
         state.setdefault("subagents", []).append(
             {
                 "at": utc_now(),
@@ -12308,14 +15014,20 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 "observation_source": observation_source,
                 "role": bound_request.get("role") or "lane",
                 "contract_id": request_contract,
-                "model": bound_request.get("model"),
-                "reasoning_effort": bound_request.get("reasoning_effort"),
+                "model": observed_model,
+                "reasoning_effort": observed_effort,
                 "fork_turns": bound_request.get("fork_turns"),
                 "attempt": bound_request.get("attempt"),
                 "slice_id": bound_request.get("slice_id"),
                 "slice_contract_id": bound_request.get("slice_contract_id"),
                 "recovery_from": bound_request.get("recovery_from"),
                 "plan_handoff_digest": canonical_handoff_digest,
+                "plan_handoff_delivery_digest": (
+                    stable_hash(canonical_body, 32)
+                    if handoff_delivered and canonical_body is not None
+                    else None
+                ),
+                "plan_handoff_delivered": handoff_delivered,
             }
         )
         if (
@@ -12344,33 +15056,17 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 state["executor_agent_id"] = agent_id
                 state["executor_failure_kind"] = None
             else:
-                state["executor_state"] = (
-                    "recovery_required"
-                    if safe_int(state.get("executor_attempt"))
-                    < MAX_EXECUTOR_ATTEMPTS
-                    else "exhausted"
-                )
+                state["executor_state"] = "recovery_required"
                 state["executor_agent_id"] = None
                 state["executor_failure_kind"] = (
-                    "protocol_missing_model"
-                    if not payload_model
-                    else
-                    "stale_contract"
+                    "model_unavailable"
+                    if binding_error == "model_unavailable"
+                    or executor_profile.get("error") == "model_unavailable"
+                    else "stale_contract"
                     if canonical_handoff_error in {"unsafe_path", "content_drift", "journal_full"}
                     or state.get("execution_contract_id") != execution_contract_id(state)
                     else "start_mismatch"
                 )
-                if state["executor_state"] == "exhausted":
-                    state["executor_review"] = _safe_executor_review(
-                        {
-                            "status": "exhausted",
-                            "execution_contract_id": state.get(
-                                "execution_contract_id"
-                            ),
-                            "attempt": state.get("executor_attempt"),
-                            "at": utc_now(),
-                        }
-                    )
         if assessor_request:
             bound = bool(state.get("assessor_state") == "spawn_pending" and bound_request.get("contract_id") == state.get("assessor_binding_id") and objective_fingerprint == state.get("objective", {}).get("fingerprint") and safe_int(bound_request.get("attempt")) == safe_int(state.get("assessor_attempt")))
             matched = bool(
@@ -12387,8 +15083,19 @@ def subagent_start(payload: dict[str, Any]) -> None:
             state["assessor_start_observed"] = observed_status
             state["assessor_observation_source"] = observation_source
             state["assessor_observed_effective"] = bool(matched)
-            state["assessor_state"] = "running" if matched else ("failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required")
-            state["assessor_failure_kind"] = None if matched else ("retry_exhausted" if state["assessor_state"] == "failed" else ("protocol_missing_model" if not payload_model else "start_mismatch"))
+            state["assessor_state"] = "running" if matched else "recovery_required"
+            state["assessor_failure_kind"] = None if matched else (
+                "model_unavailable"
+                if binding_error == "model_unavailable"
+                else "start_mismatch"
+            )
+            if matched:
+                state["assessment_liveness"] = {
+                    "binding_id": state.get("assessor_binding_id"), "agent_id": agent_id,
+                    "attempt": safe_int(state.get("assessor_attempt")), "progress_digest": None,
+                    "last_progress_at": _liveness_now(), "last_observed_at": _liveness_now(),
+                    "unblock": "none", "unblock_at": None, "recovery_from": None,
+                }
 
     _, changed = mutate_state(payload, update)
     if not decision["accepted"]:
@@ -12419,12 +15126,8 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 warnings.append(
                     "Confirmed executor request and observed start profile match "
                     f"(model={refreshed.get('executor_observed_model')}, effort={refreshed.get('executor_observed_reasoning_effort')}, "
-                    f"source={refreshed.get('executor_observation_source')}). Execute only the bound plan and acceptance. "
-                    "Launch every potentially long-running verification inside a foreground deadline from process start, "
-                    "preserve both wrapper outer status and underlying inner exit, and close its process group before Stop. "
-                    "If you discover a reversible in-scope command-contract defect you introduced, such as a missing "
-                    "deadline or incomplete status capture, repair and rerun it in this same live ownership before returning; "
-                    "do not turn that correctable defect into a replacement-plan loop."
+                    f"source={refreshed.get('executor_observation_source')}). Execute the bound plan and acceptance; "
+                    "use native judgment for decomposition, progress, verification, and reversible in-scope repair."
                 )
             else:
                 warnings.append(
@@ -12434,19 +15137,32 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 )
     warning_text = (" " + " ".join(warnings)) if warnings else ""
     private_handoff = ""
-    if executor_request and canonical_body is not None and refreshed.get("executor_state") == "running":
+    if (
+        executor_request
+        and canonical_body is not None
+        and (
+            refreshed.get("executor_state") == "running"
+            or decision.get("locked_handoff") is True
+        )
+    ):
         relative_path = _safe_plan_artifact(refreshed.get("plan_artifact")).get(
             "relative_path"
         )
         private_handoff = (
             " Canonical executor handoff was verified from the trusted plugin-data journal. "
             f"relative_path={relative_path} is plugin-data-root-relative contract metadata only; never resolve "
-            "it against cwd or a workspace. Only the global constraints and current execution "
-            "slice are injected; the rest of the large plan is intentionally withheld:\n"
+            "it against cwd or a workspace. The current native plan or optional structured slice follows:\n"
             "BEGIN_WORKFLOW_MANAGER_EXECUTION_SLICE\n"
             f"{canonical_body}"
             "END_WORKFLOW_MANAGER_EXECUTION_SLICE"
         )
+        if decision.get("locked_handoff") is True:
+            private_handoff += (
+                " The slice was delivered under a locked Start because the matching "
+                "PostToolUse acceptance receipt had not arrived. Mutation remains denied "
+                "until that exact receipt is persisted and the journal is reverified; do "
+                "not infer authorization from this handoff alone."
+            )
     elif executor_request:
         private_handoff = (
             " Canonical executor handoff verification failed"
@@ -12556,7 +15272,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     if assessor_agent and assessment is None:
         try:
             derived_plan_body = sanitize_plan_artifact_body(result)
-            parse_execution_slice_manifest(derived_plan_body)
+            execution_slice_manifest_for_plan(derived_plan_body)
         except PlanArtifactError:
             pass
         else:
@@ -12571,6 +15287,12 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                     "workflow-manager-derived-assessment-v1\0" + derived_plan_body,
                     32,
                 )
+    native_assessment_digest = (
+        native_assessor_result_digest(result) if assessor_agent else None
+    )
+    # The assessor supplies read-only judgment only. The parent owns the native
+    # plan, so assessor prose never doubles as a second plan protocol.
+    canonical_assessor_plan = False
     stall_lines = [line for line in str(result or "").splitlines() if line.startswith("EXECUTION_STALL")]
     stall_matches = [match for line in stall_lines if (match := EXECUTION_STALL_RE.fullmatch(line))]
     execution_stall_intent = bool(stall_lines)
@@ -12612,7 +15334,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             )
             current_started = (current_result_group or {}).get("request")
         successful = terminal_succeeded(current_started)
-        execution_result_current = bool(
+        marker_result_current = bool(
             execution_result
             and execution_result.group(1) == state.get("execution_contract_id")
             and (
@@ -12620,23 +15342,42 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 or execution_result.group(2) == (current_execution_slice(state) or {}).get("id")
             )
         )
+        native_result_current = bool(
+            executor_agent
+            and current_started is not None
+            and not execution_result_intent
+            and str(result or "").strip()
+        )
+        execution_result_current = marker_result_current or native_result_current
         execution_result_outcome = (
             execution_result.group(3)
             if execution_result and result_profile_current
-            else execution_result.group(2) if execution_result else None
+            else execution_result.group(2)
+            if execution_result
+            else "failed"
+            if status_value in ERROR_STATUSES or explicit_unknown_status
+            else "succeeded"
+            if native_result_current
+            else None
         )
         execution_result_succeeded = bool(
             execution_result_current and execution_result_outcome == "succeeded"
         )
+        effective_execution_body = (
+            execution_result_body
+            if execution_result
+            else str(result or "").strip()
+        )
         if executor_agent:
-            # Desktop can omit terminal status.  That route needs the unique exact
-            # result marker; a declared failed/cancelled status can never succeed.
+            # Native child prose is a candidate when the separately bound host
+            # lifecycle is current. Explicit malformed marker intent or a host
+            # failed/cancelled status still fails closed.
             successful = bool(
                 current_started is not None
                 and execution_result_succeeded
                 and status_value not in ERROR_STATUSES
                 and not explicit_unknown_status
-                and not (execution_result_current and execution_result_outcome == "failed")
+                and not (marker_result_current and execution_result_outcome == "failed")
             )
         already_terminal = any(
             group.get("state") == "terminal" and group.get("agent_id") == agent_id
@@ -12688,7 +15429,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state=state,
                 agent_id=agent_id,
                 request_fingerprint=(effective_started or {}).get("request_fingerprint"),
-                body_without_marker=execution_result_body,
+                body_without_marker=effective_execution_body,
                 outcome=str(execution_result_outcome or "invalid"),
                 terminal_status=terminal_status,
                 terminal_status_source=terminal_status_source,
@@ -12757,7 +15498,8 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                         execution_stall.group(3),
                     )
                 else:
-                    state["executor_state"] = "exhausted"
+                    state["executor_state"] = "recovery_required"
+                    state["executor_failure_kind"] = "executor_failed"
                     state["model_profile"] = "work_assessment"
                 return
             if not contract_current:
@@ -12765,6 +15507,11 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["executor_failure_kind"] = "stale_contract"
                 state["model_profile"] = "work_assessment"
             elif successful and state.get("executor_state") == "running":
+                # A completed child is a candidate for parent review even when
+                # verification is intentionally performed by the parent after
+                # the child terminates.  Requiring child-side verification here
+                # converted a normal review handoff into a recovery loop and
+                # prevented later host-recorded parent evidence from sealing it.
                 state["executor_state"] = "verification_required"
                 state["executor_agent_id"] = None
                 state["executor_failure_kind"] = None
@@ -12781,10 +15528,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                         "slice_contract_id": slice_contract_id(state),
                         "attempt": state.get("executor_attempt"),
                         "candidate_result_fingerprint": stable_hash(
-                            execution_result_body, 32
+                            effective_execution_body, 32
                         ),
                         "candidate_agent_fingerprint": stable_hash(agent_id, 32),
                         "candidate_evidence_digest": candidate_evidence_digest,
+                        "child_summary_digest": _acceptance_summary_digest(
+                            effective_execution_body, state
+                        ),
                         "review_evidence_digest": None,
                         "digest_profile": EVIDENCE_DIGEST_PROFILE,
                         "digest_source": EVIDENCE_DIGEST_SOURCE,
@@ -12795,7 +15545,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 )
                 state["model_profile"] = "work_assessment"
             elif not successful:
-                state["executor_state"] = "recovery_required" if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS else "exhausted"
+                state["executor_state"] = "recovery_required"
                 state["executor_failure_kind"] = (
                     state.get("executor_failure_kind")
                     if state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
@@ -12807,21 +15557,10 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                     stall.get("state") == "resuming"
                     and stall.get("execution_contract_id") == state.get("execution_contract_id")
                 ):
-                    stall["state"] = "exhausted"
+                    stall["state"] = "diagnosis_required"
                     stall["at"] = utc_now()
                     state["stall"] = stall
-                    state["executor_state"] = "exhausted"
-                if safe_int(state.get("executor_attempt")) >= MAX_EXECUTOR_ATTEMPTS:
-                    state["executor_review"] = _safe_executor_review(
-                        {
-                            "status": "exhausted",
-                            "execution_contract_id": state.get(
-                                "execution_contract_id"
-                            ),
-                            "attempt": state.get("executor_attempt"),
-                            "at": utc_now(),
-                        }
-                    )
+                    state["executor_state"] = "recovery_required"
         if stall_assessor:
             stall = _safe_stall(state.get("stall"))
             valid = bool(
@@ -12834,8 +15573,8 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 and stall_diagnosis.group(5) == stall.get("execution_contract_id") == state.get("execution_contract_id")
             )
             if not valid:
-                stall["state"] = "exhausted"
-                state["executor_state"] = "exhausted"
+                stall["state"] = "diagnosis_required"
+                state["executor_state"] = "recovery_required"
                 state["model_profile"] = "work_assessment"
                 state["stall"] = stall
                 return
@@ -12859,11 +15598,29 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             return
         if assessor_agent and state.get("assessor_agent_id") == agent_id:
             mutated = any(item.get("assessor_binding_id") == state.get("assessor_binding_id") and item.get("category") in {"implementation", "build_package", "delivery_device", "git"} and item.get("status") in SUCCESS_STATUSES for item in state.get("operations", []))
+            assessor_lifecycle, assessor_lifecycle_error = original_assessor_lifecycle(
+                state
+            )
+            lifecycle_current = bool(
+                not assessor_lifecycle_error
+                and assessor_lifecycle.get("agent_id") == agent_id
+                and assessor_lifecycle.get("binding_id")
+                == state.get("assessor_binding_id")
+            )
             assessment_binding = (
-                assessment.group(1) if assessment else derived_assessment_binding
+                assessment.group(1)
+                if assessment
+                else derived_assessment_binding
+                or (
+                    safe_fingerprint(state.get("assessor_binding_id"))
+                    if native_assessment_digest
+                    else None
+                )
             )
             assessment_digest = (
-                assessment.group(3) if assessment else derived_assessment_digest
+                assessment.group(3)
+                if assessment
+                else derived_assessment_digest or native_assessment_digest
             )
             valid = bool(
                 not stale
@@ -12871,18 +15628,26 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 and assessment_binding
                 and assessment_digest
                 and assessment_binding == state.get("assessor_binding_id")
+                and lifecycle_current
             )
             if assessment and mutated:
                 state["assessor_state"] = "failed"
                 state["assessor_failure_kind"] = "hard_mutation_before_confirmation"
+            elif assessor_lifecycle_error:
+                state["assessor_state"] = "recovery_required"
+                state["assessor_failure_kind"] = assessor_lifecycle_error
             elif not valid:
-                state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
-                state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "assessment_result_invalid"
+                state["assessor_state"] = "recovery_required"
+                state["assessor_failure_kind"] = "assessment_result_invalid"
             else:
-                detailed = bool(len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", str(result or ""))) >= 2 and re.search(r"(?:验收|验证|test|verify|acceptance)", str(result or ""), re.I) and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", str(result or "")))
+                detailed = bool(
+                    canonical_assessor_plan
+                    or native_assessment_digest
+                    or assessment_digest
+                )
                 if not detailed:
-                    state["assessor_state"] = "failed" if safe_int(state.get("assessor_attempt")) >= 2 else "recovery_required"
-                    state["assessor_failure_kind"] = "retry_exhausted" if state["assessor_state"] == "failed" else "hard_plan_incomplete"
+                    state["assessor_state"] = "recovery_required"
+                    state["assessor_failure_kind"] = "hard_plan_incomplete"
                     return
                 state["assessor_state"] = "hard_plan_ready"
                 state["work_difficulty"] = "hard"
@@ -12896,8 +15661,19 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["confirmed_at"] = None
                 reset_executor_binding(state)
                 state["model_profile"] = confirmed_executor_model_profile(state)
-                if write_plan_artifact(state, payload, str(result or "")):
+                if canonical_assessor_plan and write_plan_artifact(
+                    state, payload, str(result or "")
+                ):
                     state["plan_state"] = "awaiting_confirmation"
+                    auto_confirm_trusted_plan(state, payload)
+                elif canonical_assessor_plan:
+                    state["plan_state"] = "repair_required"
+                else:
+                    # Current Codex owns plan composition. The assessor's
+                    # host-bound result is read-only evidence; the parent Stop
+                    # writes the one native canonical plan without a second
+                    # assessor or another user confirmation.
+                    state["plan_state"] = "analyzing"
             state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
     updated_state, _ = mutate_state(payload, update)
@@ -12933,27 +15709,30 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             f"Workflow Manager {runtime_truth} Report these exact verified fields to the user; when Start=full, "
             "do not describe the runtime echo as absent or unavailable.",
         )
-    elif executor_agent and not decision.get("successful"):
+    elif (
+        executor_agent
+        and updated_state.get("executor_state") == "recovery_required"
+    ):
         runtime_truth = bound_runtime_truth_summary(updated_state, "confirmed_executor")
+        host_recovery = recovery_reservation_context(updated_state)
+        recovery_text = f"\n{host_recovery}" if host_recovery else ""
         emit_context(
             "SubagentStop",
-            f"Workflow Manager {runtime_truth} Confirmed executor failed. Return to the high-reasoning parent for one diagnosis. Do not repeat "
-            "unchanged actions: either make a material correction and use the one remaining bounded executor "
-            "attempt, or invalidate/replan when scope or acceptance changes.",
+            f"Workflow Manager {runtime_truth} Confirmed executor failed or requires recovery. Return to the high-reasoning parent for diagnosis. Do not repeat "
+            "unchanged actions: use new evidence, root cause, progress, or a material correction in a fresh "
+            "monotonic sequence, or invalidate/replan when scope or acceptance changes. The Hook-issued digest facts "
+            "below are sufficient; do not inspect plugin state files or infer them from child prose."
+            f"{recovery_text}",
         )
     elif executor_agent and updated_state.get("executor_state") == "verification_required":
-        contract = updated_state.get("execution_contract_id")
-        slice_item = current_execution_slice(updated_state) or {}
-        slice_contract = slice_contract_id(updated_state)
         runtime_truth = bound_runtime_truth_summary(updated_state, "confirmed_executor")
         emit_context(
             "SubagentStop",
             f"Workflow Manager {runtime_truth} Executor self-report is only a candidate. The high-reasoning parent must independently inspect "
-            "the bounded artifacts and verification evidence. End the parent turn with exactly one line: "
-            f"EXECUTION_REVIEW execution_contract_id={contract} slice_id={slice_item.get('id')} "
-            "outcome=passed|failed. This marker ends the parent turn; do not spawn the next slice before Stop seals it. The Hook generates and normalizes "
-            "the evidence digest. Only passed with bound operation evidence advances the slice; a failed review may use one fresh, "
-            "evidence-bound verification_failed v2 child and must never revive v1.",
+            "the bounded artifacts and run the acceptance verification. Native parent Stop plus host-recorded evidence is sufficient; "
+            "a plugin review marker is optional. "
+            "Only passed with bound operation evidence advances the slice; a failed review may use one fresh, "
+            "evidence-bound typed successor and must never revive a terminal child.",
         )
     else:
         emit_continue()
@@ -12968,9 +15747,60 @@ CAUSAL_REVIEW_RESULT_RE = re.compile(
 )
 EXECUTION_REVIEW_RE = re.compile(
     r"^EXECUTION_REVIEW execution_contract_id=([0-9a-f]{32}) "
-    r"slice_id=(s(?:0[1-9]|[12][0-9]|3[0-2])) "
+    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) "
     r"outcome=(passed|failed)$"
 )
+EXECUTION_REVIEW_SUMMARY_RE = re.compile(
+    r"^EXECUTION_REVIEW_SUMMARY execution_contract_id=([0-9a-f]{32}) "
+    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) checklist_digest=([0-9a-f]{32}) "
+    r"required=([0-9]{1,10}) completed=([0-9]{1,10}) pending=([0-9]{1,10})$"
+)
+
+
+def _bound_parent_review_summary(body: str, state: dict[str, Any]) -> str | None:
+    item = current_execution_slice(state) or {}
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    matches = [EXECUTION_REVIEW_SUMMARY_RE.fullmatch(line) for line in str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    matches = [match for match in matches if match]
+    explicit = False
+    if len(matches) == 1:
+        match = matches[0]
+        required, completed, pending = (
+            int(match.group(index)) for index in (4, 5, 6)
+        )
+        explicit = bool(
+            contract
+            and match.group(1) == contract
+            and match.group(2) == item.get("id")
+            and match.group(3) == item.get("checklist_digest")
+            and required == safe_int(item.get("required_count"))
+            and completed == required
+            and pending == 0
+            and completed + pending == required
+        )
+    evidence = slice_operation_evidence(state)
+    if (
+        not contract
+        or not item.get("id")
+        or not item.get("checklist_digest")
+        or not evidence.get("parent_review_evidence")
+        or not evidence.get("operation_digest")
+    ):
+        return None
+    return stable_hash(
+        "workflow-manager-parent-review-checklist-v2\0"
+        + canonical_json(
+            {
+                "checklist_digest": item.get("checklist_digest"),
+                "contract": contract,
+                "operation_digest": evidence.get("operation_digest"),
+                "required": safe_int(item.get("required_count")),
+                "slice": item.get("id"),
+                "source": "explicit" if explicit else "canonical_manifest",
+            }
+        ),
+        32,
+    )
 EXECUTION_REVIEW_V6_RE = re.compile(
     r"^EXECUTION_REVIEW execution_contract_id=([0-9a-f]{32}) "
     r"outcome=(passed|failed) evidence_digest=([0-9a-f]{32})$"
@@ -12989,11 +15819,7 @@ def stop(payload: dict[str, Any]) -> None:
         EXECUTION_REVIEW_RE if review_profile_current else EXECUTION_REVIEW_V6_RE,
     )
     causal_match = CAUSAL_REVIEW_RESULT_RE.search(assistant_message)
-    plan_ready = bool(
-        len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", assistant_message)) >= 2
-        and re.search(r"(?:验收|验证|test|verify|acceptance)", assistant_message, re.I)
-        and re.search(r"计划已就绪，等待确认后执行[。.!！\s]*$", assistant_message)
-    )
+    plan_ready = canonical_plan_message_ready(assistant_message)
 
     def update(state: dict[str, Any]) -> None:
         reconcile_unknown_operations_from_transcript(payload, state)
@@ -13014,9 +15840,16 @@ def stop(payload: dict[str, Any]) -> None:
             review_outcome = (
                 execution_review.group(3)
                 if execution_review and profile_current
-                else execution_review.group(2) if execution_review else None
+                else execution_review.group(2)
+                if execution_review
+                else "passed"
+                if not execution_review_intent and assistant_message.strip()
+                else None
             )
-            binding_valid = bool(
+            native_review = bool(
+                not execution_review_intent and assistant_message.strip()
+            )
+            marker_binding_valid = bool(
                 execution_review
                 and execution_review.group(1) == contract_id
                 and (
@@ -13028,6 +15861,18 @@ def stop(payload: dict[str, Any]) -> None:
                     not profile_current
                     or current_slice
                     and execution_review.group(2) == current_slice.get("id")
+                )
+            )
+            binding_valid = bool(
+                (marker_binding_valid or native_review)
+                and (
+                    contract_id == execution_contract_id(state)
+                    if profile_current
+                    else str(state.get("execution_profile_version")) in {"5", "6"}
+                )
+                and (
+                    not profile_current
+                    or current_slice
                     and review.get("slice_id") == current_slice.get("id")
                     and review.get("slice_contract_id") == current_slice_contract
                 )
@@ -13036,6 +15881,7 @@ def stop(payload: dict[str, Any]) -> None:
                 and review.get("attempt") == state.get("executor_attempt")
                 and review.get("candidate_result_fingerprint")
                 and review.get("candidate_evidence_digest")
+                and review.get("child_summary_digest")
             )
             if not binding_valid:
                 if execution_review_intent:
@@ -13103,6 +15949,7 @@ def stop(payload: dict[str, Any]) -> None:
                 state["executor_review"] = review
                 return
 
+            parent_summary_digest = _bound_parent_review_summary(execution_review_body, state)
             operation_evidence = slice_operation_evidence(state)
             evidence_digest = host_evidence_digest(
                 domain="parent-review-v1",
@@ -13114,11 +15961,13 @@ def stop(payload: dict[str, Any]) -> None:
                 candidate_review=review,
             )
             review["review_evidence_digest"] = evidence_digest
+            review["parent_summary_digest"] = parent_summary_digest
             review["digest_profile"] = EVIDENCE_DIGEST_PROFILE
             review["digest_source"] = EVIDENCE_DIGEST_SOURCE
             review["at"] = utc_now()
             passed_with_evidence = bool(
                 review_outcome == "passed"
+                and parent_summary_digest
                 and operation_evidence.get("verification_evidence")
                 and operation_evidence.get("parent_review_evidence")
                 and operation_evidence.get("operation_digest")
@@ -13133,6 +15982,8 @@ def stop(payload: dict[str, Any]) -> None:
                     + canonical_json(
                         {
                             "candidate_evidence_digest": review.get("candidate_evidence_digest"),
+                            "child_summary_digest": review.get("child_summary_digest"),
+                            "parent_summary_digest": parent_summary_digest,
                             "execution_contract_id": contract_id,
                             "operation_digest": operation_evidence["operation_digest"],
                             "review_evidence_digest": evidence_digest,
@@ -13170,7 +16021,6 @@ def stop(payload: dict[str, Any]) -> None:
                 if slices["current_index"] <= slices["count"]:
                     state["executor_state"] = "spawn_required"
                     state["executor_agent_id"] = None
-                    state["executor_attempt"] = 0
                     state["executor_failure_kind"] = None
                     state["executor_review"] = _empty_executor_review()
                     state["model_profile"] = confirmed_executor_model_profile(state)
@@ -13244,27 +16094,21 @@ def stop(payload: dict[str, Any]) -> None:
                 slices["current_index"] = item_index + 1
                 slices["completed_chain"] = prior_chain
                 state["execution_slices"] = slices
-                state["executor_state"] = (
-                    "recovery_required"
-                    if safe_int(state.get("executor_attempt")) < MAX_EXECUTOR_ATTEMPTS
-                    else "exhausted"
-                )
+                state["executor_state"] = "recovery_required"
                 state["executor_failure_kind"] = "verification_failed"
                 baseline = _safe_execution_baseline(state.get("last_execution_baseline")) or build_execution_baseline(state)
                 if baseline:
                     baseline["acceptance_status"] = "failed"
                     state["last_execution_baseline"] = baseline
-                review["status"] = (
-                    "failed" if state["executor_state"] == "recovery_required" else "exhausted"
-                )
+                review["status"] = "failed"
                 state["model_profile"] = "work_assessment"
                 state["executor_review"] = review
                 return
             else:
                 if review_outcome == "passed":
                     # A pass without host-bound parent verification is an
-                    # evidence repair, not a failed implementation.  Preserve
-                    # attempt one and leave the parent able to add the missing
+                    # evidence repair, not a failed implementation. Preserve
+                    # the current sequence and let the parent add the missing
                     # read-only evidence then submit a fresh review marker.
                     review["status"] = "review_required"
                     state["executor_state"] = "verification_required"
@@ -13286,26 +16130,16 @@ def stop(payload: dict[str, Any]) -> None:
                 if baseline:
                     baseline["acceptance_status"] = "failed"
                     state["last_execution_baseline"] = baseline
-                state["executor_state"] = (
-                    "recovery_required"
-                    if safe_int(state.get("executor_attempt"))
-                    < MAX_EXECUTOR_ATTEMPTS
-                    else "exhausted"
-                )
+                state["executor_state"] = "recovery_required"
                 state["executor_failure_kind"] = "verification_failed"
-                review["status"] = (
-                    "failed"
-                    if state["executor_state"] == "recovery_required"
-                    else "exhausted"
-                )
+                review["status"] = "failed"
                 state["model_profile"] = "work_assessment"
                 stall = _safe_stall(state.get("stall"))
                 if (
-                    state["executor_state"] == "exhausted"
-                    and stall.get("state") == "resuming"
+                    stall.get("state") == "resuming"
                     and stall.get("execution_contract_id") == contract_id
                 ):
-                    stall["state"] = "exhausted"
+                    stall["state"] = "diagnosis_required"
                     stall["at"] = utc_now()
                     state["stall"] = stall
             state["executor_review"] = review
@@ -13414,6 +16248,7 @@ def stop(payload: dict[str, Any]) -> None:
         if state.get("work_difficulty") == "hard" and state.get("plan_state") in {
             "analyzing",
             "invalidated",
+            "repair_required",
         }:
             if plan_ready:
                 state["confirmed_plan_digest"] = None
@@ -13422,6 +16257,9 @@ def stop(payload: dict[str, Any]) -> None:
                 state["plan_state"] = "analyzing"
                 if write_plan_artifact(state, payload, assistant_message):
                     state["plan_state"] = "awaiting_confirmation"
+                    auto_confirm_trusted_plan(state, payload)
+                else:
+                    state["plan_state"] = "repair_required"
             else:
                 state["plan_state"] = "analyzing"
 
@@ -13434,11 +16272,15 @@ def stop(payload: dict[str, Any]) -> None:
         "journal_full",
         "transaction_recovery_failed",
     }:
-        emit_context(
-            "Stop",
+        emit_stop_block(
             f"Workflow Manager canonical plan journal {artifact['write_status']} warning_code={artifact['warning_code']}; confirmation and execution remain locked until a trusted revision commits.",
         )
         return
+    # Recovery facts are already delivered on SubagentStop and on the next
+    # actionable UserPromptSubmit. Stop must not manufacture another model
+    # turn: repeated blocking here created an unbounded self-dialogue with no
+    # new host evidence. The parent remains responsible for choosing whether
+    # to diagnose, retry, replan, or finish.
     emit_continue()
 
 

@@ -1,5 +1,27 @@
 # 更新记录
 
+## 1.0.48
+
+- execution-slice manifest 改为可选增强：parent 的普通原生计划无需 JSON/fence/固定结尾；缺省时完整计划投影为一个逻辑 slice，显式 manifest 则使用 196608-byte / 1024-node 总预算且无独立 slice/list 上限。正常计划可由模型选择 3–5 slice，长计划按预算扩展，预算不足只能停止或拆分而不能降低验收。
+- 补丁 reconciliation 同时支持 legacy 唯一成功 `patch_apply_end` 与当前宿主精确空 `{}` 成功回执；同 turn 多次补丁只按唯一 call id、唯一字面 digest、唯一回执和宿主 operation 顺序一一绑定，重复、额外 sibling、拒绝或歧义仍保持 unknown，不从 `FileChange` 推断成功。Desktop 仅遗漏通用 status 时，精确绑定 executor/contract/slice/input/command/turn 的 PostToolUse 改动可由后续独立 parent verification 封存，不再强制 recovery child。缓存清理明确保留当前版本及紧邻的 1.0.47 回滚缓存。
+- Workflow Manager 插件/Hook/Skill 的版本化生产发布作为窄 Hard 分类；普通介绍与聊天不受影响。
+- State Schema 升至 28、writer/manifest 升至 1.0.48、stable-skill schema 升至 9，execution profile 保持 v10。
+- 提高 Hard 判定阈值，高置信 Simple 完全使用当前 Codex 且 Workflow Manager `Start=0`；普通规划、并行、进度、常规恢复和 compaction 交回宿主，Skill 只保留 Hard 授权、唯一 writer、挂载树安全与不可替代的 host lifecycle/acceptance 证据。
+- 固定门禁进一步收敛为宿主 lifecycle 真值、授权 envelope、单 writer/禁 nesting、挂载树 Git 与破坏性外部动作安全；计划 prose、列表/切片/阶段数量、普通输出形态、墙钟和原生调度不再形成独立门禁。显式 `irreversible_action:none` 只表示无不可逆动作，不再仅因字段名触发 Hard。
+- Hard assessor 改为进度与预算驱动的活性：600 秒仅观察、恰好 1200 秒仍 live，严格超过 1200 秒无进展时主动诊断、解卡或拆分，不直接变成 `assessment_timeout`、`blocked` 或 exhausted。轮询、迟到事件、压缩恢复和时钟回拨不重置进度。
+- typed recovery 统一核对原 assessor 的唯一 PreTool request、PostTool `host_accepted=true`、唯一 full Start 及扁平状态，严格绑定 binding/objective/sequence/model/effort/fork；缺少、未知或拒绝 host acceptance 为 `model_unavailable`，其余 lifecycle/state 冲突为 `start_mismatch`，不再从扁平字段或 child 消息推断。
+- 适配当前宿主成功 spawn 只返回 canonical `task_name`、不带通用 status 的真实回执：仅同 request fingerprint 且精确 `<task_name>`/`/root/<task_name>` 的首个结构化 Post 可形成 acceptance，重复同回执幂等，未知、拒绝、错名或冲突回执不可升级。Start 先于 Post 时只投递 digest-bound locked handoff，写入仍拒绝；精确 Post 到达后在同一状态锁内复验 journal 才解锁。
+- 默认正常 confirmed executor 保持 lower-tier + `medium`；failure/stall/incomplete/verification recovery 使用当前最高可用 `gpt-5.6-sol` + `max` + `fork_turns=1`，显式 `highest_throughout` 才使用最高档 + `ultra`。SubagentStart 同时接受并验证这一 typed-recovery profile。
+- executor sequence 改为受状态字节/节点预算保护的单调序列；`task_name` 仅是任意安全 ASCII 宿主标签，不再编码 contract、slice、sequence、failure fingerprint 或 review digest。reservation 前原子核对 failure/evidence/progress/root cause/material correction：同失败指纹且无新证据的原样重放被拒绝并要求诊断/换方案，有新证据、根因、实质修正或不同 fingerprint 可继续，三次以上不同 fingerprint 不会按固定次数耗尽。terminal child 不复活、不嵌套，始终只有一个 live writer。
+- 私有 Start handoff 由可信状态补齐宿主签发的 `execution_contract_id`、objective、plan digest/generation 与当前逻辑 slice，子执行器无需也不得扫描插件状态；request prose 和 task name 均不承载授权。Desktop 的 `opaque_v2` recovery 由 Hook 从 request/Post/full Start、终态、operation ledger 与 parent review 生成 digest-only failure/evidence 事实，parent 在当前 confirmed envelope 内补充 root cause/material correction后原子预约；合法恢复沿用既有确认且不持久化错误/诊断 prose。
+- authorization envelope 只绑定 objective 与显式 acceptance/risk category/irreversible external action 的归一化摘要，不绑定计划 prose、slice 布局或 manifest digest；同范围 repair/autosplit/verification/compaction successor 自动继承严格确认，只有 envelope 字段实质变化才重新确认。
+- assessor 已完成但 parent Stop 尚未提交可信 revision 时，提前纯确认只保存 host-bound receipt digest，同时保留 pending plan、Hard binding 和 repair；可信 revision 落盘后自动绑定，不重置 Daily 或要求用户重发。Schema 27 活跃 assessor 按当前 binding 重锚；canonical journal v2、accepted slice 与 profile-v10 宿主证据保持原样。
+- 三层绑定成立后，assessor 的普通非空只读分析只生成 digest-only 终态收据，parent 以非空且在总预算内的普通计划写入唯一 canonical revision；不再要求 `WORK_ASSESSMENT`、manifest fence、固定关键词、固定尾句、最小 prose 字节数或任意列表格式。已收到的纯确认可由同 session host rollout、唯一 lifecycle 与 parent `task_complete` 自动续接，可信 revision 落盘后绑定，原文不持久化。
+- executor 与 parent review 均接受普通非空原生 prose；`EXECUTION_RESULT`/`EXECUTION_REVIEW` 仅作可选兼容标记，显式畸形或冲突才拒绝。真正的强门禁是当前合同的宿主 operation ledger、独立 parent verification 与单 writer 证据，缺少真实 verification 才进入 `incomplete_execution`。
+- 核心 lifecycle 锁改为宿主事件串行等待，避免固定 0.75 秒争用时静默丢弃 Stop/确认；Hook 进程 45 秒仅是进程安全上限，不是工作流或 assessment deadline。
+- 当前 Codex 直接运行项目内 custom verifier 时，不再因命令不叫 `pytest/unittest` 而丢失 verification：只读且实际执行的 `verify/validate/check/acceptance/regression` 程序及其唯一结构化宿主结果可重分类；源码查看、`python -c` 字样和带写入/重定向的命令不能冒充验收。normalize-only 的可信宿主恢复会在只读 snapshot 原子持久化，不再等下一次无关 mutation。
+- 新增 1.0.43 匿名冻结 trace 正式 A/B：child Start 8→3（降低 62.5%，门槛 ≥60%），重复 `additionalContext` 856→153 UTF-8 字节（降低 82.1%，门槛 ≥50%），Hard executor 强验收检查点不减少；该静态指标明确不冒充真实 token。
+
 ## 1.0.47
 
 - 保持 Schema 27、execution profile v10 与 stable-skill schema 8；新增私有、有界、无原始输入/输出的 Hook dispatch receipt，并让 trust doctor 分别报告配置与指定会话 dispatch 状态。

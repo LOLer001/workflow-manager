@@ -20,10 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_NAME = "workflow-manager"
 PLUGIN = ROOT / "plugins" / PLUGIN_NAME
 EXPECTED_VERSION_MATRIX = {
-    "1.0.47": {
-        "schema": 27,
+    "1.0.48": {
+        "schema": 28,
         "execution_profile": "10",
-        "stable_skill_schema": 8,
+        "stable_skill_schema": 9,
     }
 }
 
@@ -114,11 +114,10 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert f"Schema {matrix['schema']}/writer {release_version}" in confirmed_execution
     assert f"execution profile v{matrix['execution_profile']}" in confirmed_execution
-    result_marker = re.search(r"`EXECUTION_RESULT [^`]+`", confirmed_execution)
-    review_marker = re.search(r"`EXECUTION_REVIEW [^`]+`", confirmed_execution)
-    assert result_marker and "evidence_digest" not in result_marker.group(0)
-    assert review_marker and "evidence_digest" not in review_marker.group(0)
-    assert "workflow-manager-execution-slices" in confirmed_execution
+    assert "`EXECUTION_RESULT` is optional" in confirmed_execution
+    assert "`EXECUTION_REVIEW` is optional" in confirmed_execution
+    assert "workflow-manager-execution-slices` JSON block is optional" in confirmed_execution
+    assert "Any concise safe ASCII `task_name` is valid" in confirmed_execution
     assert not (PLUGIN / "skills").exists()
     installer_path = PLUGIN / "scripts" / "install_stable_skill.py"
     assert installer_path.is_file()

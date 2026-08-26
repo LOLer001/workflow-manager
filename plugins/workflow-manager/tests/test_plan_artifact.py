@@ -138,6 +138,7 @@ class PlanArtifactTests(unittest.TestCase):
         selected = data or self.data
         state = self.state(selected)
         binding = state["assessor_binding_id"]
+        task_name = HOOK.bound_assessor_task_name(state)
         request = (
             f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
             "profile_resolution=highest_available Hard read-only plan then confirmation"
@@ -149,7 +150,7 @@ class PlanArtifactTests(unittest.TestCase):
                 "hook_run_id": f"{suffix}-request",
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
-                    "task_name": "high_assessor",
+                    "task_name": task_name,
                     "message": request,
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "max",
@@ -169,7 +170,7 @@ class PlanArtifactTests(unittest.TestCase):
                 "hook_run_id": f"{suffix}-request-post",
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
-                    "task_name": "high_assessor", "message": request,
+                    "task_name": task_name, "message": request,
                     "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1",
                 },
                 "tool_response": {"status": "ok"},
@@ -203,7 +204,8 @@ class PlanArtifactTests(unittest.TestCase):
     def accept_assessor_plan(self, session: str, *, data: Path | None = None, body: str | None = None) -> tuple[dict, str]:
         selected = data or self.data
         binding, agent_id = self.begin_assessor(session, data=selected)
-        message = self.assessor_result(binding, body or self.hard_body())
+        parent_plan = body or self.hard_body()
+        message = self.assessor_result(binding, parent_plan)
         result = self.run_hook(
             {
                 "hook_event_name": "SubagentStop",
@@ -216,6 +218,16 @@ class PlanArtifactTests(unittest.TestCase):
             data=selected,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        written = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "parent-plan",
+                "last_assistant_message": parent_plan,
+            },
+            data=selected,
+        )
+        self.assertEqual(written.returncode, 0, written.stderr)
         return self.state(selected), message
 
     def begin_hard_plan(self, session: str, *, data: Path | None = None) -> None:
@@ -245,7 +257,33 @@ class PlanArtifactTests(unittest.TestCase):
             data=data,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        written = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": f"{run_id}-parent-plan",
+                "last_assistant_message": body,
+            },
+            data=data,
+        )
+        self.assertEqual(written.returncode, 0, written.stderr)
         return self.state(data)
+
+    @staticmethod
+    def execution_manifest(*, slice_count: int = 1, list_count: int = 1) -> str:
+        slices = []
+        for index in range(1, slice_count + 1):
+            slices.append({
+                "id": f"s{index:02d}", "title": f"slice {index}",
+                "scope": [f"scope {item}" for item in range(list_count)],
+                "acceptance": [f"acceptance {item}" for item in range(list_count)],
+                "rollback": ["rollback"], "stop_conditions": ["stop"],
+                "expected_artifacts": ["evidence"],
+            })
+        return "```workflow-manager-execution-slices\n" + json.dumps(
+            {"version": 1, "global_constraints": ["preserve acceptance"], "slices": slices},
+            separators=(",", ":"), ensure_ascii=False,
+        ) + "\n```\n"
 
     def test_m01_assessor_hard_plan_creates_bound_markdown(self) -> None:
         state, _ = self.accept_assessor_plan("m01")
@@ -256,6 +294,41 @@ class PlanArtifactTests(unittest.TestCase):
         path = self.artifact_path(state)
         self.assertTrue(path.is_file())
         self.assertEqual(path.name, HOOK.PLAN_JOURNAL_NAME)
+
+    def test_execution_manifest_uses_byte_and_node_budgets_not_item_caps(self) -> None:
+        parsed = HOOK.parse_execution_slice_manifest(
+            self.execution_manifest(slice_count=7, list_count=9)
+        )
+        self.assertEqual(parsed["count"], 7)
+        self.assertEqual(parsed["items"][-1]["id"], "s07")
+        self.assertEqual(len(parsed["items"][0]["acceptance"]), 9)
+
+        with self.assertRaises(HOOK.PlanArtifactError) as empty:
+            HOOK.parse_execution_slice_manifest(
+                "```workflow-manager-execution-slices\n"
+                '{"version":1,"global_constraints":["x"],"slices":[]}\n```\n'
+            )
+        self.assertEqual(empty.exception.code, "slice_count_invalid")
+
+        discontinuous = json.loads(self.execution_manifest(slice_count=2).split("\n", 1)[1].rsplit("\n```", 1)[0])
+        discontinuous["slices"][1]["id"] = "s03"
+        with self.assertRaises(HOOK.PlanArtifactError) as invalid:
+            HOOK.parse_execution_slice_manifest(
+                "```workflow-manager-execution-slices\n" + json.dumps(discontinuous) + "\n```\n"
+            )
+        self.assertEqual(invalid.exception.code, "slice_id_invalid")
+
+    def test_native_plan_is_one_slice_but_explicit_malformed_manifest_is_rejected(self) -> None:
+        native = HOOK.execution_slice_manifest_for_plan(
+            "Inspect the bounded cause, implement the reversible correction, "
+            "and independently verify the confirmed acceptance before reporting."
+        )
+        self.assertEqual((native["count"], native["items"][0]["id"]), (1, "s01"))
+        with self.assertRaises(HOOK.PlanArtifactError) as malformed:
+            HOOK.execution_slice_manifest_for_plan(
+                "Native plan text\n```workflow-manager-execution-slices\n{bad}\n```\n"
+            )
+        self.assertEqual(malformed.exception.code, "manifest_json_invalid")
 
     def test_c01_hard_plan_uses_one_bound_v2_canonical_journal(self) -> None:
         state, _ = self.accept_assessor_plan("c01")
@@ -288,9 +361,24 @@ class PlanArtifactTests(unittest.TestCase):
             }
         )
         self.assertEqual(failed_output.returncode, 0, failed_output.stderr)
+        failed_output = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "c02",
+                "hook_run_id": "failed-parent-plan",
+                "last_assistant_message": self.hard_body("must-not-confirm"),
+            }
+        )
         failed = self.state()
-        self.assertNotEqual(failed["plan_state"], "awaiting_confirmation")
+        self.assertEqual(failed["plan_state"], "repair_required")
         self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
+        self.assertEqual(set(failed["plan_artifact"]["diagnostic"]), {
+            "code", "path", "actual", "limit", "unit", "recoverability",
+        })
+        self.assertLessEqual(
+            len(json.dumps(failed["plan_artifact"]["diagnostic"], separators=(",", ":")).encode()),
+            512,
+        )
 
         confirmation = self.run_hook(
             {
@@ -979,6 +1067,14 @@ class PlanArtifactTests(unittest.TestCase):
             }
         )
         self.assertEqual(first.returncode, 0, first.stderr)
+        first = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "c17",
+                "hook_run_id": "trusted-parent-plan",
+                "last_assistant_message": self.hard_body("trusted-retry"),
+            }
+        )
         failed = self.state()
         generation = failed["plan_generation"]
         self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
@@ -997,7 +1093,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(forged.returncode, 0, forged.stderr)
         observed = self.state()
         self.assertEqual(observed["plan_generation"], generation)
-        self.assertEqual(observed["plan_state"], "analyzing")
+        self.assertEqual(observed["plan_state"], "repair_required")
         self.assertEqual(observed["plan_artifact"]["write_status"], "write_failed")
         self.assertFalse((self.data / "plans").exists())
 
@@ -1688,7 +1784,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(migrated["plan_artifact"]["plan_digest"], "a" * 32)
         self.assertNotIn("must-not-survive", json.dumps(migrated))
 
-    def test_m06_write_failure_requires_a_parent_plan_retry_not_a_duplicate_agent_stop(self) -> None:
+    def test_m06_write_failure_preserves_repair_until_parent_rewrites_plan(self) -> None:
         self.data.mkdir(parents=True)
         (self.data / "plans").write_text("block plans directory", encoding="utf-8")
         binding, agent_id = self.begin_assessor("m06")
@@ -1702,8 +1798,16 @@ class PlanArtifactTests(unittest.TestCase):
             "last_assistant_message": message,
         }
         first = self.run_hook(payload)
+        first = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "m06",
+                "hook_run_id": "first-parent-plan",
+                "last_assistant_message": self.hard_body("retry"),
+            }
+        )
         failed = self.state()
-        self.assertEqual(failed["plan_state"], "analyzing")
+        self.assertEqual(failed["plan_state"], "repair_required")
         self.assertEqual(failed["plan_artifact"]["write_status"], "write_failed")
         generation = failed["plan_generation"]
         self.assertIn("write_failed", first.stdout)
@@ -1714,7 +1818,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
         self.assertEqual(unchanged["plan_artifact"]["write_status"], "write_failed")
         self.assertEqual(unchanged["plan_generation"], generation)
-        self.assertEqual(unchanged["plan_state"], "analyzing")
+        self.assertEqual(unchanged["plan_state"], "repair_required")
 
         retry = self.run_hook(
             {
@@ -1729,6 +1833,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(recovered["plan_artifact"]["write_status"], "written")
         self.assertEqual(recovered["plan_generation"], generation + 1)
         self.assertEqual(recovered["plan_state"], "awaiting_confirmation")
+        self.assertIsNone(recovered["execution_contract_id"])
 
     def test_m07_plugin_data_inside_project_is_rejected_without_self_lock(self) -> None:
         project = self.root / "project"
@@ -1744,6 +1849,16 @@ class PlanArtifactTests(unittest.TestCase):
                 "agent_id": agent_id,
                 "status": "completed",
                 "last_assistant_message": self.assessor_result(binding, self.hard_body("project")),
+            },
+            data=data,
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "m07",
+                "hook_run_id": "parent-plan",
+                "cwd": str(project),
+                "last_assistant_message": self.hard_body("project"),
             },
             data=data,
         )
@@ -1769,16 +1884,25 @@ class PlanArtifactTests(unittest.TestCase):
     def test_m09_concurrent_duplicate_stop_writes_one_artifact(self) -> None:
         binding, agent_id = self.begin_assessor("m09")
         message = self.assessor_result(binding, self.hard_body("concurrent"))
+        completed = self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "m09",
+                "hook_run_id": "assessor-stop",
+                "agent_id": agent_id,
+                "status": "completed",
+                "last_assistant_message": message,
+            }
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
         def invoke(index: int) -> subprocess.CompletedProcess[str]:
             return self.run_hook(
                 {
-                    "hook_event_name": "SubagentStop",
+                    "hook_event_name": "Stop",
                     "session_id": "m09",
                     "hook_run_id": f"stop-{index}",
-                    "agent_id": agent_id,
-                    "status": "completed",
-                    "last_assistant_message": message,
+                    "last_assistant_message": self.hard_body("concurrent"),
                 }
             )
 
@@ -1875,11 +1999,21 @@ class PlanArtifactTests(unittest.TestCase):
                 "lifecycle_status",
                 "write_status",
                 "warning_code",
+                "diagnostic",
                 "created_at",
                 "updated_at",
             },
         )
         self.assertNotIn(body, json.dumps(state, ensure_ascii=False))
+        diagnostic = artifact["diagnostic"]
+        self.assertTrue(
+            diagnostic is None
+            or (
+                set(diagnostic) == {"code", "path", "actual", "limit", "unit", "recoverability"}
+                and len(json.dumps(diagnostic, separators=(",", ":")).encode()) <= 512
+                and body not in json.dumps(diagnostic, ensure_ascii=False)
+            )
+        )
         self.assertRegex(
             artifact["relative_path"],
             r"^plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan\.md$",
@@ -2443,6 +2577,21 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertNotIn("first-secret", redacted)
         self.assertNotIn("second-secret", redacted)
         self.assertGreaterEqual(redacted.count("<redacted>"), 2)
+
+
+class ManifestDiagnosticContractTests(unittest.TestCase):
+    def test_manifest_diagnostics_are_precise_and_bounded(self) -> None:
+        cases = {
+            "missing": ("plan", "manifest_fence_missing"),
+            "not_tail": ("```workflow-manager-execution-slices\n{}\n```\nprose", "manifest_fence_not_tail"),
+            "json": ("```workflow-manager-execution-slices\n{bad}\n```", "manifest_json_invalid"),
+            "root": ("```workflow-manager-execution-slices\n[]\n```", "manifest_root_type_invalid"),
+        }
+        for name, (body, code) in cases.items():
+            with self.subTest(name=name), self.assertRaises(HOOK.PlanArtifactError) as caught:
+                HOOK.parse_execution_slice_manifest(body)
+            self.assertEqual(caught.exception.code, code)
+            self.assertLessEqual(len(HOOK.canonical_json(caught.exception.metadata).encode("utf-8")), 512)
 
 
 if __name__ == "__main__":

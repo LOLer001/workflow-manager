@@ -75,6 +75,10 @@ def generated_document(source: dict) -> dict:
     for entry in command_hooks(generated):
         entry["command"] = posix
         entry["commandWindows"] = windows
+        # Allow normal lock serialization and a large native plan journal write
+        # to finish; this is a hook-process safety bound, never a workflow or
+        # assessment deadline.
+        entry["timeout"] = 45
     return generated
 
 

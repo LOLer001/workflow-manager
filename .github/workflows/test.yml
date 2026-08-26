@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   linux:
     runs-on: ubuntu-latest
@@ -20,18 +23,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Validate repository
-        run: python scripts/validate_repository.py
+        run: python -B scripts/validate_repository.py
       - name: Run full test suite
-        run: python -m unittest discover -s plugins/workflow-manager/tests -p "test_*.py" -v
+        run: python -B -m unittest discover -s plugins/workflow-manager/tests -p "test_*.py" -v
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run native Windows tests
+      - name: Validate repository
+        run: py -3 -B scripts/validate_repository.py
+      - name: Run full native Windows suite
         working-directory: plugins/workflow-manager
-        run: py -3 -m unittest -v tests.test_windows_hook
+        run: py -3 -B -m unittest discover -s tests -p "test_*.py" -v

@@ -107,6 +107,26 @@ class WindowsHookTests(unittest.TestCase):
             self._spawn_requests[str(payload.get("session_id") or "")] = payload
         return result
 
+    @staticmethod
+    def acceptance_summary(state: dict) -> str:
+        current = HOOK.current_execution_slice(state) or {}
+        return (
+            "EXECUTION_ACCEPTANCE_SUMMARY "
+            f"execution_contract_id={state['execution_contract_id']} "
+            f"slice_id={current['id']} checklist_digest={current['checklist_digest']} "
+            f"required={current['required_count']} completed={current['required_count']} pending=0"
+        )
+
+    @staticmethod
+    def review_summary(state: dict) -> str:
+        current = HOOK.current_execution_slice(state) or {}
+        return (
+            "EXECUTION_REVIEW_SUMMARY "
+            f"execution_contract_id={state['execution_contract_id']} "
+            f"slice_id={current['id']} checklist_digest={current['checklist_digest']} "
+            f"required={current['required_count']} completed={current['required_count']} pending=0"
+        )
+
     def test_plan_directory_guard_blocks_rename_until_handles_close(self) -> None:
         root = self.data
         session = HOOK.plan_artifact_session_id("windows-handle-guard")
@@ -570,7 +590,7 @@ class WindowsHookTests(unittest.TestCase):
         assessor_request = self.run_command_windows({
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "executor-assessor-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
+            "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
                 "profile_resolution=highest_available Hard read-only plan then confirmation"
             )},
@@ -586,13 +606,12 @@ class WindowsHookTests(unittest.TestCase):
         for payload in (
             {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-assessor-start", "agent_id": "windows-executor-assessor", "model": "gpt-5.6-sol"},
             {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "executor-assessor-stop", "agent_id": "windows-executor-assessor", "status": "completed", "last_assistant_message": (
-                "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n3. 完成实机验证与回滚检查\n"
-                "验收：问题不再复现。\n"
-                "```workflow-manager-execution-slices\n"
-                '{"version":1,"global_constraints":["preserve acceptance"],"slices":[{"id":"s01","title":"repair and verify","scope":["bounded Windows test flow"],"acceptance":["verification passes"],"rollback":["revert bounded change"],"stop_conditions":["verification fails"],"expected_artifacts":["verification evidence"]}]}\n'
-                "```\n"
-                f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n"
-                "计划已就绪，等待确认后执行"
+                "根因定位需要跨模块只读分析，并保留当前验收、回滚与风险边界。"
+                "建议由父会话形成最终计划，再交给单一执行者完成修改和独立验证。"
+            )},
+            {"hook_event_name": "Stop", "session_id": session, "hook_run_id": "executor-parent-plan", "last_assistant_message": (
+                "计划：先收集有界日志并定位根因，再修改对应模块，最后运行独立验收。"
+                "保持现有授权与回滚边界；若验收失败，则依据新证据诊断并调整方案。"
             )},
             {"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "executor-confirm", "prompt": "确认按这个计划执行"},
         ):
@@ -614,20 +633,7 @@ class WindowsHookTests(unittest.TestCase):
                     "model": "gpt-5.6-terra",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
-                    "message": (
-                        "Unique exclusive executor. "
-                        f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
-                        f"plan_generation={state['plan_generation']}. "
-                        "Reread the canonical journal before execution: "
-                        f"relative_path={state['plan_artifact']['relative_path']} "
-                        f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
-                        f"journal_digest={state['plan_artifact']['journal_digest']}. "
-                        f"slice_id={(HOOK.current_execution_slice(state) or {}).get('id', '')} "
-                        f"slice_contract_id={HOOK.slice_contract_id(state)}. "
-                        "Exclusive execution ownership; "
-                        "implement the full actionable plan and run verification acceptance tests.\n"
-                        f"EXECUTION_RESULT execution_contract_id={contract_id} slice_id=s01 outcome=succeeded|failed"
-                    ),
+                    "message": "Execute the confirmed native plan as the one writer and report the verification evidence.",
                 },
             }
         )
@@ -672,10 +678,7 @@ class WindowsHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "executor-stop-without-status",
                 "agent_id": "windows-confirmed-executor",
-                "last_assistant_message": (
-                    "EXECUTION_RESULT "
-                    f"execution_contract_id={contract_id} slice_id=s01 outcome=succeeded"
-                ),
+                "last_assistant_message": "Implemented the bounded change and the recorded verification passed.",
             },
         ):
             result = self.run_command_windows(payload)
@@ -709,10 +712,7 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_event_name": "Stop",
                 "session_id": session,
                 "hook_run_id": "executor-parent-review",
-                "last_assistant_message": (
-                    "EXECUTION_REVIEW "
-                    f"execution_contract_id={contract_id} slice_id=s01 outcome=passed"
-                ),
+                "last_assistant_message": "Independent parent verification passed for the confirmed scope and acceptance.",
             }
         )
         self.assertEqual(sealed_result.returncode, 0, sealed_result.stderr)
@@ -749,7 +749,7 @@ class WindowsHookTests(unittest.TestCase):
         assessor = self.run_command_windows({
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "causal-assessor-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": "high_assessor", "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
+            "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
                 "profile_resolution=highest_available Hard read-only plan then confirmation"
             )},
@@ -765,13 +765,12 @@ class WindowsHookTests(unittest.TestCase):
         for payload in (
             {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "causal-assessor-start", "agent_id": "windows-causal-assessor", "model": "gpt-5.6-sol"},
             {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "causal-assessor-stop", "agent_id": "windows-causal-assessor", "status": "completed", "last_assistant_message": (
-                "1. 收集日志并定位根因\n2. 修改对应模块并编译部署\n3. 完成实机验证与回滚检查\n"
-                "验收：问题不再复现。\n"
-                "```workflow-manager-execution-slices\n"
-                '{"version":1,"global_constraints":["preserve acceptance"],"slices":[{"id":"s01","title":"repair and verify","scope":["bounded Windows test flow"],"acceptance":["verification passes"],"rollback":["revert bounded change"],"stop_conditions":["verification fails"],"expected_artifacts":["verification evidence"]}]}\n'
-                "```\n"
-                f"WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'b' * 32}\n"
-                "计划已就绪，等待确认后执行"
+                "根因定位需要跨模块只读分析，并保留当前验收、回滚与风险边界。"
+                "建议由父会话形成最终计划，再交给单一执行者完成修改和独立验证。"
+            )},
+            {"hook_event_name": "Stop", "session_id": session, "hook_run_id": "causal-parent-plan", "last_assistant_message": (
+                "计划：先收集有界日志并定位根因，再修改对应模块，最后运行独立验收。"
+                "保持现有授权与回滚边界；若验收失败，则依据新证据诊断并调整方案。"
             )},
             {"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "causal-confirm", "prompt": "确认按这个计划执行"},
         ):
@@ -793,20 +792,7 @@ class WindowsHookTests(unittest.TestCase):
                     "model": "gpt-5.6-terra",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
-                    "message": (
-                        "Unique exclusive executor. "
-                        f"execution_contract_id={contract_id} plan_digest={state['plan_digest']} "
-                        f"plan_generation={state['plan_generation']}. "
-                        "Reread the canonical journal before execution: "
-                        f"relative_path={state['plan_artifact']['relative_path']} "
-                        f"current_revision_digest={state['plan_artifact']['current_revision_digest']} "
-                        f"journal_digest={state['plan_artifact']['journal_digest']}. "
-                        f"slice_id={(HOOK.current_execution_slice(state) or {}).get('id', '')} "
-                        f"slice_contract_id={HOOK.slice_contract_id(state)}. "
-                        "Exclusive execution ownership; "
-                        "implement the full actionable plan and run verification acceptance tests.\n"
-                        f"EXECUTION_RESULT execution_contract_id={contract_id} slice_id=s01 outcome=succeeded|failed"
-                    ),
+                    "message": "Execute the confirmed native plan as the one writer and report the verification evidence.",
                 },
             },
             {
@@ -840,10 +826,7 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_run_id": "causal-executor-stop",
                 "agent_id": "windows-causal-executor",
                 "status": "completed",
-                "last_assistant_message": (
-                    "EXECUTION_RESULT "
-                    f"execution_contract_id={contract_id} slice_id=s01 outcome=succeeded"
-                ),
+                "last_assistant_message": "Implemented the bounded change and the recorded verification passed.",
             },
             {
                 "hook_event_name": "PostToolUse",
@@ -860,10 +843,7 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_event_name": "Stop",
                 "session_id": session,
                 "hook_run_id": "causal-parent-review",
-                "last_assistant_message": (
-                    "EXECUTION_REVIEW "
-                    f"execution_contract_id={contract_id} slice_id=s01 outcome=passed"
-                ),
+                "last_assistant_message": "Independent parent verification passed for the confirmed scope and acceptance.",
             },
         ]
         for payload in execution_events:

@@ -212,7 +212,10 @@ class HookTrustDoctorTests(unittest.TestCase):
                 elapsed = time.monotonic() - started
 
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertLess(elapsed, 3.0)
+                # Native Windows process startup can briefly exceed three seconds
+                # under a simultaneous full Linux matrix. The product timeout is
+                # still 0.2s; this outer bound only detects an unbounded harness.
+                self.assertLess(elapsed, 5.0 if os.name == "nt" else 3.0)
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["status"], "error")
                 self.assertIn(expected, payload["error"])
