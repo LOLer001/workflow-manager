@@ -38,6 +38,13 @@ jobs:
           python-version: "3.14"
       - name: Validate repository
         run: python -B scripts/validate_repository.py
+      - name: Diagnose Windows filesystem safety semantics
+        working-directory: plugins/workflow-manager
+        run: >-
+          python -B -m unittest
+          tests.test_orchestrator_hook.OrchestratorHookTests.test_new_version_requires_verified_skill_paths_before_cache_removal
+          tests.test_plan_artifact.PlanArtifactTests.test_s06_retention_uses_generation_and_preserves_forged_links
+          -v
       - name: Run full native Windows suite
         working-directory: plugins/workflow-manager
         run: python -B -m unittest discover -s tests -p "test_*.py" -v

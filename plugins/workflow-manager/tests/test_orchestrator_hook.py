@@ -3611,13 +3611,36 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertTrue(all(old.is_dir() for old in old_versions))
 
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
-            self.assertEqual(
-                HOOK.cleanup_old_plugin_versions(
-                    current,
-                    skill_paths_verified=True,
-                ),
-                1,
+            removed = HOOK.cleanup_old_plugin_versions(
+                current,
+                skill_paths_verified=True,
             )
+        def path_probe(path: Path) -> dict:
+            try:
+                info = path.lstat()
+            except OSError:
+                return {"name": path.name, "missing": True}
+            return {
+                "name": path.name,
+                "mode": int(info.st_mode),
+                "nlink": int(info.st_nlink),
+                "ino": int(info.st_ino),
+                "attributes": int(getattr(info, "st_file_attributes", 0)),
+                "reparse": int(getattr(info, "st_reparse_tag", 0)),
+                "is_dir": stat.S_ISDIR(info.st_mode),
+                "is_link": stat.S_ISLNK(info.st_mode),
+            }
+        self.assertEqual(
+            removed,
+            1,
+            {
+                "root": path_probe(current),
+                "manifest_dir": path_probe(manifest_dir),
+                "manifest": path_probe(manifest_dir / "plugin.json"),
+                "old": [path_probe(path) for path in old_versions],
+                "link": path_probe(symlink),
+            },
+        )
         self.assertTrue(current.is_dir())
         self.assertTrue(non_version.is_dir())
         self.assertTrue(noncanonical.is_dir())
