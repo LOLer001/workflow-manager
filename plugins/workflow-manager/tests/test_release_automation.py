@@ -39,7 +39,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             constants,
             {
                 "SCHEMA_VERSION": "29",
-                "WRITER_VERSION": "1.0.49",
+                "WRITER_VERSION": "1.0.50",
                 "EXECUTION_PROFILE_VERSION": "11",
                 "STABLE_SKILL_SCHEMA": "9",
             },
@@ -86,6 +86,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             "1.0.46",
             "1.0.47",
             "1.0.49",
+            "1.0.50",
         ):
             with self.subTest(version=version):
                 notes = MODULE.extract_release_notes(changelog, version)

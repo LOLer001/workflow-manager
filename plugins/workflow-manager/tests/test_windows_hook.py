@@ -349,10 +349,11 @@ class WindowsHookTests(unittest.TestCase):
         state = json.loads(states[0].read_text(encoding="utf-8"))
         self.assertEqual(state["schema_version"], HOOK.SCHEMA_VERSION)
         # PreToolUse is intentionally read-only, and ordinary unbound
-        # SubagentStart/SubagentStop now pass through native Codex without
-        # entering the plugin ledger. Six authorization/continuity events remain.
-        self.assertEqual(len(state["processed_hook_runs"]), 6)
-        self.assertEqual(sum(state["event_counts"].values()), 6)
+        # SubagentStop passes through native Codex without entering the plugin
+        # ledger. SubagentStart persists one informational lifecycle diagnostic,
+        # so seven authorization/continuity/diagnostic events remain.
+        self.assertEqual(len(state["processed_hook_runs"]), 7)
+        self.assertEqual(sum(state["event_counts"].values()), 7)
         self.assertEqual(list((self.data / "sessions").glob("*.tmp")), [])
         stable_skill = self.root / ".codex" / "skills" / "workflow-manager" / "SKILL.md"
         self.assertTrue(stable_skill.is_file())
