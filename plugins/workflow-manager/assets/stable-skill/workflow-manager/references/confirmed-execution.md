@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 30/writer 1.0.52 uses execution profile v11 and an append-only canonical journal v3.
+This reference applies only after a Hard plan is confirmed. Schema 30/writer 1.0.53 uses execution profile v11 and an append-only canonical journal v3.
 
 ## Minimal authority model
 
@@ -80,6 +80,6 @@ Recovery sequence is positive, monotonic, and limited only by bounded state byte
 
 ## Migration and resume
 
-Historical sealed success preserves its real profile/contract. Active old-profile write authority does not silently become v11; it must acquire a current trusted plan and lifecycle. Schema 29/profile-v11 running continuity may migrate lazily to Schema 30 only with its exact live request/Post/full-Start binding intact. Compaction preserves only bounded bindings, digests, sequences, and evidence—not prompt, plan, child-result, diagnosis, or review prose.
+Historical sealed success preserves its real profile/contract. Active old-profile write authority does not silently become v11; it must acquire a current trusted plan and lifecycle. Schema 29/writer 1.0.51 or Schema 30/writer 1.0.52 profile-v11 running continuity may migrate lazily only with its exact live request/Post/full-Start binding intact. Compaction preserves only bounded bindings, digests, sequences, and evidence—not prompt, plan, child-result, diagnosis, or review prose.
 
 Native summaries own ordinary continuity. A same-session resume may reconcile a verified host compaction window, but compaction evidence never grants mutation or replaces parent review.

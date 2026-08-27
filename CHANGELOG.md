@@ -1,5 +1,9 @@
 # 更新记录
 
+## 1.0.53
+
+- 修正 1.0.52 安装后 trust doctor 的发布元数据：`DISPATCH_STATE_SCHEMA` 与实际 Schema 30 收据一致，不再把已由新任务证明加载的 1.0.52/30 运行时误报为 `runtime_mismatch`。新增 doctor writer/schema 与 Hook/manifest 版本矩阵的防复发断言；运行时 mailbox/recovery 语义不变，并保留 Schema 30/writer 1.0.52 活跃 profile-v11 执行的懒迁移连续性。
+
 ## 1.0.52
 
 - 修复宿主已在 `list_agents` mailbox 中返回唯一绑定执行器的 `completed`/`FINAL_ANSWER`，但漏发 `SubagentStop` 时执行合同永久停留在 `running` 的生命周期缺口。Schema 30 仅在 request、成功 Post、full Start、agent/task、contract、slice 与 attempt 唯一一致，且 completed 正文最后一行是严格匹配的 `EXECUTION_RESULT` 时追加独立 `mailbox_terminal` 等价边界；不伪造或增加 `SubagentStop`，`wait_agent` 摘要、running/commentary、普通未绑定 agent、歧义、乱序重复和合同漂移均拒绝。

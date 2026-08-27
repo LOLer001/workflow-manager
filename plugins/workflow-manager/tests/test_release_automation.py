@@ -39,12 +39,31 @@ class ReleaseAutomationTests(unittest.TestCase):
             constants,
             {
                 "SCHEMA_VERSION": "30",
-                "WRITER_VERSION": "1.0.52",
+                "WRITER_VERSION": "1.0.53",
                 "EXECUTION_PROFILE_VERSION": "11",
                 "STABLE_SKILL_SCHEMA": "9",
             },
         )
         self.assertEqual(manifest["version"], constants["WRITER_VERSION"])
+        doctor = (
+            PLUGIN_ROOT / "scripts" / "hook_trust_doctor.py"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            re.search(
+                r'^DISPATCH_WRITER_VERSION\s*=\s*"([^"]+)"$',
+                doctor,
+                re.MULTILINE,
+            ).group(1),
+            constants["WRITER_VERSION"],
+        )
+        self.assertEqual(
+            re.search(
+                r"^DISPATCH_STATE_SCHEMA\s*=\s*([0-9]+)$",
+                doctor,
+                re.MULTILINE,
+            ).group(1),
+            constants["SCHEMA_VERSION"],
+        )
 
     def test_release_launchers_disable_bytecode(self) -> None:
         installer = (PLUGIN_ROOT / "scripts" / "install_stable_skill.py").read_text(
@@ -89,6 +108,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             "1.0.50",
             "1.0.51",
             "1.0.52",
+            "1.0.53",
         ):
             with self.subTest(version=version):
                 notes = MODULE.extract_release_notes(changelog, version)
