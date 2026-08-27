@@ -1,5 +1,9 @@
 # 更新记录
 
+## 1.0.51
+
+- 将 Linux GitHub Actions 全量测试 job 的上限从 10 分钟提高到 20 分钟，覆盖 316 项套件在托管 runner 上的正常耗时波动；测试矩阵、断言、Windows 30 分钟上限、Schema 29、execution profile v11 与运行时行为均不降低或改变。
+
 ## 1.0.50
 
 - 修正 Windows 九事件发布夹具：普通未绑定 `SubagentStart` 自 1.0.49 起会持久化一条 `ordinary_spawn_no_active_hard` 信息诊断，因此授权/连续性/诊断事件总数应为 7；运行时行为、Schema 29、execution profile v11 与 journal v3 合同不变。

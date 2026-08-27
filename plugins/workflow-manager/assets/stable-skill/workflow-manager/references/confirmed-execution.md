@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 29/writer 1.0.50 uses execution profile v11 and an append-only canonical journal v3.
+This reference applies only after a Hard plan is confirmed. Schema 29/writer 1.0.51 uses execution profile v11 and an append-only canonical journal v3.
 
 ## Minimal authority model
 

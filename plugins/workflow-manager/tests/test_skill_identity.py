@@ -128,7 +128,7 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn("inherits the existing strict confirmation", self.regression_continuity)
 
     def test_protocol_continuity_and_privacy_are_preserved(self) -> None:
-        self.assertIn("Schema 29/writer 1.0.50", self.confirmed_execution)
+        self.assertIn("Schema 29/writer 1.0.51", self.confirmed_execution)
         self.assertIn("execution profile v11", self.confirmed_execution)
         self.assertIn("canonical journal v3", self.confirmed_execution)
         self.assertIn("preserves its real profile/contract", self.confirmed_execution)
@@ -152,9 +152,9 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.50")
-        self.assertIn("/1.0.50/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.50\n")
+        self.assertEqual(self.manifest["version"], "1.0.51")
+        self.assertIn("/1.0.51/", readme)
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.51\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
     def test_ci_runs_python_without_bytecode_on_linux_and_windows(self) -> None:
@@ -162,6 +162,14 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', workflow)
         self.assertIn('PYTHONUTF8: "1"', workflow)
         self.assertIn('python-version: "3.12"', workflow)
+        self.assertRegex(
+            workflow,
+            r"jobs:\n  linux:\n    runs-on: ubuntu-latest\n    timeout-minutes: 20",
+        )
+        self.assertRegex(
+            workflow,
+            r"  windows:\n    runs-on: windows-latest\n    timeout-minutes: 30",
+        )
         self.assertIn("python -B scripts/validate_repository.py", workflow)
         self.assertIn("python -B -m unittest discover", workflow)
         self.assertNotIn("py -3 -B scripts/validate_repository.py", workflow)
