@@ -4,7 +4,7 @@
 
 ## 核心能力
 
-1.0.48 将 Workflow Manager 收敛为当前 Codex 的窄授权与宿主证据层：高置信 Simple 保持 `Start=0`；Hard 使用动态 manifest 预算、可连续恢复的单调 sequence、仅摘要的授权 envelope 与三层 lifecycle 真值，不再用固定切片/尝试数或墙钟超时替代诊断。
+1.0.49 将 Workflow Manager 收敛为当前 Codex 的窄授权与宿主证据层：高置信 Simple 保持 `Start=0`；Hard 使用动态 manifest 预算、可连续恢复的单调 sequence、仅摘要的授权 envelope 与三层 lifecycle 真值，不再用固定切片/尝试数或墙钟超时替代诊断。
 
 - 当前 Codex 原生负责普通规划、并行、进度、工具使用、常规错误恢复、压缩、模型选择和子智能体编排；插件不再重复注入 route、阶段顺序、agent cap、side lane、压力、重试或通用进度建议。
 - 固定门禁只保留四类不可替代边界：宿主 request/acceptance/Start 真值、Hard 授权 envelope、单 live writer/禁止 child nesting，以及挂载树 Git/破坏性外部动作安全。计划措辞、列表格式、切片数量、阶段数量、墙钟、普通输出形态和原生调度都不是独立门禁。
@@ -43,14 +43,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.48\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.49\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.48/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.49/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -71,14 +71,14 @@ codex plugin list --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.48\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.49\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.48/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.49/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
 ```
 
 `hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
@@ -119,7 +119,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.48 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.49 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -143,7 +143,7 @@ Codex Multi-Agent V2 可能在本地 `PreToolUse` 前加密 collaboration `messa
 
 `work_executor_low_latest` 是默认正常 executor 的动态逻辑策略，不是固定产品名。typed recovery 使用当前最高可用 `gpt-5.6-sol` + `max` + `fork_turns=1`，只有显式 `highest_throughout` 使用最高档 + `ultra`。PreTool 唯一请求、PostTool `host_accepted=true` 与唯一 full Start 分别记录；只有三者、扁平状态和当前合同一致时才进入 running。每个切片候选仍须通过父会话独立验收，恢复不能复活 terminal child、嵌套 child 或扩大范围。
 
-升级到 Schema 28 时继续清除旧的通用 route/phase/cap、压力、普通失败升档、跨任务协调和普通 agent lifecycle 字段。canonical journal v2、有效 Hard 修订、切片、宿主生成证据、封存 baseline、因果复核和参考验收继续按严格边界迁移；普通规划、并行和压缩语义由当前 Codex 原生恢复。
+升级到 Schema 29 时继续清除旧的通用 route/phase/cap、压力、普通失败升档、跨任务协调和普通 agent lifecycle 字段。canonical journal v3 仅追加 typed 记录并保留全部 v2 字节前缀；已封存的 executable revision、切片、宿主生成证据、封存 baseline、因果复核和参考验收继续按严格边界迁移；普通规划、并行和压缩语义由当前 Codex 原生恢复。
 
 真实 token 无法从累计宿主计数中可靠归因给插件。本仓库把 1.0.43 的匿名冻结 trace 作为正式静态 A/B：确定性断言 child Start 从 8 降至 3（62.5%，要求至少 60%）、重复 `additionalContext` 从 856 降至 153 UTF-8 字节（82.1%，要求至少 50%），同时保留同等数量的 Hard executor 强验收检查点。另一个三臂模拟只比较 Hook `additionalContext` 字节、child Start、工具尝试和相同验收证据。插件为 Hard 授权增加的 assessor/executor 成本不会伪装成原生零开销；这些模拟字节和累计宿主计数都不是可归因的真实 token。
 

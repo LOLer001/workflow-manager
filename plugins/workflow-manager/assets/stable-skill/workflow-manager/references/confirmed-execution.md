@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 28/writer 1.0.48 uses execution profile v10 and canonical journal v2.
+This reference applies only after a Hard plan is confirmed. Schema 29/writer 1.0.49 uses execution profile v11 and an append-only canonical journal v3.
 
 ## Minimal authority model
 
@@ -37,7 +37,7 @@ Plan formatting is native Codex behavior. A `workflow-manager-execution-slices` 
 - no separate slice or list-count ceiling exists;
 - insufficient budget means stop or split, never weaken acceptance.
 
-The current trusted revision is the plan-content authority. `update_plan` is only a digest-bound UI projection. An external edit, replacement, link race, wrong path identity, or digest mismatch makes the active contract stale.
+The current trusted executable revision is the plan-content authority. `update_plan` is only a digest-bound UI projection. v3 terminal seals and durable conclusions append after the immutable revision prefix and cannot rewrite a completed revision or grant execution authority. The v11 contract binds the selected executable revision plus that immutable prefix, so an allowed tail record does not invalidate an already sealed contract. An external edit, replacement, link race, wrong path identity, or digest mismatch makes the active contract stale.
 
 One revision may contain exactly 983040 UTF-8 bytes and the journal exactly 10485760 bytes. One byte over produces `revision_too_large` or `journal_full` without consuming a generation. Journal/state publication follows `marker → journal → state → cleanup`; recovery accepts only old journal/old state or new journal/new state. Mixed or unprovable states fail closed.
 

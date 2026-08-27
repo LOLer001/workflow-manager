@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.0.49
+
+- 修复 Desktop 短确认：原始消息先限长，随后仅裁剪外围空白；接受外围 LF/CRLF，拒绝内部换行、代码块和附加条款。支持“计划生成 → 查看计划 → 短确认”与安全早到确认续接。
+- 升级到 Schema 29 / execution profile v11：canonical journal v3 只追加 typed executable revision、terminal seal 或 durable conclusion，保留既有 v2 字节前缀；尾部结论不授予执行权，也不重写已完成 revision。
+- 将同会话完成后问题分类为 direct follow-up、回归、副作用、验收缺口、执行暴露、只读不确定调查或无关新目标；没有 change-set 时禁止归因为 introduced regression。
+- 修复“不可逆外部动作无”的无冒号否定识别，并避免普通“版本”问答改变 reference 合同。
+
 ## 1.0.48
 
 - Windows CI 固定使用 `actions/setup-python` 提供的 Python 3.12 并启用 UTF-8，不再由 `py -3` 绕开已声明解释器、在中文隐私夹具上触发 cp1252 写入失败和逐项 10 秒等待；Windows 文件安全夹具先 canonicalize 临时根并以二进制 LF 写入，产品的 canonical-path 与 canonical-byte 拒绝边界保持不变。

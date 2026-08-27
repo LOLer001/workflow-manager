@@ -354,10 +354,10 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 28)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.48")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 29)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.49")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
-        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "10")
+        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "11")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         for ambiguous in (
@@ -450,7 +450,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (28, "1.0.48"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (29, "1.0.49"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -477,7 +477,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.48 active", context)
+        self.assertIn("Workflow Manager 1.0.49 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1128,8 +1128,8 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (28, "1.0.48"))
-        self.assertEqual(migrated["execution_profile_version"], "10")
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (29, "1.0.49"))
+        self.assertEqual(migrated["execution_profile_version"], "11")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
         self.assertIsNone(migrated["assessor_failure_kind"])
@@ -1224,7 +1224,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (28, "1.0.48", "10"),
+                    (29, "1.0.49", "11"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1270,7 +1270,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (28, "1.0.48", "5", "verification_required", 1),
+            (29, "1.0.49", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -6384,6 +6384,20 @@ class OrchestratorHookTests(unittest.TestCase):
                         "role": "high_assessor",
                         "contract_id": binding,
                         "attempt": running["assessor_attempt"],
+                        "model": start["model"],
+                        "reasoning_effort": start["reasoning_effort"],
+                        "fork_turns": start["fork_turns"],
+                        "result_meta": {"fingerprint": "a" * 16, "length": 128},
+                    }
+                )
+                assessment_receipt = HOOK.original_assessor_result_receipt(running)
+                self.assertIsNotNone(assessment_receipt)
+                running["plan_composition"] = HOOK._safe_plan_composition(
+                    {
+                        "status": "pending",
+                        "assessor_binding_id": binding,
+                        "objective_fingerprint": running["objective"]["fingerprint"],
+                        "assessment_receipt": assessment_receipt,
                     }
                 )
                 self.state_files(data)[0].write_text(json.dumps(running), encoding="utf-8")
@@ -6948,6 +6962,16 @@ class OrchestratorHookTests(unittest.TestCase):
         state["confirmed_at"] = None
         state["assessor_state"] = "hard_plan_ready"
         HOOK.reset_executor_binding(state)
+        assessment_receipt = HOOK.original_assessor_result_receipt(state)
+        self.assertIsNotNone(assessment_receipt)
+        state["plan_composition"] = HOOK._safe_plan_composition(
+            {
+                "status": "pending",
+                "assessor_binding_id": state["assessor_binding_id"],
+                "objective_fingerprint": state["objective"]["fingerprint"],
+                "assessment_receipt": assessment_receipt,
+            }
+        )
         self.state_files()[0].write_text(json.dumps(state), encoding="utf-8")
         successor = (
             "1. 将同范围修复拆为更多预算内切片\n"
@@ -7999,12 +8023,20 @@ class OrchestratorHookTests(unittest.TestCase):
         session = "causal-binding"
         completed = self.create_completed_execution_baseline(session)
         old_contract = completed["execution_contract_id"]
+        old_confirmation_count = completed["authorization_envelope"][
+            "confirmation_count"
+        ]
+        journal_path = self.data.joinpath(
+            *completed["plan_artifact"]["relative_path"].split("/")
+        )
+        old_journal = journal_path.read_bytes()
+        feedback_prompt = "验收发现修复后新出现黑屏，请排查关联性"
         self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "causal-binding-feedback",
-                "prompt": "验收发现修复后新出现黑屏，请排查关联性",
+                "prompt": feedback_prompt,
             }
         )
         triage = self.load_only_state()
@@ -8067,7 +8099,33 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIsNone(resolved["execution_contract_id"])
 
         ready = self.assessor_hard_plan(session, run_id="replacement-plan", message="1. 对照前序变更与黑屏日志确认根因\n2. 修正对应模块并审查受影响路径\n3. 编译部署并验证重启与黑屏回归\n验收：重启和黑屏均不再复现。")
-        self.assertEqual(ready["plan_state"], "awaiting_confirmation")
+        # A same-envelope causal successor receives a fresh contract without
+        # consuming another user confirmation.
+        self.assertEqual(ready["plan_state"], "confirmed")
+        self.assertEqual(
+            ready["authorization_envelope"]["confirmation_count"],
+            old_confirmation_count,
+        )
+        self.assertNotEqual(ready["execution_contract_id"], old_contract)
+        new_journal = journal_path.read_bytes()
+        self.assertTrue(new_journal.startswith(old_journal))
+        parsed = HOOK.parse_plan_journal(new_journal)
+        executable = parsed["records"][-1]
+        self.assertEqual(executable["record_type"], "executable_revision")
+        self.assertEqual(
+            executable["data"]["causal_type"], "introduced_regression"
+        )
+        self.assertEqual(
+            executable["data"]["parent_revision_digest"], completed["plan_digest"]
+        )
+        self.assertEqual(executable["data"]["parent_contract_id"], old_contract)
+        self.assertEqual(
+            executable["data"]["terminal_baseline_id"],
+            completed["last_execution_baseline"]["baseline_id"],
+        )
+        journal_text = new_journal.decode("utf-8")
+        self.assertNotIn(feedback_prompt, journal_text)
+        self.assertNotIn("CAUSAL_REVIEW", journal_text)
         self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -8078,6 +8136,10 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         confirmed = self.load_only_state()
         self.assertEqual(confirmed["plan_state"], "confirmed")
+        self.assertEqual(
+            confirmed["authorization_envelope"]["confirmation_count"],
+            old_confirmation_count,
+        )
         self.assertNotEqual(confirmed["execution_contract_id"], old_contract)
         self.assertEqual(
             confirmed["execution_contract_id"],
@@ -8119,6 +8181,70 @@ class OrchestratorHookTests(unittest.TestCase):
             state["objective"]["fingerprint"],
             completed["objective"]["fingerprint"],
         )
+
+    def test_causal_successor_with_new_release_risk_requires_fresh_confirmation(self) -> None:
+        session = "causal-risk-drift"
+        completed = self.create_completed_execution_baseline(session)
+        old_contract = completed["execution_contract_id"]
+        old_objective = completed["objective"]["fingerprint"]
+        prompt = (
+            "验收发现修复后新增黑屏；新增发布到生产的不可逆动作作为修复步骤，"
+            "请排查关联性"
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "risk-feedback",
+                "prompt": prompt,
+            }
+        )
+        triage = self.load_only_state()
+        review = triage["causal_review"]
+        self.assertEqual(triage["objective"]["fingerprint"], old_objective)
+        self.assertIsNone(triage["authorization_envelope"]["digest"])
+        self.assertNotEqual(
+            triage["pending_causal_revision"]["authorization_envelope_digest"],
+            HOOK.authorization_envelope_digest(triage),
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "risk-conclusion",
+                "last_assistant_message": (
+                    "CAUSAL_REVIEW "
+                    f"baseline_id={review['baseline_id']} review_id={review['review_id']} "
+                    f"outcome=introduced_regression evidence_digest={'b' * 32}"
+                ),
+            }
+        )
+        ready = self.assessor_hard_plan(
+            session,
+            run_id="risk-replacement-plan",
+            message=(
+                "1. 绑定前序变更定位黑屏根因\n"
+                "2. 修复后执行受影响回归\n"
+                "3. 发布到生产并验证回滚边界\n"
+                "验收：黑屏消失且生产发布证据完整。"
+            ),
+        )
+        self.assertEqual(ready["plan_state"], "awaiting_confirmation")
+        self.assertIsNone(ready["execution_contract_id"])
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "risk-confirm",
+                "prompt": "确认按这个计划执行",
+            }
+        )
+        confirmed = self.load_only_state()
+        self.assertEqual(confirmed["plan_state"], "confirmed")
+        self.assertEqual(
+            confirmed["authorization_envelope"]["confirmation_count"], 1
+        )
+        self.assertNotEqual(confirmed["execution_contract_id"], old_contract)
 
     def test_uncertain_causal_outcome_stays_read_only(self) -> None:
         session = "causal-uncertain"
@@ -9611,7 +9737,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.48 active", context)
+        self.assertIn("Workflow Manager 1.0.49 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10300,10 +10426,28 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (28, "1.0.48"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (29, "1.0.49"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
+
+
+class ConfirmationNormalizationV1049Tests(unittest.TestCase):
+    def test_outer_desktop_newlines_are_allowed_but_internal_controls_are_not(self) -> None:
+        for value in ("确认执行\n", "\r\n 确认执行 \r\n", "继续啊，我确认执行\n"):
+            with self.subTest(value=value):
+                self.assertTrue(HOOK.pure_plan_confirmation(value))
+        for value in ("确认\n执行", "```确认执行```", "确认执行，但是增加发布"):
+            with self.subTest(value=value):
+                self.assertFalse(HOOK.pure_plan_confirmation(value))
+
+    def test_no_irreversible_clause_does_not_mask_positive_release_risk(self) -> None:
+        domain = {"task_domain": "work"}
+        route = {"phase_hints": []}
+        no_action = HOOK.classify_work_difficulty("不可逆外部动作无", domain, route)
+        mixed = HOOK.classify_work_difficulty("不可逆外部动作无；发布 Workflow Manager 插件 1.0.49", domain, route)
+        self.assertNotIn("critical_irreversible_or_production", no_action["difficulty_rule_codes"])
+        self.assertIn("critical_workflow_manager_versioned_release", mixed["difficulty_rule_codes"])
 
 
 if __name__ == "__main__":

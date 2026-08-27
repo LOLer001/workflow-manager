@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 28
-WRITER_VERSION = "1.0.48"
+SCHEMA_VERSION = 29
+WRITER_VERSION = "1.0.49"
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
-EXECUTION_PROFILE_VERSION = "10"
+EXECUTION_PROFILE_VERSION = "11"
 # The assessor is the hard-work safety gate: use the highest generally exposed
 # effort (max); ultra is reserved for the explicit whole-session policy.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
@@ -67,6 +67,7 @@ MAX_SUBAGENTS = 24
 MAX_TERMINAL_SUBAGENT_LIFECYCLES = 10
 MAX_COMPACTIONS = 16
 MAX_GUARDS = 32
+MAX_LIFECYCLE_DIAGNOSTICS = 32
 MAX_PROCESSED_RUNS = 128
 MAX_DUPLICATE_NOTICES = 64
 MAX_STATE_BYTES = 1024 * 1024
@@ -163,7 +164,23 @@ def _empty_assessment_liveness() -> dict[str, Any]:
             "last_progress_at": None, "last_observed_at": None, "unblock": "none",
             "unblock_at": None, "recovery_from": None}
 CAUSAL_REVIEW_STATES = {"none", "triage_required", "triaging", "resolved"}
-CAUSAL_REVIEW_OUTCOMES = {"introduced", "fix_ineffective", "unrelated", "uncertain"}
+# Keep the four profile-10 spellings readable during a lazy migration.  New
+# records always use the explicit v3 causal type names below.
+CAUSAL_REVIEW_OUTCOMES = {
+    "introduced", "unrelated", "direct_followup", "introduced_regression",
+    "verified_side_effect", "fix_ineffective", "acceptance_gap_no_change",
+    "execution_exposed_gap", "uncertain", "explanatory_conclusion",
+    "unrelated_new_objective",
+}
+LEGACY_CAUSAL_OUTCOME_MAP = {
+    "introduced": "introduced_regression",
+    "unrelated": "unrelated_new_objective",
+}
+LIFECYCLE_DIAGNOSTIC_CODES = frozenset({
+    "ordinary_spawn_no_active_hard", "pretool_missing", "start_missing",
+    "contract_mismatch",
+})
+LIFECYCLE_DIAGNOSTIC_LEVELS = frozenset({"info", "warning", "error"})
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
 REFERENCE_ACCEPTANCE_STATES = {"disabled", "planned", "candidate", "accepted", "failed"}
 PLAN_ARTIFACT_LIFECYCLE_STATUSES = {
@@ -223,6 +240,15 @@ LEGACY_PLAN_ARTIFACT_OWNER = "<!-- workflow-manager-plan-artifact:v1"
 PLAN_ARTIFACT_OWNER = LEGACY_PLAN_ARTIFACT_OWNER
 PLAN_JOURNAL_OWNER = "<!-- workflow-manager-plan-journal:v2"
 PLAN_REVISION_OWNER = "<!-- workflow-manager-plan-revision:v2"
+PLAN_JOURNAL_V3_RECORD_OWNER = "<!-- workflow-manager-plan-record:v3"
+CAUSAL_RECORD_TYPES = frozenset({
+    "executable_revision", "terminal_seal", "durable_conclusion",
+})
+CAUSAL_TYPES = frozenset({
+    "direct_followup", "introduced_regression", "verified_side_effect",
+    "fix_ineffective", "acceptance_gap_no_change", "execution_exposed_gap",
+    "uncertain", "explanatory_conclusion", "unrelated_new_objective",
+})
 PLAN_ARTIFACT_BODY_MARKER = "<!-- workflow-manager-plan-body -->"
 PLAN_JOURNAL_NAME = "hard-plan.md"
 LEGACY_PLAN_ARTIFACT_NAME_RE = re.compile(
@@ -880,7 +906,14 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     artifact = _safe_plan_artifact(state.get("plan_artifact"))
     canonical_path = str(artifact.get("relative_path") or "")
     revision_digest = safe_fingerprint(artifact.get("current_revision_digest"))
-    journal_digest = safe_fingerprint(artifact.get("journal_digest"))
+    # A v3 journal is append-only.  Terminal seals and durable conclusions are
+    # deliberately allowed after an executable revision completes, so the
+    # active contract must bind the immutable prefix selected at confirmation,
+    # rather than the mutable journal tail.
+    journal_digest = safe_fingerprint(
+        artifact.get("journal_prefix_digest") or artifact.get("journal_digest")
+    )
+    journal_prefix_bytes = max(safe_int(artifact.get("journal_prefix_bytes")), 0)
     slices = _safe_execution_slices(state.get("execution_slices"))
     manifest_digest = safe_fingerprint(slices.get("manifest_digest"))
     if not (
@@ -906,6 +939,14 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
         state.get("execution_profile_version") or EXECUTION_PROFILE_VERSION,
         16,
     )
+    if profile_version == EXECUTION_PROFILE_VERSION:
+        lineage = _safe_causal_lineage(state.get("causal_lineage"))
+        if (
+            lineage.get("selected_revision_digest") != plan
+            or lineage.get("selected_prefix_digest") != journal_digest
+            or journal_prefix_bytes <= 0
+        ):
+            return None
     preference = safe_session_execution_preference(
         state.get("session_execution_preference")
     )
@@ -914,6 +955,8 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
         f"\0{generation}\0{plan}\0{canonical_path}\0{revision_digest}\0{journal_digest}"
         f"\0{manifest_digest}\0{slices.get('global_constraints_digest')}\0{slices.get('count')}"
     )
+    if profile_version == EXECUTION_PROFILE_VERSION:
+        material += f"\0prefix_bytes={journal_prefix_bytes}"
     if preference == "highest_throughout":
         material += (
             f"\0{highest_execution_model(state) or 'unresolved'}"
@@ -948,7 +991,14 @@ def reference_requested(prompt: str) -> bool:
 
 
 def reference_contract_changed(prompt: str) -> bool:
-    return bool(re.search(r"(?:版本|version|方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态)", prompt, re.I))
+    # A bare "version" occurs in ordinary product questions.  Only an
+    # explicit request to alter a reference/fidelity contract is material.
+    return bool(re.search(
+        r"(?:参考|reference|视觉|fidelity).{0,48}(?:版本|version|方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态)"
+        r"|(?:版本|version|方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态).{0,48}(?:参考|reference|视觉|fidelity)"
+        r"|(?:切换|改为|改成|变更|switch|change).{0,48}(?:方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态)",
+        prompt, re.I,
+    ))
 
 
 def _safe_reference_acceptance(item: Any) -> dict[str, Any]:
@@ -1861,6 +1911,22 @@ def authorization_scope_from_prompt(
     }
 
 
+def authorization_scope_change_requested(prompt: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    change = re.search(
+        r"(?:新增|增加|扩大|改为|改成|变更|new|add|expand|change)",
+        normalized,
+        re.I,
+    )
+    boundary = re.search(
+        r"(?:验收|acceptance|风险|risk|生产|production|发布|release|publish|"
+        r"部署|deploy|删除|delete|不可逆|irreversible)",
+        normalized,
+        re.I,
+    )
+    return bool(change and boundary)
+
+
 def authorization_envelope_digest(state: dict[str, Any]) -> str | None:
     """Digest-only confirmation scope; never persist plan/prompt prose."""
     objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
@@ -1904,6 +1970,99 @@ def _safe_authorization_envelope(value: Any) -> dict[str, Any]:
         "strict_confirm_receipt": receipt,
         "confirmation_count": safe_sequence(value.get("confirmation_count")),
     } if digest and receipt else {"digest": None, "strict_confirm_receipt": None, "confirmation_count": 0}
+
+
+def pending_causal_successor(
+    state: dict[str, Any], *, causal_type: str, issue_fingerprint: Any,
+    evidence_digest: Any = None,
+) -> dict[str, Any]:
+    """Capture the completed parent's exact digest-only successor boundary."""
+    if causal_type not in EXECUTABLE_CAUSAL_TYPES:
+        return {}
+    baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    envelope = _safe_authorization_envelope(state.get("authorization_envelope"))
+    lineage = _safe_causal_lineage(state.get("causal_lineage"))
+    root = (
+        lineage.get("root_objective_fingerprint")
+        or safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    )
+    issue = safe_fingerprint(issue_fingerprint)
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    parent_revision = _fingerprint32(state.get("plan_digest"))
+    parent_prefix = _fingerprint32(artifact.get("journal_prefix_digest"))
+    if not (
+        state.get("plan_state") == "confirmed"
+        and state.get("executor_state") == "succeeded"
+        and baseline.get("acceptance_status") in {"passed", "failed"}
+        and baseline.get("execution_contract_id") == contract
+        and baseline.get("plan_digest") == parent_revision
+        and baseline.get("objective_fingerprint") == root
+        and lineage.get("terminal_baseline_id") == baseline.get("baseline_id")
+        and lineage.get("terminal_seal_digest")
+        and envelope.get("digest") == authorization_envelope_digest(state)
+        and envelope.get("strict_confirm_receipt")
+        and root and issue and contract and parent_revision and parent_prefix
+    ):
+        return {}
+    if causal_type == "introduced_regression" and not baseline.get("change_set_digest"):
+        return {}
+    scope = _safe_authorization_scope(state.get("authorization_scope"))
+    return _safe_pending_causal_revision({
+        "causal_type": causal_type,
+        "creation_state": "assessment_required",
+        "parent_revision_digest": parent_revision,
+        "parent_contract_id": contract,
+        "parent_prefix_digest": parent_prefix,
+        "terminal_baseline_id": baseline.get("baseline_id"),
+        "root_objective_fingerprint": root,
+        "issue_fingerprint": issue,
+        "evidence_digest": evidence_digest,
+        "change_set_digest": baseline.get("change_set_digest"),
+        "authorization_envelope_digest": envelope.get("digest"),
+        "strict_confirm_receipt": envelope.get("strict_confirm_receipt"),
+        **scope,
+    })
+
+
+def causal_successor_inheritance_valid(state: dict[str, Any]) -> bool:
+    pending = _safe_pending_causal_revision(state.get("pending_causal_revision"))
+    if not pending:
+        return True
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
+    lineage = _safe_causal_lineage(state.get("causal_lineage"))
+    envelope = _safe_authorization_envelope(state.get("authorization_envelope"))
+    scope = _safe_authorization_scope(state.get("authorization_scope"))
+    return bool(
+        pending.get("creation_state") == "plan_composition"
+        and pending.get("parent_revision_digest") != state.get("plan_digest")
+        and pending.get("parent_contract_id")
+        == baseline.get("execution_contract_id")
+        and pending.get("parent_revision_digest") == baseline.get("plan_digest")
+        and pending.get("terminal_baseline_id") == baseline.get("baseline_id")
+        and pending.get("root_objective_fingerprint")
+        == state.get("objective", {}).get("fingerprint")
+        == lineage.get("root_objective_fingerprint")
+        and lineage.get("selected_revision_digest") == state.get("plan_digest")
+        and lineage.get("current_issue_fingerprint") == pending.get("issue_fingerprint")
+        and lineage.get("current_causal_type") == pending.get("causal_type")
+        and artifact.get("current_revision_digest") == state.get("plan_digest")
+        and artifact.get("journal_prefix_digest")
+        == lineage.get("selected_prefix_digest")
+        and pending.get("authorization_envelope_digest")
+        == envelope.get("digest")
+        == authorization_envelope_digest(state)
+        and pending.get("strict_confirm_receipt")
+        == envelope.get("strict_confirm_receipt")
+        and all(
+            pending.get(key) == scope.get(key)
+            for key in (
+                "acceptance_digest", "risk_category_digest",
+                "irreversible_action_digest",
+            )
+        )
+    )
 
 
 def recovery_fingerprint(
@@ -2629,6 +2788,11 @@ def activate_trusted_plan(
     }
     state["pending_confirmation_receipt"] = None
     if initialize_confirmed_executor(state):
+        lineage = _safe_causal_lineage(state.get("causal_lineage"))
+        if lineage.get("selected_revision_digest") == state.get("plan_digest"):
+            lineage["selected_contract_id"] = state.get("execution_contract_id")
+            state["causal_lineage"] = _safe_causal_lineage(lineage)
+        state["pending_causal_revision"] = {}
         return True
     state["plan_state"] = "invalidated"
     state["confirmed_plan_digest"] = None
@@ -2648,7 +2812,12 @@ def auto_confirm_trusted_plan(state: dict[str, Any], payload: dict[str, Any]) ->
             increment_confirmation=True,
         )
     envelope = _safe_authorization_envelope(state.get("authorization_envelope"))
-    if expected and envelope.get("digest") == expected and envelope.get("strict_confirm_receipt"):
+    if (
+        expected
+        and envelope.get("digest") == expected
+        and envelope.get("strict_confirm_receipt")
+        and causal_successor_inheritance_valid(state)
+    ):
         return activate_trusted_plan(
             state,
             payload,
@@ -3517,8 +3686,13 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
             "report_fingerprint": None,
             "baseline_id": None,
             "outcome": None,
+            "causal_type": None,
             "evidence_digest": None,
         },
+        "causal_lineage": _safe_causal_lineage(None),
+        "pending_causal_revision": {},
+        "plan_composition": _safe_plan_composition(None),
+        "lifecycle_diagnostics": [],
         "stall": _safe_stall(None),
         "created_at": now,
         "updated_at": now,
@@ -4003,8 +4177,189 @@ def _safe_causal_review(item: Any) -> dict[str, Any]:
         "report_fingerprint": safe_fingerprint(item.get("report_fingerprint")) or None,
         "baseline_id": safe_fingerprint(item.get("baseline_id")) or None,
         "outcome": outcome if outcome in CAUSAL_REVIEW_OUTCOMES else None,
+        "causal_type": (
+            LEGACY_CAUSAL_OUTCOME_MAP.get(str(item.get("causal_type") or ""), str(item.get("causal_type") or ""))
+            if LEGACY_CAUSAL_OUTCOME_MAP.get(str(item.get("causal_type") or ""), str(item.get("causal_type") or "")) in CAUSAL_TYPES
+            else LEGACY_CAUSAL_OUTCOME_MAP.get(str(outcome or ""), str(outcome or ""))
+            if LEGACY_CAUSAL_OUTCOME_MAP.get(str(outcome or ""), str(outcome or "")) in CAUSAL_TYPES
+            else None
+        ),
         "evidence_digest": safe_fingerprint(item.get("evidence_digest")) or None,
     }
+
+
+EXECUTABLE_CAUSAL_TYPES = CAUSAL_TYPES - frozenset({
+    "uncertain", "explanatory_conclusion", "unrelated_new_objective",
+})
+
+
+def _safe_causal_lineage(item: Any) -> dict[str, Any]:
+    item = item if isinstance(item, dict) else {}
+    causal_type = str(item.get("current_causal_type") or "")
+    return {
+        "root_objective_fingerprint": safe_fingerprint(
+            item.get("root_objective_fingerprint")
+        ) or None,
+        "selected_revision_digest": _fingerprint32(
+            item.get("selected_revision_digest")
+        ),
+        "selected_contract_id": _fingerprint32(item.get("selected_contract_id")),
+        "selected_prefix_digest": _fingerprint32(
+            item.get("selected_prefix_digest")
+        ),
+        "terminal_baseline_id": _fingerprint32(item.get("terminal_baseline_id")),
+        "terminal_seal_digest": _fingerprint32(item.get("terminal_seal_digest")),
+        "current_issue_fingerprint": safe_fingerprint(
+            item.get("current_issue_fingerprint")
+        ) or None,
+        "current_causal_type": causal_type if causal_type in CAUSAL_TYPES else None,
+        "tail_record_type": (
+            item.get("tail_record_type")
+            if item.get("tail_record_type") in CAUSAL_RECORD_TYPES else None
+        ),
+        "tail_record_digest": _fingerprint32(item.get("tail_record_digest")),
+    }
+
+
+def _safe_pending_causal_revision(item: Any) -> dict[str, Any]:
+    item = item if isinstance(item, dict) else {}
+    causal_type = str(item.get("causal_type") or "")
+    creation_state = str(item.get("creation_state") or "")
+    result = {
+        "causal_type": causal_type if causal_type in EXECUTABLE_CAUSAL_TYPES else None,
+        "creation_state": (
+            creation_state
+            if creation_state in {"assessment_required", "plan_composition"}
+            else None
+        ),
+        "parent_revision_digest": _fingerprint32(
+            item.get("parent_revision_digest")
+        ),
+        "parent_contract_id": _fingerprint32(item.get("parent_contract_id")),
+        "parent_prefix_digest": _fingerprint32(item.get("parent_prefix_digest")),
+        "terminal_baseline_id": _fingerprint32(item.get("terminal_baseline_id")),
+        "root_objective_fingerprint": safe_fingerprint(
+            item.get("root_objective_fingerprint")
+        ) or None,
+        "issue_fingerprint": safe_fingerprint(item.get("issue_fingerprint")) or None,
+        "evidence_digest": _fingerprint32(item.get("evidence_digest")),
+        "change_set_digest": _fingerprint32(item.get("change_set_digest")),
+        "authorization_envelope_digest": _fingerprint32(
+            item.get("authorization_envelope_digest")
+        ),
+        "strict_confirm_receipt": _fingerprint32(
+            item.get("strict_confirm_receipt")
+        ),
+        "acceptance_digest": _fingerprint32(item.get("acceptance_digest")),
+        "risk_category_digest": _fingerprint32(item.get("risk_category_digest")),
+        "irreversible_action_digest": _fingerprint32(
+            item.get("irreversible_action_digest")
+        ),
+    }
+    required = (
+        result["causal_type"], result["creation_state"],
+        result["parent_revision_digest"], result["parent_contract_id"],
+        result["parent_prefix_digest"], result["terminal_baseline_id"],
+        result["root_objective_fingerprint"], result["issue_fingerprint"],
+        result["authorization_envelope_digest"], result["strict_confirm_receipt"],
+    )
+    if not all(required):
+        return {}
+    if result["causal_type"] == "introduced_regression" and not result["change_set_digest"]:
+        return {}
+    return result
+
+
+def _safe_plan_composition(item: Any) -> dict[str, Any]:
+    item = item if isinstance(item, dict) else {}
+    status = item.get("status") if item.get("status") in {"none", "pending"} else "none"
+    binding = _fingerprint32(item.get("assessor_binding_id"))
+    objective = safe_fingerprint(item.get("objective_fingerprint")) or None
+    receipt = _fingerprint32(item.get("assessment_receipt"))
+    if status != "pending" or not (binding and objective and receipt):
+        return {
+            "status": "none", "assessor_binding_id": None,
+            "objective_fingerprint": None, "assessment_receipt": None,
+            "turn_id": None,
+        }
+    return {
+        "status": "pending",
+        "assessor_binding_id": binding,
+        "objective_fingerprint": objective,
+        "assessment_receipt": receipt,
+        "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
+    }
+
+
+def _safe_lifecycle_diagnostic(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict) or item.get("code") not in LIFECYCLE_DIAGNOSTIC_CODES:
+        return None
+    level = item.get("level") if item.get("level") in LIFECYCLE_DIAGNOSTIC_LEVELS else "error"
+    return {
+        "code": item["code"],
+        "level": level,
+        "role": item.get("role") if item.get("role") in {"lane", "high_assessor", "confirmed_executor"} else "lane",
+        "request_fingerprint": safe_fingerprint(item.get("request_fingerprint")) or None,
+        "agent_fingerprint": _fingerprint32(item.get("agent_fingerprint")),
+        "contract_id": _fingerprint32(item.get("contract_id")),
+        "at": str(item.get("at") or "")[:40] or None,
+    }
+
+
+def record_lifecycle_diagnostic(
+    state: dict[str, Any], code: str, *, level: str, role: str = "lane",
+    request_fingerprint: Any = None, agent_id: Any = None, contract_id: Any = None,
+) -> None:
+    if code not in LIFECYCLE_DIAGNOSTIC_CODES:
+        return
+    item = _safe_lifecycle_diagnostic({
+        "code": code,
+        "level": level,
+        "role": role,
+        "request_fingerprint": request_fingerprint,
+        "agent_fingerprint": stable_hash(str(agent_id), 32) if agent_id else None,
+        "contract_id": contract_id,
+        "at": utc_now(),
+    })
+    if item is None:
+        return
+    diagnostics = [
+        value for raw in as_list(state.get("lifecycle_diagnostics"))
+        if (value := _safe_lifecycle_diagnostic(raw)) is not None
+    ]
+    if diagnostics and canonical_json(diagnostics[-1]) == canonical_json(item):
+        return
+    state["lifecycle_diagnostics"] = [*diagnostics, item][-MAX_LIFECYCLE_DIAGNOSTICS:]
+
+
+def active_hard_lifecycle(state: dict[str, Any]) -> bool:
+    return bool(
+        state.get("task_domain") == "work"
+        and state.get("work_difficulty") == "hard"
+        and (
+            state.get("plan_state") not in {None, "none"}
+            or state.get("assessor_state") not in {None, "none"}
+            or state.get("executor_state") not in {None, "none", "succeeded"}
+            or _safe_causal_review(state.get("causal_review")).get("state")
+            in {"triage_required", "triaging"}
+        )
+    )
+
+
+def expected_bound_role(state: dict[str, Any]) -> str | None:
+    assessor_due = state.get("assessor_state") in {
+        "spawn_required", "spawn_pending", "running", "recovery_required",
+    }
+    executor_due = (
+        state.get("plan_state") == "confirmed"
+        and state.get("executor_state") in {
+            "spawn_required", "spawn_pending", "running", "recovery_required",
+            "verification_required",
+        }
+    )
+    if assessor_due == executor_due:
+        return None
+    return "high_assessor" if assessor_due else "confirmed_executor"
 
 
 def empty_plan_artifact() -> dict[str, Any]:
@@ -4017,6 +4372,8 @@ def empty_plan_artifact() -> dict[str, Any]:
         "content_digest": None,
         "current_revision_digest": None,
         "journal_digest": None,
+        "journal_prefix_digest": None,
+        "journal_prefix_bytes": 0,
         "generation": 0,
         "revision_count": 0,
         "lifecycle_status": "none",
@@ -4057,6 +4414,8 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
             "content_digest": content_digest,
             "current_revision_digest": current_revision_digest,
             "journal_digest": safe_fingerprint(item.get("journal_digest")) or None,
+            "journal_prefix_digest": safe_fingerprint(item.get("journal_prefix_digest")) or None,
+            "journal_prefix_bytes": max(safe_int(item.get("journal_prefix_bytes")), 0),
             "generation": max(safe_int(item.get("generation")), 0),
             "revision_count": max(safe_int(item.get("revision_count")), 0),
             "lifecycle_status": item.get("lifecycle_status") if item.get("lifecycle_status") in PLAN_ARTIFACT_LIFECYCLE_STATUSES else "none",
@@ -4227,6 +4586,13 @@ PLAN_REVISION_HEADER_RE = re.compile(
     rb"revision_bytes: ([0-9]+)\n"
     rb"-->\n"
 )
+PLAN_JOURNAL_V3_RECORD_RE = re.compile(
+    rb"<!-- workflow-manager-plan-record:v3\n"
+    rb"record_type: (executable_revision|terminal_seal|durable_conclusion)\n"
+    rb"record_digest: ([0-9a-f]{32})\n"
+    rb"record_bytes: ([0-9]+)\n"
+    rb"-->\n"
+)
 
 
 def parse_plan_journal(
@@ -4246,11 +4612,68 @@ def parse_plan_journal(
         raise PlanArtifactError("content_drift")
     position += len(preamble)
     revisions: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     previous_generation = 0
+    first_tail_position: int | None = None
+    selected_prefix_end: int | None = None
+    selected_record_digest: str | None = None
+    selected_revision_digest: str | None = None
+    pending_revision_after_tail: str | None = None
     while position < len(document):
         revision_header = PLAN_REVISION_HEADER_RE.match(document, position)
         if revision_header is None:
-            raise PlanArtifactError("content_drift")
+            record_header = PLAN_JOURNAL_V3_RECORD_RE.match(document, position)
+            if record_header is None:
+                raise PlanArtifactError("content_drift")
+            if first_tail_position is None:
+                first_tail_position = position
+            record_type = record_header.group(1).decode("ascii")
+            record_digest = record_header.group(2).decode("ascii")
+            record_bytes = safe_int(record_header.group(3).decode("ascii"))
+            record_start = record_header.end()
+            record_end = record_start + record_bytes
+            record_body = document[record_start:record_end]
+            if (record_bytes <= 0 or record_end > len(document)
+                    or not record_body.endswith(b"\n")
+                    or stable_hash(record_body, 32) != record_digest):
+                raise PlanArtifactError("content_drift")
+            try:
+                decoded = json.loads(record_body)
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise PlanArtifactError("content_drift") from error
+            if not isinstance(decoded, dict) or decoded.get("record_type") != record_type:
+                raise PlanArtifactError("content_drift")
+            # Typed tails intentionally never contain transcript/prompt/result prose.
+            if any(key in decoded for key in ("prompt", "response", "transcript", "message")):
+                raise PlanArtifactError("content_drift")
+            if record_type == "executable_revision":
+                executable_digest = _fingerprint32(
+                    decoded.get("executable_revision_digest")
+                )
+                if (
+                    not pending_revision_after_tail
+                    or executable_digest != pending_revision_after_tail
+                    or executable_digest
+                    != (revisions[-1].get("revision_digest") if revisions else None)
+                ):
+                    raise PlanArtifactError("content_drift")
+                selected_prefix_end = record_end
+                selected_record_digest = record_digest
+                selected_revision_digest = executable_digest
+                pending_revision_after_tail = None
+            elif pending_revision_after_tail:
+                # A causal plan revision and its typed selector are one logical
+                # append.  No terminal/evidence record may observe it halfway.
+                raise PlanArtifactError("content_drift")
+            records.append({
+                "record_type": record_type,
+                "record_digest": record_digest,
+                "record_start": position,
+                "record_end": record_end,
+                "data": decoded,
+            })
+            position = record_end
+            continue
         generation = safe_int(revision_header.group(1).decode("ascii"))
         if generation <= previous_generation:
             raise PlanArtifactError("content_drift")
@@ -4286,10 +4709,28 @@ def parse_plan_journal(
             }
         )
         previous_generation = generation
+        if first_tail_position is not None:
+            if pending_revision_after_tail is not None:
+                raise PlanArtifactError("content_drift")
+            pending_revision_after_tail = revision_digest
         position = body_end
+    if pending_revision_after_tail is not None:
+        # A plain later revision is a new root objective in the same private
+        # session journal, not a causal successor.  It receives a fresh
+        # immutable prefix but no parent link or inherited confirmation.
+        selected_prefix_end = len(document)
+        selected_record_digest = None
+        selected_revision_digest = pending_revision_after_tail
     if not revisions:
         raise PlanArtifactError("content_drift")
     current = revisions[-1]
+    immutable_prefix_end = (
+        selected_prefix_end
+        if selected_prefix_end is not None
+        else first_tail_position
+        if first_tail_position is not None
+        else len(document)
+    )
     return {
         "session_token": session,
         "created_at": header.group(2).decode("utf-8"),
@@ -4300,6 +4741,14 @@ def parse_plan_journal(
         "objective_fingerprint": current["objective_fingerprint"],
         "difficulty_decision_id": current["difficulty_decision_id"],
         "journal_digest": stable_hash(document, 32),
+        "journal_prefix_digest": stable_hash(document[:immutable_prefix_end], 32),
+        "journal_prefix_bytes": immutable_prefix_end,
+        "records": records,
+        "selected_executable_record_digest": selected_record_digest,
+        "selected_executable_revision_digest": (
+            selected_revision_digest or current["revision_digest"]
+        ),
+        "journal_format_version": 3 if records else 2,
     }
 
 
@@ -4312,6 +4761,7 @@ def append_plan_journal_revision(
     objective_fingerprint: str | None,
     difficulty_decision_id: str | None,
     created_at: str,
+    causal_record: dict[str, Any] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     body_bytes = body.encode("utf-8")
     if len(body_bytes) > MAX_PLAN_REVISION_BYTES:
@@ -4344,10 +4794,75 @@ def append_plan_journal_revision(
         f"## Revision {generation}\n\n"
     ).encode("utf-8") + body_bytes
     document = prefix + revision
+    if causal_record is not None:
+        bound_causal_record = dict(causal_record)
+        bound_causal_record["executable_revision_digest"] = revision_digest
+        document += _encoded_plan_journal_record(
+            "executable_revision", bound_causal_record
+        )
     if len(document) > MAX_PLAN_JOURNAL_BYTES:
         raise PlanArtifactError("journal_full")
     parsed = parse_plan_journal(document, expected_session=session)
     if parsed["generation"] != generation or parsed["current_revision_digest"] != revision_digest:
+        raise PlanArtifactError("content_drift")
+    return document, parsed
+
+
+def _encoded_plan_journal_record(record_type: str, data: dict[str, Any]) -> bytes:
+    if record_type not in CAUSAL_RECORD_TYPES or not isinstance(data, dict):
+        raise PlanArtifactError("content_drift")
+    if any(key in data for key in ("prompt", "response", "transcript", "message")):
+        raise PlanArtifactError("content_drift")
+    canonical = dict(data)
+    canonical["record_type"] = record_type
+    if record_type == "executable_revision":
+        causal = canonical.get("causal_type")
+        if causal not in CAUSAL_TYPES:
+            raise PlanArtifactError("content_drift")
+        required = (
+            _fingerprint32(canonical.get("executable_revision_digest")),
+            _fingerprint32(canonical.get("parent_revision_digest")),
+            _fingerprint32(canonical.get("parent_contract_id")),
+            _fingerprint32(canonical.get("parent_prefix_digest")),
+            _fingerprint32(canonical.get("terminal_baseline_id")),
+            safe_fingerprint(canonical.get("root_objective_fingerprint")),
+            safe_fingerprint(canonical.get("issue_fingerprint")),
+            _fingerprint32(canonical.get("authorization_envelope_digest")),
+            _fingerprint32(canonical.get("strict_confirm_receipt")),
+        )
+        if not all(required) or canonical.get("creation_state") != "executable":
+            raise PlanArtifactError("content_drift")
+        if causal == "introduced_regression" and not safe_fingerprint(canonical.get("change_set_digest")):
+            raise PlanArtifactError("content_drift")
+        if causal == "uncertain" and canonical.get("creation_state") not in {"read_only", "triage"}:
+            raise PlanArtifactError("content_drift")
+    body = (canonical_json(canonical) + "\n").encode("utf-8")
+    digest = stable_hash(body, 32)
+    return (
+        f"{PLAN_JOURNAL_V3_RECORD_OWNER}\n"
+        f"record_type: {record_type}\n"
+        f"record_digest: {digest}\n"
+        f"record_bytes: {len(body)}\n"
+        "-->\n"
+    ).encode("utf-8") + body
+
+
+def append_plan_journal_record(existing: bytes, *, record_type: str, data: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    """Append an immutable v3 causal record without rewriting prior bytes.
+
+    This is deliberately separate from plan composition.  A terminal seal or
+    durable conclusion is evidence, never a new execution authority.
+    """
+    record = _encoded_plan_journal_record(record_type, data)
+    record_header = PLAN_JOURNAL_V3_RECORD_RE.match(record)
+    expected_digest = (
+        record_header.group(2).decode("ascii") if record_header is not None else None
+    )
+    document = existing + record
+    if len(document) > MAX_PLAN_JOURNAL_BYTES:
+        raise PlanArtifactError("journal_full")
+    parsed = parse_plan_journal(document)
+    if not parsed["records"] or parsed["records"][-1]["record_digest"] != expected_digest:
         raise PlanArtifactError("content_drift")
     return document, parsed
 
@@ -6332,6 +6847,8 @@ def migrate_legacy_plan_artifacts(
                 "content_digest": revision_digest,
                 "current_revision_digest": revision_digest,
                 "journal_digest": parsed["journal_digest"],
+                "journal_prefix_digest": parsed["journal_prefix_digest"],
+                "journal_prefix_bytes": parsed["journal_prefix_bytes"],
                 "generation": parsed["generation"],
                 "revision_count": parsed["revision_count"],
                 "lifecycle_status": "ready",
@@ -6450,6 +6967,10 @@ def _stored_artifact_matches_journal(
         == artifact.get("current_revision_digest")
         == parsed.get("current_revision_digest")
         and artifact.get("journal_digest") == parsed.get("journal_digest")
+        and (not artifact.get("journal_prefix_digest")
+             or artifact.get("journal_prefix_digest") == parsed.get("journal_prefix_digest"))
+        and (not artifact.get("journal_prefix_bytes")
+             or artifact.get("journal_prefix_bytes") == parsed.get("journal_prefix_bytes"))
         and artifact.get("generation") == parsed.get("generation")
         and artifact.get("revision_count") == parsed.get("revision_count")
         and artifact.get("objective_fingerprint")
@@ -6480,6 +7001,9 @@ def write_plan_artifact(
     try:
         body = sanitize_plan_artifact_body(message)
         execution_slices = execution_slice_manifest_for_plan(body)
+        pending_causal = _safe_pending_causal_revision(
+            state.get("pending_causal_revision")
+        )
         objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
         difficulty = safe_fingerprint(state.get("difficulty_decision_id"))
         if not objective or not difficulty:
@@ -6518,6 +7042,26 @@ def write_plan_artifact(
                     previous, parsed_existing
                 ):
                     raise PlanArtifactError("content_drift")
+            if pending_causal:
+                baseline = _safe_execution_baseline(
+                    state.get("last_execution_baseline")
+                )
+                if not (
+                    parsed_existing
+                    and pending_causal.get("parent_revision_digest")
+                    == parsed_existing.get("current_revision_digest")
+                    == previous.get("current_revision_digest")
+                    and pending_causal.get("parent_prefix_digest")
+                    == parsed_existing.get("journal_prefix_digest")
+                    == previous.get("journal_prefix_digest")
+                    and pending_causal.get("parent_contract_id")
+                    == baseline.get("execution_contract_id")
+                    and pending_causal.get("terminal_baseline_id")
+                    == baseline.get("baseline_id")
+                    and pending_causal.get("root_objective_fingerprint")
+                    == objective
+                ):
+                    raise PlanArtifactError("content_drift")
             document, parsed = append_plan_journal_revision(
                 existing,
                 session=session,
@@ -6526,6 +7070,10 @@ def write_plan_artifact(
                 objective_fingerprint=objective,
                 difficulty_decision_id=difficulty,
                 created_at=now,
+                causal_record=(
+                    {**pending_causal, "creation_state": "executable"}
+                    if pending_causal else None
+                ),
             )
             prepared_backup_name = (
                 _transaction_name(target, "backup", directory_fd)
@@ -6624,6 +7172,8 @@ def write_plan_artifact(
                 "content_digest": plan_digest,
                 "current_revision_digest": plan_digest,
                 "journal_digest": parsed["journal_digest"],
+                "journal_prefix_digest": parsed["journal_prefix_digest"],
+                "journal_prefix_bytes": parsed["journal_prefix_bytes"],
                 "generation": generation,
                 "revision_count": parsed["revision_count"],
                 "lifecycle_status": "ready",
@@ -6641,6 +7191,32 @@ def write_plan_artifact(
         state["execution_slices"] = persisted_execution_slices(
             execution_slices, plan_digest
         )
+        if pending_causal:
+            latest = parsed["records"][-1]
+            state["causal_lineage"] = _safe_causal_lineage({
+                "root_objective_fingerprint": pending_causal.get(
+                    "root_objective_fingerprint"
+                ),
+                "selected_revision_digest": plan_digest,
+                "selected_contract_id": None,
+                "selected_prefix_digest": parsed.get("journal_prefix_digest"),
+                "terminal_baseline_id": pending_causal.get("terminal_baseline_id"),
+                "terminal_seal_digest": _safe_causal_lineage(
+                    state.get("causal_lineage")
+                ).get("terminal_seal_digest"),
+                "current_issue_fingerprint": pending_causal.get("issue_fingerprint"),
+                "current_causal_type": pending_causal.get("causal_type"),
+                "tail_record_type": latest.get("record_type"),
+                "tail_record_digest": latest.get("record_digest"),
+            })
+            pending_causal["creation_state"] = "plan_composition"
+            state["pending_causal_revision"] = pending_causal
+        else:
+            state["causal_lineage"] = _safe_causal_lineage({
+                "root_objective_fingerprint": objective,
+                "selected_revision_digest": plan_digest,
+                "selected_prefix_digest": parsed.get("journal_prefix_digest"),
+            })
         return True
     except PlanArtifactError as error:
         failure["write_status"] = (
@@ -6656,6 +7232,88 @@ def write_plan_artifact(
         failure["diagnostic"] = PlanArtifactError("write_error").metadata
     state["plan_artifact"] = failure
     return False
+
+
+def append_runtime_plan_record(
+    state: dict[str, Any], payload: dict[str, Any], *, record_type: str, data: dict[str, Any]
+) -> bool:
+    """Append bounded v3 evidence without changing executable authority.
+
+    Runtime tails are written only after their state transition is otherwise
+    proven.  The immutable executable prefix stays pinned in state, while the
+    full digest is advanced atomically so later reads still detect tampering.
+    """
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    parts = str(artifact.get("relative_path") or "").split("/")
+    if len(parts) != 3 or not artifact.get("journal_digest"):
+        return False
+    try:
+        root = _canonical_plan_data_root(payload)
+        session = plan_artifact_session_id(payload.get("session_id"))
+        if parts[1] != session or parts[2] != PLAN_JOURNAL_NAME:
+            raise PlanArtifactError("unsafe_path")
+        target = root / "plans" / session / PLAN_JOURNAL_NAME
+        with plan_session_directory_guard(root, session, create=False) as guard:
+            guard["verify"]()
+            existing = _read_plan_artifact_document(target, directory_fd=guard["directory_fd"])
+            parsed = parse_plan_journal(existing, expected_session=session)
+            if not _stored_artifact_matches_journal(artifact, parsed):
+                raise PlanArtifactError("content_drift")
+            document, updated = append_plan_journal_record(existing, record_type=record_type, data=data)
+            transaction = _atomic_write_plan_file(
+                target, document, expected_old_bytes=existing,
+                directory_fd=guard["directory_fd"], verify_binding=guard["verify"],
+            )
+            _commit_plan_write(transaction, guard["verify"])
+            _fsync_plan_directory(guard["directory_fd"])
+            installed = _read_plan_artifact_document(target, directory_fd=guard["directory_fd"])
+            if installed != document or parse_plan_journal(installed, expected_session=session) != updated:
+                raise PlanArtifactError("content_drift")
+        artifact["journal_digest"] = updated["journal_digest"]
+        artifact["journal_prefix_digest"] = updated["journal_prefix_digest"]
+        artifact["journal_prefix_bytes"] = updated["journal_prefix_bytes"]
+        artifact["updated_at"] = utc_now()
+        state["plan_artifact"] = artifact
+        latest = updated["records"][-1]
+        lineage = _safe_causal_lineage(state.get("causal_lineage"))
+        lineage.update({
+            "root_objective_fingerprint": (
+                lineage.get("root_objective_fingerprint")
+                or safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+            ),
+            "tail_record_type": latest.get("record_type"),
+            "tail_record_digest": latest.get("record_digest"),
+        })
+        if latest.get("record_type") == "terminal_seal":
+            lineage["terminal_baseline_id"] = _fingerprint32(
+                latest.get("data", {}).get("terminal_baseline_id")
+                or latest.get("data", {}).get("baseline_id")
+            )
+            lineage["terminal_seal_digest"] = latest.get("record_digest")
+        state["causal_lineage"] = _safe_causal_lineage(lineage)
+        return True
+    except (OSError, PlanArtifactError):
+        # A failed evidence append must not silently turn a verified success
+        # into a different execution contract.  Preserve the prior state for
+        # recovery and let normal artifact verification fail closed if needed.
+        return False
+
+
+def seal_completed_execution(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Persist the terminal baseline as a non-authorizing immutable v3 tail."""
+    baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
+    contract = safe_fingerprint(state.get("execution_contract_id"))
+    if not baseline or not contract or baseline.get("execution_contract_id") != contract:
+        return False
+    return append_runtime_plan_record(state, payload, record_type="terminal_seal", data={
+        "parent_revision_digest": safe_fingerprint(state.get("plan_digest")),
+        "parent_contract_id": contract,
+        "terminal_baseline_id": baseline.get("baseline_id"),
+        "root_objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+        "acceptance_status": baseline.get("acceptance_status"),
+        "change_set_digest": baseline.get("change_set_digest"),
+        "verification_digest": baseline.get("verification_digest"),
+    })
 
 
 def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> bool:
@@ -6843,6 +7501,11 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             item.get("last_execution_baseline")
         ),
         "causal_review": _safe_causal_review(item.get("causal_review")),
+        "causal_lineage": _safe_causal_lineage(item.get("causal_lineage")),
+        "lifecycle_diagnostics": [
+            value for raw in as_list(item.get("lifecycle_diagnostics"))[-4:]
+            if (value := _safe_lifecycle_diagnostic(raw)) is not None
+        ],
         "stall": _safe_stall(item.get("stall")),
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
@@ -6986,7 +7649,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     source_schema = safe_int(value.get("schema_version"))
     base["execution_slices"] = (
         _safe_execution_slices(value.get("execution_slices"))
-        if source_schema >= SCHEMA_VERSION
+        if source_schema >= 28
         else _empty_execution_slices()
     )
     source_writer = (
@@ -7036,6 +7699,13 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         in {"review_required", "recovery_started", "failed", "exhausted"}
         and value.get("executor_state") in {"verification_required", "exhausted"}
     )
+    active_profile10_continuity = bool(
+        source_schema == 28
+        and source_profile == "10"
+        and value.get("plan_state") == "confirmed"
+        and source_contract
+        and value.get("executor_state") in {"running", "verification_required"}
+    )
     # Active and failed contracts rebind to the current profile. A completed,
     # baseline-sealed contract keeps the profile it actually executed under;
     # rewriting it to v6 would either invent evidence or reopen finished work.
@@ -7046,6 +7716,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if sealed_historical_success
         or legacy_verification_pending
         or review_profile_continuity
+        or active_profile10_continuity
         else EXECUTION_PROFILE_VERSION
     )
     base["executor_state"] = (
@@ -7148,6 +7819,15 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["executor_attempt"] = max(base["executor_attempt"], 1)
         base["executor_agent_id"] = None
     base["causal_review"] = _safe_causal_review(value.get("causal_review"))
+    base["causal_lineage"] = _safe_causal_lineage(value.get("causal_lineage"))
+    base["pending_causal_revision"] = _safe_pending_causal_revision(
+        value.get("pending_causal_revision")
+    )
+    base["plan_composition"] = _safe_plan_composition(value.get("plan_composition"))
+    base["lifecycle_diagnostics"] = [
+        item for raw in as_list(value.get("lifecycle_diagnostics"))
+        if (item := _safe_lifecycle_diagnostic(raw)) is not None
+    ][-MAX_LIFECYCLE_DIAGNOSTICS:]
     if safe_int(value.get("schema_version")) >= 17:
         base["stall"] = _safe_stall(value.get("stall"))
     base["last_assistant"] = safe_metadata(value.get("last_assistant"))
@@ -7229,7 +7909,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["subagents"] = retained_subagent_records(base, contract_subagents)
     expected_contract = (
         source_contract
-        if sealed_historical_success or legacy_verification_pending or review_profile_continuity
+        if sealed_historical_success or legacy_verification_pending or review_profile_continuity or active_profile10_continuity
         else execution_contract_id(base)
     ) if base["plan_state"] == "confirmed" else None
     valid_execution_binding = bool(
@@ -7240,6 +7920,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             or sealed_historical_success
             or legacy_verification_pending
             or review_profile_continuity
+            or active_profile10_continuity
         )
     )
     if base["plan_state"] == "confirmed" and not valid_execution_binding:
@@ -7385,6 +8066,18 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["assessor_state"] = "hard_plan_ready"
         base["assessor_failure_kind"] = None
         base["model_profile"] = "work_assessment"
+        assessment_receipt = original_assessor_result_receipt(base)
+        if assessment_receipt:
+            base["plan_composition"] = _safe_plan_composition(
+                {
+                    "status": "pending",
+                    "assessor_binding_id": base.get("assessor_binding_id"),
+                    "objective_fingerprint": base.get("objective", {}).get(
+                        "fingerprint"
+                    ),
+                    "assessment_receipt": assessment_receipt,
+                }
+            )
         latest_prompt = (
             base["prompts"][-1] if as_list(base.get("prompts")) else {}
         )
@@ -7436,7 +8129,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         source_schema == 27 and base.get("assessor_state") == "running"
         and base.get("assessor_binding_id") and base.get("assessor_agent_id")
         and base.get("assessor_observed_effective")
-    ):
+    ) and not active_profile10_continuity:
         # Opaque lifecycle/request records are evidence from the old writer, not
         # authority for a resumed task. Preserve canonical plans and completed
         # baselines, but remove transient caches and rebind unfinished assessment.
@@ -7573,6 +8266,10 @@ def trim_state(state: dict[str, Any]) -> None:
     state["subagents"] = retained_subagent_records(state)
     state["compactions"] = list(state.get("compactions", []))[-MAX_COMPACTIONS:]
     state["guards"] = list(state.get("guards", []))[-MAX_GUARDS:]
+    state["lifecycle_diagnostics"] = [
+        item for raw in as_list(state.get("lifecycle_diagnostics"))
+        if (item := _safe_lifecycle_diagnostic(raw)) is not None
+    ][-MAX_LIFECYCLE_DIAGNOSTICS:]
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
     state["duplicate_notices"] = list(state.get("duplicate_notices", []))[-MAX_DUPLICATE_NOTICES:]
     state["pending_recovery_facts"] = pending_recovery_facts_for_state(state)
@@ -9831,7 +10528,7 @@ def classify_work_difficulty(
         # Explicitly declaring that no irreversible action exists is scope
         # metadata, not evidence of irreversible risk.
         critical_text = re.sub(
-            r"(?:irreversible[_ -]?action|不可逆(?:外部)?动作)\s*[:=：]\s*"
+            r"(?:irreversible[_ -]?action|不可逆(?:外部)?动作)\s*(?:[:=：]\s*)?"
             r"(?:none|no|false|无|否|不适用|n/?a)(?=$|[\s,;，；])",
             "",
             lower,
@@ -12185,6 +12882,11 @@ def session_start(payload: dict[str, Any]) -> None:
                 state.get("last_execution_baseline")
             ),
             "causal_review": _safe_causal_review(state.get("causal_review")),
+            "causal_lineage": _safe_causal_lineage(state.get("causal_lineage")),
+            "lifecycle_diagnostics": [
+                item for raw in as_list(state.get("lifecycle_diagnostics"))[-4:]
+                if (item := _safe_lifecycle_diagnostic(raw)) is not None
+            ],
             "stall": _safe_stall(state.get("stall")),
             "reference_acceptance": _safe_reference_acceptance(state.get("reference_acceptance")),
             "terminal_successes": [
@@ -12365,6 +13067,7 @@ def is_control_followup(prompt: str) -> bool:
 
 
 PLAN_CONFIRM_PATTERNS = (
+    r"(?:继续(?:啊|吧)?(?:我)?[，, ]*)?(?:严格)?确认执行",
     r"(?:严格)?确认执行",
     r"(?:严格)?确认按(?:这个|上述|该|此|新)计划执行",
     r"同意按(?:这个|上述|该|此|新)计划执行",
@@ -12411,11 +13114,14 @@ def _normalized_control_candidate(prompt: str) -> str:
     bodies and code blocks must remain opaque to control recognition.
     """
     raw = str(prompt or "")
-    if not raw or len(raw.encode("utf-8")) > 512 or "\n" in raw or "\r" in raw:
+    # Bound the original Desktop payload before trimming.  Desktop commonly
+    # adds a trailing LF/CRLF, but an embedded line break, fenced code, or
+    # extra sentence must never become an authorization control by trimming.
+    if not raw or len(raw.encode("utf-8")) > 512:
         return ""
     value = re.sub(r"(?:&#(?:32|x20);|&nbsp;)", " ", raw, flags=re.I).strip()
-    if len(value) >= 2 and value.startswith("`") and value.endswith("`") and value.count("`") == 2:
-        value = value[1:-1]
+    if not value or "\n" in value or "\r" in value or "```" in value or "`" in value:
+        return ""
     return re.sub(r"[ \t]+", " ", value).strip().lower()
 
 
@@ -12489,7 +13195,15 @@ def contains_plan_change_marker(normalized: str) -> bool:
 
 
 def plan_replan_request(prompt: str) -> bool:
-    normalized = _normalized_control_candidate(prompt)
+    inline = re.sub(
+        r"(?:&#(?:32|x20);|&nbsp;)", " ", str(prompt or ""), flags=re.I
+    ).strip()
+    inline_match = re.fullmatch(r"`([^`\r\n]+)`", inline)
+    normalized = (
+        re.sub(r"[ \t]+", " ", inline_match.group(1)).strip().lower()
+        if inline_match
+        else _normalized_control_candidate(prompt)
+    )
     if re.search(r"\b(?:is|was|are|means|mean|described|explained)\b", normalized, re.I):
         return False
     for pattern in PLAN_REPLAN_PATTERNS:
@@ -12606,6 +13320,16 @@ def unmet_acceptance_without_recorded_change(
         and not successful_acceptance_feedback(prompt)
         and any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
     )
+
+
+def causal_review_hint(prompt: str, previous: dict[str, Any]) -> str:
+    """Return only a provisional safety class; evidence controls the outcome."""
+    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    if any(marker in normalized for marker in ("仍然", "还是", "没修好", "未修好", "still fails", "not fixed")):
+        return "fix_ineffective"
+    if re.search(r"(?:执行|构建|编译|部署|测试|execution|build|deploy|test).{0,32}(?:暴露|发现|exposed|revealed)", normalized):
+        return "execution_exposed_gap"
+    return "uncertain"
 
 
 def is_progress_followup(prompt: str) -> bool:
@@ -12791,6 +13515,11 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     acceptance_miss = unmet_acceptance_without_recorded_change(
         prompt, previous, new_objective=new_objective
     )
+    scope_changed = bool(
+        not new_objective
+        and active_plan
+        and authorization_scope_change_requested(prompt)
+    )
     reference_failure = acceptance_miss or (reference_rejection and not causal_report)
     already_confirmed = previous.get("plan_state") == "confirmed"
     confirmed_plan = confirmable_pending and pure_plan_confirmation(prompt)
@@ -12809,6 +13538,38 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and not new_objective
         and prompt_changes_pending_plan(prompt)
         and not confirmed_plan
+    )
+    causal_hint = causal_review_hint(prompt, previous) if causal_report else None
+    completed_direct_followup = bool(
+        plan_changed
+        and previous.get("executor_state") == "succeeded"
+        and _safe_execution_baseline(previous.get("last_execution_baseline"))
+    )
+    pending_successor = (
+        pending_causal_successor(
+            previous,
+            causal_type=(
+                causal_hint
+                if causal_hint in EXECUTABLE_CAUSAL_TYPES
+                else "direct_followup"
+            ),
+            issue_fingerprint=text_metadata(prompt).get("fingerprint"),
+        )
+        if causal_report
+        else
+        pending_causal_successor(
+            previous,
+            causal_type="acceptance_gap_no_change",
+            issue_fingerprint=text_metadata(prompt).get("fingerprint"),
+        )
+        if acceptance_miss
+        else pending_causal_successor(
+            previous,
+            causal_type="direct_followup",
+            issue_fingerprint=text_metadata(prompt).get("fingerprint"),
+        )
+        if completed_direct_followup
+        else {}
     )
     continuation = not new_objective and (
         preference_directive is not None
@@ -12834,7 +13595,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 "difficulty_decision_id": stable_hash(f"reference\0{stable_hash(prompt)}", 24),
             }
         )
-    if continuation and not causal_report and previous.get("last_route"):
+    if continuation and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
     if (confirmable_pending or early_confirmation) and pure_plan_confirmation(prompt):
         classification["difficulty_decision_id"] = previous.get("difficulty_decision_id")
@@ -12919,10 +13680,11 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 "report_fingerprint": prompt_meta.get("fingerprint"),
                 "baseline_id": baseline.get("baseline_id"),
                 "outcome": None,
+                "causal_type": causal_hint,
                 "evidence_digest": None,
             }
             state["model_profile"] = "work_assessment"
-        elif acceptance_miss and state.get("objective"):
+        elif acceptance_miss and state.get("objective") and not pending_successor:
             prior = state["objective"]
             state["objective"] = {
                 "fingerprint": stable_hash(
@@ -12931,7 +13693,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 "length": max(safe_int(prior.get("length")), 0) + prompt_meta["length"],
                 "updated_at": utc_now(),
             }
-        elif plan_changed and state.get("objective"):
+        elif plan_changed and state.get("objective") and not pending_successor:
             prior = state["objective"]
             state["objective"] = {
                 "fingerprint": stable_hash(
@@ -12944,7 +13706,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["objective"] = {**prompt_meta, "updated_at": utc_now()}
         if not continuation or not state.get("authorization_scope"):
             state["authorization_scope"] = authorization_scope_from_prompt(prompt)
-        elif plan_changed or acceptance_miss:
+        elif plan_changed or acceptance_miss or scope_changed:
             state["authorization_scope"] = authorization_scope_from_prompt(
                 prompt, state.get("authorization_scope")
             )
@@ -12955,6 +13717,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         ):
             state["authorization_envelope"] = _safe_authorization_envelope(None)
             state["pending_confirmation_receipt"] = None
+        if pending_successor:
+            state["pending_causal_revision"] = pending_successor
         if early_confirmation:
             state["pending_confirmation_receipt"] = (
                 pending_confirmation_receipt_for_state(state)
@@ -13019,8 +13783,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if causal_report:
             # Freeze the old plan/contract for comparison. The causal guard allows only
             # evidence collection until a structured, baseline-bound conclusion is recorded.
-            if state.get("last_execution_baseline"):
-                state["last_execution_baseline"]["acceptance_status"] = "failed"
+            pass
         elif reference_failure:
             state["plan_state"] = "analyzing"
             state["plan_digest"] = None
@@ -13030,8 +13793,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["confirmed_at"] = None
             reset_executor_binding(state)
             state["causal_review"] = _safe_causal_review(None)
-            if state.get("last_execution_baseline"):
-                state["last_execution_baseline"]["acceptance_status"] = "failed"
             state["model_profile"] = "work_assessment"
         elif confirmed_plan:
             envelope_digest = authorization_envelope_digest(state)
@@ -13100,7 +13861,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                     }
                 )
         assessor_needed = classification.get("task_domain") == "work" and (
-            not continuation or causal_report or reference_failure or replan or plan_changed
+            not continuation or reference_failure or replan or plan_changed
         )
         if assessor_needed:
             hard_assessment = bool(
@@ -13260,7 +14021,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             f"supports a bound conclusion. baseline_id={review.get('baseline_id')} "
             f"review_id={review.get('review_id')}. End the assessment with exactly: CAUSAL_REVIEW "
             f"baseline_id={review.get('baseline_id')} review_id={review.get('review_id')} "
-            "outcome=<introduced|fix_ineffective|unrelated|uncertain> evidence_digest=<32hex>."
+            "outcome=<direct_followup|introduced_regression|verified_side_effect|fix_ineffective|"
+            "acceptance_gap_no_change|execution_exposed_gap|uncertain|explanatory_conclusion|"
+            "unrelated_new_objective> evidence_digest=<32hex>."
         )
     elif reference_failure:
         context += (
@@ -13663,6 +14426,18 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 f"({snapshot_failure}); mutation cannot fail open."
             )
             return
+    if is_subagent_spawn_tool(payload) and not active_hard_lifecycle(state):
+        def record_ordinary_spawn(current: dict[str, Any]) -> None:
+            record_lifecycle_diagnostic(
+                current,
+                "ordinary_spawn_no_active_hard",
+                level="info",
+                role="lane",
+                request_fingerprint=fingerprint,
+            )
+
+        # Informational only: ordinary Codex scheduling remains entirely native.
+        mutate_state(payload, record_ordinary_spawn)
     nested_caller = next(
         (
             safe_label(payload.get(key), 120)
@@ -13752,11 +14527,9 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         ) in {"triage_required", "triaging"}
         assessor_intent = bool(
             not causal_active
-            and (
-                state.get("assessor_state")
-                in {"spawn_required", "recovery_required"}
-                or subagent_request_has_assessor_intent(payload)
-            )
+            and active_hard_lifecycle(state)
+            and state.get("assessor_state")
+            in {"spawn_required", "spawn_pending", "running", "recovery_required"}
         )
         assessor_ok, assessor_reason = confirmed_assessor_request(payload, state)
         if causal_active:
@@ -14404,6 +15177,11 @@ def compact_event(payload: dict[str, Any], phase: str) -> None:
                     state.get("last_execution_baseline")
                 ),
                 "causal_review": _safe_causal_review(state.get("causal_review")),
+                "causal_lineage": _safe_causal_lineage(state.get("causal_lineage")),
+                "lifecycle_diagnostics": [
+                    item for raw in as_list(state.get("lifecycle_diagnostics"))[-4:]
+                    if (item := _safe_lifecycle_diagnostic(raw)) is not None
+                ],
                 "stall": _safe_stall(state.get("stall")),
                 "active_agent_scopes": active_agent_scope_summary(state),
                 "recent_successes": [
@@ -14885,6 +15663,32 @@ def subagent_start(payload: dict[str, Any]) -> None:
     executor_request = request.get("role") == "confirmed_executor"
     assessor_request = request.get("role") == "high_assessor"
     if not executor_request and not assessor_request:
+        expected_role = expected_bound_role(previous)
+
+        def record_unbound_start(state: dict[str, Any]) -> None:
+            if expected_role and active_hard_lifecycle(state):
+                record_lifecycle_diagnostic(
+                    state,
+                    "pretool_missing",
+                    level="error",
+                    role=expected_role,
+                    agent_id=payload.get("agent_id"),
+                    contract_id=(
+                        state.get("assessor_binding_id")
+                        if expected_role == "high_assessor"
+                        else state.get("execution_contract_id")
+                    ),
+                )
+            elif not active_hard_lifecycle(state):
+                record_lifecycle_diagnostic(
+                    state,
+                    "ordinary_spawn_no_active_hard",
+                    level="info",
+                    role="lane",
+                    agent_id=payload.get("agent_id"),
+                )
+
+        mutate_state(payload, record_unbound_start)
         emit_continue()
         return
     observed_model, observed_effort, observation_source = start_turn_observation(payload)
@@ -14927,6 +15731,15 @@ def subagent_start(payload: dict[str, Any]) -> None:
             # profile conflict.  It still never becomes a running role.
             conflict = subagent_start_conflict_reason(state, agent_id, bound_request)
         if conflict:
+            record_lifecycle_diagnostic(
+                state,
+                "contract_mismatch",
+                level="error",
+                role=("confirmed_executor" if executor_request else "high_assessor"),
+                request_fingerprint=bound_request.get("request_fingerprint"),
+                agent_id=agent_id,
+                contract_id=bound_request.get("contract_id"),
+            )
             state.setdefault("guards", []).append(
                 {
                     "at": utc_now(),
@@ -15067,6 +15880,16 @@ def subagent_start(payload: dict[str, Any]) -> None:
                     or state.get("execution_contract_id") != execution_contract_id(state)
                     else "start_mismatch"
                 )
+                if state["executor_failure_kind"] in {"stale_contract", "start_mismatch"}:
+                    record_lifecycle_diagnostic(
+                        state,
+                        "contract_mismatch",
+                        level="error",
+                        role="confirmed_executor",
+                        request_fingerprint=bound_request.get("request_fingerprint"),
+                        agent_id=agent_id,
+                        contract_id=request_contract,
+                    )
         if assessor_request:
             bound = bool(state.get("assessor_state") == "spawn_pending" and bound_request.get("contract_id") == state.get("assessor_binding_id") and objective_fingerprint == state.get("objective", {}).get("fingerprint") and safe_int(bound_request.get("attempt")) == safe_int(state.get("assessor_attempt")))
             matched = bool(
@@ -15089,6 +15912,16 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 if binding_error == "model_unavailable"
                 else "start_mismatch"
             )
+            if not matched and binding_error != "model_unavailable":
+                record_lifecycle_diagnostic(
+                    state,
+                    "contract_mismatch",
+                    level="error",
+                    role="high_assessor",
+                    request_fingerprint=bound_request.get("request_fingerprint"),
+                    agent_id=agent_id,
+                    contract_id=bound_request.get("contract_id"),
+                )
             if matched:
                 state["assessment_liveness"] = {
                     "binding_id": state.get("assessor_binding_id"), "agent_id": agent_id,
@@ -15254,6 +16087,23 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         previous.get("assessor_agent_id"),
         previous.get("executor_agent_id"),
     }:
+        expected_role = expected_bound_role(previous)
+        if expected_role and active_hard_lifecycle(previous):
+            def record_missing_start(state: dict[str, Any]) -> None:
+                record_lifecycle_diagnostic(
+                    state,
+                    "start_missing",
+                    level="error",
+                    role=expected_role,
+                    agent_id=agent_id,
+                    contract_id=(
+                        state.get("assessor_binding_id")
+                        if expected_role == "high_assessor"
+                        else state.get("execution_contract_id")
+                    ),
+                )
+
+            mutate_state(payload, record_missing_start)
         emit_continue()
         return
     started_objective = str((started or {}).get("objective_fingerprint") or "")
@@ -15333,7 +16183,29 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 None,
             )
             current_started = (current_result_group or {}).get("request")
-        successful = terminal_succeeded(current_started)
+        # Stall diagnosis is a bounded follow-up to the already-proven
+        # assessor lifecycle, not a fresh child spawn needing another Start.
+        start_missing = current_result_group is not None and not stall_assessor
+        successful = terminal_succeeded(current_started) and not start_missing
+        if start_missing:
+            missing_role = str((current_started or {}).get("role") or "lane")
+            record_lifecycle_diagnostic(
+                state,
+                "start_missing",
+                level="error",
+                role=missing_role,
+                request_fingerprint=(current_started or {}).get("request_fingerprint"),
+                agent_id=agent_id,
+                contract_id=(current_started or {}).get("contract_id"),
+            )
+            if missing_role == "confirmed_executor":
+                state["executor_state"] = "recovery_required"
+                state["executor_failure_kind"] = "start_mismatch"
+                state["executor_agent_id"] = None
+            elif missing_role == "high_assessor":
+                state["assessor_state"] = "recovery_required"
+                state["assessor_failure_kind"] = "start_mismatch"
+                state["assessor_agent_id"] = None
         marker_result_current = bool(
             execution_result
             and execution_result.group(1) == state.get("execution_contract_id")
@@ -15345,6 +16217,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         native_result_current = bool(
             executor_agent
             and current_started is not None
+            and not start_missing
             and not execution_result_intent
             and str(result or "").strip()
         )
@@ -15374,6 +16247,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             # failed/cancelled status still fails closed.
             successful = bool(
                 current_started is not None
+                and not start_missing
                 and execution_result_succeeded
                 and status_value not in ERROR_STATUSES
                 and not explicit_unknown_status
@@ -15630,7 +16504,10 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 and assessment_binding == state.get("assessor_binding_id")
                 and lifecycle_current
             )
-            if assessment and mutated:
+            if start_missing:
+                state["assessor_state"] = "recovery_required"
+                state["assessor_failure_kind"] = "start_mismatch"
+            elif assessment and mutated:
                 state["assessor_state"] = "failed"
                 state["assessor_failure_kind"] = "hard_mutation_before_confirmation"
             elif assessor_lifecycle_error:
@@ -15674,6 +16551,21 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                     # writes the one native canonical plan without a second
                     # assessor or another user confirmation.
                     state["plan_state"] = "analyzing"
+                    receipt = original_assessor_result_receipt(state)
+                    if receipt:
+                        state["plan_composition"] = _safe_plan_composition({
+                            "status": "pending",
+                            "assessor_binding_id": state.get("assessor_binding_id"),
+                            "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+                            "assessment_receipt": receipt,
+                            "turn_id": (effective_started or {}).get("turn_id"),
+                        })
+                        pending_causal = _safe_pending_causal_revision(
+                            state.get("pending_causal_revision")
+                        )
+                        if pending_causal:
+                            pending_causal["creation_state"] = "plan_composition"
+                            state["pending_causal_revision"] = pending_causal
             state["last_route"] = {**safe_route(state.get("last_route")), "work_difficulty": state.get("work_difficulty"), "difficulty_confidence": state.get("difficulty_confidence"), "difficulty_rule_codes": state.get("difficulty_rule_codes"), "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION, "difficulty_decision_id": state.get("difficulty_decision_id"), "model_profile": state.get("model_profile"), "at": utc_now()}
 
     updated_state, _ = mutate_state(payload, update)
@@ -15742,7 +16634,9 @@ CAUSAL_REVIEW_RESULT_RE = re.compile(
     r"(?im)^\s*CAUSAL_REVIEW\s+"
     r"baseline_id=([0-9a-f]{32})\s+"
     r"review_id=([0-9a-f]{32})\s+"
-    r"outcome=(introduced|fix_ineffective|unrelated|uncertain)\s+"
+    r"outcome=(direct_followup|introduced_regression|verified_side_effect|"
+    r"fix_ineffective|acceptance_gap_no_change|execution_exposed_gap|uncertain|"
+    r"explanatory_conclusion|unrelated_new_objective|introduced|unrelated)\s+"
     r"evidence_digest=([0-9a-f]{32})\s*$"
 )
 EXECUTION_REVIEW_RE = re.compile(
@@ -16070,6 +16964,17 @@ def stop(payload: dict[str, Any]) -> None:
                     state["executor_review"] = review
                     state["model_profile"] = confirmed_executor_model_profile(state)
                     state["causal_review"] = _safe_causal_review(None)
+                    if not seal_completed_execution(state, payload):
+                        # A terminal lifecycle without its durable seal is not
+                        # publishable completion. Keep the bounded candidate
+                        # available for normal recovery instead of claiming a
+                        # success that cannot be causally continued.
+                        state["executor_state"] = "recovery_required"
+                        state["executor_failure_kind"] = "verification_failed"
+                        review["status"] = "failed"
+                        state["executor_review"] = review
+                        state["model_profile"] = "work_assessment"
+                        return
                     stall = _safe_stall(state.get("stall"))
                     if (
                         stall.get("state") == "resuming"
@@ -16151,35 +17056,60 @@ def stop(payload: dict[str, Any]) -> None:
         if review.get("state") in {"triage_required", "triaging"}:
             if causal_match:
                 baseline_id, review_id, outcome, evidence_digest = causal_match.groups()
+                causal_type = LEGACY_CAUSAL_OUTCOME_MAP.get(outcome, outcome)
+                baseline = _safe_execution_baseline(
+                    state.get("last_execution_baseline")
+                )
                 binding_valid = bool(
                     baseline_id == review.get("baseline_id")
                     and review_id == review.get("review_id")
-                    and baseline_id
-                    == _safe_execution_baseline(
-                        state.get("last_execution_baseline")
-                    ).get("baseline_id")
+                    and baseline_id == baseline.get("baseline_id")
+                    and causal_type in CAUSAL_TYPES
+                    and not (
+                        causal_type == "introduced_regression"
+                        and not baseline.get("change_set_digest")
+                    )
                 )
                 if binding_valid:
                     review["outcome"] = outcome
+                    review["causal_type"] = causal_type
                     review["evidence_digest"] = evidence_digest
-                    if outcome == "uncertain":
+                    if causal_type == "uncertain":
                         review["state"] = "triaging"
                         state["model_profile"] = "work_assessment"
-                    else:
+                    elif causal_type == "explanatory_conclusion":
+                        if append_runtime_plan_record(
+                            state,
+                            payload,
+                            record_type="durable_conclusion",
+                            data={
+                                "causal_type": causal_type,
+                                "parent_revision_digest": state.get("plan_digest"),
+                                "parent_contract_id": state.get("execution_contract_id"),
+                                "terminal_baseline_id": baseline_id,
+                                "root_objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+                                "issue_fingerprint": review.get("report_fingerprint"),
+                                "conclusion_digest": evidence_digest,
+                                "evidence_digest": evidence_digest,
+                            },
+                        ):
+                            review["state"] = "resolved"
+                        else:
+                            review["state"] = "triaging"
+                            state["model_profile"] = "work_assessment"
+                    elif causal_type == "unrelated_new_objective":
                         review["state"] = "resolved"
                         report_fingerprint = str(review.get("report_fingerprint") or "")
-                        prior_objective = str(
-                            state.get("objective", {}).get("fingerprint") or ""
-                        )
                         state["objective"] = {
-                            "fingerprint": stable_hash(
-                                f"{prior_objective}\0{report_fingerprint}\0{review_id}", 16
-                            ),
-                            "length": max(
-                                safe_int(state.get("objective", {}).get("length")), 0
-                            ),
+                            "fingerprint": report_fingerprint,
+                            "length": 0,
                             "updated_at": utc_now(),
                         }
+                        state["authorization_scope"] = _safe_authorization_scope(None)
+                        state["authorization_envelope"] = _safe_authorization_envelope(None)
+                        state["pending_confirmation_receipt"] = None
+                        state["pending_causal_revision"] = {}
+                        state["causal_lineage"] = _safe_causal_lineage(None)
                         state["plan_state"] = "analyzing"
                         state["plan_digest"] = None
                         state["plan_objective_fingerprint"] = None
@@ -16187,39 +17117,49 @@ def stop(payload: dict[str, Any]) -> None:
                         state["confirmed_plan_digest"] = None
                         state["confirmed_at"] = None
                         reset_executor_binding(state)
-                        prior_followup_difficulty = state.get("work_difficulty")
-                        prior_followup_confidence = state.get("difficulty_confidence")
-                        prior_followup_rules = list(state.get("difficulty_rule_codes") or [])
-                        prior_followup_decision = state.get("difficulty_decision_id")
                         state["task_domain"] = "work"
-                        state["work_difficulty"] = (
-                            "hard"
-                            if outcome in {"introduced", "fix_ineffective"}
-                            else (
-                                prior_followup_difficulty
-                                if prior_followup_difficulty in {"simple", "hard"}
-                                else "unknown"
-                            )
+                        state["model_profile"] = "work_assessment"
+                        state["assessor_generation"] = max(
+                            safe_int(state.get("assessor_generation")), 0
+                        ) + 1
+                        state["assessor_binding_id"] = assessor_binding_id(state)
+                        state["assessor_state"] = "spawn_required"
+                        state["assessor_agent_id"] = None
+                        state["assessor_attempt"] = 0
+                        state["assessor_failure_kind"] = None
+                        state["assessor_input_fingerprint"] = report_fingerprint
+                    else:
+                        review["state"] = "resolved"
+                        successor = _safe_pending_causal_revision(
+                            state.get("pending_causal_revision")
                         )
-                        state["difficulty_confidence"] = (
-                            "high"
-                            if outcome in {"introduced", "fix_ineffective"}
-                            else (
-                                prior_followup_confidence
-                                if prior_followup_confidence in {"low", "medium", "high"}
-                                else "low"
-                            )
-                        )
-                        state["difficulty_rule_codes"] = (
-                            ["causal_regression_review"]
-                            if outcome in {"introduced", "fix_ineffective"}
-                            else prior_followup_rules or ["causal_unrelated_followup"]
-                        )
-                        state["difficulty_decision_id"] = (
-                            stable_hash(f"causal\0{outcome}\0{review_id}", 24)
-                            if outcome in {"introduced", "fix_ineffective"}
-                            else safe_fingerprint(prior_followup_decision)
-                            or stable_hash(f"causal\0{outcome}\0{review_id}", 24)
+                        if successor:
+                            successor.update({
+                                "causal_type": causal_type,
+                                "creation_state": "assessment_required",
+                                "evidence_digest": evidence_digest,
+                            })
+                            successor = _safe_pending_causal_revision(successor)
+                        if not successor:
+                            review["state"] = "triaging"
+                            review["causal_type"] = "uncertain"
+                            state["model_profile"] = "work_assessment"
+                            state["causal_review"] = review
+                            return
+                        state["pending_causal_revision"] = successor
+                        state["plan_state"] = "analyzing"
+                        state["plan_digest"] = None
+                        state["plan_objective_fingerprint"] = None
+                        state["plan_difficulty_decision_id"] = None
+                        state["confirmed_plan_digest"] = None
+                        state["confirmed_at"] = None
+                        reset_executor_binding(state)
+                        state["task_domain"] = "work"
+                        state["work_difficulty"] = "hard"
+                        state["difficulty_confidence"] = "high"
+                        state["difficulty_rule_codes"] = ["causal_followup_review"]
+                        state["difficulty_decision_id"] = stable_hash(
+                            f"causal\0{causal_type}\0{review_id}", 24
                         )
                         state["model_profile"] = "work_assessment"
                         route = dict(state.get("last_route") or {})
@@ -16250,12 +17190,23 @@ def stop(payload: dict[str, Any]) -> None:
             "invalidated",
             "repair_required",
         }:
-            if plan_ready:
+            composition = _safe_plan_composition(state.get("plan_composition"))
+            composition_valid = bool(
+                composition.get("status") == "pending"
+                and composition.get("assessor_binding_id")
+                == state.get("assessor_binding_id")
+                and composition.get("objective_fingerprint")
+                == state.get("objective", {}).get("fingerprint")
+                and composition.get("assessment_receipt")
+                == original_assessor_result_receipt(state)
+            )
+            if plan_ready and composition_valid:
                 state["confirmed_plan_digest"] = None
                 state["confirmed_at"] = None
                 reset_executor_binding(state)
                 state["plan_state"] = "analyzing"
                 if write_plan_artifact(state, payload, assistant_message):
+                    state["plan_composition"] = _safe_plan_composition(None)
                     state["plan_state"] = "awaiting_confirmation"
                     auto_confirm_trusted_plan(state, payload)
                 else:

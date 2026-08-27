@@ -1994,6 +1994,8 @@ class PlanArtifactTests(unittest.TestCase):
                 "content_digest",
                 "current_revision_digest",
                 "journal_digest",
+                "journal_prefix_digest",
+                "journal_prefix_bytes",
                 "generation",
                 "revision_count",
                 "lifecycle_status",
@@ -2593,6 +2595,35 @@ class ManifestDiagnosticContractTests(unittest.TestCase):
                 HOOK.parse_execution_slice_manifest(body)
             self.assertEqual(caught.exception.code, code)
             self.assertLessEqual(len(HOOK.canonical_json(caught.exception.metadata).encode("utf-8")), 512)
+
+
+class JournalV3Tests(unittest.TestCase):
+    def test_v3_tail_preserves_v2_prefix_and_is_typed(self) -> None:
+        body = "A bounded executable plan.\n"
+        v2, _ = HOOK.append_plan_journal_revision(
+            None, session="session-0123456789abcdef", generation=1, body=body,
+            objective_fingerprint="a" * 16, difficulty_decision_id="b" * 16,
+            created_at="2026-08-27T00:00:00+00:00",
+        )
+        v3, parsed = HOOK.append_plan_journal_record(
+            v2, record_type="terminal_seal",
+            data={"baseline_id": "c" * 32, "acceptance_status": "passed"},
+        )
+        self.assertTrue(v3.startswith(v2))
+        self.assertEqual(parsed["journal_format_version"], 3)
+        self.assertEqual(parsed["records"][-1]["record_type"], "terminal_seal")
+
+    def test_unproven_regression_and_transcript_are_rejected(self) -> None:
+        v2, _ = HOOK.append_plan_journal_revision(
+            None, session="session-0123456789abcdef", generation=1, body="plan\n",
+            objective_fingerprint="a" * 16, difficulty_decision_id="b" * 16,
+            created_at="2026-08-27T00:00:00+00:00",
+        )
+        with self.assertRaises(HOOK.PlanArtifactError):
+            HOOK.append_plan_journal_record(v2, record_type="executable_revision", data={
+                "causal_type": "introduced_regression", "creation_state": "planned"})
+        with self.assertRaises(HOOK.PlanArtifactError):
+            HOOK.append_plan_journal_record(v2, record_type="durable_conclusion", data={"message": "raw chat"})
 
 
 if __name__ == "__main__":
