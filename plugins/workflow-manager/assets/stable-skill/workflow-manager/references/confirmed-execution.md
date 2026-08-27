@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 29/writer 1.0.51 uses execution profile v11 and an append-only canonical journal v3.
+This reference applies only after a Hard plan is confirmed. Schema 30/writer 1.0.52 uses execution profile v11 and an append-only canonical journal v3.
 
 ## Minimal authority model
 
@@ -24,6 +24,8 @@ For assessor, executor, and typed recovery, resolve one original lifecycle from 
 These sources and flattened state must agree on current objective/contract, monotonic sequence, requested and observed model, reasoning effort, and `fork_turns=1`. Do not infer missing facts from flattened fields, child messages, partial events, or later summaries. Missing, unknown, or rejected host acceptance maps to `model_unavailable`; every other request/Start/state conflict maps to `start_mismatch`.
 
 The Hook may privately inject the verified plan and host-issued `execution_contract_id` at Start without reading plugin state from the child. A Start seen before Post remains mutation-locked; only the later exact Post plus an in-lock journal recheck can make it running.
+
+If Desktop omits `SubagentStop` but a parent `list_agents` result exposes one structured `completed` mailbox entry for the uniquely bound executor, the Hook may append a separate `mailbox_terminal` equivalent boundary. It requires the current request, accepted Post, full Start, agent/task, contract, slice, and attempt to agree and the completed body to end with one exact matching `EXECUTION_RESULT`. It never fabricates or increments `SubagentStop`; `wait_agent` update summaries, running snapshots, commentary, ordinary unbound agents, duplicates, ambiguity, malformed markers, and drift remain non-terminal.
 
 ## Native plan and journal
 
@@ -72,10 +74,12 @@ All failure, stall, incomplete, and verification recovery uses the same producti
 
 At each boundary the Hook derives one host-generated evidence digest and failure fingerprint from lifecycle, terminal, operation-ledger, and review facts. Never search state files or infer them from child prose. Recovery state does not force another turn or child: the parent may diagnose, independently verify, replan, or finish natively. Only if the model chooses an encrypted or plaintext recovery spawn, the parent supplies those Hook-issued facts plus the diagnosed root cause and material correction. The Hook persists only digests and atomically reserves that fresh child inside the existing authorization envelope; this is not another confirmation.
 
+An exact recovery delegation may race ahead of the matching mailbox terminal observation. While the current executor remains uniquely live, retain only a contract/task/agent/attempt-bound `terminal_pending` digest record with no spawn or mutation authority. Promote it only when the later completed boundary reports the same typed failure fingerprint and evidence digest; if the terminal boundary arrives first, a later exact recovery binds normally. Conflicts are discarded fail-closed and raw prompt, result, root-cause, and correction text are never persisted.
+
 Recovery sequence is positive, monotonic, and limited only by bounded state byte/node budget. Reject an unchanged replay of the same failure fingerprint when it has no new evidence, root cause, progress, or material correction. Allow new evidence, a diagnosed root cause, a material correction, or a different fingerprint. Three or more distinct failure fingerprints are valid. Never revive a terminal child, use `followup_task` on it, nest an executor, overlap the writer, repeat an unchanged failed method, or lower acceptance.
 
 ## Migration and resume
 
-Historical sealed success preserves its real profile/contract. Active old-profile write authority does not silently become v10; it must acquire a current trusted plan and lifecycle. Compaction preserves only bounded bindings, digests, sequences, and evidence—not prompt, plan, child-result, diagnosis, or review prose.
+Historical sealed success preserves its real profile/contract. Active old-profile write authority does not silently become v11; it must acquire a current trusted plan and lifecycle. Schema 29/profile-v11 running continuity may migrate lazily to Schema 30 only with its exact live request/Post/full-Start binding intact. Compaction preserves only bounded bindings, digests, sequences, and evidence—not prompt, plan, child-result, diagnosis, or review prose.
 
 Native summaries own ordinary continuity. A same-session resume may reconcile a verified host compaction window, but compaction evidence never grants mutation or replaces parent review.

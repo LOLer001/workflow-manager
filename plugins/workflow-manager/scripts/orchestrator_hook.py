@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 29
-WRITER_VERSION = "1.0.51"
+SCHEMA_VERSION = 30
+WRITER_VERSION = "1.0.52"
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
 EXECUTION_PROFILE_VERSION = "11"
@@ -135,6 +135,7 @@ EXECUTOR_FAILURE_KINDS = {
     "verification_failed",
     "incomplete_execution",
 }
+TERMINAL_SUBAGENT_EVENTS = frozenset({"stop", "mailbox_terminal"})
 # Executor and assessor sequence values are monotonic identities, never retry
 # budgets.  Persistence byte/node budgets are the only generic growth bound.
 RECOVERY_EXECUTOR_MODEL = "gpt-5.6-sol"
@@ -1200,7 +1201,7 @@ def _legacy_candidate_executor_review(
     )
     candidate_evidence: str | None = None
     for item in reversed(as_list(value.get("subagents"))):
-        if not isinstance(item, dict) or item.get("event") != "stop":
+        if not isinstance(item, dict) or item.get("event") not in TERMINAL_SUBAGENT_EVENTS:
             continue
         if item.get("role") != "confirmed_executor":
             continue
@@ -1429,7 +1430,7 @@ def original_assessor_result_receipt(state: dict[str, Any]) -> str | None:
         item
         for item in as_list(state.get("subagents"))
         if isinstance(item, dict)
-        and item.get("event") == "stop"
+        and item.get("event") in TERMINAL_SUBAGENT_EVENTS
         and item.get("role") == "high_assessor"
         and item.get("agent_id") == lifecycle.get("agent_id")
         and item.get("contract_id") == lifecycle.get("binding_id")
@@ -1496,7 +1497,7 @@ def restore_native_executor_review_candidate(
         record
         for record in as_list(state.get("subagents"))
         if isinstance(record, dict)
-        and record.get("event") == "stop"
+        and record.get("event") in TERMINAL_SUBAGENT_EVENTS
         and record.get("role") == "confirmed_executor"
         and record.get("contract_id") == state.get("execution_contract_id")
         and record.get("slice_id") == item.get("id")
@@ -1713,7 +1714,8 @@ def reconcile_post_accepted_bound_start(
         or started.get("start_observed") != "full"
         or not started.get("observation_source")
         or any(
-            item.get("event") == "stop" and item.get("agent_id") == agent_id
+            item.get("event") in TERMINAL_SUBAGENT_EVENTS
+            and item.get("agent_id") == agent_id
             for item in records
         )
     ):
@@ -2118,6 +2120,74 @@ def _normalized_recovery_digest(value: Any, domain: str) -> str | None:
     return token if len(token) == 32 else stable_hash(f"{domain}\0{token}", 32)
 
 
+def _recovery_prompt_claim(
+    prompt: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse digest-only recovery input without deciding that recovery exists."""
+    failures = re.findall(
+        r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]\s*([a-z_]+)\b",
+        prompt,
+        re.I,
+    )
+    failure_values = {value.lower() for value in failures}
+    failure = next(iter(failure_values)) if len(failure_values) == 1 else None
+    if failure not in EXECUTOR_FAILURE_KINDS:
+        return None, "recovery reservation requires one typed failure"
+
+    def one_token(marker: str) -> str | None:
+        values = [value.lower() for value in re.findall(marker, prompt, re.I)]
+        return values[0] if values and len(set(values)) == 1 else None
+
+    failure_fingerprint = _normalized_recovery_digest(
+        one_token(
+            r"(?:failure_fingerprint|failure-fingerprint|失败指纹)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+        ),
+        "workflow-manager-external-failure-v1",
+    )
+    evidence = _normalized_recovery_digest(
+        one_token(
+            r"(?:evidence_digest|evidence-digest|verification_evidence_digest|verification-evidence-digest)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+        ),
+        "workflow-manager-external-evidence-v1",
+    )
+    progress_token = one_token(
+        r"(?:progress_digest|progress-digest|进展摘要)\s*[:=：]\s*([0-9a-f]{32,64})\b"
+    )
+    progress = (
+        _normalized_recovery_digest(
+            progress_token, "workflow-manager-external-progress-v1"
+        )
+        if progress_token
+        else None
+    )
+    if not failure_fingerprint or not evidence:
+        return None, (
+            "recovery reservation requires one failure fingerprint and evidence digest"
+        )
+    root_matches = re.findall(
+        r"(?:root_cause|root-cause|根因)\s*[:=：]\s*([^\n\r]{2,512})",
+        prompt,
+        re.I,
+    )
+    correction_matches = re.findall(
+        r"(?:material_correction|material-correction|实质修正)\s*[:=：]\s*([^\n\r]{8,2048})",
+        prompt,
+        re.I,
+    )
+    if len(root_matches) != 1 or len(correction_matches) != 1:
+        return None, (
+            "recovery reservation requires one root cause and material correction"
+        )
+    return {
+        "failure_kind": failure,
+        "failure_fingerprint": failure_fingerprint,
+        "evidence_digest": evidence,
+        "progress_digest": progress,
+        "root_cause_digest": stable_hash(root_matches[0].strip(), 32),
+        "correction_digest": stable_hash(correction_matches[0].strip(), 32),
+    }, None
+
+
 def _recovery_lifecycle_projection(
     state: dict[str, Any], event: str, contract: str, attempt: int
 ) -> dict[str, Any] | None:
@@ -2127,7 +2197,11 @@ def _recovery_lifecycle_projection(
             item
             for item in reversed(as_list(state.get("subagents")))
             if isinstance(item, dict)
-            and item.get("event") == event
+            and (
+                item.get("event") == event
+                or event == "stop"
+                and item.get("event") in TERMINAL_SUBAGENT_EVENTS
+            )
             and item.get("role") == "confirmed_executor"
             and item.get("contract_id") == contract
             and safe_sequence(item.get("attempt")) == attempt
@@ -2309,6 +2383,11 @@ def _safe_pending_recovery_facts(value: Any) -> dict[str, Any] | None:
         "objective_fingerprint": objective,
         "slice_id": slice_id,
         "slice_contract_id": slice_contract,
+        "source": (
+            value.get("source")
+            if value.get("source") in {"host_lifecycle", "mailbox_final"}
+            else "host_lifecycle"
+        ),
     }
 
 
@@ -2328,8 +2407,37 @@ def _build_pending_recovery_facts(state: dict[str, Any]) -> dict[str, Any] | Non
         and slice_contract
     ):
         return None
-    evidence = executor_recovery_evidence_digest(state, str(failure))
-    fingerprint = recovery_fingerprint(state, str(failure), evidence)
+    mailbox_terminal = next(
+        (
+            item
+            for item in reversed(as_list(state.get("subagents")))
+            if isinstance(item, dict)
+            and item.get("event") == "mailbox_terminal"
+            and item.get("terminal_lifecycle_source") == "mailbox_completed"
+            and item.get("role") == "confirmed_executor"
+            and item.get("contract_id") == contract
+            and item.get("slice_id") == slice_id
+            and item.get("slice_contract_id") == slice_contract
+            and safe_sequence(item.get("attempt"))
+            == safe_sequence(state.get("executor_attempt"))
+            and item.get("execution_result_contract_match") is True
+            and item.get("execution_result_outcome") == "failed"
+            and item.get("reported_failure_kind") == failure
+            and _fingerprint32(item.get("reported_failure_fingerprint"))
+            and _fingerprint32(item.get("reported_evidence_digest"))
+        ),
+        None,
+    )
+    evidence = (
+        _fingerprint32(mailbox_terminal.get("reported_evidence_digest"))
+        if mailbox_terminal
+        else executor_recovery_evidence_digest(state, str(failure))
+    )
+    fingerprint = (
+        _fingerprint32(mailbox_terminal.get("reported_failure_fingerprint"))
+        if mailbox_terminal
+        else recovery_fingerprint(state, str(failure), evidence)
+    )
     if not evidence or not fingerprint:
         return None
     return {
@@ -2341,6 +2449,7 @@ def _build_pending_recovery_facts(state: dict[str, Any]) -> dict[str, Any] | Non
         "objective_fingerprint": objective,
         "slice_id": slice_id,
         "slice_contract_id": slice_contract,
+        "source": "mailbox_final" if mailbox_terminal else "host_lifecycle",
     }
 
 
@@ -2374,7 +2483,7 @@ def _safe_pending_recovery_reservation(value: Any) -> dict[str, Any] | None:
     prompt_receipt = _fingerprint32(value.get("prompt_receipt"))
     if not all((contract, objective, slice_id, slice_contract, prompt_receipt)):
         return None
-    return {
+    result = {
         **record,
         "execution_contract_id": contract,
         "objective_fingerprint": objective,
@@ -2382,6 +2491,110 @@ def _safe_pending_recovery_reservation(value: Any) -> dict[str, Any] | None:
         "slice_contract_id": slice_contract,
         "prompt_receipt": prompt_receipt,
     }
+    if value.get("stage") == "terminal_pending":
+        terminal_attempt = safe_sequence(value.get("terminal_attempt"))
+        terminal_agent_id = (
+            safe_label(value.get("terminal_agent_id"), 120)
+            if value.get("terminal_agent_id")
+            else None
+        )
+        terminal_task_name = (
+            safe_label(value.get("terminal_task_name"), 120)
+            if value.get("terminal_task_name")
+            else None
+        )
+        terminal_request_fingerprint = safe_fingerprint(
+            value.get("terminal_request_fingerprint")
+        )
+        if not all(
+            (
+                terminal_attempt > 0,
+                terminal_agent_id,
+                terminal_task_name,
+                terminal_request_fingerprint,
+            )
+        ):
+            return None
+        result.update(
+            {
+                "stage": "terminal_pending",
+                "terminal_attempt": terminal_attempt,
+                "terminal_agent_id": terminal_agent_id,
+                "terminal_task_name": terminal_task_name,
+                "terminal_request_fingerprint": terminal_request_fingerprint,
+            }
+        )
+    return result
+
+
+def _unique_running_executor_group(
+    state: dict[str, Any], reservation: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Resolve one fully bound live executor; ambiguity always returns None."""
+    contract = _fingerprint32(state.get("execution_contract_id"))
+    current = current_execution_slice(state) or {}
+    attempt = safe_sequence(state.get("executor_attempt"))
+    agent_id = (
+        safe_label(state.get("executor_agent_id"), 120)
+        if state.get("executor_agent_id")
+        else None
+    )
+    if not (
+        state.get("plan_state") == "confirmed"
+        and state.get("confirmed_plan_digest") == state.get("plan_digest")
+        and state.get("executor_state") == "running"
+        and contract
+        and contract == execution_contract_id(state)
+        and current.get("id")
+        and slice_contract_id(state)
+        and attempt > 0
+        and agent_id
+    ):
+        return None
+    matches: list[dict[str, Any]] = []
+    for group in subagent_lifecycle_groups(state):
+        request = group.get("request")
+        started = group.get("start")
+        if not (
+            group.get("state") == "live"
+            and group.get("agent_id") == agent_id
+            and isinstance(request, dict)
+            and isinstance(started, dict)
+            and request.get("role") == "confirmed_executor"
+            and request.get("requested") is True
+            and request.get("host_accepted") is True
+            and request.get("contract_id") == contract
+            and request.get("slice_id") == current.get("id")
+            and request.get("slice_contract_id") == slice_contract_id(state)
+            and safe_sequence(request.get("attempt")) == attempt
+            and started.get("request_fingerprint")
+            == request.get("request_fingerprint")
+            and started.get("contract_id") == contract
+            and started.get("slice_id") == current.get("id")
+            and started.get("slice_contract_id") == slice_contract_id(state)
+            and safe_sequence(started.get("attempt")) == attempt
+            and started.get("start_observed") == "full"
+            and started.get("agent_id") == agent_id
+            and request.get("task_name")
+        ):
+            continue
+        if reservation and not (
+            reservation.get("stage") == "terminal_pending"
+            and reservation.get("execution_contract_id") == contract
+            and reservation.get("objective_fingerprint")
+            == state.get("objective", {}).get("fingerprint")
+            and reservation.get("slice_id") == current.get("id")
+            and reservation.get("slice_contract_id") == slice_contract_id(state)
+            and reservation.get("sequence") == next_sequence(attempt)
+            and reservation.get("terminal_attempt") == attempt
+            and reservation.get("terminal_agent_id") == agent_id
+            and reservation.get("terminal_task_name") == request.get("task_name")
+            and reservation.get("terminal_request_fingerprint")
+            == request.get("request_fingerprint")
+        ):
+            continue
+        matches.append(group)
+    return matches[0] if len(matches) == 1 else None
 
 
 def pending_recovery_reservation_for_state(
@@ -2390,6 +2603,12 @@ def pending_recovery_reservation_for_state(
     reservation = _safe_pending_recovery_reservation(
         state.get("pending_recovery_reservation") if value is None else value
     )
+    if reservation and reservation.get("stage") == "terminal_pending":
+        return (
+            reservation
+            if _unique_running_executor_group(state, reservation) is not None
+            else None
+        )
     current = current_execution_slice(state) or {}
     facts = pending_recovery_facts_for_state(state)
     if not reservation or not (
@@ -2599,6 +2818,101 @@ def parse_pending_recovery_reservation(
         "slice_id": current.get("id"),
         "slice_contract_id": slice_contract_id(state),
         "prompt_receipt": receipt,
+    }, None
+
+
+def parse_running_recovery_reservation(
+    prompt: str, state: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Stage an exact recovery claim while its bound executor is still live.
+
+    The record carries no mutation authority.  It becomes usable only after a
+    separately observed, matching mailbox terminal boundary reports the same
+    failure identity.
+    """
+    if not re.search(
+        r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]", prompt, re.I
+    ):
+        return None, None
+    group = _unique_running_executor_group(state)
+    if group is None:
+        return None, "early recovery has no unique live executor binding"
+    claim, error = _recovery_prompt_claim(prompt)
+    if not claim:
+        return None, error
+    if not recovery_chain_allows(
+        state,
+        claim["failure_kind"],
+        claim.get("evidence_digest"),
+        claim.get("correction_digest"),
+        claim.get("root_cause_digest"),
+        claim.get("progress_digest"),
+        None,
+        claim.get("failure_fingerprint"),
+    ):
+        return None, (
+            "unchanged recovery replay requires new evidence, root cause, "
+            "progress, or material correction"
+        )
+    request = group["request"]
+    current = current_execution_slice(state) or {}
+    sequence = next_sequence(state.get("executor_attempt"))
+    review = stable_hash(
+        "workflow-manager-early-recovery-review-v1\0"
+        + canonical_json(
+            {
+                "agent": stable_hash(str(group.get("agent_id")), 32),
+                "attempt": safe_sequence(state.get("executor_attempt")),
+                "contract": state.get("execution_contract_id"),
+                "correction": claim.get("correction_digest"),
+                "evidence": claim.get("evidence_digest"),
+                "failure": claim.get("failure_kind"),
+                "failure_fingerprint": claim.get("failure_fingerprint"),
+                "request": request.get("request_fingerprint"),
+                "root": claim.get("root_cause_digest"),
+                "sequence": sequence,
+                "slice": current.get("id"),
+            }
+        ),
+        32,
+    )
+    receipt = stable_hash(
+        "workflow-manager-terminal-pending-recovery-v1\0"
+        + canonical_json(
+            {
+                "attempt": safe_sequence(state.get("executor_attempt")),
+                "contract": state.get("execution_contract_id"),
+                "correction": claim.get("correction_digest"),
+                "evidence": claim.get("evidence_digest"),
+                "failure": claim.get("failure_kind"),
+                "failure_fingerprint": claim.get("failure_fingerprint"),
+                "objective": state.get("objective", {}).get("fingerprint"),
+                "progress": claim.get("progress_digest"),
+                "request": request.get("request_fingerprint"),
+                "review": review,
+                "root": claim.get("root_cause_digest"),
+                "sequence": sequence,
+                "slice": current.get("id"),
+                "slice_contract": slice_contract_id(state),
+                "task": request.get("task_name"),
+            }
+        ),
+        32,
+    )
+    return {
+        **claim,
+        "sequence": sequence,
+        "review_digest": review,
+        "execution_contract_id": state.get("execution_contract_id"),
+        "objective_fingerprint": state.get("objective", {}).get("fingerprint"),
+        "slice_id": current.get("id"),
+        "slice_contract_id": slice_contract_id(state),
+        "prompt_receipt": receipt,
+        "stage": "terminal_pending",
+        "terminal_attempt": safe_sequence(state.get("executor_attempt")),
+        "terminal_agent_id": group.get("agent_id"),
+        "terminal_task_name": request.get("task_name"),
+        "terminal_request_fingerprint": request.get("request_fingerprint"),
     }, None
 
 
@@ -3862,7 +4176,11 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
         fork_turns = ""
     value = {
         "at": item.get("at"),
-        "event": item.get("event") if item.get("event") in {"request", "start", "stop"} else "unknown",
+        "event": (
+            item.get("event")
+            if item.get("event") in {"request", "start", *TERMINAL_SUBAGENT_EVENTS}
+            else "unknown"
+        ),
         "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
         "agent_id": safe_label(item.get("agent_id"), 120) if item.get("agent_id") else None,
         "agent_type": safe_label(item.get("agent_type"), 80) if item.get("agent_type") else None,
@@ -3949,12 +4267,50 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
             in {"host_missing", "host_declared_success"}
             else None
         ),
+        "terminal_lifecycle_source": (
+            item.get("terminal_lifecycle_source")
+            if item.get("terminal_lifecycle_source") == "mailbox_completed"
+            else None
+        ),
+        "reported_failure_kind": (
+            item.get("reported_failure_kind")
+            if item.get("reported_failure_kind") in EXECUTOR_FAILURE_KINDS
+            else None
+        ),
+        "reported_failure_fingerprint": _fingerprint32(
+            item.get("reported_failure_fingerprint")
+        ),
+        "reported_evidence_digest": _fingerprint32(
+            item.get("reported_evidence_digest")
+        ),
     }
     if isinstance(result_meta, dict):
         value["result_meta"] = {
             "fingerprint": safe_label(result_meta.get("fingerprint"), 64),
             "length": max(safe_int(result_meta.get("length")), 0),
         }
+    if value["event"] == "mailbox_terminal" and not (
+        value["role"] == "confirmed_executor"
+        and value["terminal_lifecycle_source"] == "mailbox_completed"
+        and value["status"] == "completed"
+        and value["terminal_status"] == "completed"
+        and value["terminal_status_source"] == "host_declared_success"
+        and value["execution_result_contract_match"] is True
+        and value["execution_result_outcome"] in {"succeeded", "failed"}
+        and _fingerprint32(value["execution_result_evidence_digest"])
+        and value["evidence_digest_profile"] == EVIDENCE_DIGEST_PROFILE
+        and value["evidence_digest_source"] == EVIDENCE_DIGEST_SOURCE
+        and value.get("result_meta", {}).get("fingerprint")
+        and value["agent_id"]
+        and value["task_name"]
+        and value["request_fingerprint"]
+        and value["objective_fingerprint"]
+        and value["contract_id"]
+        and value["slice_id"]
+        and value["slice_contract_id"]
+        and value["attempt"] > 0
+    ):
+        return None
     return value
 
 
@@ -3970,7 +4326,7 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
             "agent_id": str(item.get("agent_id") or "") or None,
             "request": item if item.get("event") == "request" else None,
             "start": item if item.get("event") == "start" else None,
-            "stop": item if item.get("event") == "stop" else None,
+            "stop": item if item.get("event") in TERMINAL_SUBAGENT_EVENTS else None,
             "records": [(index, item)],
             "first_index": index,
             "last_index": index,
@@ -4022,7 +4378,7 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
             group["agent_id"] = agent_id
             live_by_agent[agent_id] = group
             continue
-        if event == "stop":
+        if event in TERMINAL_SUBAGENT_EVENTS:
             group = live_by_agent.pop(agent_id, None)
             if group is None:
                 group = next(
@@ -7706,6 +8062,14 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and source_contract
         and value.get("executor_state") in {"running", "verification_required"}
     )
+    active_profile11_continuity = bool(
+        source_schema == 29
+        and source_writer == "1.0.51"
+        and source_profile == "11"
+        and value.get("plan_state") == "confirmed"
+        and source_contract
+        and value.get("executor_state") in {"running", "verification_required"}
+    )
     # Active and failed contracts rebind to the current profile. A completed,
     # baseline-sealed contract keeps the profile it actually executed under;
     # rewriting it to v6 would either invent evidence or reopen finished work.
@@ -7717,6 +8081,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         or legacy_verification_pending
         or review_profile_continuity
         or active_profile10_continuity
+        or active_profile11_continuity
         else EXECUTION_PROFILE_VERSION
     )
     base["executor_state"] = (
@@ -7909,7 +8274,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["subagents"] = retained_subagent_records(base, contract_subagents)
     expected_contract = (
         source_contract
-        if sealed_historical_success or legacy_verification_pending or review_profile_continuity or active_profile10_continuity
+        if sealed_historical_success or legacy_verification_pending or review_profile_continuity or active_profile10_continuity or active_profile11_continuity
         else execution_contract_id(base)
     ) if base["plan_state"] == "confirmed" else None
     valid_execution_binding = bool(
@@ -7921,6 +8286,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             or legacy_verification_pending
             or review_profile_continuity
             or active_profile10_continuity
+            or active_profile11_continuity
         )
     )
     if base["plan_state"] == "confirmed" and not valid_execution_binding:
@@ -8129,7 +8495,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         source_schema == 27 and base.get("assessor_state") == "running"
         and base.get("assessor_binding_id") and base.get("assessor_agent_id")
         and base.get("assessor_observed_effective")
-    ) and not active_profile10_continuity:
+    ) and not active_profile10_continuity and not active_profile11_continuity:
         # Opaque lifecycle/request records are evidence from the old writer, not
         # authority for a resumed task. Preserve canonical plans and completed
         # baselines, but remove transient caches and rebind unfinished assessment.
@@ -9753,7 +10119,7 @@ def resume_compaction_gate_misclassification_once(payload: dict[str, Any], state
         return False
     if any(str(item.get("at") or "") > checkpoint_at and item.get("category") in {"implementation", "build_package", "delivery_device"} for item in state.get("operations", []) if isinstance(item, dict)):
         return False
-    if any(str(item.get("at") or "") > checkpoint_at and item.get("event") in {"request", "start", "stop"} for item in state.get("subagents", []) if isinstance(item, dict)):
+    if any(str(item.get("at") or "") > checkpoint_at and item.get("event") in {"request", "start", *TERMINAL_SUBAGENT_EVENTS} for item in state.get("subagents", []) if isinstance(item, dict)):
         return False
     if not transcript_has_exact_compaction_gate(payload.get("transcript_path"), session_id, safe_int(checkpoint.get("window_number")), current["id"]):
         return False
@@ -10008,7 +10374,7 @@ def resume_completed_parent_review_once(
     completion_at = str(proof.get("completion_at") or "")
     if completion_at and any(
         str(event.get("at") or "") > completion_at
-        and event.get("event") in {"request", "start", "stop"}
+        and event.get("event") in {"request", "start", *TERMINAL_SUBAGENT_EVENTS}
         for event in state.get("subagents", [])
         if isinstance(event, dict)
     ):
@@ -13416,8 +13782,18 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and previous.get("plan_state") == "confirmed"
         and previous.get("executor_state") == "recovery_required"
     )
+    early_recovery_control_followup = bool(
+        recovery_marker_present
+        and previous.get("plan_state") == "confirmed"
+        and previous.get("executor_state") == "running"
+    )
+    recovery_followup = recovery_control_followup or early_recovery_control_followup
     pending_recovery_record, pending_recovery_error = (
         parse_pending_recovery_reservation(prompt, previous)
+        if recovery_control_followup
+        else parse_running_recovery_reservation(prompt, previous)
+        if early_recovery_control_followup
+        else (None, "recovery reservation is not pending")
         if recovery_marker_present
         else (None, None)
     )
@@ -13451,7 +13827,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and plan_replan_request(prompt)
         and previous.get("objective", {}).get("fingerprint") != stable_hash(prompt)
     )
-    new_objective = False if recovery_control_followup else bool(
+    new_objective = False if recovery_followup else bool(
         failed_assessor_replan
         or (
             explicit_new
@@ -13526,13 +13902,13 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     replan = (
         active_plan
         and not causal_active
-        and not recovery_control_followup
+        and not recovery_followup
         and plan_replan_request(prompt)
     )
     plan_changed = (
         active_plan
         and not causal_active
-        and not recovery_control_followup
+        and not recovery_followup
         and not causal_report
         and not acceptance_miss
         and not new_objective
@@ -13580,7 +13956,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or same_assessor_objective_retry
         or delegated_control_followup
         or early_confirmation
-        or recovery_control_followup
+        or recovery_followup
     )
     classification = classify_prompt(prompt)
     if requested_reference:
@@ -13835,16 +14211,39 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
             state["causal_review"] = _safe_causal_review(None)
             state["last_execution_baseline"] = {}
-        if recovery_control_followup:
-            state["pending_recovery_reservation"] = (
-                pending_recovery_reservation_for_state(
-                    state, pending_recovery_record
+        if recovery_followup:
+            reservation_error = pending_recovery_error
+            if early_recovery_control_followup:
+                existing = _safe_pending_recovery_reservation(
+                    state.get("pending_recovery_reservation")
                 )
-                if pending_recovery_record
-                else None
-            )
+                staged = _safe_pending_recovery_reservation(
+                    pending_recovery_record
+                )
+                if staged and (
+                    not existing
+                    or existing.get("stage") != "terminal_pending"
+                    or existing.get("prompt_receipt") == staged.get("prompt_receipt")
+                ):
+                    state["pending_recovery_reservation"] = staged
+                elif existing and existing.get("stage") == "terminal_pending":
+                    state["pending_recovery_reservation"] = existing
+                    reservation_error = (
+                        reservation_error
+                        or "conflicting early recovery reservation"
+                    )
+                else:
+                    state["pending_recovery_reservation"] = None
+            else:
+                state["pending_recovery_reservation"] = (
+                    pending_recovery_reservation_for_state(
+                        state, pending_recovery_record
+                    )
+                    if pending_recovery_record
+                    else None
+                )
             state["model_profile"] = confirmed_executor_model_profile(state)
-            if pending_recovery_error or not state["pending_recovery_reservation"]:
+            if reservation_error or not state["pending_recovery_reservation"]:
                 state.setdefault("guards", []).append(
                     {
                         "at": utc_now(),
@@ -13855,7 +14254,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                         "action": "deny",
                         "fingerprint": stable_hash(
                             "workflow-manager-recovery-reservation-deny-v1\0"
-                            + str(pending_recovery_error or "stale binding"),
+                            + str(reservation_error or "stale binding"),
                             32,
                         ),
                     }
@@ -14104,6 +14503,17 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 "verification, then report the result naturally. Host-recorded verification plus parent Stop seals the "
                 "review; EXECUTION_REVIEW is optional. A material failure uses a fresh typed child and never revives a terminal child."
             )
+        elif refreshed_for_assessor.get("executor_state") == "running":
+            staged = _safe_pending_recovery_reservation(
+                refreshed_for_assessor.get("pending_recovery_reservation")
+            )
+            if staged and staged.get("stage") == "terminal_pending":
+                context += (
+                    " The exact recovery claim arrived before the bound terminal lifecycle. It is retained as "
+                    "digest-only terminal_pending evidence and carries no mutation or spawn authority. A unique "
+                    "matching mailbox completed result plus final EXECUTION_RESULT must form the terminal boundary "
+                    "before the reservation can bind automatically."
+                )
     elif classification.get("work_difficulty") == "hard" and not pending_plan:
         context += (
             " Hard work: use the high-tier assessment, then present one ordinary plan covering scope, verification, "
@@ -14737,6 +15147,348 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
 
     # All remaining ordinary tool and subagent scheduling decisions are native
     # Codex behavior.  The Hook is silent after its fixed safety/contract gates.
+
+
+def _mailbox_agents_payload(
+    value: Any, depth: int = 0
+) -> tuple[list[Any] | None, bool]:
+    """Unwrap only the bounded host list-agents response envelope."""
+    if depth > 5:
+        return None, True
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not _json_container_text(stripped) or len(stripped) > 256_000:
+            return None, False
+        try:
+            return _mailbox_agents_payload(json.loads(stripped), depth + 1)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None, False
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            return None, bool(value)
+        return _mailbox_agents_payload(value[0], depth + 1)
+    if not isinstance(value, dict) or len(value) > 32:
+        return None, False
+    agent_keys = [key for key in value if normalized_key(key) == "agents"]
+    if agent_keys:
+        if len(agent_keys) != 1 or not isinstance(value[agent_keys[0]], list):
+            return None, True
+        agents = value[agent_keys[0]]
+        return (agents, False) if len(agents) <= 64 else (None, True)
+    wrapper_keys = [
+        key
+        for key in value
+        if normalized_key(key)
+        in {"content", "output", "result", "toolresponse", "response", "text"}
+    ]
+    candidates: list[list[Any]] = []
+    ambiguous = False
+    for key in wrapper_keys:
+        agents, child_ambiguous = _mailbox_agents_payload(value[key], depth + 1)
+        ambiguous = ambiguous or child_ambiguous
+        if agents is not None:
+            candidates.append(agents)
+    return (
+        (candidates[0], False)
+        if len(candidates) == 1 and not ambiguous
+        else (None, bool(candidates) or ambiguous)
+    )
+
+
+def _mailbox_task_matches(agent_name: Any, expected_task_name: str) -> bool:
+    if not isinstance(agent_name, str) or not expected_task_name:
+        return False
+    normalized = agent_name.replace("\\", "/").rstrip("/")
+    return normalized == expected_task_name or normalized.endswith(
+        "/" + expected_task_name
+    )
+
+
+def mailbox_completed_result(
+    response: Any, expected_task_name: str
+) -> str | None:
+    """Return one explicit completed mailbox result for exactly one task."""
+    agents, ambiguous = _mailbox_agents_payload(response)
+    if ambiguous or agents is None:
+        return None
+    matches: list[tuple[str | None, bool]] = []
+    for item in agents:
+        if not isinstance(item, dict) or len(item) > 16:
+            continue
+        name_keys = [key for key in item if normalized_key(key) == "agentname"]
+        status_keys = [key for key in item if normalized_key(key) == "agentstatus"]
+        if len(name_keys) != 1 or not _mailbox_task_matches(
+            item[name_keys[0]], expected_task_name
+        ):
+            continue
+        if len(status_keys) != 1:
+            matches.append((None, True))
+            continue
+        status = item[status_keys[0]]
+        if isinstance(status, dict):
+            keys = [normalized_key(key) for key in status]
+            completed_keys = [
+                key for key in status if normalized_key(key) == "completed"
+            ]
+            if (
+                len(status) == 1
+                and keys == ["completed"]
+                and len(completed_keys) == 1
+                and isinstance(status[completed_keys[0]], str)
+                and status[completed_keys[0]].strip()
+            ):
+                matches.append((status[completed_keys[0]], False))
+            else:
+                matches.append((None, bool(completed_keys)))
+        else:
+            matches.append((None, False))
+    if len(matches) != 1 or matches[0][1]:
+        return None
+    return matches[0][0]
+
+
+def _mailbox_reported_recovery_facts(body: str) -> dict[str, Any]:
+    """Extract only a unique typed failure identity from a terminal report."""
+    explicit = {
+        value.lower()
+        for value in re.findall(
+            r"(?:recovery_from|recovery-from)\s*[:=]\s*([a-z_]+)\b",
+            body,
+            re.I,
+        )
+    }
+    observed = {
+        value
+        for value in EXECUTOR_FAILURE_KINDS
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])", body)
+    }
+    kinds = explicit or observed
+    if len(kinds) != 1:
+        return {}
+    failure = next(iter(kinds))
+
+    def one_line(name: str, domain: str) -> str | None:
+        values = re.findall(
+            rf"(?im)^\s*`?{name}=([0-9a-f]{{32,64}})`?\s*$", body
+        )
+        normalized = {
+            value
+            for raw in values
+            if (value := _normalized_recovery_digest(raw, domain)) is not None
+        }
+        return next(iter(normalized)) if len(normalized) == 1 else None
+
+    failure_fingerprint = one_line(
+        "failure_fingerprint", "workflow-manager-external-failure-v1"
+    )
+    evidence = one_line(
+        "evidence_digest", "workflow-manager-external-evidence-v1"
+    )
+    return (
+        {
+            "failure_kind": failure,
+            "failure_fingerprint": failure_fingerprint,
+            "evidence_digest": evidence,
+        }
+        if failure_fingerprint and evidence
+        else {}
+    )
+
+
+def reconcile_bound_mailbox_terminal(
+    state: dict[str, Any], response: Any, payload: dict[str, Any]
+) -> str | None:
+    """Persist an equivalent boundary when the host omits SubagentStop.
+
+    This never manufactures a SubagentStop event.  It accepts only the one
+    current request/Post/full-Start executor and one host-structured completed
+    mailbox result whose final marker matches its contract and slice.
+    """
+    staged = _safe_pending_recovery_reservation(
+        state.get("pending_recovery_reservation")
+    )
+    group = _unique_running_executor_group(
+        state, staged if staged and staged.get("stage") == "terminal_pending" else None
+    )
+    if group is None:
+        return None
+    request = group["request"]
+    started = group["start"]
+    result = mailbox_completed_result(response, str(request.get("task_name") or ""))
+    if result is None:
+        return None
+    marker, body, intent = _strict_terminal_marker(
+        result, "EXECUTION_RESULT", EXECUTION_RESULT_RE
+    )
+    current = current_execution_slice(state) or {}
+    if not (
+        intent
+        and marker
+        and marker.group(1) == state.get("execution_contract_id")
+        and marker.group(2) == current.get("id")
+        and request.get("contract_id") == state.get("execution_contract_id")
+        and request.get("slice_contract_id") == slice_contract_id(state)
+        and safe_sequence(request.get("attempt"))
+        == safe_sequence(state.get("executor_attempt"))
+    ):
+        return None
+    outcome = marker.group(3)
+    reported = (
+        _mailbox_reported_recovery_facts(body) if outcome == "failed" else {}
+    )
+    candidate_evidence = host_evidence_digest(
+        domain="executor-result-v1",
+        state=state,
+        agent_id=group.get("agent_id"),
+        request_fingerprint=request.get("request_fingerprint"),
+        body_without_marker=body,
+        outcome=outcome,
+        terminal_status="completed",
+        terminal_status_source="host_declared_success",
+    )
+    state.setdefault("subagents", []).append(
+        {
+            "at": utc_now(),
+            "event": "mailbox_terminal",
+            "turn_id": safe_label(payload.get("turn_id"), 120)
+            if payload.get("turn_id")
+            else None,
+            "agent_id": group.get("agent_id"),
+            "agent_type": started.get("agent_type"),
+            "task_name": request.get("task_name"),
+            "scope_fingerprint": request.get("scope_fingerprint"),
+            "request_fingerprint": request.get("request_fingerprint"),
+            "objective_fingerprint": request.get("objective_fingerprint"),
+            "stale": False,
+            "status": "completed",
+            "result_meta": text_metadata(result),
+            "execution_result_contract_match": True,
+            "execution_result_outcome": outcome,
+            "execution_result_evidence_digest": candidate_evidence,
+            "evidence_digest_profile": EVIDENCE_DIGEST_PROFILE,
+            "evidence_digest_source": EVIDENCE_DIGEST_SOURCE,
+            "terminal_status": "completed",
+            "terminal_status_source": "host_declared_success",
+            "terminal_lifecycle_source": "mailbox_completed",
+            "reported_failure_kind": reported.get("failure_kind"),
+            "reported_failure_fingerprint": reported.get("failure_fingerprint"),
+            "reported_evidence_digest": reported.get("evidence_digest"),
+            "role": "confirmed_executor",
+            "contract_id": request.get("contract_id"),
+            "slice_id": request.get("slice_id"),
+            "slice_contract_id": request.get("slice_contract_id"),
+            "model": started.get("model"),
+            "reasoning_effort": started.get("reasoning_effort"),
+            "fork_turns": started.get("fork_turns"),
+            "attempt": request.get("attempt"),
+        }
+    )
+    state.setdefault("guards", []).append(
+        {
+            "at": utc_now(),
+            "turn_id": safe_label(payload.get("turn_id"), 120)
+            if payload.get("turn_id")
+            else None,
+            "kind": "mailbox_terminal_reconciled",
+            "action": "advise",
+            "fingerprint": stable_hash(
+                "workflow-manager-mailbox-terminal-v1\0"
+                + canonical_json(
+                    {
+                        "agent": stable_hash(str(group.get("agent_id")), 32),
+                        "attempt": safe_sequence(request.get("attempt")),
+                        "contract": request.get("contract_id"),
+                        "result": text_metadata(result).get("fingerprint"),
+                        "slice": request.get("slice_id"),
+                    }
+                ),
+                32,
+            ),
+        }
+    )
+    state["executor_agent_id"] = None
+    state["model_profile"] = "work_assessment"
+    if outcome == "succeeded":
+        state["executor_state"] = "verification_required"
+        state["executor_failure_kind"] = None
+        state["pending_recovery_reservation"] = None
+        baseline = build_execution_baseline(state)
+        if baseline:
+            baseline["acceptance_status"] = "incomplete"
+            state["last_execution_baseline"] = baseline
+            state["causal_review"] = _safe_causal_review(None)
+        state["executor_review"] = _safe_executor_review(
+            {
+                "status": "review_required",
+                "execution_contract_id": state.get("execution_contract_id"),
+                "slice_id": current.get("id"),
+                "slice_contract_id": slice_contract_id(state),
+                "attempt": state.get("executor_attempt"),
+                "candidate_result_fingerprint": stable_hash(body, 32),
+                "candidate_agent_fingerprint": stable_hash(
+                    str(group.get("agent_id")), 32
+                ),
+                "candidate_evidence_digest": candidate_evidence,
+                "child_summary_digest": _acceptance_summary_digest(body, state),
+                "review_evidence_digest": None,
+                "digest_profile": EVIDENCE_DIGEST_PROFILE,
+                "digest_source": EVIDENCE_DIGEST_SOURCE,
+                "terminal_status": "completed",
+                "terminal_status_source": "host_declared_success",
+                "at": utc_now(),
+            }
+        )
+        return outcome
+    state["executor_state"] = "recovery_required"
+    state["executor_failure_kind"] = (
+        reported.get("failure_kind") or "executor_failed"
+    )
+    promoted = None
+    if staged and staged.get("stage") == "terminal_pending":
+        if reported and all(
+            staged.get(key) == reported.get(key)
+            for key in (
+                "failure_kind",
+                "failure_fingerprint",
+                "evidence_digest",
+            )
+        ):
+            promoted = {
+                key: value
+                for key, value in staged.items()
+                if key
+                not in {
+                    "stage",
+                    "terminal_attempt",
+                    "terminal_agent_id",
+                    "terminal_task_name",
+                    "terminal_request_fingerprint",
+                }
+            }
+        else:
+            state.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "recovery_reservation",
+                    "action": "deny",
+                    "fingerprint": stable_hash(
+                        "workflow-manager-early-recovery-mismatch-v1\0"
+                        + str(staged.get("prompt_receipt") or ""),
+                        32,
+                    ),
+                }
+            )
+    state["pending_recovery_reservation"] = (
+        pending_recovery_reservation_for_state(state, promoted)
+        if promoted
+        else None
+    )
+    return outcome
+
+
 def post_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
     response = payload.get("tool_response")
@@ -14843,7 +15595,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             state.get("executor_state") == "recovery_required"
             and state.get("executor_failure_kind") == "incomplete_execution"
             and any(
-                record.get("event") == "stop"
+                record.get("event") in TERMINAL_SUBAGENT_EVENTS
                 and record.get("role") == "confirmed_executor"
                 and record.get("contract_id") == state.get("execution_contract_id")
                 and record.get("slice_id") == (current_execution_slice(state) or {}).get("id")
@@ -15039,6 +15791,11 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             state["telemetry"] = telemetry
 
         if parent_child_collection:
+            mailbox_outcome = reconcile_bound_mailbox_terminal(
+                state, response, payload
+            )
+            if mailbox_outcome:
+                runtime_delivery["mailbox_terminal"] = mailbox_outcome
             role: str | None = None
             role_binding = ""
             if state.get("executor_state") in {
@@ -15103,12 +15860,31 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             "PostToolUse",
             "Workflow Manager assessor liveness: the delivered unblock received a further 600-second observation without progress and the prior Stop is verified. Start one materially corrected non-overlapping successor with any safe ASCII task_name.",
         )
-    if runtime_delivery.get("late_executor"):
+    if runtime_delivery.get("mailbox_terminal"):
+        outcome = runtime_delivery["mailbox_terminal"]
+        pending = pending_recovery_reservation_for_state(updated_state)
+        recovery = recovery_reservation_context(updated_state)
+        detail = (
+            " The already staged digest-only recovery reservation now matches and is host-bound; use one fresh "
+            "executor spawn and never follow up the terminal child."
+            if outcome == "failed" and pending
+            else f"\n{recovery}"
+            if outcome == "failed" and recovery
+            else " The executor candidate now requires independent parent acceptance review."
+        )
+        emit_context(
+            "PostToolUse",
+            "Workflow Manager reconciled one missing terminal hook from a unique bound mailbox completed result. "
+            "This is a mailbox_terminal equivalent boundary, not a fabricated SubagentStop; intermediate, running, "
+            "unbound, ambiguous, or contract-mismatched observations remain non-terminal."
+            + detail,
+        )
+    elif runtime_delivery.get("late_executor"):
         emit_context(
             "PostToolUse",
             "Workflow Manager accepted the one exact late spawn receipt, reverified the private canonical journal, and unlocked the already delivered digest-bound executor slice. The request, Post receipt, full Start, model, effort, fork, sequence, objective, contract, and current slice now agree.",
         )
-    if runtime_delivery.get("role"):
+    elif runtime_delivery.get("role"):
         runtime_truth = bound_runtime_truth_summary(
             updated_state, runtime_delivery["role"]
         )

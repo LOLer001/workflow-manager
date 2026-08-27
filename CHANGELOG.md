@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.0.52
+
+- 修复宿主已在 `list_agents` mailbox 中返回唯一绑定执行器的 `completed`/`FINAL_ANSWER`，但漏发 `SubagentStop` 时执行合同永久停留在 `running` 的生命周期缺口。Schema 30 仅在 request、成功 Post、full Start、agent/task、contract、slice 与 attempt 唯一一致，且 completed 正文最后一行是严格匹配的 `EXECUTION_RESULT` 时追加独立 `mailbox_terminal` 等价边界；不伪造或增加 `SubagentStop`，`wait_agent` 摘要、running/commentary、普通未绑定 agent、歧义、乱序重复和合同漂移均拒绝。
+- exact typed recovery 若早于该终态到达，只保存合同绑定的 digest-only `terminal_pending` 记录且不授予 spawn/mutation 权；匹配终态形成后自动提升，终态先到时后续 recovery 也可使用 mailbox 报告的 failure/evidence 摘要。保留 Schema 29/profile v11 活跃执行的懒迁移连续性，压缩与重复投递保持幂等，原始 prompt、回答、根因和修正文本均不持久化。
+
 ## 1.0.51
 
 - 将 Linux GitHub Actions 全量测试 job 的上限从 10 分钟提高到 20 分钟，覆盖 316 项套件在托管 runner 上的正常耗时波动；测试矩阵、断言、Windows 30 分钟上限、Schema 29、execution profile v11 与运行时行为均不降低或改变。

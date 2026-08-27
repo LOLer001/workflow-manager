@@ -354,8 +354,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 29)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.51")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 30)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.52")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "11")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -450,7 +450,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (29, "1.0.51"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (30, "1.0.52"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -477,7 +477,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.51 active", context)
+        self.assertIn("Workflow Manager 1.0.52 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1128,7 +1128,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (29, "1.0.51"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (30, "1.0.52"))
         self.assertEqual(migrated["execution_profile_version"], "11")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1224,7 +1224,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (29, "1.0.51", "11"),
+                    (30, "1.0.52", "11"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1270,7 +1270,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (29, "1.0.51", "5", "verification_required", 1),
+            (30, "1.0.52", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1383,6 +1383,449 @@ class OrchestratorHookTests(unittest.TestCase):
             self.run_hook(stop, data=case_data)
             blocked = self.load_only_state(case_data)
             self.assertEqual((blocked["assessor_state"], blocked["assessor_failure_kind"], blocked["plan_state"]), ("recovery_required", "assessment_result_invalid", "analyzing"), label)
+
+    def test_bound_executor_mailbox_terminal_promotes_exact_early_recovery(self) -> None:
+        session = "executor-mailbox-terminal-recovery"
+        state = self.create_confirmed_executor_state(session, slice_count=1)
+        self.run_hook(
+            self.executor_spawn_payload(
+                state,
+                session=session,
+                hook_run_id="request",
+                fork_turns="1",
+            )
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "start",
+                "agent_id": "mailbox-terminal-executor",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+            }
+        )
+        running = self.load_only_state()
+        self.assertEqual(running["executor_state"], "running")
+        request = next(
+            item
+            for item in running["subagents"]
+            if item.get("event") == "request"
+            and item.get("role") == "confirmed_executor"
+        )
+        task_name = request["task_name"]
+        stop_count = running["event_counts"]["SubagentStop"]
+
+        schema29 = json.loads(json.dumps(running))
+        schema29["schema_version"] = 29
+        schema29["writer_version"] = "1.0.51"
+        migrated = HOOK.normalize_state(schema29, {"session_id": session})
+        self.assertEqual(
+            (
+                migrated["schema_version"],
+                migrated["writer_version"],
+                migrated["executor_state"],
+                migrated["executor_agent_id"],
+            ),
+            (30, "1.0.52", "running", "mailbox-terminal-executor"),
+        )
+        self.assertEqual(len(migrated["subagents"]), len(running["subagents"]))
+        self.state_files()[0].write_text(
+            json.dumps(schema29), encoding="utf-8"
+        )
+
+        failure_fingerprint = "a" * 32
+        evidence_digest = "b" * 32
+        root_cause = "the host omitted the bound terminal lifecycle hook"
+        material_correction = (
+            "reconcile one uniquely bound completed mailbox result before recovery"
+        )
+        recovery_prompt = (
+            "recovery_from=verification_failed\n"
+            f"failure_fingerprint={failure_fingerprint}\n"
+            f"evidence_digest={evidence_digest}\n"
+            f"root_cause={root_cause}\n"
+            f"material_correction={material_correction}"
+        )
+        early = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "early-recovery",
+                "prompt": recovery_prompt,
+            }
+        )
+        staged_state = self.load_only_state()
+        staged = staged_state["pending_recovery_reservation"]
+        self.assertEqual(staged_state["executor_state"], "running")
+        self.assertEqual(staged["stage"], "terminal_pending")
+        self.assertEqual(staged["terminal_task_name"], task_name)
+        self.assertIn("carries no mutation or spawn authority", early.stdout)
+        persisted = self.state_files()[0].read_text(encoding="utf-8")
+        self.assertNotIn(root_cause, persisted)
+        self.assertNotIn(material_correction, persisted)
+        self.run_hook(
+            {
+                "hook_event_name": "PreCompact",
+                "session_id": session,
+                "hook_run_id": "early-recovery-precompact",
+                "trigger": "auto",
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "hook_run_id": "early-recovery-resume",
+                "source": "resume",
+            }
+        )
+        self.assertEqual(
+            self.load_only_state()["pending_recovery_reservation"], staged
+        )
+
+        final = (
+            "Windows verification exposed the accepted lifecycle gap as "
+            "verification_failed.\n"
+            f"`failure_fingerprint={failure_fingerprint}`\n"
+            f"`evidence_digest={evidence_digest}`\n"
+            f"EXECUTION_RESULT execution_contract_id={state['execution_contract_id']} "
+            "slice_id=s01 outcome=failed"
+        )
+        mailbox = json.dumps(
+            {
+                "agents": [
+                    {"agent_name": "/root", "agent_status": "running"},
+                    {
+                        "agent_name": f"/root/{task_name}",
+                        "agent_status": {"completed": final},
+                    },
+                ]
+            }
+        )
+        reconciled = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "list-completed",
+                "tool_name": "collaboration.list_agents",
+                "tool_input": {},
+                "tool_response": mailbox,
+            }
+        )
+        recovered = self.load_only_state()
+        terminal = [
+            item
+            for item in recovered["subagents"]
+            if item.get("event") == "mailbox_terminal"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["terminal_lifecycle_source"], "mailbox_completed")
+        self.assertEqual(recovered["event_counts"]["SubagentStop"], stop_count)
+        self.assertEqual(
+            (recovered["executor_state"], recovered["executor_failure_kind"]),
+            ("recovery_required", "verification_failed"),
+        )
+        self.assertEqual(
+            recovered["pending_recovery_facts"]["source"], "mailbox_final"
+        )
+        pending = recovered["pending_recovery_reservation"]
+        self.assertIsNotNone(pending)
+        self.assertNotIn("stage", pending)
+        self.assertEqual(pending["failure_fingerprint"], failure_fingerprint)
+        self.assertEqual(pending["evidence_digest"], evidence_digest)
+        self.assertIn("not a fabricated SubagentStop", reconciled.stdout)
+
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "list-completed-duplicate",
+                "tool_name": "collaboration.list_agents",
+                "tool_input": {},
+                "tool_response": mailbox,
+            }
+        )
+        duplicate = self.load_only_state()
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in duplicate["subagents"]
+                    if item.get("event") == "mailbox_terminal"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(duplicate["pending_recovery_reservation"], pending)
+
+        opaque = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "opaque-recovery",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": HOOK.bound_executor_task_name(duplicate),
+                    "message": "gAAAAA" + ("A" * 80),
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "max",
+                    "fork_turns": "1",
+                },
+            }
+        )
+        self.assertNotEqual(
+            json.loads(opaque.stdout)["hookSpecificOutput"].get(
+                "permissionDecision"
+            ),
+            "deny",
+        )
+        self.assertEqual(self.load_only_state()["executor_state"], "spawn_pending")
+
+    def test_bound_executor_mailbox_terminal_allows_delayed_exact_recovery(self) -> None:
+        session = "executor-mailbox-terminal-delayed-recovery"
+        state = self.create_confirmed_executor_state(session, slice_count=1)
+        self.run_hook(
+            self.executor_spawn_payload(
+                state,
+                session=session,
+                hook_run_id="request",
+                fork_turns="1",
+            )
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "start",
+                "agent_id": "mailbox-delayed-recovery-executor",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+            }
+        )
+        running = self.load_only_state()
+        task_name = next(
+            item["task_name"]
+            for item in running["subagents"]
+            if item.get("event") == "request"
+            and item.get("role") == "confirmed_executor"
+        )
+        failure_fingerprint = "d" * 32
+        evidence_digest = "e" * 32
+        final = (
+            "The terminal lifecycle acceptance failed as verification_failed.\n"
+            f"failure_fingerprint={failure_fingerprint}\n"
+            f"evidence_digest={evidence_digest}\n"
+            f"EXECUTION_RESULT execution_contract_id={state['execution_contract_id']} "
+            "slice_id=s01 outcome=failed"
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "completed-before-recovery",
+                "tool_name": "collaboration.list_agents",
+                "tool_input": {},
+                "tool_response": json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "agent_name": f"/root/{task_name}",
+                                "agent_status": {"completed": final},
+                            }
+                        ]
+                    }
+                ),
+            }
+        )
+        terminal = self.load_only_state()
+        self.assertEqual(
+            (terminal["executor_state"], terminal["executor_failure_kind"]),
+            ("recovery_required", "verification_failed"),
+        )
+        self.assertIsNone(terminal["pending_recovery_reservation"])
+        self.assertEqual(
+            terminal["pending_recovery_facts"]["failure_fingerprint"],
+            failure_fingerprint,
+        )
+        recovery_prompt = (
+            "recovery_from=verification_failed\n"
+            f"failure_fingerprint={failure_fingerprint}\n"
+            f"evidence_digest={evidence_digest}\n"
+            "root_cause=the completed mailbox became visible before the delegated recovery\n"
+            "material_correction=reserve the exact recovery after the durable terminal boundary"
+        )
+        reserved_output = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "delayed-recovery",
+                "prompt": recovery_prompt,
+            }
+        )
+        reserved = self.load_only_state()
+        self.assertIsNotNone(
+            reserved["pending_recovery_reservation"], reserved_output.stdout
+        )
+        self.assertNotIn("stage", reserved["pending_recovery_reservation"])
+        self.assertEqual(
+            reserved["pending_recovery_reservation"]["failure_fingerprint"],
+            failure_fingerprint,
+        )
+
+    def test_bound_executor_mailbox_terminal_rejects_nonfinal_ambiguous_and_unbound(self) -> None:
+        session = "executor-mailbox-terminal-reject"
+        state = self.create_confirmed_executor_state(session, slice_count=1)
+        self.run_hook(
+            self.executor_spawn_payload(
+                state,
+                session=session,
+                hook_run_id="request",
+                fork_turns="1",
+            )
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": session,
+                "hook_run_id": "start",
+                "agent_id": "mailbox-reject-executor",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+            }
+        )
+        running = self.load_only_state()
+        task_name = next(
+            item["task_name"]
+            for item in running["subagents"]
+            if item.get("event") == "request"
+            and item.get("role") == "confirmed_executor"
+        )
+        exact = (
+            f"EXECUTION_RESULT execution_contract_id={state['execution_contract_id']} "
+            "slice_id=s01 outcome=succeeded"
+        )
+        wrong = (
+            f"EXECUTION_RESULT execution_contract_id={'c' * 32} "
+            "slice_id=s01 outcome=succeeded"
+        )
+        cases = {
+            "running": {
+                "agents": [
+                    {
+                        "agent_name": f"/root/{task_name}",
+                        "agent_status": "running",
+                    }
+                ]
+            },
+            "commentary": {
+                "agents": [
+                    {
+                        "agent_name": f"/root/{task_name}",
+                        "agent_status": {"completed": "progress only"},
+                    }
+                ]
+            },
+            "wrong-contract": {
+                "agents": [
+                    {
+                        "agent_name": f"/root/{task_name}",
+                        "agent_status": {"completed": wrong},
+                    }
+                ]
+            },
+            "ordinary-agent": {
+                "agents": [
+                    {
+                        "agent_name": "/root/ordinary_lane",
+                        "agent_status": {"completed": exact},
+                    }
+                ]
+            },
+            "duplicate": {
+                "agents": [
+                    {
+                        "agent_name": f"/root/{task_name}",
+                        "agent_status": {"completed": exact},
+                    },
+                    {
+                        "agent_name": f"/root/{task_name}",
+                        "agent_status": {"completed": exact},
+                    },
+                ]
+            },
+        }
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "reject-wait-summary",
+                "tool_name": "collaboration.wait_agent",
+                "tool_input": {"timeout_ms": 30000},
+                "tool_response": {
+                    "updates": [
+                        {
+                            "task_name": task_name,
+                            "message_type": "FINAL_ANSWER",
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertEqual(self.load_only_state()["executor_state"], "running")
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                self.run_hook(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": session,
+                        "hook_run_id": f"reject-{label}",
+                        "tool_name": "collaboration.list_agents",
+                        "tool_input": {},
+                        "tool_response": json.dumps(response),
+                    }
+                )
+                unchanged = self.load_only_state()
+                self.assertEqual(unchanged["executor_state"], "running")
+                self.assertFalse(
+                    any(
+                        item.get("event") == "mailbox_terminal"
+                        for item in unchanged["subagents"]
+                    )
+                )
+        stop_count = self.load_only_state()["event_counts"]["SubagentStop"]
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "accept-exact-after-rejections",
+                "tool_name": "collaboration.list_agents",
+                "tool_input": {},
+                "tool_response": json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "agent_name": f"/root/{task_name}",
+                                "agent_status": {"completed": exact},
+                            }
+                        ]
+                    }
+                ),
+            }
+        )
+        accepted = self.load_only_state()
+        self.assertEqual(accepted["executor_state"], "verification_required")
+        self.assertEqual(accepted["event_counts"]["SubagentStop"], stop_count)
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in accepted["subagents"]
+                    if item.get("event") == "mailbox_terminal"
+                ]
+            ),
+            1,
+        )
 
     def test_bound_executor_missing_terminal_status_requires_a_unique_exact_result(self) -> None:
         session = "executor-status-missing"
@@ -9737,7 +10180,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.51 active", context)
+        self.assertIn("Workflow Manager 1.0.52 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10426,7 +10869,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (29, "1.0.51"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (30, "1.0.52"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
