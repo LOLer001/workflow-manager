@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 30
-WRITER_VERSION = "1.0.53"
+SCHEMA_VERSION = 31
+WRITER_VERSION = "1.0.54"
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
 EXECUTION_PROFILE_VERSION = "11"
@@ -179,7 +179,7 @@ LEGACY_CAUSAL_OUTCOME_MAP = {
 }
 LIFECYCLE_DIAGNOSTIC_CODES = frozenset({
     "ordinary_spawn_no_active_hard", "pretool_missing", "start_missing",
-    "contract_mismatch",
+    "contract_mismatch", "legacy_plan_rejected", "root_identity_mismatch",
 })
 LIFECYCLE_DIAGNOSTIC_LEVELS = frozenset({"info", "warning", "error"})
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
@@ -3926,6 +3926,60 @@ def _safe_stall(item: Any) -> dict[str, Any]:
     return result
 
 
+def _safe_continuation_lease(item: Any) -> dict[str, Any]:
+    item = item if isinstance(item, dict) else {}
+    phase = item.get("phase") if item.get("phase") in {"none", "pending", "emitted", "consumed"} else "none"
+    key = _fingerprint32(item.get("key"))
+    reason_digest = _fingerprint32(item.get("reason_digest"))
+    if phase == "none" or not key or not reason_digest:
+        return {"phase": "none", "key": None, "reason_digest": None, "at": None}
+    return {
+        "phase": phase, "key": key, "reason_digest": reason_digest,
+        "at": str(item.get("at") or "")[:40] or None,
+    }
+
+
+def continuation_lease_key(payload: dict[str, Any], reason: str) -> str:
+    """Stable idempotency key for a host continuation request."""
+    return stable_hash(
+        "continuation-lease-v1\0%s\0%s\0%s" % (
+            safe_label(payload.get("session_id"), 120),
+            safe_label(payload.get("hook_run_id"), 120),
+            stable_hash(reason, 32),
+        ), 32,
+    )
+
+
+def claim_continuation_lease(state: dict[str, Any], payload: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Atomically claim/recover one continuation emission.
+
+    An emitted-but-unconsumed lease is deliberately replayed with the *same*
+    key.  That covers a SIGKILL between stdout and the final consume write
+    without allowing the host to create a second logical continuation.
+    """
+    key = continuation_lease_key(payload, reason)
+    digest = stable_hash(reason, 32)
+    lease = _safe_continuation_lease(state.get("continuation_lease"))
+    if lease["key"] != key or lease["reason_digest"] != digest:
+        lease = {"phase": "pending", "key": key, "reason_digest": digest, "at": utc_now()}
+    if lease["phase"] == "consumed":
+        state["continuation_lease"] = lease
+        return {**lease, "emit": False}
+    # The state write enclosing this function is the atomic ownership claim.
+    lease["phase"] = "emitted"
+    lease["at"] = utc_now()
+    state["continuation_lease"] = lease
+    return {**lease, "emit": True}
+
+
+def consume_continuation_lease(state: dict[str, Any], key: str) -> None:
+    lease = _safe_continuation_lease(state.get("continuation_lease"))
+    if lease["key"] == key and lease["phase"] == "emitted":
+        lease["phase"] = "consumed"
+        lease["at"] = utc_now()
+        state["continuation_lease"] = lease
+
+
 def new_state(payload: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     return {
@@ -3933,6 +3987,11 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "writer_version": WRITER_VERSION,
         "session_fingerprint": stable_hash(payload.get("session_id") or payload.get("hook_run_id")),
         "cwd_fingerprint": stable_hash(payload.get("cwd")),
+        # These are immutable root-task facts.  Later child/resume events may
+        # observe a different cwd or rollout, but can never retarget recovery.
+        "root_session_fingerprint": stable_hash(payload.get("session_id") or payload.get("hook_run_id")),
+        "root_cwd_fingerprint": stable_hash(payload.get("cwd")),
+        "root_rollout_identity": None,
         "model": safe_label(payload.get("model"), 80) if payload.get("model") else None,
         "task_domain": "unknown",
         "domain_confidence": "low",
@@ -4008,6 +4067,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_composition": _safe_plan_composition(None),
         "lifecycle_diagnostics": [],
         "stall": _safe_stall(None),
+        "continuation_lease": _safe_continuation_lease(None),
         "created_at": now,
         "updated_at": now,
         "objective": {},
@@ -4092,6 +4152,10 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "tool": safe_label(item.get("tool"), 120),
         "fingerprint": fingerprint[:64],
         "status": status_value,
+        "envelope_status": safe_label(item.get("envelope_status"), 32).lower()
+        if item.get("envelope_status") else None,
+        "leaf_status": safe_label(item.get("leaf_status"), 32).lower()
+        if item.get("leaf_status") else None,
         "category": safe_label(item.get("category"), 32) if item.get("category") else "other",
         "plan_digest": plan_digest,
         "execution_contract_id": contract_id,
@@ -4749,10 +4813,6 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
     canonical_match = re.fullmatch(
         r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan\.md", relative
     )
-    legacy_match = re.fullmatch(
-        r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan-g[0-9]{4,}-[0-9a-f]{32}\.md",
-        relative,
-    )
     plan_digest = safe_fingerprint(item.get("plan_digest")) or None
     content_digest = safe_fingerprint(item.get("content_digest")) or None
     current_revision_digest = (
@@ -4762,8 +4822,8 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
     )
     result.update(
         {
-            "relative_path": relative if canonical_match or legacy_match else None,
-            "format_version": 2 if canonical_match else 1 if legacy_match else 0,
+            "relative_path": relative if canonical_match else None,
+            "format_version": 2 if canonical_match else 0,
             "objective_fingerprint": safe_fingerprint(item.get("objective_fingerprint")) or None,
             "difficulty_decision_id": safe_fingerprint(item.get("difficulty_decision_id")) or None,
             "plan_digest": plan_digest,
@@ -4782,9 +4842,6 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
             "updated_at": str(item.get("updated_at"))[:40] if item.get("updated_at") else None,
         }
     )
-    if legacy_match and result["plan_digest"] not in result["relative_path"]:
-        result["relative_path"] = None
-        result["format_version"] = 0
     if result["format_version"] == 2:
         if result["plan_digest"] != result["current_revision_digest"]:
             result["current_revision_digest"] = None
@@ -7026,6 +7083,22 @@ def parse_legacy_plan_artifact(
 def migrate_legacy_plan_artifacts(
     state: dict[str, Any], payload: dict[str, Any], source_schema: int
 ) -> bool:
+    # Project-local .codex/plans was a legacy review mirror.  It is
+    # untrusted input, not a migration source: never open it, parse a plan
+    # body, create a journal from it, remove it, or pass it to an executor.
+    # Active authority therefore fails closed.  The files are deliberately
+    # left untouched for the project owner to inspect or remove themselves.
+    if source_schema < 20:
+        active = state.get("plan_state") in {
+            "plan_ready", "awaiting_confirmation", "confirmed",
+        } or state.get("executor_state") not in {None, "none", "succeeded"}
+        if active:
+            invalidate_plan_authority(state, warning_code="legacy_unavailable")
+        record_lifecycle_diagnostic(
+            state, "legacy_plan_rejected", level="warning",
+            contract_id=state.get("execution_contract_id"),
+        )
+        return False
     legacy_plan_state = state.pop("_legacy_plan_state", state.get("plan_state"))
     legacy_executor_state = state.pop(
         "_legacy_executor_state", state.get("executor_state")
@@ -7863,6 +7936,7 @@ def _safe_compaction(item: Any) -> dict[str, Any] | None:
             if (value := _safe_lifecycle_diagnostic(raw)) is not None
         ],
         "stall": _safe_stall(item.get("stall")),
+        "continuation_lease": _safe_continuation_lease(item.get("continuation_lease")),
         "active_agent_scopes": [
             scope for raw in as_list(item.get("active_agent_scopes"))
             if (scope := _safe_active_agent_scope(raw)) is not None
@@ -7877,10 +7951,29 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value, dict):
         return base
     base["created_at"] = value.get("created_at") or base["created_at"]
-    for key in ("session_fingerprint", "cwd_fingerprint"):
+    for key in (
+        "session_fingerprint", "cwd_fingerprint", "root_session_fingerprint",
+        "root_cwd_fingerprint",
+    ):
         fingerprint = safe_fingerprint(value.get(key))
         if fingerprint:
             base[key] = fingerprint
+    # A pre-v31 state did not distinguish a root identity.  Its persisted
+    # session/cwd are the only safe historical roots; never substitute the
+    # cwd from this resume event.
+    if not safe_fingerprint(value.get("root_session_fingerprint")):
+        base["root_session_fingerprint"] = base["session_fingerprint"]
+    if not safe_fingerprint(value.get("root_cwd_fingerprint")):
+        base["root_cwd_fingerprint"] = base["cwd_fingerprint"]
+    root_rollout_identity = value.get("root_rollout_identity")
+    base["root_rollout_identity"] = (
+        root_rollout_identity
+        if isinstance(root_rollout_identity, dict)
+        and set(root_rollout_identity) == {"device", "inode"}
+        and all(isinstance(root_rollout_identity.get(key), int) and root_rollout_identity[key] >= 0
+                for key in ("device", "inode"))
+        else None
+    )
     if value.get("model"):
         base["model"] = safe_label(value.get("model"), 80)
     # Schema 14 had no session-wide preference. Never infer opt-in from legacy
@@ -8532,6 +8625,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["assessment_liveness"] = _empty_assessment_liveness()
     base["pending_recovery_facts"] = pending_recovery_facts_for_state(base)
     base["pending_recovery_reservation"] = pending_recovery_reservation_for_state(base)
+    base["continuation_lease"] = _safe_continuation_lease(value.get("continuation_lease"))
     sync_plan_artifact_lifecycle(base)
     base["schema_version"] = SCHEMA_VERSION
     base["writer_version"] = WRITER_VERSION
@@ -8702,6 +8796,24 @@ def _rollout_user_message(record: dict[str, Any]) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+def root_rollout_regular_file_identity(path_value: Any) -> dict[str, int] | None:
+    """Return an immutable identity for one regular host-owned rollout.
+
+    Size and mtime intentionally are not part of the identity: Desktop may
+    append a rollout while a task is alive.  Device/inode pin the actual file
+    and lstat prevents symlink substitution on both POSIX and Windows.
+    """
+    if not path_value:
+        return None
+    try:
+        info = Path(str(path_value)).lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return None
+        return {"device": int(info.st_dev), "inode": int(info.st_ino)}
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def reconcile_missed_parent_controls_from_rollout(
     payload: dict[str, Any], state: dict[str, Any]
 ) -> bool:
@@ -8722,7 +8834,17 @@ def reconcile_missed_parent_controls_from_rollout(
     ):
         return False
     session_id = safe_label(payload.get("session_id"), 120)
-    if not session_id or state.get("session_fingerprint") != stable_hash(session_id):
+    if not session_id or state.get("root_session_fingerprint") != stable_hash(session_id):
+        return False
+    root_identity = root_rollout_regular_file_identity(payload.get("transcript_path"))
+    if root_identity is None:
+        record_lifecycle_diagnostic(state, "root_identity_mismatch", level="warning")
+        return False
+    bound_identity = state.get("root_rollout_identity")
+    if bound_identity is None:
+        state["root_rollout_identity"] = root_identity
+    elif bound_identity != root_identity:
+        record_lifecycle_diagnostic(state, "root_identity_mismatch", level="error")
         return False
     records = read_host_rollout_records(payload.get("transcript_path"))
     if not records:
@@ -8738,7 +8860,7 @@ def reconcile_missed_parent_controls_from_rollout(
     meta = metas[0]
     if meta.get("id") != session_id or meta.get("session_id") != session_id:
         return False
-    if state.get("cwd_fingerprint") and stable_hash(meta.get("cwd")) != state.get("cwd_fingerprint"):
+    if state.get("root_cwd_fingerprint") and stable_hash(meta.get("cwd")) != state.get("root_cwd_fingerprint"):
         return False
 
     confirmations: list[int] = []
@@ -8766,13 +8888,21 @@ def reconcile_missed_parent_controls_from_rollout(
                         else None,
                     )
                 )
-    if not plans:
+    # A rollout is a recovery bridge, not an event log from which we may pick
+    # a convenient historical plan.  In particular, a child completion can
+    # look exactly like a parent ``task_complete`` record.  Without a unique
+    # parent candidate there is no host fact tying a plan to this live Hard
+    # contract, so leave the normal parent Stop path in charge.
+    if len(plans) != 1:
         return False
-    confirmed_plans = [
-        item for item in plans if any(position > item[0] for position in confirmations)
-    ]
-    plan_index, plan_message, plan_turn = (confirmed_plans or plans)[-1]
-    has_confirmation = any(position > plan_index for position in confirmations)
+    plan_index, plan_message, plan_turn = plans[0]
+    later_confirmations = [position for position in confirmations if position > plan_index]
+    # A pure confirmation is similarly one causal boundary.  Duplicate or
+    # earlier confirmations may belong to a prior/child turn and must never
+    # unlock the recovered plan.
+    if len(later_confirmations) > 1:
+        return False
+    has_confirmation = len(later_confirmations) == 1
     changed = False
     if has_confirmation:
         receipt = pending_confirmation_receipt_for_state(state)
@@ -8959,8 +9089,10 @@ def mutate_state(
                 state.pop("_source_schema_version", SCHEMA_VERSION)
             )
             state.pop("_normalized_state_changed", None)
-            if payload.get("cwd"):
-                state["cwd_fingerprint"] = stable_hash(payload.get("cwd"))
+            # The initial cwd is part of the root task identity.  Do not let a
+            # later hook event (especially a child rollout or resumed window)
+            # overwrite it: reconciliation compares against this immutable
+            # value and fails closed on cross-cwd evidence.
             current_root = current_plugin_root_fingerprint()
             if current_root:
                 # Runtime activation identity is evidence about the Hook that is
@@ -9539,33 +9671,67 @@ def literal_apply_patch_source(source: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def host_exec_receipt_statuses(output: Any) -> tuple[str, str | None]:
+    """Separate an outer ``functions.exec`` envelope from its one tool leaf.
+
+    Desktop's custom-tool output can wrap a real ``exec_command`` or
+    ``write_stdin`` result in content/text/JSON layers.  The wrapper's
+    ``completed``/``ok`` only says that transport succeeded; it must never
+    overwrite the nested command exit code.  More than one terminal leaf is
+    deliberately unknown: there is no safe call/session association to pick.
+    """
+    # Do not use response_status here: it deliberately descends into content,
+    # which would make the leaf's failure look like an outer transport error.
+    envelope = "unknown"
+    if isinstance(output, dict):
+        if output.get("error") or output.get("isError") is True or output.get("is_error") is True:
+            envelope = "error"
+        elif output.get("success") is False or output.get("ok") is False:
+            envelope = "error"
+        else:
+            direct = str(output.get("status") or output.get("state") or "").strip().lower()
+            if direct in ERROR_STATUSES:
+                envelope = "error"
+            elif direct in RUNNING_STATUSES:
+                envelope = "running"
+            elif direct in {"complete", "completed", "done", "ok", "success", "succeeded"}:
+                envelope = "ok"
+    leaves: list[str] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 12 or len(leaves) > 1:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            if text[:1] in "[{":
+                try:
+                    visit(json.loads(text), depth + 1)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        # An exit_code belongs to the actual shell/session tool result, unlike
+        # generic host wrapper status.  Preserve even a nonzero code.
+        if isinstance(value.get("exit_code"), int):
+            leaves.append("ok" if value["exit_code"] == 0 else f"error:{value['exit_code']}")
+            return
+        for key in ("content", "output", "result", "tool_response", "response", "text"):
+            if key in value:
+                visit(value[key], depth + 1)
+
+    visit(output)
+    return envelope, leaves[0] if len(leaves) == 1 else None
+
+
 def host_exec_output_status(output: Any) -> str:
-    """Preserve an exact structured exit code inside the host exec wrapper."""
-    structured_statuses: list[str] = []
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-                continue
-            text = item["text"].strip()
-            if text[:1] not in "[{":
-                continue
-            try:
-                decoded = json.loads(text)
-            except Exception:
-                continue
-            if isinstance(decoded, dict):
-                status = response_status(decoded)
-                if status != "unknown":
-                    structured_statuses.append(status)
-    typed_error = next(
-        (status for status in structured_statuses if status.startswith("error:")),
-        None,
-    )
-    if typed_error:
-        return typed_error
-    if any(status.startswith("error") for status in structured_statuses):
-        return "error"
-    return response_status(output)
+    """Use one exact nested tool receipt; outer transport status is advisory."""
+    _envelope, leaf = host_exec_receipt_statuses(output)
+    return leaf or "unknown"
 
 
 def host_apply_patch_receipt_success(response: Any) -> bool:
@@ -13067,6 +13233,40 @@ def emit_stop_block(reason: str) -> None:
     )
 
 
+def emit_leased_stop_block(payload: dict[str, Any], reason: str) -> None:
+    """Persist pending→emitted→consumed around one idempotent Stop request."""
+    lease_box: dict[str, Any] = {}
+
+    def claim(state: dict[str, Any]) -> None:
+        lease_box.update(claim_continuation_lease(state, payload, reason))
+
+    # The business Stop mutation has already consumed its host hook-run key.
+    # Lease claim is a separate persistence boundary and must not be filtered
+    # as a duplicate of that business event.
+    claim_payload = dict(payload)
+    claim_payload.pop("hook_run_id", None)
+    mutate_state(claim_payload, claim)
+    if not lease_box.get("emit"):
+        emit_continue()
+        return
+    key = str(lease_box["key"])
+    # Test-only crash seam: production ignores it unless explicitly enabled.
+    # It proves the persisted emitted lease survives a process SIGKILL window.
+    if os.environ.get("WORKFLOW_MANAGER_TEST_SIGKILL_AFTER_LEASE_EMITTED") == "1":
+        os._exit(137)
+    emit_stop_block(f"{reason} continuation_key={key}")
+
+    def consume(state: dict[str, Any]) -> None:
+        consume_continuation_lease(state, key)
+
+    # This is a distinct durable boundary, not a duplicate delivery of the
+    # Stop event that claimed the lease; duplicate-hook suppression therefore
+    # must not discard the consume acknowledgement.
+    consume_payload = dict(payload)
+    consume_payload.pop("hook_run_id", None)
+    mutate_state(consume_payload, consume)
+
+
 def current_slice_resume_delta(
     state: dict[str, Any], canonical_body: str
 ) -> dict[str, Any] | None:
@@ -15498,6 +15698,14 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         if tool_key == "applypatch"
         else response_status(response)
     )
+    exec_envelope_status: str | None = None
+    exec_leaf_status: str | None = None
+    if tool_key in {"functionsexec", "exec"}:
+        # A PostToolUse event for the outer custom tool is admissible only when
+        # exactly one inner shell/session receipt is present.  Keep both facts
+        # in the ledger for parent diagnosis, but make the leaf authoritative.
+        exec_envelope_status, exec_leaf_status = host_exec_receipt_statuses(response)
+        status_value = exec_leaf_status or "unknown"
     requested_spawn_task_name: str | None = None
     if is_subagent_spawn_tool(payload):
         requested_spawn_task_name, _ = subagent_request_fields(payload)
@@ -15646,6 +15854,8 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "tool": tool,
                 "fingerprint": fingerprint,
                 "status": status_value,
+                "envelope_status": exec_envelope_status,
+                "leaf_status": exec_leaf_status,
                 "category": category,
                 "plan_digest": active_plan_digest,
                 "execution_contract_id": (
@@ -17516,6 +17726,17 @@ def stop(payload: dict[str, Any]) -> None:
                 if not execution_review_intent and assistant_message.strip()
                 else None
             )
+            # Native parent prose is allowed, but it cannot accidentally seal
+            # a candidate when it expressly records a negative acceptance or
+            # says that the requested release has not begun.  This also wins
+            # over a contradictory optional ``outcome=passed`` marker.
+            explicit_negative_review = bool(re.search(
+                r"(?i)(?:\\b(?:not\\s+passed|failed|failure|not\\s+started)\\b|"
+                r"未通过|失败|未开始|尚未发布|发布未开始)",
+                assistant_message,
+            ))
+            if explicit_negative_review:
+                review_outcome = "failed"
             native_review = bool(
                 not execution_review_intent and assistant_message.strip()
             )
@@ -17999,8 +18220,9 @@ def stop(payload: dict[str, Any]) -> None:
         "journal_full",
         "transaction_recovery_failed",
     }:
-        emit_stop_block(
-            f"Workflow Manager canonical plan journal {artifact['write_status']} warning_code={artifact['warning_code']}; confirmation and execution remain locked until a trusted revision commits.",
+        emit_leased_stop_block(
+            payload,
+            f"Workflow Manager canonical plan journal {artifact['write_status']} warning_code={artifact['warning_code']} plan_generation={safe_int(updated_state.get('plan_generation'))} plan_digest={artifact.get('plan_digest') or 'none'} failure_instance={artifact.get('updated_at') or 'none'}; confirmation and execution remain locked until a trusted revision commits.",
         )
         return
     # Recovery facts are already delivered on SubagentStop and on the next

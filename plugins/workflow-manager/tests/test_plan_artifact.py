@@ -858,7 +858,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(list(journal.parent.glob(".*transaction*")), [])
         self.assertEqual(list(journal.parent.glob(".*backup*")), [])
 
-    def test_c11_schema19_merges_up_to_six_verified_mirrors_then_cleans(self) -> None:
+    def test_c11_schema19_mirrors_fail_closed_without_reading_or_cleanup(self) -> None:
         session = "c11"
         payload = {"hook_event_name": "SessionStart", "session_id": session}
         environment = patch.dict(
@@ -909,21 +909,17 @@ class PlanArtifactTests(unittest.TestCase):
         HOOK.atomic_write(HOOK.state_path(payload), legacy)
 
         migrated = HOOK.snapshot_state(payload)
-        journal = directory / HOOK.PLAN_JOURNAL_NAME
-        parsed = HOOK.parse_plan_journal(journal.read_bytes(), expected_session=token)
-        self.assertEqual(
-            [item["generation"] for item in parsed["revisions"]], [2, 4, 6]
-        )
         self.assertEqual(migrated["schema_version"], HOOK.SCHEMA_VERSION)
         self.assertEqual(migrated["plan_state"], "invalidated")
-        self.assertEqual(migrated["plan_artifact"]["revision_count"], 3)
-        self.assertEqual(list(directory.glob("hard-plan-g*.md")), [])
+        self.assertEqual(migrated["plan_artifact"]["write_status"], "legacy_unavailable")
+        self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+        self.assertEqual(len(list(directory.glob("hard-plan-g*.md"))), 3)
         self.assertEqual(list(directory.glob(".*transaction*")), [])
 
     def test_c12_schema19_over_six_or_running_contract_fails_closed(self) -> None:
         for count, executor_state, expected_status in (
             (7, "none", "legacy_unavailable"),
-            (1, "running", "written"),
+            (1, "running", "legacy_unavailable"),
         ):
             with self.subTest(count=count, executor_state=executor_state):
                 selected = self.root / f"legacy-{count}-{executor_state}"
@@ -987,10 +983,8 @@ class PlanArtifactTests(unittest.TestCase):
                         observed["plan_artifact"]["write_status"], expected_status
                     )
                     if executor_state == "running":
-                        self.assertEqual(
-                            observed["executor_failure_kind"], "stale_contract"
-                        )
-                        self.assertTrue((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+                        self.assertIsNone(observed["executor_failure_kind"])
+                        self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
                     else:
                         self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
                         self.assertEqual(len(list(directory.glob("hard-plan-g*.md"))), 7)
@@ -1179,7 +1173,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(list(journal.parent.glob(".*backup*")), [])
 
-    def test_c20_schema19_cleanup_failure_is_retried_from_transaction_marker(self) -> None:
+    def test_c20_schema19_never_starts_cleanup_transaction(self) -> None:
         session = "c20"
         payload = {"hook_event_name": "SessionStart", "session_id": session}
         environment = patch.dict(
@@ -1224,21 +1218,12 @@ class PlanArtifactTests(unittest.TestCase):
         )
         HOOK.atomic_write(HOOK.state_path(payload), legacy)
 
-        with patch.object(
-            HOOK,
-            "_retain_plan_artifacts",
-            side_effect=HOOK.PlanArtifactError("unsafe_path"),
-        ):
-            first = HOOK.snapshot_state(payload)
+        first = HOOK.snapshot_state(payload)
         marker = directory / HOOK.PLAN_TRANSACTION_MARKER_NAME
         self.assertEqual(first["schema_version"], HOOK.SCHEMA_VERSION)
-        self.assertTrue((directory / HOOK.PLAN_JOURNAL_NAME).exists())
+        self.assertEqual(first["plan_artifact"]["write_status"], "legacy_unavailable")
+        self.assertFalse((directory / HOOK.PLAN_JOURNAL_NAME).exists())
         self.assertTrue(legacy_path.exists())
-        self.assertTrue(marker.exists())
-
-        recovered = HOOK.snapshot_state(payload)
-        self.assertEqual(recovered["plan_state"], "invalidated")
-        self.assertFalse(legacy_path.exists())
         self.assertFalse(marker.exists())
 
     def test_c21_confirmation_rereads_journal_inside_state_mutation(self) -> None:
@@ -1425,7 +1410,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertFalse((journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists())
         self.assertEqual(list(journal.parent.glob(".*backup*")), [])
 
-    def test_c25_schema19_migration_preserves_file_created_after_absence_check(self) -> None:
+    def test_c25_schema19_never_attempts_journal_creation(self) -> None:
         session = "c25"
         payload = {"hook_event_name": "SessionStart", "session_id": session}
         environment = patch.dict(
@@ -1471,27 +1456,12 @@ class PlanArtifactTests(unittest.TestCase):
         )
         HOOK.atomic_write(HOOK.state_path(payload), legacy)
         journal = directory / HOOK.PLAN_JOURNAL_NAME
-        external = b"EXTERNAL_CREATED_DURING_MIGRATION\n"
-        real_atomic_write = HOOK._atomic_write_plan_file
-        raced = False
-
-        def create_at_atomic_entry(path: Path, document: bytes, **kwargs: object) -> dict:
-            nonlocal raced
-            if not raced:
-                path.write_bytes(external)
-                raced = True
-            return real_atomic_write(path, document, **kwargs)
-
-        with patch.object(
-            HOOK, "_atomic_write_plan_file", side_effect=create_at_atomic_entry
-        ):
-            observed = HOOK.snapshot_state(payload)
-        self.assertTrue(raced)
+        observed = HOOK.snapshot_state(payload)
         self.assertEqual(observed["plan_state"], "invalidated")
         self.assertEqual(
             observed["plan_artifact"]["write_status"], "legacy_unavailable"
         )
-        self.assertEqual(journal.read_bytes(), external)
+        self.assertFalse(journal.exists())
         self.assertEqual(legacy_path.read_bytes(), legacy_bytes)
         self.assertFalse((directory / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists())
         self.assertEqual(list(directory.glob(".*backup*")), [])

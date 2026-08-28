@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from contextlib import redirect_stdout
 import hashlib
 import io
 import importlib.util
@@ -354,8 +355,8 @@ class OrchestratorHookTests(unittest.TestCase):
         )
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
-        self.assertEqual(HOOK.SCHEMA_VERSION, 30)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.53")
+        self.assertEqual(HOOK.SCHEMA_VERSION, 31)
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.54")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "11")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -450,7 +451,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (30, "1.0.53"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (31, "1.0.54"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -477,7 +478,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.53 active", context)
+        self.assertIn("Workflow Manager 1.0.54 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1128,7 +1129,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (30, "1.0.53"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (31, "1.0.54"))
         self.assertEqual(migrated["execution_profile_version"], "11")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1224,7 +1225,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (30, "1.0.53", "11"),
+                    (31, "1.0.54", "11"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1270,7 +1271,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (30, "1.0.53", "5", "verification_required", 1),
+            (31, "1.0.54", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1427,7 +1428,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (30, "1.0.53", "running", "mailbox-terminal-executor"),
+            (31, "1.0.54", "running", "mailbox-terminal-executor"),
         )
         self.assertEqual(len(migrated["subagents"]), len(running["subagents"]))
         schema30 = json.loads(json.dumps(running))
@@ -1440,7 +1441,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.53", "running", "mailbox-terminal-executor"),
+            ("1.0.54", "running", "mailbox-terminal-executor"),
         )
         self.assertEqual(
             len(migrated_1052["subagents"]), len(running["subagents"])
@@ -7027,6 +7028,181 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual((pending["executor_state"], pending["executor_attempt"]), ("spawn_pending", 1))
         self.assertEqual(HOOK.bound_executor_task_name(pending), "plain_writer")
 
+    def test_host_rollout_parent_reconciliation_rejects_ambiguous_history(self) -> None:
+        session = "rollout-parent-ambiguous-history"
+        cwd = str(Path(self.temporary.name) / "project")
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session,
+                       "hook_run_id": "objective", "cwd": cwd,
+                       "prompt": "修复跨模块生产故障、定位未知根因并完成严格验证"})
+        running = self.start_running_assessor(session, run_id="assessor")
+        self.run_hook({"hook_event_name": "SubagentStop", "session_id": session,
+                       "hook_run_id": "assessor-stop", "agent_id": running["assessor_agent_id"],
+                       "status": "completed", "last_assistant_message": "bounded assessment"})
+        rollout = Path(self.temporary.name) / "ambiguous-parent-controls.jsonl"
+        records = [
+            {"type": "session_meta", "payload": {"id": session, "session_id": session, "cwd": cwd}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "old", "last_agent_message": "计划：历史计划，验收与回滚明确。"}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "current", "last_agent_message": "计划：当前计划，验收与回滚明确。"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "确认执行"}]}},
+        ]
+        rollout.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records), encoding="utf-8")
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session,
+                       "hook_run_id": "reconcile", "cwd": cwd, "transcript_path": str(rollout),
+                       "tool_name": "get_goal", "tool_input": {}, "tool_response": {"status": "ok"}})
+        state = self.load_only_state()
+        self.assertEqual((state["plan_state"], state["executor_state"]), ("analyzing", "none"))
+
+    def test_root_cwd_identity_is_not_overwritten_by_later_event(self) -> None:
+        session = "immutable-root-cwd"
+        root_cwd = str(Path(self.temporary.name) / "root")
+        child_cwd = str(Path(self.temporary.name) / "child")
+        self.run_hook({"hook_event_name": "SessionStart", "session_id": session,
+                       "hook_run_id": "root", "cwd": root_cwd})
+        first = self.load_only_state()
+        self.run_hook({"hook_event_name": "PostToolUse", "session_id": session,
+                       "hook_run_id": "child", "cwd": child_cwd, "tool_name": "get_goal",
+                       "tool_input": {}, "tool_response": {"status": "ok"}})
+        self.assertEqual(self.load_only_state()["cwd_fingerprint"], first["cwd_fingerprint"])
+
+    def test_continuation_lease_replays_sigkill_with_one_idempotency_key(self) -> None:
+        payload = {
+            "hook_event_name": "Stop", "session_id": "continuation-lease",
+            "hook_run_id": "stop-1",
+        }
+        reason = "journal write_failed"
+        state = HOOK.new_state(payload)
+        first = HOOK.claim_continuation_lease(state, payload, reason)
+        self.assertEqual(first["phase"], "emitted")
+        self.assertTrue(first["emit"])
+        # SIGKILL after the emitted persistence but before stdout/consume:
+        # recovery may replay only the same dedupe key.
+        recovered = HOOK.normalize_state(state, payload)
+        replay = HOOK.claim_continuation_lease(recovered, payload, reason)
+        self.assertTrue(replay["emit"])
+        self.assertEqual(replay["key"], first["key"])
+        HOOK.consume_continuation_lease(recovered, replay["key"])
+        done = HOOK.claim_continuation_lease(recovered, payload, reason)
+        self.assertFalse(done["emit"])
+        self.assertEqual(done["phase"], "consumed")
+        replacement = HOOK.claim_continuation_lease(
+            recovered, payload, reason + " failure_instance=repaired-at-2"
+        )
+        self.assertTrue(replacement["emit"])
+        self.assertNotEqual(replacement["key"], first["key"])
+
+    def test_nested_exec_leaf_exit_overrides_outer_transport_ok(self) -> None:
+        # ``functions.exec`` completed, but its only bound exec_command leaf
+        # failed.  The outer transport result is never verification evidence.
+        output = {
+            "status": "ok",
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "completed", "result": {"session_id": 7, "exit_code": 1}
+            })}],
+        }
+        self.assertEqual(HOOK.host_exec_receipt_statuses(output), ("ok", "error:1"))
+        self.assertEqual(HOOK.host_exec_output_status(output), "error:1")
+
+    def test_nested_exec_multiple_leaf_receipts_are_unknown(self) -> None:
+        # Two calls in one outer custom-tool output have no one-to-one binding
+        # to an operation; even two apparent successes must remain unknown.
+        output = {
+            "status": "ok",
+            "content": [
+                {"type": "text", "text": '{"exit_code":0}'},
+                {"type": "text", "text": '{"session_id":7,"exit_code":1}'},
+            ],
+        }
+        self.assertEqual(HOOK.host_exec_receipt_statuses(output), ("ok", None))
+        self.assertEqual(HOOK.host_exec_output_status(output), "unknown")
+
+    def test_posttool_functions_exec_records_leaf_not_outer_status(self) -> None:
+        session = "posttool-nested-exec"
+        self.run_hook({
+            "hook_event_name": "PostToolUse", "session_id": session,
+            "hook_run_id": "inner-failure", "tool_name": "functions.exec",
+            "tool_input": {"source": "await tools.exec_command({cmd: 'test -f artifact'})"},
+            "tool_response": {"status": "ok", "content": [{
+                "text": json.dumps({"session_id": 5, "exit_code": 1})
+            }]},
+        })
+        operation = self.load_only_state()["operations"][-1]
+        self.assertEqual((operation["status"], operation["envelope_status"], operation["leaf_status"]),
+                         ("error:1", "ok", "error:1"))
+
+    def test_native_parent_review_explicit_negative_never_seals(self) -> None:
+        session = "negative-native-parent-review"
+        candidate = self.create_executor_candidate(session, native_result=True)
+        self.run_hook({
+            "hook_event_name": "PostToolUse", "session_id": session,
+            "hook_run_id": "parent-verify", "tool_name": "Bash",
+            "tool_input": {"command": "test -f bounded_acceptance && stat -c %s bounded_acceptance"},
+            "tool_response": {"status": "ok", "exit_code": 0},
+        })
+        self.run_hook({
+            "hook_event_name": "Stop", "session_id": session,
+            "hook_run_id": "negative-review",
+            "last_assistant_message": "验收未通过；发布未开始。",
+        })
+        rejected = self.load_only_state()
+        self.assertEqual((rejected["executor_state"], rejected["executor_review"]["status"]),
+                         ("recovery_required", "failed"))
+        self.assertNotEqual(rejected["last_execution_baseline"]["acceptance_status"], "passed")
+
+    def test_leased_stop_emits_key_once_and_concurrent_claims_share_it(self) -> None:
+        payload = {
+            "hook_event_name": "Stop", "session_id": "continuation-output",
+            "hook_run_id": "stop-1",
+        }
+        reason = "journal write_failed"
+        with patch.dict(os.environ, {"PLUGIN_DATA": str(self.data)}, clear=False):
+            with redirect_stdout(io.StringIO()) as output:
+                HOOK.emit_leased_stop_block(payload, reason)
+            emitted = json.loads(output.getvalue())
+            key = HOOK.continuation_lease_key(payload, reason)
+            self.assertIn(key, emitted["reason"])
+            self.assertEqual(HOOK.snapshot_state(payload)["continuation_lease"]["phase"], "consumed")
+            with redirect_stdout(io.StringIO()) as duplicate:
+                HOOK.emit_leased_stop_block(payload, reason)
+            self.assertEqual(json.loads(duplicate.getvalue()), {"continue": True})
+
+        state = HOOK.new_state(payload)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            leases = list(pool.map(
+                lambda _: HOOK.claim_continuation_lease(state, payload, reason), range(2)
+            ))
+        self.assertEqual({lease["key"] for lease in leases}, {key})
+
+    def test_subprocess_sigkill_recovers_emitted_lease_with_same_key(self) -> None:
+        payload = {"hook_event_name": "Stop", "session_id": "lease-kill", "hook_run_id": "stop"}
+        reason = "journal write_failed failure_instance=1"
+        runner = (
+            "import importlib.util;"
+            f"s=importlib.util.spec_from_file_location('h',{str(SCRIPT)!r});"
+            "h=importlib.util.module_from_spec(s);s.loader.exec_module(h);"
+            f"h.emit_leased_stop_block({payload!r},{reason!r})"
+        )
+        env = os.environ | {"PLUGIN_DATA": str(self.data), "WORKFLOW_MANAGER_TEST_SIGKILL_AFTER_LEASE_EMITTED": "1"}
+        killed = subprocess.run([sys.executable, "-B", "-c", runner], env=env, capture_output=True, text=True)
+        self.assertEqual(killed.returncode, 137)
+        with patch.dict(os.environ, {"PLUGIN_DATA": str(self.data)}, clear=False):
+            self.assertEqual(HOOK.snapshot_state(payload)["continuation_lease"]["phase"], "emitted")
+        resumed = subprocess.run([sys.executable, "-B", "-c", runner], env={k: v for k, v in env.items() if k != "WORKFLOW_MANAGER_TEST_SIGKILL_AFTER_LEASE_EMITTED"}, capture_output=True, text=True, check=True)
+        key = HOOK.continuation_lease_key(payload, reason)
+        self.assertIn(key, resumed.stdout)
+        third = subprocess.run([sys.executable, "-B", "-c", runner], env={k: v for k, v in env.items() if k != "WORKFLOW_MANAGER_TEST_SIGKILL_AFTER_LEASE_EMITTED"}, capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(third.stdout), {"continue": True})
+
+    def test_root_rollout_identity_rejects_regular_file_replacement(self) -> None:
+        first = Path(self.temporary.name) / "rollout-a.jsonl"
+        second = Path(self.temporary.name) / "rollout-b.jsonl"
+        first.write_text("{}\n", encoding="utf-8")
+        second.write_text("{}\n", encoding="utf-8")
+        state = HOOK.new_state({"session_id": "root-rollout"})
+        state["root_rollout_identity"] = HOOK.root_rollout_regular_file_identity(first)
+        self.assertNotEqual(
+            state["root_rollout_identity"], HOOK.root_rollout_regular_file_identity(second)
+        )
+
     def test_native_assessor_result_flows_to_parent_manifest_without_format_gate(self) -> None:
         self.assertRegex(
             HOOK.native_assessor_result_digest("需复核") or "",
@@ -9145,7 +9321,9 @@ class OrchestratorHookTests(unittest.TestCase):
             ("string_raw_error", [record("response_item", {"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r=await tools.exec_command({cmd: String.raw`test -f artifact`, workdir: \"/tmp\"});"}), record("response_item", {"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"{\"exit_code\": 1}"}]})], digest, "error:1"),
             ("string_raw_shell", [record("response_item", {"type":"custom_tool_call","name":"exec","call_id":"c1","input":f"const r=await tools.exec_command({{cmd: String.raw`{real_command}`, workdir: \"/tmp\"}});"}), record("response_item", {"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"{\"exit_code\": 1}"}]})], real_digest, "error:1"),
             ("raw_interpolation", [record("response_item", {"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r=await tools.exec_command({cmd: String.raw`${danger}`, workdir: \"/tmp\"});"}), structured], digest, "unknown"),
-            ("stdout_only", [call, record("response_item", {"type": "custom_tool_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "Script completed\nWall time 0\nOutput:\nstdout"}]})], digest, "ok"),
+            # A successful outer functions.exec envelope without its structured
+            # exec_command/write_stdin result is not acceptance evidence.
+            ("stdout_only", [call, record("response_item", {"type": "custom_tool_call_output", "call_id": "c1", "output": [{"type": "input_text", "text": "Script completed\nWall time 0\nOutput:\nstdout"}]})], digest, "unknown"),
             ("wrong_turn", [{**call, "payload": {**call["payload"], "internal_chat_message_metadata_passthrough": {"turn_id": "other"}}}, structured], digest, "unknown"),
             ("wrong_digest", [call, structured], "0" * 32, "unknown"),
             ("duplicate_call", [call, call, structured], digest, "unknown"),
@@ -10195,7 +10373,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.53 active", context)
+        self.assertIn("Workflow Manager 1.0.54 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10884,7 +11062,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (30, "1.0.53"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (31, "1.0.54"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))

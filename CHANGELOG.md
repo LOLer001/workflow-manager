@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.54
+
+- 恢复证据绑定为不可变 root session、root cwd 与首个宿主 regular rollout 文件的 device/inode 身份；跨 cwd、替换文件、符号链接或不唯一的 rollout 一律不用于恢复 parent 控制面。
+- 历史项目内 `.codex/plans` review mirror 仅作为污染证据，活跃合同 fail-closed：不再读取、解析、迁移、写入、清理或向执行器交付其正文。新增有界结构化 `legacy_plan_rejected`、`root_identity_mismatch` 生命周期诊断。
+- Schema 升至 31，writer/plugin 版本升至 1.0.54。
+
 ## 1.0.53
 
 - 修正 1.0.52 安装后 trust doctor 的发布元数据：`DISPATCH_STATE_SCHEMA` 与实际 Schema 30 收据一致，不再把已由新任务证明加载的 1.0.52/30 运行时误报为 `runtime_mismatch`。新增 doctor writer/schema 与 Hook/manifest 版本矩阵的防复发断言；运行时 mailbox/recovery 语义不变，并保留 Schema 30/writer 1.0.52 活跃 profile-v11 执行的懒迁移连续性。

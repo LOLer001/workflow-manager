@@ -38,8 +38,8 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(
             constants,
             {
-                "SCHEMA_VERSION": "30",
-                "WRITER_VERSION": "1.0.53",
+                "SCHEMA_VERSION": "31",
+                "WRITER_VERSION": "1.0.54",
                 "EXECUTION_PROFILE_VERSION": "11",
                 "STABLE_SKILL_SCHEMA": "9",
             },
@@ -109,6 +109,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             "1.0.51",
             "1.0.52",
             "1.0.53",
+            "1.0.54",
         ):
             with self.subTest(version=version):
                 notes = MODULE.extract_release_notes(changelog, version)
