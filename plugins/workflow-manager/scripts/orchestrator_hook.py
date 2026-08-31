@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 32
-WRITER_VERSION = "1.0.55"
+WRITER_VERSION = "1.0.56"
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
 EXECUTION_PROFILE_VERSION = "11"
@@ -8250,7 +8250,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     )
     active_profile11_continuity = bool(
         (source_schema, source_writer)
-        in {(29, "1.0.51"), (30, "1.0.52")}
+        in {(29, "1.0.51"), (30, "1.0.52"), (32, "1.0.55")}
         and source_profile == "11"
         and value.get("plan_state") == "confirmed"
         and source_contract

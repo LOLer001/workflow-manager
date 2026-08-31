@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.0.56
+
+- 修正 1.0.55 引入 TaskEpoch 后的 C24 首次写入竞态夹具：外部竞态文件现在写入当前 state 的 epoch-scoped canonical journal，而不是 legacy session journal；产品的 no-clobber、事务回滚与 fail-closed 语义不变。
+- 采用 forward-only 发布，保留既有 1.0.55 Tag/Release 与历史；Schema 维持 32、execution profile 维持 v11，并保留 Schema 32/writer 1.0.55 活跃合同的懒迁移连续性。
+
 ## 1.0.55
 
 - 引入隔离 TaskEpoch：真实的新目标或跨工作区任务拥有独立授权包络与 canonical journal；仅 worktree 迁移不会清除既有合同。

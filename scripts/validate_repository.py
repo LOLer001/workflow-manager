@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_NAME = "workflow-manager"
 PLUGIN = ROOT / "plugins" / PLUGIN_NAME
 EXPECTED_VERSION_MATRIX = {
-    "1.0.55": {
+    "1.0.56": {
         "schema": 32,
         "execution_profile": "11",
         "stable_skill_schema": 9,

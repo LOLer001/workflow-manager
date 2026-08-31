@@ -1371,7 +1371,9 @@ class PlanArtifactTests(unittest.TestCase):
             "session_id": session,
             "hook_run_id": "first-write-absence-race",
         }
-        token = HOOK.plan_artifact_session_id(session)
+        token = HOOK.plan_artifact_session_id(
+            session, self.state()["task_epoch"]["id"]
+        )
         journal = self.data / "plans" / token / HOOK.PLAN_JOURNAL_NAME
         external = b"EXTERNAL_CREATED_AFTER_ABSENCE_CHECK\n"
         environment = patch.dict(

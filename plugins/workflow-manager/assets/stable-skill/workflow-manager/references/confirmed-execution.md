@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 32/writer 1.0.55 uses execution profile v11 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
+This reference applies only after a Hard plan is confirmed. Schema 32/writer 1.0.56 uses execution profile v11 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 

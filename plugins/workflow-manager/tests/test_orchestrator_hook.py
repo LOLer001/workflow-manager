@@ -356,7 +356,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 32)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.55")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.56")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "11")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -451,7 +451,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (32, "1.0.55"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (32, "1.0.56"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -478,7 +478,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.55 active", context)
+        self.assertIn("Workflow Manager 1.0.56 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1129,7 +1129,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (32, "1.0.55"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (32, "1.0.56"))
         self.assertEqual(migrated["execution_profile_version"], "11")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1225,7 +1225,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (32, "1.0.55", "11"),
+                    (32, "1.0.56", "11"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1271,7 +1271,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (32, "1.0.55", "5", "verification_required", 1),
+            (32, "1.0.56", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1428,7 +1428,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (32, "1.0.55", "running", "mailbox-terminal-executor"),
+            (32, "1.0.56", "running", "mailbox-terminal-executor"),
         )
         self.assertEqual(len(migrated["subagents"]), len(running["subagents"]))
         schema30 = json.loads(json.dumps(running))
@@ -1441,13 +1441,28 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.55", "running", "mailbox-terminal-executor"),
+            ("1.0.56", "running", "mailbox-terminal-executor"),
         )
         self.assertEqual(
             len(migrated_1052["subagents"]), len(running["subagents"])
         )
+        schema32 = json.loads(json.dumps(running))
+        schema32["schema_version"] = 32
+        schema32["writer_version"] = "1.0.55"
+        migrated_1055 = HOOK.normalize_state(schema32, {"session_id": session})
+        self.assertEqual(
+            (
+                migrated_1055["writer_version"],
+                migrated_1055["executor_state"],
+                migrated_1055["executor_agent_id"],
+            ),
+            ("1.0.56", "running", "mailbox-terminal-executor"),
+        )
+        self.assertEqual(
+            len(migrated_1055["subagents"]), len(running["subagents"])
+        )
         self.state_files()[0].write_text(
-            json.dumps(schema30), encoding="utf-8"
+            json.dumps(schema32), encoding="utf-8"
         )
 
         failure_fingerprint = "a" * 32
@@ -10373,7 +10388,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.55 active", context)
+        self.assertIn("Workflow Manager 1.0.56 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11062,7 +11077,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (32, "1.0.55"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (32, "1.0.56"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
