@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.0.55
+
+- 引入隔离 TaskEpoch：真实的新目标或跨工作区任务拥有独立授权包络与 canonical journal；仅 worktree 迁移不会清除既有合同。
+- 旧 epoch 按审计状态封存；证据不完整标记为 `isolated_incomplete` 或 `authority_unknown`，活动 writer 会阻止切换而不会被静默重定向。
+- continuation lease 绑定 epoch，避免旧任务的迟到或重放 Stop 消耗新任务的续接。
+- Schema 升至 32；仅迁移 1.0.54 历史状态，不改写历史 journal 或制造成功。
+
 ## 1.0.54
 
 - 恢复证据绑定为不可变 root session、root cwd 与首个宿主 regular rollout 文件的 device/inode 身份；跨 cwd、替换文件、符号链接或不唯一的 rollout 一律不用于恢复 parent 控制面。

@@ -38,8 +38,8 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(
             constants,
             {
-                "SCHEMA_VERSION": "31",
-                "WRITER_VERSION": "1.0.54",
+                "SCHEMA_VERSION": "32",
+                "WRITER_VERSION": "1.0.55",
                 "EXECUTION_PROFILE_VERSION": "11",
                 "STABLE_SKILL_SCHEMA": "9",
             },

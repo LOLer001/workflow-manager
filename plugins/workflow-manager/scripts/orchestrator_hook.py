@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 31
-WRITER_VERSION = "1.0.54"
+SCHEMA_VERSION = 32
+WRITER_VERSION = "1.0.55"
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
 EXECUTION_PROFILE_VERSION = "11"
@@ -180,6 +180,8 @@ LEGACY_CAUSAL_OUTCOME_MAP = {
 LIFECYCLE_DIAGNOSTIC_CODES = frozenset({
     "ordinary_spawn_no_active_hard", "pretool_missing", "start_missing",
     "contract_mismatch", "legacy_plan_rejected", "root_identity_mismatch",
+    "epoch_switch_live_writer", "epoch_switch_lifecycle_conflict",
+    "epoch_switch_irreversible_pending", "epoch_authority_unknown",
 })
 LIFECYCLE_DIAGNOSTIC_LEVELS = frozenset({"info", "warning", "error"})
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
@@ -3391,10 +3393,84 @@ def safe_id(value: Any) -> str:
     return f"{readable}-{stable_hash(raw)}"
 
 
-def plan_artifact_session_id(value: Any) -> str:
-    """Keep private plan paths unlinkable to readable host session labels."""
+def plan_artifact_session_id(value: Any, epoch_id: Any = None) -> str:
+    """Keep each private canonical journal unlinkable and epoch-scoped.
+
+    A session may legitimately host several unrelated objectives.  The old
+    schema used one directory per session, which let a new cwd/objective reuse
+    an old journal identity.  Epoch-less calls intentionally retain the v31
+    path so migration can read historical journals without rewriting them.
+    """
     raw = str(value or "")
-    return f"session-{stable_hash('plan-artifact-session' + chr(0) + raw)}"
+    scope = raw if not epoch_id else raw + chr(0) + str(epoch_id)
+    return f"session-{stable_hash('plan-artifact-session' + chr(0) + scope)}"
+
+
+def _safe_task_epoch(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"id": None, "sequence": 0, "status": "none", "objective_fingerprint": None}
+    epoch_id = safe_fingerprint(value.get("id"))
+    status = value.get("status") if value.get("status") in {
+        "active", "archived", "isolated_incomplete", "authority_unknown", "blocked"
+    } else "none"
+    return {
+        "id": epoch_id or None,
+        "sequence": max(safe_int(value.get("sequence")), 0),
+        "status": status,
+        "objective_fingerprint": safe_fingerprint(value.get("objective_fingerprint")) or None,
+    }
+
+
+def task_epoch_id(payload: dict[str, Any], sequence: int, objective_fingerprint: Any) -> str:
+    return stable_hash(
+        "task-epoch-v1\0%s\0%s\0%s" % (
+            safe_label(payload.get("session_id"), 120), max(sequence, 1),
+            safe_fingerprint(objective_fingerprint) or "unbound",
+        ), 32,
+    )
+
+
+def _epoch_has_live_writer(state: dict[str, Any]) -> bool:
+    return state.get("executor_state") in {"spawn_pending", "running"} or state.get("assessor_state") in {"spawn_pending", "running"}
+
+
+def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective: dict[str, Any]) -> bool:
+    """Archive a terminal epoch and create an isolated successor.
+
+    This function is deliberately called only after the prompt classifier has
+    ruled out a same-objective worktree migration.  It never revokes an active
+    writer: callers must retain the old epoch and surface a diagnostic instead.
+    """
+    if _epoch_has_live_writer(state):
+        record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
+        return False
+    current = _safe_task_epoch(state.get("task_epoch"))
+    archive = list(state.get("archived_epochs", []))[-7:]
+    if current.get("id"):
+        status = "archived"
+        if state.get("executor_state") not in {"none", "succeeded"}:
+            status = "isolated_incomplete"
+        if state.get("executor_start_observed") == "full" and not state.get("executor_observed_effective"):
+            status = "authority_unknown"
+            record_lifecycle_diagnostic(state, "epoch_authority_unknown", level="warning")
+        archive.append({
+            "id": current["id"], "sequence": current["sequence"], "status": status,
+            "objective_fingerprint": current.get("objective_fingerprint"),
+            "plan_digest": safe_fingerprint(state.get("plan_digest")) or None,
+            "execution_contract_id": safe_fingerprint(state.get("execution_contract_id")) or None,
+        })
+    sequence = max(current.get("sequence", 0), 0) + 1
+    state["task_epoch"] = {
+        "id": task_epoch_id(payload, sequence, objective.get("fingerprint")),
+        "sequence": sequence, "status": "active",
+        "objective_fingerprint": safe_fingerprint(objective.get("fingerprint")) or None,
+    }
+    state["cwd_fingerprint"] = stable_hash(payload.get("cwd"))
+    state["root_cwd_fingerprint"] = state["cwd_fingerprint"]
+    state["root_session_fingerprint"] = stable_hash(payload.get("session_id") or payload.get("hook_run_id"))
+    state["root_rollout_identity"] = None
+    state["archived_epochs"] = archive[-8:]
+    return True
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -3932,18 +4008,19 @@ def _safe_continuation_lease(item: Any) -> dict[str, Any]:
     key = _fingerprint32(item.get("key"))
     reason_digest = _fingerprint32(item.get("reason_digest"))
     if phase == "none" or not key or not reason_digest:
-        return {"phase": "none", "key": None, "reason_digest": None, "at": None}
+        return {"phase": "none", "key": None, "reason_digest": None, "epoch_id": None, "at": None}
     return {
         "phase": phase, "key": key, "reason_digest": reason_digest,
+        "epoch_id": safe_fingerprint(item.get("epoch_id")) or None,
         "at": str(item.get("at") or "")[:40] or None,
     }
 
 
-def continuation_lease_key(payload: dict[str, Any], reason: str) -> str:
+def continuation_lease_key(payload: dict[str, Any], reason: str, epoch_id: Any = None) -> str:
     """Stable idempotency key for a host continuation request."""
     return stable_hash(
-        "continuation-lease-v1\0%s\0%s\0%s" % (
-            safe_label(payload.get("session_id"), 120),
+        "continuation-lease-v2\0%s\0%s\0%s\0%s" % (
+            safe_label(payload.get("session_id"), 120), safe_fingerprint(epoch_id) or "legacy",
             safe_label(payload.get("hook_run_id"), 120),
             stable_hash(reason, 32),
         ), 32,
@@ -3957,11 +4034,12 @@ def claim_continuation_lease(state: dict[str, Any], payload: dict[str, Any], rea
     key.  That covers a SIGKILL between stdout and the final consume write
     without allowing the host to create a second logical continuation.
     """
-    key = continuation_lease_key(payload, reason)
+    epoch_id = _safe_task_epoch(state.get("task_epoch")).get("id")
+    key = continuation_lease_key(payload, reason, epoch_id)
     digest = stable_hash(reason, 32)
     lease = _safe_continuation_lease(state.get("continuation_lease"))
-    if lease["key"] != key or lease["reason_digest"] != digest:
-        lease = {"phase": "pending", "key": key, "reason_digest": digest, "at": utc_now()}
+    if lease["key"] != key or lease["reason_digest"] != digest or lease.get("epoch_id") != epoch_id:
+        lease = {"phase": "pending", "key": key, "reason_digest": digest, "epoch_id": epoch_id, "at": utc_now()}
     if lease["phase"] == "consumed":
         state["continuation_lease"] = lease
         return {**lease, "emit": False}
@@ -3992,6 +4070,10 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "root_session_fingerprint": stable_hash(payload.get("session_id") or payload.get("hook_run_id")),
         "root_cwd_fingerprint": stable_hash(payload.get("cwd")),
         "root_rollout_identity": None,
+        # Epoch 0 is intentionally unbound until UserPromptSubmit supplies an
+        # objective.  Schema-31 migration keeps its legacy journal untouched.
+        "task_epoch": {"id": None, "sequence": 0, "status": "none", "objective_fingerprint": None},
+        "archived_epochs": [],
         "model": safe_label(payload.get("model"), 80) if payload.get("model") else None,
         "task_domain": "unknown",
         "domain_confidence": "low",
@@ -6851,7 +6933,7 @@ def recover_plan_transaction(state: dict[str, Any], payload: dict[str, Any]) -> 
             if not artifact.get("journal_digest"):
                 return True
             raise
-        session = plan_artifact_session_id(payload.get("session_id"))
+        session = plan_artifact_session_id(payload.get("session_id"), _safe_task_epoch(state.get("task_epoch")).get("id"))
         directory = root / "plans" / session
         try:
             directory_info = directory.lstat()
@@ -7121,7 +7203,7 @@ def migrate_legacy_plan_artifacts(
         return False
     try:
         root = _canonical_plan_data_root(payload)
-        session = plan_artifact_session_id(payload.get("session_id"))
+        session = plan_artifact_session_id(payload.get("session_id"), _safe_task_epoch(state.get("task_epoch")).get("id"))
         expected_prefix = f"plans/{session}/"
         if not str(artifact.get("relative_path") or "").startswith(expected_prefix):
             raise PlanArtifactError("legacy_unavailable")
@@ -7413,7 +7495,7 @@ def write_plan_artifact(
     state: dict[str, Any], payload: dict[str, Any], message: str
 ) -> bool:
     previous = _safe_plan_artifact(state.get("plan_artifact"))
-    session = plan_artifact_session_id(payload.get("session_id"))
+    session = plan_artifact_session_id(payload.get("session_id"), _safe_task_epoch(state.get("task_epoch")).get("id"))
     relative = f"plans/{session}/{PLAN_JOURNAL_NAME}"
     now = utc_now()
     failure = dict(previous)
@@ -7678,7 +7760,7 @@ def append_runtime_plan_record(
         return False
     try:
         root = _canonical_plan_data_root(payload)
-        session = plan_artifact_session_id(payload.get("session_id"))
+        session = plan_artifact_session_id(payload.get("session_id"), _safe_task_epoch(state.get("task_epoch")).get("id"))
         if parts[1] != session or parts[2] != PLAN_JOURNAL_NAME:
             raise PlanArtifactError("unsafe_path")
         target = root / "plans" / session / PLAN_JOURNAL_NAME
@@ -7766,7 +7848,7 @@ def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> bool
         ):
             raise PlanArtifactError("unsafe_path")
         _, session, filename = parts
-        if session != plan_artifact_session_id(payload.get("session_id")):
+        if session != plan_artifact_session_id(payload.get("session_id"), _safe_task_epoch(state.get("task_epoch")).get("id")):
             raise PlanArtifactError("content_drift")
         root = _canonical_plan_data_root(payload)
         target = root / "plans" / session / filename
@@ -7965,6 +8047,17 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["root_session_fingerprint"] = base["session_fingerprint"]
     if not safe_fingerprint(value.get("root_cwd_fingerprint")):
         base["root_cwd_fingerprint"] = base["cwd_fingerprint"]
+    # Do not invent an epoch id for schema-31 state: its journal path is part
+    # of the historical evidence.  It becomes an explicit successor only on a
+    # later safe new-objective boundary.
+    base["task_epoch"] = _safe_task_epoch(value.get("task_epoch"))
+    base["archived_epochs"] = [
+        _safe_task_epoch(item) | {
+            "plan_digest": safe_fingerprint(item.get("plan_digest")) or None,
+            "execution_contract_id": safe_fingerprint(item.get("execution_contract_id")) or None,
+        }
+        for item in as_list(value.get("archived_epochs")) if isinstance(item, dict)
+    ][-8:]
     root_rollout_identity = value.get("root_rollout_identity")
     base["root_rollout_identity"] = (
         root_rollout_identity
@@ -14027,6 +14120,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and plan_replan_request(prompt)
         and previous.get("objective", {}).get("fingerprint") != stable_hash(prompt)
     )
+    cwd_changed = bool(
+        previous.get("cwd_fingerprint")
+        and previous.get("cwd_fingerprint") != stable_hash(payload.get("cwd"))
+    )
     new_objective = False if recovery_followup else bool(
         failed_assessor_replan
         or (
@@ -14040,6 +14137,19 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
         )
     )
+    # A cwd change is not itself a contract reset: an exact control/recovery
+    # may be a worktree migration.  But ordinary new work in another workspace
+    # must never inherit confirmation, journal, or writer ownership.
+    if cwd_changed and not (
+        is_control_followup(prompt) or pure_plan_confirmation(prompt)
+        or same_assessor_objective_retry or recovery_followup
+    ):
+        new_objective = True
+    epoch_switch_blocked = bool(new_objective and _epoch_has_live_writer(previous))
+    if epoch_switch_blocked:
+        # Retain the old contract intact.  A later host event can only settle
+        # that epoch; it cannot be reinterpreted as the requested successor.
+        new_objective = False
     delegated_control_followup = bool(
         delegated_prompt is not None
         and previous.get("task_domain") == "work"
@@ -14147,7 +14257,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if completed_direct_followup
         else {}
     )
-    continuation = not new_objective and (
+    continuation = epoch_switch_blocked or (not new_objective and (
         preference_directive is not None
         or is_control_followup(prompt)
         or is_progress_followup(prompt)
@@ -14157,7 +14267,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or delegated_control_followup
         or early_confirmation
         or recovery_followup
-    )
+    ))
     classification = classify_prompt(prompt)
     if requested_reference:
         classification.update(
@@ -14238,6 +14348,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                     ),
                 }
             )
+        if epoch_switch_blocked:
+            record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
         if preference_directive is not None:
             state["session_execution_preference"] = preference_directive
             if preference_changed and state.get("plan_state") == "confirmed":
@@ -14280,6 +14392,14 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             }
         elif not continuation or not state.get("objective"):
             state["objective"] = {**prompt_meta, "updated_at": utc_now()}
+        # A first task and every genuine successor receive a fresh private
+        # epoch/journal.  Existing v31 state remains epoch-less until such a
+        # boundary so its old evidence is only migrated, never rewritten.
+        if (not _safe_task_epoch(state.get("task_epoch")).get("id") and not state.get("objective", {}).get("fingerprint")):
+            record_lifecycle_diagnostic(state, "epoch_switch_lifecycle_conflict", level="error")
+        elif (not _safe_task_epoch(state.get("task_epoch")).get("id") and not state.get("plan_digest")) or new_objective:
+            if not rotate_task_epoch(state, payload, state.get("objective", {})):
+                record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
         if not continuation or not state.get("authorization_scope"):
             state["authorization_scope"] = authorization_scope_from_prompt(prompt)
         elif plan_changed or acceptance_miss or scope_changed:

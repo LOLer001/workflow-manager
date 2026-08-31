@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 31/writer 1.0.54 uses execution profile v11 and an append-only canonical journal v3.
+This reference applies only after a Hard plan is confirmed. Schema 32/writer 1.0.55 uses execution profile v11 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 
@@ -29,7 +29,7 @@ If Desktop omits `SubagentStop` but a parent `list_agents` result exposes one st
 
 ## Native plan and journal
 
-The parent writes one bounded ordinary plan to private plugin data at `plans/<session-token>/hard-plan.md`. Before `plan_state` becomes `awaiting_confirmation`, the current trusted revision must commit successfully. The journal alone never grants authority. Objective, revision digest, journal digest, confirmation envelope, execution contract, and current ownership must also agree.
+The parent writes one bounded ordinary plan to private plugin data at `plans/<epoch-token>/hard-plan.md`. Before `plan_state` becomes `awaiting_confirmation`, the current trusted revision must commit successfully. The journal alone never grants authority. Objective, revision digest, journal digest, confirmation envelope, execution contract, and current ownership must also agree.
 
 Plan formatting is native Codex behavior. A `workflow-manager-execution-slices` JSON block is optional:
 
