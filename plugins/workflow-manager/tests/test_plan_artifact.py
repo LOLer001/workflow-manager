@@ -26,16 +26,35 @@ HOOK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HOOK)
 
 
+def _native_test_tmp_dir(platform_name: str | None = None) -> str | None:
+    selected = os.name if platform_name is None else platform_name
+    return "/tmp" if selected == "posix" and Path("/tmp").is_dir() else None
+
+
 class PlanArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
-        native_tmp = "/tmp" if Path("/tmp").is_dir() else None
+        native_tmp = _native_test_tmp_dir()
         self.temporary = tempfile.TemporaryDirectory(prefix="workflow-plan-artifact-", dir=native_tmp)
+        if native_tmp is not None:
+            self.assertEqual(Path(self.temporary.name).parent, Path("/tmp"))
         self.root = Path(self.temporary.name)
         self.data = self.root / "data"
         self.codex_home = self.root / ".codex"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_test_tmp_selection_is_platform_safe_and_cwd_independent(self) -> None:
+        selected = _native_test_tmp_dir()
+        self.assertIsNone(_native_test_tmp_dir("nt"))
+        original = Path.cwd()
+        alternate = Path(self.temporary.name) / "alternate-cwd"
+        alternate.mkdir()
+        try:
+            os.chdir(alternate)
+            self.assertEqual(_native_test_tmp_dir(), selected)
+        finally:
+            os.chdir(original)
 
     def symlink_or_skip(
         self,

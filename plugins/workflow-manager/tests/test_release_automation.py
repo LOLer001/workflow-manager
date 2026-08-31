@@ -24,23 +24,20 @@ class ReleaseAutomationTests(unittest.TestCase):
         hook = (PLUGIN_ROOT / "scripts" / "orchestrator_hook.py").read_text(
             encoding="utf-8"
         )
+        metadata = json.loads((PLUGIN_ROOT / "release_metadata.json").read_text(encoding="utf-8"))
+        self.assertIn("RELEASE_METADATA = _release_metadata()", hook)
         constants = {
-            name: re.search(
-                rf'^\s*{name}\s*=\s*"?([^"\s]+)"?\s*$', hook, re.MULTILINE
-            ).group(1)
-            for name in (
-                "SCHEMA_VERSION",
-                "WRITER_VERSION",
-                "EXECUTION_PROFILE_VERSION",
-                "STABLE_SKILL_SCHEMA",
-            )
+            "SCHEMA_VERSION": str(metadata["schema"]),
+            "WRITER_VERSION": metadata["version"],
+            "EXECUTION_PROFILE_VERSION": metadata["execution_profile"],
+            "STABLE_SKILL_SCHEMA": str(metadata["stable_skill_schema"]),
         }
         self.assertEqual(
             constants,
             {
-                "SCHEMA_VERSION": "32",
-                "WRITER_VERSION": "1.0.56",
-                "EXECUTION_PROFILE_VERSION": "11",
+                "SCHEMA_VERSION": "33",
+                "WRITER_VERSION": "1.0.57",
+                "EXECUTION_PROFILE_VERSION": "12",
                 "STABLE_SKILL_SCHEMA": "9",
             },
         )
@@ -63,6 +60,10 @@ class ReleaseAutomationTests(unittest.TestCase):
                 re.MULTILINE,
             ).group(1),
             constants["SCHEMA_VERSION"],
+        )
+        self.assertEqual(
+            re.search(r'^DISPATCH_EXECUTION_PROFILE\s*=\s*"([^\"]+)"$', doctor, re.MULTILINE).group(1),
+            constants["EXECUTION_PROFILE_VERSION"],
         )
 
     def test_release_launchers_disable_bytecode(self) -> None:

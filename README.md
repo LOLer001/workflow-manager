@@ -4,11 +4,11 @@
 
 ## 核心能力
 
-Workflow Manager 1.0.56 是当前 Codex 的 Hard 任务安全层：普通开发保持原生体验，只在高风险、跨范围或未知根因任务中介入。
+Workflow Manager 1.0.57 是当前 Codex 的 Hard 任务安全层：普通开发保持原生体验，只在高风险、跨范围或未知根因任务中介入。
 
 - **确认后执行**：Hard 任务先只读分析并生成可审阅计划，用户明确确认后才允许修改、构建、部署或设备操作。
 - **可信授权**：同时校验子任务请求、宿主接受和实际启动，避免错误模型、错任务或伪造状态获得写权限。
-- **单写者与独立验收**：同一合同始终只有一个执行者；禁止嵌套和重叠写入，结果必须由父会话依据真实工具证据复核。
+- **单写者与独立验收**：同一合同在任一时刻恰好只有一个写入者；无子写入者时父会话可取得当前 slice 租约，子写入者被预留、存活或终态未知时父级写入安全拒绝。
 - **连续恢复**：失败、中断、压缩或恢复后沿用已确认范围；原样重放、状态漂移和越权变更会被拒绝。
 - **开发环境安全**：阻止在 CIFS、Samba、UNC、DrvFS 等挂载树运行 Git，并对不可逆外部操作保持显式授权。
 
@@ -25,14 +25,14 @@ codex plugin add workflow-manager@workflow-manager --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.56\scripts\install_stable_skill.py" --codex-home "$CodexHome"
+py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.57\scripts\install_stable_skill.py" --codex-home "$CodexHome"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.56/scripts/install_stable_skill.py" --codex-home "$codex_home"
+python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.57/scripts/install_stable_skill.py" --codex-home "$codex_home"
 ```
 
 检查安装状态：
@@ -53,14 +53,14 @@ codex plugin list --json
 
 ```powershell
 $CodexHome = Join-Path $env:USERPROFILE ".codex"
-py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.56\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
+py -3 -B "$CodexHome\plugins\cache\workflow-manager\workflow-manager\1.0.57\scripts\hook_trust_doctor.py" --cwd "C:\path\to\workspace"
 ```
 
 Linux、WSL 或 macOS：
 
 ```bash
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.56/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
+python3 -B "$codex_home/plugins/cache/workflow-manager/workflow-manager/1.0.57/scripts/hook_trust_doctor.py" --cwd /path/to/workspace
 ```
 
 `hook_trust_doctor.py` 只调用 app-server 的 `hooks/list`，不会修改配置。退出码：
@@ -101,7 +101,7 @@ codex plugin add workflow-manager@workflow-manager --json
 生产环境可固定到发布标签：
 
 ```bash
-codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.56 --json
+codex plugin marketplace add LOLer001/workflow-manager --ref v1.0.57 --json
 ```
 
 如需回退，先移除插件和市场，再使用目标标签重新添加：
@@ -116,7 +116,7 @@ codex plugin add workflow-manager@workflow-manager --json
 ## 工作方式与边界
 
 - **普通任务**：Codex 原生完成规划、工具调用、并行、恢复和压缩；插件不启动评估者，也不增加流程格式。
-- **Hard 任务**：确认前只允许读取、搜索和静态检查；确认后由单一执行者按合同实施，父会话独立验收。
+- **Hard 任务**：确认前只允许读取、搜索和静态检查；确认后由当前 slice 的唯一写入者按合同实施。父会话可在无子写入者且诊断已完成时直接取得租约，或选择一个绑定子执行器；两者不得重叠。
 - **恢复与变更**：同一授权范围内的修复和恢复可连续推进；目标、风险或不可逆操作发生实质变化时重新确认，身份或证据不一致时安全拒绝。
 - **插件边界**：只负责 Hard 授权、宿主运行证据、单写者和外部安全；不接管 Codex 的日常计划、调度、模型判断或输出格式。
 

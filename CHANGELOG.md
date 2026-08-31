@@ -1,5 +1,17 @@
 # 更新记录
 
+## 1.0.57
+
+- 将 Hard 合同从“必须一个子执行器”收敛为“同一时刻恰好一个写入者”：严格确认且当前无 pending/live/unknown 子写入者、无未完成 causal/stall 诊断时，父任务原子取得当前 contract/slice 的唯一租约，可连续实现、失败修正、验证与发布；租约存活时拒绝 child spawn，子写入者存在时父写入 fail-closed。
+- 父级接管 `verification_required` 旧候选会单调增加 attempt、清空旧 review candidate，并将后续宿主操作绑定当前 epoch/contract/slice；父级成功变更与验证可由 PostTool/Stop 证据封存，无需伪造 child Stop。挂载树 Git、设备与新增不可逆动作边界不放宽。
+- 错误 profile 的 assessor Start 保持 `recovery_required/start_mismatch` 且结果永不具权威；仅当前 epoch、request、contract、attempt、agent 与 rejected generation 全部唯一一致的真实 `SubagentStop` 可将其 liveness 幂等终结为 `terminal`，迟到、字段冲突或复用 id 事件只写隔离 tombstone，不影响 attempt 2。
+- 释放已由完整宿主 inventory 明确缺席的 request-only 高阶 assessor 预约，并隔离其迟到 Start，避免绑定后继预约。
+- 测试临时目录仅在 POSIX 的真实 `/tmp` 下固定；Windows 改用系统临时目录，标准 unittest 入口不依赖当前工作目录。
+- 升级 Schema 33 / writer 1.0.57 / execution profile v12。历史 sealed success 保留原 profile；未完成 v11 写权不会静默升级，证据不唯一时隔离并 fail-closed。
+- 强化 TaskEpoch、append-only v3 root 选择与 writer liveness：迟到事件只能唯一绑定原 epoch，缺少唯一完整 inventory 的 child 进入 `isolated_incomplete`，未知终态不伪造成功。
+- continuation outbox 采用 `epoch + contract + reason_digest` 稳定键；stdout 仅为发送尝试，只有精确宿主 receipt 或 root-visible 匹配消息可确认消费。
+- `git tag` 门禁按三态解析：list/verify 查询保持只读，创建、删除、重指向、混合、动态或不完整 argv 均作为 mutation fail-closed。
+
 ## 1.0.56
 
 - 修正 1.0.55 引入 TaskEpoch 后的 C24 首次写入竞态夹具：外部竞态文件现在写入当前 state 的 epoch-scoped canonical journal，而不是 legacy session journal；产品的 no-clobber、事务回滚与 fail-closed 语义不变。

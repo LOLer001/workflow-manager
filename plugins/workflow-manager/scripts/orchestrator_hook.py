@@ -23,17 +23,51 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 32
-WRITER_VERSION = "1.0.56"
+def _release_metadata() -> dict[str, Any]:
+    """Read the one checked-in release identity before accepting any state."""
+    # The POSIX runner executes a content-addressed copy of this file.  Its
+    # sibling directory deliberately contains only the hook, so prefer the
+    # trusted plugin root supplied by that runner and fall back to source.
+    configured_root = os.environ.get("PLUGIN_ROOT")
+    path = (
+        Path(configured_root) / "release_metadata.json"
+        if configured_root
+        else Path(__file__).resolve().parents[1] / "release_metadata.json"
+    )
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except OSError:
+        # A legacy single-file cache may predate the metadata companion.  It
+        # has no authority to upgrade state; retain the last compatible
+        # release identity so the lifecycle hook can fail open and the next
+        # normal runner refresh restores the structured source of truth.
+        value = {"version": "1.0.57", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+    if not (
+        isinstance(value, dict)
+        and isinstance(value.get("version"), str)
+        and re.fullmatch(r"\d+\.\d+\.\d+", value["version"])
+        and isinstance(value.get("schema"), int)
+        and isinstance(value.get("execution_profile"), str)
+        and value["execution_profile"].isdigit()
+        and isinstance(value.get("stable_skill_schema"), int)
+    ):
+        raise RuntimeError("invalid Workflow Manager release metadata")
+    return value
+
+
+RELEASE_METADATA = _release_metadata()
+SCHEMA_VERSION = RELEASE_METADATA["schema"]
+WRITER_VERSION = RELEASE_METADATA["version"]
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
-EXECUTION_PROFILE_VERSION = "11"
+EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the hard-work safety gate: use the highest generally exposed
 # effort (max); ultra is reserved for the explicit whole-session policy.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
 HIGHEST_SESSION_REASONING_EFFORT = "ultra"
 STABLE_SKILL_NAME = "workflow-manager"
-STABLE_SKILL_SCHEMA = 9
+STABLE_SKILL_SCHEMA = RELEASE_METADATA["stable_skill_schema"]
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
 # 1.0.46 removed these generic workflow references from the bundled Skill, but
 # the old updater only overlaid current files.  Delete a retired path only when
@@ -182,8 +216,19 @@ LIFECYCLE_DIAGNOSTIC_CODES = frozenset({
     "contract_mismatch", "legacy_plan_rejected", "root_identity_mismatch",
     "epoch_switch_live_writer", "epoch_switch_lifecycle_conflict",
     "epoch_switch_irreversible_pending", "epoch_authority_unknown",
+    "legacy_writer_isolated", "late_event_isolated_epoch",
+    "late_event_epoch_ambiguous", "inventory_writer_absent",
+    "inventory_writer_unknown", "inventory_writer_live",
 })
 LIFECYCLE_DIAGNOSTIC_LEVELS = frozenset({"info", "warning", "error"})
+CHILD_LIVENESS_STATES = frozenset(
+    {"none", "live", "absent", "terminal", "unknown", "isolated_incomplete"}
+)
+PARENT_WRITER_LEASE_STATES = frozenset({"none", "live", "sealed"})
+ISOLATED_LIFECYCLE_STATES = frozenset(
+    {"isolated_incomplete", "late_start", "late_terminal", "late_post"}
+)
+MAX_ISOLATED_LIFECYCLES = 8
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
 REFERENCE_ACCEPTANCE_STATES = {"disabled", "planned", "candidate", "accepted", "failed"}
 PLAN_ARTIFACT_LIFECYCLE_STATUSES = {
@@ -902,6 +947,7 @@ def codex_delegation_input(value: str) -> str | None:
 
 def execution_contract_id(state: dict[str, Any]) -> str | None:
     """Bind one executor to the exact confirmed objective and plan without storing plan text."""
+    epoch_id = current_task_epoch_id(state)
     objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
     difficulty = safe_fingerprint(state.get("difficulty_decision_id"))
     plan = safe_fingerprint(state.get("plan_digest"))
@@ -945,7 +991,11 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     if profile_version == EXECUTION_PROFILE_VERSION:
         lineage = _safe_causal_lineage(state.get("causal_lineage"))
         if (
-            lineage.get("selected_revision_digest") != plan
+            not epoch_id
+            or _safe_task_epoch(state.get("task_epoch")).get("status") != "active"
+            or _safe_task_epoch(state.get("task_epoch")).get("objective_fingerprint")
+            != objective
+            or lineage.get("selected_revision_digest") != plan
             or lineage.get("selected_prefix_digest") != journal_digest
             or journal_prefix_bytes <= 0
         ):
@@ -954,7 +1004,7 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
         state.get("session_execution_preference")
     )
     material = (
-        f"{profile_version}\0{preference}\0{objective}\0{difficulty}"
+        f"{profile_version}\0{preference}\0{epoch_id or 'legacy'}\0{objective}\0{difficulty}"
         f"\0{generation}\0{plan}\0{canonical_path}\0{revision_digest}\0{journal_digest}"
         f"\0{manifest_digest}\0{slices.get('global_constraints_digest')}\0{slices.get('count')}"
     )
@@ -978,7 +1028,10 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
 def assessor_binding_id(state: dict[str, Any]) -> str | None:
     objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
     generation = max(safe_int(state.get("assessor_generation")), 0)
-    return stable_hash(f"assessor-v1\0{objective}\0{generation}", 32) if objective and generation else None
+    epoch_id = current_task_epoch_id(state)
+    return stable_hash(
+        f"assessor-v2\0{epoch_id or 'legacy'}\0{objective}\0{generation}", 32
+    ) if objective and generation else None
 
 
 def reference_requested(prompt: str) -> bool:
@@ -1711,8 +1764,17 @@ def reconcile_post_accepted_bound_start(
         return False
     started = matching_starts[0]
     agent_id = safe_label(started.get("agent_id"), 120)
+    expected_lifecycle = lifecycle_binding_fingerprint(
+        epoch_id=current_task_epoch_id(state), role=role, agent_id=agent_id,
+        request_fingerprint=request.get("request_fingerprint"),
+        contract_id=request.get("contract_id"), attempt=request.get("attempt"),
+    )
     if (
         not agent_id
+        or request.get("epoch_id") != current_task_epoch_id(state)
+        or started.get("epoch_id") != current_task_epoch_id(state)
+        or not expected_lifecycle
+        or started.get("lifecycle_fingerprint") != expected_lifecycle
         or started.get("start_observed") != "full"
         or not started.get("observation_source")
         or any(
@@ -1772,6 +1834,14 @@ def reconcile_post_accepted_bound_start(
             "unblock_at": None,
             "recovery_from": None,
         }
+        _set_writer_liveness(
+            state, status="live",
+            binding=_writer_liveness_binding(
+                state, role, request=request, agent_id=agent_id
+            ),
+            source="host_lifecycle",
+            observation={"event": "late_post_rebind", "role": role},
+        )
         return True
     if (
         state.get("executor_state") != "recovery_required"
@@ -1849,6 +1919,14 @@ def reconcile_post_accepted_bound_start(
     state["executor_state"] = "running"
     state["executor_agent_id"] = agent_id
     state["executor_failure_kind"] = None
+    _set_writer_liveness(
+        state, status="live",
+        binding=_writer_liveness_binding(
+            state, role, request=request, agent_id=agent_id
+        ),
+        source="host_lifecycle",
+        observation={"event": "late_post_rebind", "role": role},
+    )
     return True
 
 
@@ -3421,6 +3499,143 @@ def _safe_task_epoch(value: Any) -> dict[str, Any]:
     }
 
 
+def _safe_child_liveness(value: Any) -> dict[str, Any]:
+    item = value if isinstance(value, dict) else {}
+    status = item.get("status") if item.get("status") in CHILD_LIVENESS_STATES else "none"
+    role = item.get("role") if item.get("role") in {
+        "high_assessor", "confirmed_executor"
+    } else None
+    epoch_id = safe_fingerprint(item.get("epoch_id")) or None
+    agent_fingerprint = _fingerprint32(item.get("agent_fingerprint"))
+    request_fingerprint = safe_fingerprint(item.get("request_fingerprint")) or None
+    # A host can prove that a reserved writer was never created (for example
+    # capacity exhaustion or a SIGKILL before an id was assigned).  Such an
+    # explicit absence is still a structured lifecycle fact, not ``unknown``.
+    # Every other non-empty status needs an agent identity; otherwise it must
+    # remain fail-closed.
+    if status == "absent" and not (role and request_fingerprint):
+        status = "unknown"
+    elif status != "none" and status != "absent" and not (role and agent_fingerprint):
+        status = "unknown"
+    return {
+        "status": status,
+        "role": role,
+        "epoch_id": epoch_id,
+        "agent_fingerprint": agent_fingerprint,
+        "request_fingerprint": request_fingerprint,
+        "source": (
+            item.get("source")
+            if item.get("source") in {"host_inventory", "schema_migration", "host_lifecycle"}
+            else None
+        ),
+        "observation_digest": _fingerprint32(item.get("observation_digest")),
+        "at": str(item.get("at") or "")[:40] or None,
+    }
+
+
+def _safe_parent_writer_lease(value: Any) -> dict[str, Any]:
+    item = value if isinstance(value, dict) else {}
+    status = item.get("status") if item.get("status") in PARENT_WRITER_LEASE_STATES else "none"
+    return {
+        "status": status,
+        "epoch_id": safe_fingerprint(item.get("epoch_id")) or None,
+        "execution_contract_id": _fingerprint32(item.get("execution_contract_id")),
+        "slice_id": safe_slice_id(item.get("slice_id")),
+        "slice_contract_id": _fingerprint32(item.get("slice_contract_id")),
+        "attempt": safe_sequence(item.get("attempt")),
+        "acquired_at": str(item.get("acquired_at") or "")[:40] or None,
+        "last_operation_digest": _fingerprint32(item.get("last_operation_digest")),
+    }
+
+
+def parent_writer_lease_current(state: dict[str, Any]) -> bool:
+    lease = _safe_parent_writer_lease(state.get("parent_writer_lease"))
+    current = current_execution_slice(state) or {}
+    return bool(
+        lease.get("status") == "live"
+        and lease.get("epoch_id") == current_task_epoch_id(state)
+        and lease.get("execution_contract_id") == state.get("execution_contract_id")
+        and lease.get("slice_id") == current.get("id")
+        and lease.get("slice_contract_id") == slice_contract_id(state)
+        and lease.get("attempt") == safe_sequence(state.get("executor_attempt"))
+        and state.get("execution_contract_id") == execution_contract_id(state)
+    )
+
+
+def parent_writer_acquisition_block(state: dict[str, Any]) -> str | None:
+    if state.get("plan_state") != "confirmed" or state.get("confirmed_plan_digest") != state.get("plan_digest"):
+        return "the Hard plan is not currently confirmed"
+    if state.get("execution_contract_id") != execution_contract_id(state):
+        return "the execution contract is stale"
+    if _safe_causal_review(state.get("causal_review")).get("state") in {"triage_required", "triaging"}:
+        return "causal diagnosis is unfinished"
+    if _safe_stall(state.get("stall")).get("state") not in {"none", "resolved"}:
+        return "stall diagnosis is unfinished"
+    liveness = _safe_child_liveness(state.get("child_liveness")).get("status")
+    if liveness in {"live", "unknown"}:
+        return f"child writer liveness is {liveness}"
+    if any(group.get("state") in {"pending", "result_pending", "live"} for group in subagent_lifecycle_groups(state)):
+        return "a child writer is reserved or live"
+    if state.get("executor_state") not in {"spawn_required", "recovery_required", "verification_required", "running"}:
+        return "the current slice is not writable"
+    return None
+
+
+def acquire_parent_writer_lease(state: dict[str, Any]) -> bool:
+    if parent_writer_lease_current(state):
+        return True
+    if parent_writer_acquisition_block(state):
+        return False
+    state["executor_attempt"] = next_sequence(state.get("executor_attempt"))
+    state["executor_agent_id"] = None
+    state["executor_state"] = "running"
+    state["executor_failure_kind"] = None
+    state["executor_review"] = _empty_executor_review()
+    state["pending_recovery_facts"] = None
+    state["pending_recovery_reservation"] = None
+    current = current_execution_slice(state) or {}
+    state["parent_writer_lease"] = _safe_parent_writer_lease({
+        "status": "live", "epoch_id": current_task_epoch_id(state),
+        "execution_contract_id": state.get("execution_contract_id"),
+        "slice_id": current.get("id"), "slice_contract_id": slice_contract_id(state),
+        "attempt": state.get("executor_attempt"), "acquired_at": utc_now(),
+    })
+    return True
+
+
+def _safe_isolated_lifecycle(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    role = value.get("role")
+    agent = _fingerprint32(value.get("agent_fingerprint"))
+    request = safe_fingerprint(value.get("request_fingerprint")) or None
+    # An explicit host absence can precede assignment of an agent id.  Keep a
+    # bounded synthetic identity for the tombstone so a late event cannot be
+    # mistaken for a successor, while never inventing a live agent.
+    if (
+        status not in ISOLATED_LIFECYCLE_STATES
+        or role not in {"high_assessor", "confirmed_executor"}
+        or (not agent and not (status == "isolated_incomplete" and request))
+    ):
+        return None
+    return {
+        "status": status,
+        "role": role,
+        "epoch_id": safe_fingerprint(value.get("epoch_id")) or None,
+        "agent_fingerprint": agent,
+        "request_fingerprint": request,
+        "contract_id": _fingerprint32(value.get("contract_id")),
+        "attempt": safe_sequence(value.get("attempt")),
+        "event_digest": _fingerprint32(value.get("event_digest")),
+        "at": str(value.get("at") or "")[:40] or None,
+    }
+
+
+def current_task_epoch_id(state: dict[str, Any]) -> str | None:
+    return _safe_task_epoch(state.get("task_epoch")).get("id")
+
+
 def task_epoch_id(payload: dict[str, Any], sequence: int, objective_fingerprint: Any) -> str:
     return stable_hash(
         "task-epoch-v1\0%s\0%s\0%s" % (
@@ -3431,7 +3646,138 @@ def task_epoch_id(payload: dict[str, Any], sequence: int, objective_fingerprint:
 
 
 def _epoch_has_live_writer(state: dict[str, Any]) -> bool:
-    return state.get("executor_state") in {"spawn_pending", "running"} or state.get("assessor_state") in {"spawn_pending", "running"}
+    liveness = _safe_child_liveness(state.get("child_liveness"))
+    return bool(
+        state.get("executor_state") in {"spawn_pending", "running"}
+        or state.get("assessor_state") in {"spawn_pending", "running"}
+        or liveness.get("status") in {"live", "unknown"}
+    )
+
+
+def _active_legacy_lifecycle(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one old-writer owner without granting it current authority."""
+    executor_active = value.get("executor_state") in {"spawn_pending", "running"}
+    assessor_active = value.get("assessor_state") in {"spawn_pending", "running"}
+    if not (executor_active or assessor_active):
+        return None
+    role = "confirmed_executor" if executor_active else "high_assessor"
+    agent_id = value.get("executor_agent_id") if executor_active else value.get("assessor_agent_id")
+    contract = value.get("execution_contract_id") if executor_active else value.get("assessor_binding_id")
+    attempt = value.get("executor_attempt") if executor_active else value.get("assessor_attempt")
+    request = next(
+        (
+            item
+            for item in reversed(as_list(value.get("subagents")))
+            if isinstance(item, dict)
+            and item.get("event") == "request"
+            and item.get("role") == role
+            and (
+                not contract
+                or safe_fingerprint(item.get("contract_id"))
+                == safe_fingerprint(contract)
+            )
+            and safe_sequence(item.get("attempt")) == safe_sequence(attempt)
+        ),
+        {},
+    )
+    started = next(
+        (
+            item
+            for item in reversed(as_list(value.get("subagents")))
+            if isinstance(item, dict)
+            and item.get("event") == "start"
+            and item.get("role") == role
+            and (
+                not agent_id or str(item.get("agent_id") or "") == str(agent_id)
+            )
+        ),
+        {},
+    )
+    resolved_agent = str(agent_id or started.get("agent_id") or "").strip()
+    if not resolved_agent:
+        return None
+    return _safe_isolated_lifecycle(
+        {
+            "status": "isolated_incomplete",
+            "role": role,
+            "epoch_id": _safe_task_epoch(value.get("task_epoch")).get("id"),
+            "agent_fingerprint": stable_hash(resolved_agent, 32),
+            "request_fingerprint": request.get("request_fingerprint")
+            or started.get("request_fingerprint"),
+            "contract_id": contract,
+            "attempt": attempt,
+            "at": utc_now(),
+        }
+    )
+
+
+def isolate_legacy_writer(
+    state: dict[str, Any], value: dict[str, Any], *, source_writer: str
+) -> bool:
+    """Tombstone one pre-v12 owner and require a fresh current lifecycle.
+
+    The tombstone keeps only bounded routing identities.  It lets a late
+    Start/Stop be attributed to the old epoch after transient lifecycle rows
+    are discarded, without ever making the old process a current writer.
+    """
+    isolated = _active_legacy_lifecycle(value)
+    if isolated is None:
+        return False
+    existing = [
+        item
+        for raw in as_list(state.get("isolated_lifecycles"))
+        if (item := _safe_isolated_lifecycle(raw)) is not None
+    ]
+    identity = (
+        isolated.get("role"), isolated.get("agent_fingerprint"),
+        isolated.get("request_fingerprint"), isolated.get("attempt"),
+    )
+    if not any(
+        (
+            item.get("role"), item.get("agent_fingerprint"),
+            item.get("request_fingerprint"), item.get("attempt"),
+        ) == identity
+        for item in existing
+    ):
+        existing.append(isolated)
+    state["isolated_lifecycles"] = existing[-MAX_ISOLATED_LIFECYCLES:]
+    state["child_liveness"] = _safe_child_liveness(
+        {
+            "status": "isolated_incomplete",
+            "role": isolated["role"],
+            "epoch_id": isolated.get("epoch_id"),
+            "agent_fingerprint": isolated["agent_fingerprint"],
+            "request_fingerprint": isolated.get("request_fingerprint"),
+            "source": "schema_migration",
+            "observation_digest": stable_hash(
+                f"schema33-isolation\0{source_writer}\0{isolated['agent_fingerprint']}",
+                32,
+            ),
+            "at": utc_now(),
+        }
+    )
+    record_lifecycle_diagnostic(
+        state,
+        "legacy_writer_isolated",
+        level="warning",
+        role=isolated["role"],
+        request_fingerprint=isolated.get("request_fingerprint"),
+        contract_id=isolated.get("contract_id"),
+    )
+    if isolated["role"] == "confirmed_executor":
+        state["executor_state"] = "recovery_required"
+        state["executor_failure_kind"] = "stale_contract"
+        state["executor_agent_id"] = None
+        state["executor_observed_effective"] = False
+        state["executor_review"] = _empty_executor_review()
+        state["model_profile"] = "work_assessment"
+    else:
+        state["assessor_state"] = "recovery_required"
+        state["assessor_failure_kind"] = "stale_binding"
+        state["assessor_agent_id"] = None
+        state["assessor_observed_effective"] = False
+        state["model_profile"] = "work_assessment"
+    return True
 
 
 def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective: dict[str, Any]) -> bool:
@@ -3471,6 +3817,228 @@ def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective:
     state["root_rollout_identity"] = None
     state["archived_epochs"] = archive[-8:]
     return True
+
+
+def _lifecycle_agent_fingerprint(agent_id: Any, request_fingerprint: Any) -> str:
+    """Give pre-assignment tombstones a deterministic non-live identity."""
+    agent = safe_label(agent_id, 120) if agent_id else ""
+    if agent:
+        return stable_hash("workflow-manager-agent-v1\0" + agent, 32)
+    return stable_hash(
+        "workflow-manager-unassigned-writer-v1\0"
+        + (safe_fingerprint(request_fingerprint) or "unknown"),
+        32,
+    )
+
+
+def _append_isolated_lifecycle(
+    state: dict[str, Any], *, status: str, role: str, agent_id: Any,
+    request_fingerprint: Any, contract_id: Any, attempt: Any,
+    event_material: Any, epoch_id: Any = None,
+) -> None:
+    """Keep a bounded tombstone; it never re-grants writer ownership."""
+    if status not in ISOLATED_LIFECYCLE_STATES or role not in {
+        "high_assessor", "confirmed_executor"
+    }:
+        return
+    request = safe_fingerprint(request_fingerprint) or None
+    item = _safe_isolated_lifecycle(
+        {
+            "status": status,
+            "role": role,
+            "epoch_id": safe_fingerprint(epoch_id) or current_task_epoch_id(state),
+            "agent_fingerprint": _lifecycle_agent_fingerprint(agent_id, request),
+            "request_fingerprint": request,
+            "contract_id": contract_id,
+            "attempt": attempt,
+            "event_digest": stable_hash(
+                "workflow-manager-isolated-lifecycle-v1\0"
+                + canonical_json(event_material), 32,
+            ),
+            "at": utc_now(),
+        }
+    )
+    if item is None:
+        return
+    current = [
+        value for raw in as_list(state.get("isolated_lifecycles"))
+        if (value := _safe_isolated_lifecycle(raw)) is not None
+    ]
+    identity = (
+        item.get("status"), item.get("role"), item.get("epoch_id"),
+        item.get("agent_fingerprint"), item.get("request_fingerprint"),
+        item.get("attempt"), item.get("event_digest"),
+    )
+    if not any(
+        (
+            existing.get("status"), existing.get("role"), existing.get("epoch_id"),
+            existing.get("agent_fingerprint"), existing.get("request_fingerprint"),
+            existing.get("attempt"), existing.get("event_digest"),
+        ) == identity
+        for existing in current
+    ):
+        current.append(item)
+    state["isolated_lifecycles"] = current[-MAX_ISOLATED_LIFECYCLES:]
+
+
+def _writer_liveness_binding(
+    state: dict[str, Any], role: str, *, request: dict[str, Any] | None = None,
+    agent_id: Any = None,
+) -> dict[str, Any]:
+    """Project the current epoch/role/request/attempt identity once."""
+    record = request if isinstance(request, dict) else {}
+    if role == "confirmed_executor":
+        contract = state.get("execution_contract_id")
+        attempt = state.get("executor_attempt")
+        live_agent = state.get("executor_agent_id")
+    else:
+        contract = state.get("assessor_binding_id")
+        attempt = state.get("assessor_attempt")
+        live_agent = state.get("assessor_agent_id")
+    resolved_agent = agent_id if agent_id not in (None, "") else live_agent
+    request_fp = record.get("request_fingerprint")
+    return {
+        "role": role,
+        "epoch_id": current_task_epoch_id(state),
+        "agent_id": safe_label(resolved_agent, 120) if resolved_agent else None,
+        "agent_fingerprint": _lifecycle_agent_fingerprint(resolved_agent, request_fp),
+        "request_fingerprint": safe_fingerprint(request_fp) or None,
+        "contract_id": _fingerprint32(record.get("contract_id") or contract),
+        "attempt": safe_sequence(record.get("attempt") or attempt),
+    }
+
+
+def _set_writer_liveness(
+    state: dict[str, Any], *, status: str, binding: dict[str, Any], source: str,
+    observation: Any,
+) -> None:
+    """Persist the only allowed inventory states: live, absent, or unknown."""
+    state["child_liveness"] = _safe_child_liveness(
+        {
+            "status": status,
+            "role": binding.get("role"),
+            "epoch_id": binding.get("epoch_id"),
+            "agent_fingerprint": binding.get("agent_fingerprint"),
+            "request_fingerprint": binding.get("request_fingerprint"),
+            "source": source,
+            "observation_digest": stable_hash(
+                "workflow-manager-writer-inventory-v1\0"
+                + canonical_json(observation), 32,
+            ),
+            "at": utc_now(),
+        }
+    )
+
+
+def _release_writer_after_explicit_absence(
+    state: dict[str, Any], *, binding: dict[str, Any], reason: str,
+    source: str, observation: Any,
+) -> None:
+    """A trusted explicit absence frees the slot but leaves a tombstone."""
+    role = str(binding.get("role") or "")
+    if role not in {"high_assessor", "confirmed_executor"}:
+        return
+    # Retire a request-only reservation before opening its successor slot.
+    # Otherwise it remains pending, blocking the successor or capturing a
+    # delayed Start intended for the old request.
+    if role == "high_assessor" and binding.get("agent_id") is None:
+        matching_requests = [
+            item for item in as_list(state.get("subagents"))
+            if isinstance(item, dict)
+            and item.get("event") == "request"
+            and item.get("role") == role
+            and item.get("epoch_id") == binding.get("epoch_id")
+            and item.get("request_fingerprint") == binding.get("request_fingerprint")
+            and item.get("contract_id") == binding.get("contract_id")
+            and safe_sequence(item.get("attempt")) == safe_sequence(binding.get("attempt"))
+        ]
+        if len(matching_requests) == 1:
+            matching_requests[0]["status"] = "isolated_incomplete"
+    _append_isolated_lifecycle(
+        state,
+        status="isolated_incomplete",
+        role=role,
+        agent_id=binding.get("agent_id"),
+        request_fingerprint=binding.get("request_fingerprint"),
+        contract_id=binding.get("contract_id"),
+        attempt=binding.get("attempt"),
+        event_material={"reason": reason, "source": source, "observation": observation},
+    )
+    # ``isolated_incomplete`` is deliberately non-live, so the current parent
+    # can decide whether to recover.  It cannot make a late event authoritative.
+    _set_writer_liveness(
+        state, status="isolated_incomplete", binding=binding,
+        source=source, observation={"reason": reason, "observation": observation},
+    )
+    record_lifecycle_diagnostic(
+        state, "inventory_writer_absent", level="warning", role=role,
+        request_fingerprint=binding.get("request_fingerprint"),
+        contract_id=binding.get("contract_id"),
+    )
+    if role == "confirmed_executor":
+        state["executor_state"] = "recovery_required"
+        state["executor_failure_kind"] = (
+            "model_unavailable" if reason == "capacity" else "incomplete_execution"
+        )
+        state["executor_agent_id"] = None
+        state["executor_observed_effective"] = False
+        state["model_profile"] = "work_assessment"
+    else:
+        state["assessor_state"] = "recovery_required"
+        state["assessor_failure_kind"] = "model_unavailable"
+        state["assessor_agent_id"] = None
+        state["assessor_observed_effective"] = False
+        state["model_profile"] = "work_assessment"
+
+
+def _mark_writer_inventory_unknown(
+    state: dict[str, Any], *, binding: dict[str, Any], source: str,
+    observation: Any, preserve_writer: bool = False,
+) -> None:
+    """Unknown inventory keeps the one-writer gate closed until host truth arrives."""
+    role = str(binding.get("role") or "")
+    _set_writer_liveness(
+        state, status="unknown", binding=binding, source=source,
+        observation=observation,
+    )
+    record_lifecycle_diagnostic(
+        state, "inventory_writer_unknown", level="error", role=role,
+        request_fingerprint=binding.get("request_fingerprint"),
+        contract_id=binding.get("contract_id"),
+    )
+    if preserve_writer:
+        # A malformed or partial inventory says neither that the writer is
+        # gone nor that its terminal result is safe. Keep the current host
+        # lifecycle identity so an exact Stop/mailbox result can still close
+        # it, while the ``unknown`` liveness gate blocks every successor.
+        return
+    if role == "confirmed_executor":
+        state["executor_state"] = "recovery_required"
+        state["executor_failure_kind"] = (
+            state.get("executor_failure_kind")
+            if state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
+            else "incomplete_execution"
+        )
+        state["executor_agent_id"] = None
+        state["executor_observed_effective"] = False
+        state["model_profile"] = "work_assessment"
+    elif role == "high_assessor":
+        state["assessor_state"] = "recovery_required"
+        state["assessor_failure_kind"] = (
+            state.get("assessor_failure_kind")
+            if state.get("assessor_failure_kind")
+            in {"model_unavailable", "start_mismatch", "assessment_result_invalid"}
+            else "start_mismatch"
+        )
+        state["assessor_agent_id"] = None
+        state["assessor_observed_effective"] = False
+        state["model_profile"] = "work_assessment"
+
+
+def writer_liveness_blocks_successor(state: dict[str, Any]) -> bool:
+    return _safe_child_liveness(state.get("child_liveness")).get("status") in {
+        "live", "unknown"
+    }
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -4008,20 +4576,42 @@ def _safe_continuation_lease(item: Any) -> dict[str, Any]:
     key = _fingerprint32(item.get("key"))
     reason_digest = _fingerprint32(item.get("reason_digest"))
     if phase == "none" or not key or not reason_digest:
-        return {"phase": "none", "key": None, "reason_digest": None, "epoch_id": None, "at": None}
+        return {
+            "phase": "none", "key": None, "reason_digest": None,
+            "epoch_id": None, "contract_id": None, "ack_source": None,
+            "ack_digest": None, "at": None,
+        }
     return {
         "phase": phase, "key": key, "reason_digest": reason_digest,
         "epoch_id": safe_fingerprint(item.get("epoch_id")) or None,
+        "contract_id": _fingerprint32(item.get("contract_id")),
+        "ack_source": (
+            item.get("ack_source")
+            if item.get("ack_source") in {"host_posttool", "root_visible"}
+            else None
+        ),
+        "ack_digest": _fingerprint32(item.get("ack_digest")),
         "at": str(item.get("at") or "")[:40] or None,
     }
 
 
-def continuation_lease_key(payload: dict[str, Any], reason: str, epoch_id: Any = None) -> str:
-    """Stable idempotency key for a host continuation request."""
+def continuation_lease_key(
+    payload: dict[str, Any], reason: str, epoch_id: Any = None,
+    contract_id: Any = None,
+) -> str:
+    """Stable idempotency key for a host continuation request.
+
+    A hook run is only a delivery attempt, never part of the logical outbox
+    identity.  This deliberately binds the current epoch and contract so a
+    delayed receipt cannot consume a successor's continuation.
+    """
     return stable_hash(
-        "continuation-lease-v2\0%s\0%s\0%s\0%s" % (
-            safe_label(payload.get("session_id"), 120), safe_fingerprint(epoch_id) or "legacy",
-            safe_label(payload.get("hook_run_id"), 120),
+        "continuation-lease-v3\0%s\0%s\0%s" % (
+            safe_fingerprint(epoch_id) or "legacy",
+            # ``payload`` is only retained as a call-shape compatibility
+            # parameter.  A hook event never supplies the contract component;
+            # production claimants pass the locked state value explicitly.
+            _fingerprint32(contract_id) or "unbound",
             stable_hash(reason, 32),
         ), 32,
     )
@@ -4035,11 +4625,23 @@ def claim_continuation_lease(state: dict[str, Any], payload: dict[str, Any], rea
     without allowing the host to create a second logical continuation.
     """
     epoch_id = _safe_task_epoch(state.get("task_epoch")).get("id")
-    key = continuation_lease_key(payload, reason, epoch_id)
+    # The external payload is untrusted input.  The contract component comes
+    # only from the state that owns this locked mutation boundary.
+    contract_id = _fingerprint32(state.get("execution_contract_id"))
+    key = continuation_lease_key(payload, reason, epoch_id, contract_id)
     digest = stable_hash(reason, 32)
     lease = _safe_continuation_lease(state.get("continuation_lease"))
-    if lease["key"] != key or lease["reason_digest"] != digest or lease.get("epoch_id") != epoch_id:
-        lease = {"phase": "pending", "key": key, "reason_digest": digest, "epoch_id": epoch_id, "at": utc_now()}
+    if (
+        lease["key"] != key
+        or lease["reason_digest"] != digest
+        or lease.get("epoch_id") != epoch_id
+        or lease.get("contract_id") != contract_id
+    ):
+        lease = {
+            "phase": "pending", "key": key, "reason_digest": digest,
+            "epoch_id": epoch_id, "contract_id": contract_id,
+            "ack_source": None, "ack_digest": None, "at": utc_now(),
+        }
     if lease["phase"] == "consumed":
         state["continuation_lease"] = lease
         return {**lease, "emit": False}
@@ -4050,12 +4652,117 @@ def claim_continuation_lease(state: dict[str, Any], payload: dict[str, Any], rea
     return {**lease, "emit": True}
 
 
-def consume_continuation_lease(state: dict[str, Any], key: str) -> None:
+def continuation_lease_is_current(state: dict[str, Any], lease: dict[str, Any]) -> bool:
+    """A delayed acknowledgement may never cross an epoch or contract."""
+    return bool(
+        lease.get("epoch_id") == current_task_epoch_id(state)
+        and lease.get("contract_id") == _fingerprint32(state.get("execution_contract_id"))
+    )
+
+
+def consume_continuation_lease(
+    state: dict[str, Any], key: str, *, source: str | None = None,
+    receipt: Any = None,
+) -> bool:
+    """Consume one outbox item only at a trusted host acknowledgement edge.
+
+    Rendering a Stop response is intentionally absent from this function's
+    authority model.  Production callers must provide either a structured
+    PostTool receipt or a root-visible echo; direct unit helpers cannot turn
+    stdout into an acknowledgement by omitting ``source``.
+    """
     lease = _safe_continuation_lease(state.get("continuation_lease"))
-    if lease["key"] == key and lease["phase"] == "emitted":
+    if (
+        source in {"host_posttool", "root_visible"}
+        and _fingerprint32(key)
+        and lease["key"] == key
+        and lease["phase"] == "emitted"
+        and continuation_lease_is_current(state, lease)
+    ):
         lease["phase"] = "consumed"
+        lease["ack_source"] = source
+        lease["ack_digest"] = stable_hash(
+            "workflow-manager-continuation-ack-v1\0"
+            + source + "\0" + canonical_json(receipt),
+            32,
+        )
         lease["at"] = utc_now()
         state["continuation_lease"] = lease
+        return True
+    return False
+
+
+def _strict_continuation_ack_record(value: Any) -> str | None:
+    """Read only an explicit structured host acknowledgement, never text."""
+    if not isinstance(value, dict) or len(value) > 16:
+        return None
+    key_fields = [key for key in value if normalized_key(key) in {"continuationkey", "continuationleasekey"}]
+    accepted_fields = [key for key in value if normalized_key(key) in {"hostaccepted", "accepted", "acknowledged"}]
+    if len(key_fields) == 1 and len(accepted_fields) == 1:
+        key = _fingerprint32(value.get(key_fields[0]))
+        if key and value.get(accepted_fields[0]) is True:
+            return key
+    return None
+
+
+def trusted_posttool_continuation_ack(
+    response: Any, depth: int = 0, in_receipt: bool = False,
+) -> str | None:
+    """Return one unique host receipt key without parsing CLI/MCP text output."""
+    if depth > 4 or not isinstance(response, dict) or len(response) > 32:
+        return None
+    # A bare result object is not a receipt: arbitrary tools may return
+    # JSON-shaped values.  Only an explicit host receipt envelope reaches the
+    # strict key/accepted pair below.
+    direct = _strict_continuation_ack_record(response) if in_receipt else None
+    candidates = [direct] if direct else []
+    # These containers are host protocol envelopes.  Deliberately exclude
+    # output/content/text/stdout/stderr: an arbitrary command's printed JSON
+    # is not a host acceptance receipt.
+    wrappers = {
+        "continuationreceipt", "receipt", "structuredcontent", "toolresponse",
+        "response", "result",
+    }
+    for raw_key, nested in response.items():
+        wrapper = normalized_key(raw_key)
+        if wrapper not in wrappers:
+            continue
+        nested_key = trusted_posttool_continuation_ack(
+            nested, depth + 1,
+            in_receipt=in_receipt or wrapper in {"continuationreceipt", "receipt"},
+        )
+        if nested_key:
+            candidates.append(nested_key)
+    unique = {item for item in candidates if item}
+    return next(iter(unique)) if len(unique) == 1 else None
+
+
+CONTINUATION_ROOT_KEY_RE = re.compile(
+    r"\s*continuation_key=([0-9a-f]{32})\s*\Z"
+)
+
+
+def payload_claims_child_identity(payload: dict[str, Any]) -> bool:
+    """A continuation acknowledgement is root-only, never child-attributed."""
+    return any(
+        payload.get(field) not in (None, "")
+        for field in (
+            "agent_id", "subagent_id", "agent_name", "parent_agent_id", "role",
+        )
+    )
+
+
+def root_visible_continuation_ack(payload: dict[str, Any]) -> str | None:
+    """A user/root prompt may echo one exact outbox key; child prose may not."""
+    if payload.get("hook_event_name") != "UserPromptSubmit":
+        return None
+    if payload_claims_child_identity(payload):
+        return None
+    raw = payload.get("prompt")
+    if not isinstance(raw, str) or len(raw.encode("utf-8", errors="replace")) > 4096:
+        return None
+    match = CONTINUATION_ROOT_KEY_RE.fullmatch(raw)
+    return match.group(1) if match else None
 
 
 def new_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4074,6 +4781,9 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         # objective.  Schema-31 migration keeps its legacy journal untouched.
         "task_epoch": {"id": None, "sequence": 0, "status": "none", "objective_fingerprint": None},
         "archived_epochs": [],
+        "isolated_lifecycles": [],
+        "child_liveness": _safe_child_liveness(None),
+        "parent_writer_lease": _safe_parent_writer_lease(None),
         "model": safe_label(payload.get("model"), 80) if payload.get("model") else None,
         "task_domain": "unknown",
         "domain_confidence": "low",
@@ -4241,6 +4951,7 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "category": safe_label(item.get("category"), 32) if item.get("category") else "other",
         "plan_digest": plan_digest,
         "execution_contract_id": contract_id,
+        "epoch_id": safe_fingerprint(item.get("epoch_id")) or None,
         "slice_id": safe_slice_id(item.get("slice_id")),
         "slice_contract_id": _fingerprint32(item.get("slice_contract_id")),
         "assessor_binding_id": safe_fingerprint(item.get("assessor_binding_id")) or None,
@@ -4328,6 +5039,8 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
             else "unknown"
         ),
         "turn_id": safe_label(item.get("turn_id"), 120) if item.get("turn_id") else None,
+        "epoch_id": safe_fingerprint(item.get("epoch_id")) or None,
+        "lifecycle_fingerprint": _fingerprint32(item.get("lifecycle_fingerprint")),
         "agent_id": safe_label(item.get("agent_id"), 120) if item.get("agent_id") else None,
         "agent_type": safe_label(item.get("agent_type"), 80) if item.get("agent_type") else None,
         "task_name": safe_label(item.get("task_name"), 120) if item.get("task_name") else None,
@@ -4463,8 +5176,11 @@ def _safe_subagent(item: Any) -> dict[str, Any] | None:
 def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
     records = value.get("subagents", []) if isinstance(value, dict) else as_list(value)
     groups: list[dict[str, Any]] = []
-    live_by_agent: dict[str, dict[str, Any]] = {}
-    terminal_by_agent: dict[str, dict[str, Any]] = {}
+    # A process id may recur after an epoch change.  Keep the grouping key
+    # generation-scoped so a delayed terminal record cannot attach itself to a
+    # successor merely because the host reused an agent string.
+    live_by_agent: dict[tuple[str, str | None], dict[str, Any]] = {}
+    terminal_by_agent: dict[tuple[str, str | None], dict[str, Any]] = {}
 
     def new_group(index: int, item: dict[str, Any], state_value: str) -> dict[str, Any]:
         group = {
@@ -4487,15 +5203,21 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
         if event == "request":
             if not safe_fingerprint(item.get("request_fingerprint")):
                 continue
-            group = new_group(index, item, "result_pending" if item.get("agent_id") else "pending")
+            group = new_group(
+                index,
+                item,
+                "isolated" if item.get("status") == "isolated_incomplete"
+                else "result_pending" if item.get("agent_id") else "pending",
+            )
             if group["state"] == "result_pending":
                 group["agent_id"] = str(item.get("agent_id"))
             continue
         agent_id = str(item.get("agent_id") or "")
         if not agent_id:
             continue
+        identity = (agent_id, safe_fingerprint(item.get("epoch_id")) or None)
         if event == "start":
-            if agent_id in live_by_agent:
+            if identity in live_by_agent:
                 continue
             request_fingerprint = safe_fingerprint(item.get("request_fingerprint"))
             request_group = next(
@@ -4506,10 +5228,12 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
                     and request_fingerprint
                     and safe_fingerprint((group.get("request") or {}).get("request_fingerprint"))
                     == request_fingerprint
+                    and safe_fingerprint((group.get("request") or {}).get("epoch_id"))
+                    == identity[1]
                 ),
                 None,
             )
-            prior_terminal = terminal_by_agent.get(agent_id)
+            prior_terminal = terminal_by_agent.get(identity)
             if prior_terminal and (
                 not request_group
                 or safe_int(request_group.get("first_index")) <= safe_int(prior_terminal.get("last_index"))
@@ -4522,10 +5246,10 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
                 group["last_index"] = index
                 group["state"] = "live"
             group["agent_id"] = agent_id
-            live_by_agent[agent_id] = group
+            live_by_agent[identity] = group
             continue
         if event in TERMINAL_SUBAGENT_EVENTS:
-            group = live_by_agent.pop(agent_id, None)
+            group = live_by_agent.pop(identity, None)
             if group is None:
                 group = next(
                     (
@@ -4533,11 +5257,14 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
                         for candidate in reversed(groups)
                         if candidate.get("state") == "result_pending"
                         and candidate.get("agent_id") == agent_id
+                        and safe_fingerprint(
+                            (candidate.get("request") or {}).get("epoch_id")
+                        ) == identity[1]
                     ),
                     None,
                 )
             if group is None:
-                if agent_id in terminal_by_agent:
+                if identity in terminal_by_agent:
                     continue
                 group = new_group(index, item, "terminal")
             else:
@@ -4546,7 +5273,7 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
                 group["last_index"] = index
                 group["state"] = "terminal"
             group["agent_id"] = agent_id
-            terminal_by_agent[agent_id] = group
+            terminal_by_agent[identity] = group
     return groups
 
 
@@ -4599,6 +5326,7 @@ def append_result_pending_subagent(
         {
             "at": utc_now(),
             "event": "request",
+            "epoch_id": current_task_epoch_id(state),
             "agent_id": agent,
             "task_name": "high_assessor_followup",
             "status": "pending",
@@ -5205,8 +5933,11 @@ def parse_plan_journal(
         )
         previous_generation = generation
         if first_tail_position is not None:
-            if pending_revision_after_tail is not None:
-                raise PlanArtifactError("content_drift")
+            # A typed tail seals the preceding executable prefix.  More than
+            # one ordinary root may subsequently be appended in the same
+            # journal; the newest complete root is authoritative.  Only a
+            # typed selector is atomic with the revision immediately before
+            # it, so do not mistake consecutive roots for a broken pair.
             pending_revision_after_tail = revision_digest
         position = body_end
     if pending_revision_after_tail is not None:
@@ -8058,6 +8789,13 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         }
         for item in as_list(value.get("archived_epochs")) if isinstance(item, dict)
     ][-8:]
+    base["isolated_lifecycles"] = [
+        item
+        for raw in as_list(value.get("isolated_lifecycles"))
+        if (item := _safe_isolated_lifecycle(raw)) is not None
+    ][-MAX_ISOLATED_LIFECYCLES:]
+    base["child_liveness"] = _safe_child_liveness(value.get("child_liveness"))
+    base["parent_writer_lease"] = _safe_parent_writer_lease(value.get("parent_writer_lease"))
     root_rollout_identity = value.get("root_rollout_identity")
     base["root_rollout_identity"] = (
         root_rollout_identity
@@ -8248,14 +8986,9 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and source_contract
         and value.get("executor_state") in {"running", "verification_required"}
     )
-    active_profile11_continuity = bool(
-        (source_schema, source_writer)
-        in {(29, "1.0.51"), (30, "1.0.52"), (32, "1.0.55")}
-        and source_profile == "11"
-        and value.get("plan_state") == "confirmed"
-        and source_contract
-        and value.get("executor_state") in {"running", "verification_required"}
-    )
+    # v11 lifecycle records remain audit evidence only.  They must not gain
+    # v12 write authority during a schema migration.
+    active_profile11_continuity = False
     # Active and failed contracts rebind to the current profile. A completed,
     # baseline-sealed contract keeps the profile it actually executed under;
     # rewriting it to v6 would either invent evidence or reopen finished work.
@@ -8495,6 +9228,19 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             if base["executor_state"] in {"verification_required", "exhausted"}
             else confirmed_executor_model_profile(base)
         )
+    if (
+        source_profile == "11"
+        and not sealed_historical_success
+        and value.get("executor_state") in {"spawn_pending", "running", "verification_required"}
+        and base.get("plan_state") == "confirmed"
+    ):
+        # A currently active v11 writer is not terminal proof.  Isolate it
+        # and require a v12 recovery lifecycle instead of silently reusing it.
+        base["executor_state"] = "recovery_required"
+        base["executor_failure_kind"] = "stale_contract"
+        base["executor_agent_id"] = None
+        base["executor_review"] = _empty_executor_review()
+        base["model_profile"] = "work_assessment"
     elif (
         base["plan_state"] == "invalidated"
         and base.get("executor_failure_kind") == "stale_contract"
@@ -8677,27 +9423,50 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         in {"plan_ready", "awaiting_confirmation", "confirmed"}
     ):
         invalidate_plan_authority(base, warning_code="legacy_unavailable")
-    if source_writer != WRITER_VERSION and not (
-        source_schema == 27 and base.get("assessor_state") == "running"
-        and base.get("assessor_binding_id") and base.get("assessor_agent_id")
-        and base.get("assessor_observed_effective")
-    ) and not active_profile10_continuity and not active_profile11_continuity:
+    legacy_assessor_reanchor = bool(
+        source_schema == 27
+        and value.get("assessor_state") == "running"
+        and safe_fingerprint(value.get("assessor_binding_id"))
+        and value.get("assessor_agent_id")
+        and value.get("assessor_observed_effective")
+    )
+    legacy_writer_isolated = bool(
+        source_writer != WRITER_VERSION
+        and not sealed_historical_success
+        and not legacy_assessor_reanchor
+        and isolate_legacy_writer(base, value, source_writer=source_writer)
+    )
+    if (
+        source_writer != WRITER_VERSION
+        and not legacy_assessor_reanchor
+        and not active_profile10_continuity
+        and not active_profile11_continuity
+    ):
         # Opaque lifecycle/request records are evidence from the old writer, not
         # authority for a resumed task. Preserve canonical plans and completed
         # baselines, but remove transient caches and rebind unfinished assessment.
         base["subagents"] = []
         base["processed_hook_runs"] = []
         base["duplicate_notices"] = []
-        base["assessor_agent_id"] = None
-        base["assessor_model"] = None
-        base["assessor_reasoning_effort"] = None
-        base["assessor_failure_kind"] = None
-        base["assessor_observed_effective"] = False
-        base["assessor_observed_model"] = None
-        base["assessor_observed_reasoning_effort"] = None
-        base["assessor_fork_turns"] = None
-        base["assessor_attempt"] = 0
-        if (
+        isolated_role = _safe_child_liveness(
+            base.get("child_liveness")
+        ).get("role")
+        if not (legacy_writer_isolated and isolated_role == "high_assessor"):
+            base["assessor_agent_id"] = None
+            base["assessor_model"] = None
+            base["assessor_reasoning_effort"] = None
+            base["assessor_failure_kind"] = None
+            base["assessor_observed_effective"] = False
+            base["assessor_observed_model"] = None
+            base["assessor_observed_reasoning_effort"] = None
+            base["assessor_fork_turns"] = None
+            base["assessor_attempt"] = 0
+        if legacy_writer_isolated:
+            # The current plan/contract can be repaired by a fresh v12
+            # recovery child, but the pre-v12 process is only a tombstone.
+            # Do not reopen assessment or overwrite the explicit recovery.
+            pass
+        elif (
             base["task_domain"] == "work"
             and base.get("work_difficulty") == "hard"
             and base.get("objective", {}).get("fingerprint")
@@ -8823,6 +9592,12 @@ def trim_state(state: dict[str, Any]) -> None:
         item for raw in as_list(state.get("lifecycle_diagnostics"))
         if (item := _safe_lifecycle_diagnostic(raw)) is not None
     ][-MAX_LIFECYCLE_DIAGNOSTICS:]
+    state["isolated_lifecycles"] = [
+        item
+        for raw in as_list(state.get("isolated_lifecycles"))
+        if (item := _safe_isolated_lifecycle(raw)) is not None
+    ][-MAX_ISOLATED_LIFECYCLES:]
+    state["child_liveness"] = _safe_child_liveness(state.get("child_liveness"))
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
     state["duplicate_notices"] = list(state.get("duplicate_notices", []))[-MAX_DUPLICATE_NOTICES:]
     state["pending_recovery_facts"] = pending_recovery_facts_for_state(state)
@@ -12014,6 +12789,8 @@ def confirmed_executor_request(
         or not current_execution_slice(state)
     ):
         return False, "missing confirmed execution contract"
+    if writer_liveness_blocks_successor(state):
+        return False, "writer inventory is live or unknown; do not overlap a successor"
 
     candidates = subagent_request_candidates(payload)
     raw_task_name = candidates[0].get("task_name") if candidates else None
@@ -12070,6 +12847,8 @@ def confirmed_assessor_request(
         return False, f"assessor {resolution['error']}"
     if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
         return False, "duplicate assessor"
+    if writer_liveness_blocks_successor(state):
+        return False, "writer inventory is live or unknown; do not overlap a successor"
 
     candidates = subagent_request_candidates(payload)
     raw_task_name = candidates[0].get("task_name") if candidates else None
@@ -12119,8 +12898,103 @@ PLAN_MUTATING_GIT_COMMANDS = {
     "revert",
     "rm",
     "switch",
-    "tag",
 }
+
+
+GIT_TAG_QUERY_OPTIONS = {
+    "-l", "--list", "-n", "--points-at", "--contains", "--no-contains",
+    "--merged", "--no-merged", "-v", "--verify", "--format", "--sort",
+    "--column", "--color", "--ignore-case",
+}
+GIT_TAG_WRITE_OPTIONS = {
+    "-a", "--annotate", "-s", "--sign", "-u", "--local-user", "-m",
+    "--message", "-F", "--file", "-e", "--edit", "--trailer", "-d",
+    "--delete", "-f", "--force", "--create-reflog",
+}
+
+
+def git_tag_disposition(command: str) -> str:
+    """Classify every visible `git tag` invocation conservatively.
+
+    Bare `git tag` is a query.  A tag name is a create unless list/verify mode
+    is explicit; option values, dynamic argv and mixed query/write forms are
+    intentionally unknown (and therefore mutation-gated).
+    """
+    invocations = []
+    for view in command_views(command):
+        masked = shell_syntax_view(view)
+        invocations.extend(GIT_INVOCATION_RE.finditer(masked))
+    # Nested shell views repeat their outer invocation.  Multiple visible git
+    # starts in the original command are still an unsafe composite request.
+    if git_invocation_count(command) > 1:
+        return "mutation"
+    invocation = _git_invocation(command)
+    if not invocation or invocation[1].group(1).lower() != "tag":
+        return "none"
+    view, match = invocation
+    segment = _outer_shell_segment(view, match.start())
+    try:
+        argv = shlex.split(segment, posix=True)
+    except (TypeError, ValueError):
+        return "unknown"
+    try:
+        git_index = next(i for i, value in enumerate(argv) if value.lower() in {"git", "git.exe"})
+    except StopIteration:
+        return "unknown"
+    args = argv[git_index + 1:]
+    # Strip only unambiguous global options before the `tag` command.
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item in {"-C", "-c", "--git-dir", "--work-tree"}:
+            index += 2
+        elif item.startswith(("-C", "-c", "--git-dir=", "--work-tree=")):
+            index += 1
+        else:
+            break
+    if index >= len(args) or args[index].lower() != "tag":
+        return "unknown"
+    tag_args = args[index + 1:]
+    if any(any(marker in value for marker in ("$", "`", "\x00")) for value in tag_args):
+        return "unknown"
+    query_mode = False
+    positionals = []
+    option_needs_value = {"-n", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged", "--format", "--sort", "--column", "--color", "-u", "--local-user", "-m", "--message", "-F", "--file", "--trailer"}
+    index = 0
+    while index < len(tag_args):
+        item = tag_args[index]
+        if item == "--":
+            if index + 1 >= len(tag_args):
+                return "unknown"
+            positionals.extend(tag_args[index + 1:])
+            break
+        option = item.split("=", 1)[0]
+        if option in GIT_TAG_WRITE_OPTIONS:
+            return "mutation"
+        if option in GIT_TAG_QUERY_OPTIONS or (option.startswith("-n") and option != "-n"):
+            query_mode = True
+            if option in option_needs_value and "=" not in item and option != "-n":
+                if index + 1 >= len(tag_args):
+                    return "unknown"
+                index += 1
+        elif item.startswith("-"):
+            return "unknown"
+        else:
+            positionals.append(item)
+        index += 1
+    if query_mode:
+        return "read_only"
+    return "read_only" if not positionals else "mutation"
+
+
+def git_command_mutates(command: str) -> bool:
+    aggregated = static_git_invocations(command, None)
+    if aggregated is not None and len(aggregated) > 1:
+        return not all(item["disposition"] == "read_only" for item in aggregated)
+    subcommand = git_subcommand(command)
+    if subcommand == "tag":
+        return git_tag_disposition(command) != "read_only"
+    return bool(subcommand in PLAN_MUTATING_GIT_COMMANDS)
 
 
 def command_mutates_device(command: str) -> bool:
@@ -12267,8 +13141,7 @@ def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> s
     command = extract_command(payload)
     if not command:
         return None
-    subcommand = git_subcommand(command)
-    if subcommand in PLAN_MUTATING_GIT_COMMANDS:
+    if git_command_mutates(command):
         return "Git mutation"
     if any(BUILD_COMMAND_RE.search(shell_syntax_view(candidate)) for candidate in command_views(command)):
         return "build or package"
@@ -12280,7 +13153,7 @@ def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> s
 
 
 def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str | None:
-    """Keep confirmed hard-work mutation with the one explicitly configured executor."""
+    """Keep confirmed Hard mutation with exactly one current writer."""
     if state.get("work_difficulty") != "hard" or state.get("plan_state") != "confirmed":
         return None
     if state.get("confirmed_plan_digest") != state.get("plan_digest"):
@@ -12289,6 +13162,8 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
     if "requestuserinput" in tool_key:
         return None
     if is_subagent_spawn_tool(payload):
+        if parent_writer_lease_current(state):
+            return "child spawn while the parent owns the writer lease"
         if subagent_request_is_read_only(payload):
             return None
         valid, reason = confirmed_executor_request(payload, state)
@@ -12349,6 +13224,10 @@ def executor_gate_guard(payload: dict[str, Any], state: dict[str, Any]) -> str |
         and safe_int(live_request.get("attempt"))
         == safe_int(state.get("executor_attempt"))
     ):
+        return None
+    if caller_id is None and parent_writer_lease_current(state):
+        return None
+    if caller_id is None and parent_writer_acquisition_block(state) is None:
         return None
     return f"parent or unbound {mutating}"
 
@@ -12565,6 +13444,86 @@ def git_invocation_count(command: str) -> int:
     )
 
 
+def static_git_invocations(
+    command: str, payload_cwd: Any
+) -> list[dict[str, str | None]] | None:
+    """Parse a small, deliberately static Git-only command list.
+
+    This is the sole aggregation exception: every segment must be a literal
+    Git invocation, all must be read-only, and all resolve to one native cwd.
+    Shell expansion, pipelines, a non-Git segment, or an omitted cwd is not a
+    static command list and therefore remains fail-closed.
+    """
+    if not isinstance(command, str) or not command.strip() or any(
+        marker in command for marker in ("$", "`", "\x00", "\n", "\r")
+    ):
+        return None
+    try:
+        # A Windows-native Hook receives literal ``C:\\...`` paths.  POSIX
+        # shlex consumes their backslashes before cwd classification, which
+        # can turn an otherwise static aggregate into a generic composite.
+        # Preserve Windows path text here; the same native/mounted gate below
+        # still decides whether the resolved cwd is allowed.
+        lexer = shlex.shlex(command, posix=os.name != "nt", punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except (TypeError, ValueError):
+        return None
+    if any(token in {"&&", "&", "|", "||"} for token in tokens):
+        return None
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token == ";":
+            if not segments[-1]:
+                return None
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    if not segments[-1] or len(segments) < 2:
+        return None
+    results: list[dict[str, str | None]] = []
+    common_cwd: str | None = None
+    for argv in segments:
+        index = 0
+        if not argv or argv[index].lower() not in {"git", "git.exe"}:
+            return None
+        index += 1
+        cwd = str(payload_cwd or "").strip() or None
+        while index < len(argv):
+            item = argv[index]
+            if item in {"-C", "-c", "--git-dir", "--work-tree"}:
+                if index + 1 >= len(argv) or item != "-C":
+                    return None
+                cwd, error = _normalize_structured_command_cwd(argv[index + 1], cwd)
+                if error:
+                    return None
+                index += 2
+            elif item.startswith("-C") and item != "-C":
+                cwd, error = _normalize_structured_command_cwd(item[2:], cwd)
+                if error:
+                    return None
+                index += 1
+            else:
+                break
+        if index >= len(argv) or not cwd:
+            return None
+        subcommand = argv[index].lower()
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", subcommand):
+            return None
+        rendered = "git " + " ".join(shlex.quote(item) for item in argv[1:])
+        disposition = (
+            git_tag_disposition(rendered)
+            if subcommand == "tag"
+            else "mutation" if subcommand in PLAN_MUTATING_GIT_COMMANDS else "read_only"
+        )
+        if common_cwd is None:
+            common_cwd = cwd
+        elif cwd != common_cwd:
+            return None
+        results.append({"subcommand": subcommand, "cwd": cwd, "disposition": disposition})
+    return results
+
+
 def explicit_git_cwd(command: str, payload_cwd: Any) -> tuple[str | None, str | None]:
     """Resolve visible `git -C` options without trusting an unavailable tool workdir."""
     invocation = _git_invocation(command)
@@ -12743,12 +13702,22 @@ def command_guard(payload: dict[str, Any]) -> tuple[str, str] | None:
     if not command:
         return None
     subcommand = git_subcommand(command)
-    if subcommand and git_invocation_count(command) != 1:
+    aggregate = static_git_invocations(command, resolution.get("cwd"))
+    if subcommand and git_invocation_count(command) != 1 and aggregate is None:
         return (
             "ambiguous_git_input",
-            "Workflow Manager guard blocked multiple Git invocations in one command. Run one bounded Git "
-            "operation per tool call so each execution directory and subcommand is checked independently.",
+            "Workflow Manager guard blocked a non-static Git composite. Only literal, Git-only, read-only "
+            "invocations in one explicit native Linux cwd may be aggregated.",
         )
+    if aggregate is not None:
+        if not all(item["disposition"] == "read_only" for item in aggregate):
+            return ("ambiguous_git_input", "Workflow Manager guard blocked a Git composite containing a write.")
+        effective_cwd = aggregate[0]["cwd"]
+        if cwd_is_wsl_or_network_mount(effective_cwd):
+            return ("mounted_local_git", "Workflow Manager guard blocked Git in a WSL/DrvFS/CIFS/UNC working tree.")
+        if not real_tmp_git_directory(effective_cwd):
+            return ("invalid_tmp_git_cwd", "Workflow Manager guard blocked an unavailable native Git cwd.")
+        return None
     if subcommand and resolution.get("error"):
         return (
             "ambiguous_git_input",
@@ -13327,7 +14296,11 @@ def emit_stop_block(reason: str) -> None:
 
 
 def emit_leased_stop_block(payload: dict[str, Any], reason: str) -> None:
-    """Persist pending→emitted→consumed around one idempotent Stop request."""
+    """Persist a continuation send attempt without self-acknowledging it.
+
+    stdout is not a host receipt.  A later exact structured receipt/root
+    message is the only authority allowed to consume the durable outbox item.
+    """
     lease_box: dict[str, Any] = {}
 
     def claim(state: dict[str, Any]) -> None:
@@ -13348,16 +14321,6 @@ def emit_leased_stop_block(payload: dict[str, Any], reason: str) -> None:
     if os.environ.get("WORKFLOW_MANAGER_TEST_SIGKILL_AFTER_LEASE_EMITTED") == "1":
         os._exit(137)
     emit_stop_block(f"{reason} continuation_key={key}")
-
-    def consume(state: dict[str, Any]) -> None:
-        consume_continuation_lease(state, key)
-
-    # This is a distinct durable boundary, not a duplicate delivery of the
-    # Stop event that claimed the lease; duplicate-hook suppression therefore
-    # must not discard the consume acknowledgement.
-    consume_payload = dict(payload)
-    consume_payload.pop("hook_run_id", None)
-    mutate_state(consume_payload, consume)
 
 
 def current_slice_resume_delta(
@@ -14048,6 +15011,8 @@ def authorization_context(classification: dict[str, Any]) -> str:
 
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     raw_prompt = str(payload.get("prompt") or "")
+    root_continuation_key = root_visible_continuation_ack(payload)
+    continuation_ack_delivery: dict[str, bool] = {"consumed": False}
     delegated_prompt = codex_delegation_input(raw_prompt)
     prompt = delegated_prompt if delegated_prompt is not None else raw_prompt
     identity_preflight = bool(
@@ -14137,6 +15102,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
         )
     )
+    if root_continuation_key:
+        # An exact root echo acknowledges transport only; it can never become
+        # a fresh objective or reshape the confirmed envelope.
+        new_objective = False
     # A cwd change is not itself a contract reset: an exact control/recovery
     # may be a worktree migration.  But ordinary new work in another workspace
     # must never inherit confirmation, journal, or writer ownership.
@@ -14257,7 +15226,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if completed_direct_followup
         else {}
     )
-    continuation = epoch_switch_blocked or (not new_objective and (
+    continuation = bool(root_continuation_key) or epoch_switch_blocked or (not new_objective and (
         preference_directive is not None
         or is_control_followup(prompt)
         or is_progress_followup(prompt)
@@ -14327,6 +15296,11 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
+        if root_continuation_key:
+            continuation_ack_delivery["consumed"] = consume_continuation_lease(
+                state, root_continuation_key, source="root_visible",
+                receipt={"continuation_key": root_continuation_key},
+            )
         prompt_meta = text_metadata(prompt)
         prior_authorization_digest = authorization_envelope_digest(state)
         if identity_preflight and state.get("assessor_state") in {
@@ -14351,12 +15325,18 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if epoch_switch_blocked:
             record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
         if preference_directive is not None:
-            state["session_execution_preference"] = preference_directive
-            if preference_changed and state.get("plan_state") == "confirmed":
-                reset_executor_binding(state)
-                state["execution_contract_id"] = execution_contract_id(state)
-                state["executor_state"] = "spawn_required"
-                state["model_profile"] = confirmed_executor_model_profile(state)
+            if preference_changed and _epoch_has_live_writer(state):
+                record_lifecycle_diagnostic(
+                    state, "epoch_switch_live_writer", level="error",
+                    role=("confirmed_executor" if state.get("executor_agent_id") else "high_assessor"),
+                )
+            else:
+                state["session_execution_preference"] = preference_directive
+                if preference_changed and state.get("plan_state") == "confirmed":
+                    reset_executor_binding(state)
+                    state["execution_contract_id"] = execution_contract_id(state)
+                    state["executor_state"] = "spawn_required"
+                    state["model_profile"] = confirmed_executor_model_profile(state)
         if causal_report:
             baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
             review_id = stable_hash(
@@ -14397,7 +15377,15 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         # boundary so its old evidence is only migrated, never rewritten.
         if (not _safe_task_epoch(state.get("task_epoch")).get("id") and not state.get("objective", {}).get("fingerprint")):
             record_lifecycle_diagnostic(state, "epoch_switch_lifecycle_conflict", level="error")
-        elif (not _safe_task_epoch(state.get("task_epoch")).get("id") and not state.get("plan_digest")) or new_objective:
+        elif (
+            (not _safe_task_epoch(state.get("task_epoch")).get("id") and not state.get("plan_digest"))
+            or new_objective
+            or (
+                not continuation
+                and _safe_task_epoch(state.get("task_epoch")).get("objective_fingerprint")
+                != state.get("objective", {}).get("fingerprint")
+            )
+        ):
             if not rotate_task_epoch(state, payload, state.get("objective", {})):
                 record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
         if not continuation or not state.get("authorization_scope"):
@@ -14634,6 +15622,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             state["telemetry"] = telemetry
 
     mutate_state(payload, update)
+    if continuation_ack_delivery["consumed"]:
+        emit_context(
+            "UserPromptSubmit",
+            "Workflow Manager consumed one continuation lease from the exact root-visible key; ordinary text and stdout never acknowledge it.",
+        )
+        return
     prior_route = safe_route(previous.get("last_route"))
     route_changed = any(
         prior_route.get(key) != classification.get(key)
@@ -14764,8 +15758,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     elif confirmed_plan:
         executor_task = bound_executor_task_name(refreshed_for_assessor)
         context += (
-            " Confirmation is bound. The Hook will privately deliver the verified native plan to the one executor; "
-            "task_name is only an opaque host label and does not carry authorization."
+            " Confirmation is bound. Exactly one writer may own the current slice. With no pending/live/unknown "
+            "child writer or unfinished causal/stall diagnosis, the parent may acquire the slice lease directly. "
+            "If a child is chosen, the Hook privately delivers the verified plan; task_name is only an opaque host label."
         )
         if refreshed_for_assessor.get("session_execution_preference") == "highest_throughout":
             context += (
@@ -14913,6 +15908,7 @@ def record_confirmed_executor_pretool(
             {
                 "at": utc_now(),
                 "event": "request",
+                "epoch_id": current_task_epoch_id(candidate),
                 "turn_id": safe_label(payload.get("turn_id"), 120)
                 if payload.get("turn_id")
                 else None,
@@ -15176,6 +16172,33 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         ),
         None,
     )
+    if (
+        nested_caller
+        and _safe_child_liveness(state.get("child_liveness")).get("status") == "unknown"
+        and known_writer_roles(state, nested_caller)
+    ):
+        # A partial inventory may not be used to keep working optimistically.
+        # The original child remains available only to deliver its exact Stop;
+        # all further tool actions are blocked until a structured live/absent
+        # host fact resolves the ownership boundary.
+        def record_unknown_writer_guard(current: dict[str, Any]) -> None:
+            current.setdefault("guards", []).append(
+                {
+                    "at": utc_now(),
+                    "turn_id": safe_label(payload.get("turn_id"), 120)
+                    if payload.get("turn_id")
+                    else None,
+                    "kind": "writer_inventory_unknown",
+                    "action": "deny",
+                    "fingerprint": fingerprint,
+                }
+            )
+
+        mutate_state(payload, record_unknown_writer_guard)
+        emit_pretool_deny(
+            "Workflow Manager blocked this child tool action: writer inventory is unknown; wait for an exact host lifecycle or complete inventory fact."
+        )
+        return
     if is_subagent_spawn_tool(payload) and nested_caller:
         def record_nested_guard(current: dict[str, Any]) -> None:
             current.setdefault("guards", []).append(
@@ -15307,6 +16330,7 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                     {
                         "at": utc_now(),
                         "event": "request",
+                        "epoch_id": current_task_epoch_id(candidate),
                         "turn_id": safe_label(payload.get("turn_id"), 120)
                         if payload.get("turn_id")
                         else None,
@@ -15415,9 +16439,9 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
                 "reasoning_effort=medium"
             )
         emit_pretool_deny(
-            f"Workflow Manager blocked {executor_block}: this confirmed hard-work plan requires exactly one "
-            f"executor. {profile_instruction}, fork_turns=1, and use any safe ASCII task_name. "
-            "The Hook supplies the private plan/contract after the host accepts the spawn."
+            f"Workflow Manager blocked {executor_block}: this confirmed Hard contract permits exactly one "
+            "writer at a time. The parent may write only while no child is reserved, live, or unknown; "
+            f"otherwise {profile_instruction}, fork_turns=1, and use any safe ASCII task_name."
         )
         return
     if is_subagent_spawn_tool(payload):
@@ -15445,6 +16469,33 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             f"Workflow Manager blocked {blocked_action}: this hard work plan is not strictly confirmed. "
             "Continue read-only analysis or present an ordinary plan, then wait for confirmation."
         )
+        return
+    parent_mutation = plan_confirmation_guard(
+        payload, {**state, "plan_state": "awaiting_confirmation", "confirmed_plan_digest": None},
+    )
+    if (parent_mutation and state.get("work_difficulty") == "hard"
+            and state.get("plan_state") == "confirmed"
+            and not payload_claims_child_identity(payload)):
+        fixed_guard = command_guard(payload)
+        if fixed_guard:
+            _, reason = fixed_guard
+            emit_pretool_deny(reason)
+            return
+        parent_command = extract_command(payload) or ""
+        if command_mutates_device(parent_command):
+            emit_pretool_deny(
+                "Workflow Manager blocked device mutation: a parent writer lease does not relax the fixed device boundary."
+            )
+            return
+        decision = {"acquired": False, "reason": None}
+        def reserve_parent(current: dict[str, Any]) -> None:
+            decision["reason"] = parent_writer_acquisition_block(current)
+            if decision["reason"] is None and acquire_parent_writer_lease(current):
+                decision["acquired"] = True
+        mutate_state(payload, reserve_parent)
+        if not decision["acquired"]:
+            emit_pretool_deny("Workflow Manager blocked parent mutation: "
+                              + str(decision["reason"] or "the unique writer lease is unavailable") + ".")
         return
     guard = command_guard(payload)
     if guard:
@@ -15567,6 +16618,211 @@ def mailbox_completed_result(
     return matches[0][0]
 
 
+def _inventory_live_binding(
+    state: dict[str, Any]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Find one current live writer without selecting by agent id alone."""
+    liveness = _safe_child_liveness(state.get("child_liveness"))
+    for role in ("confirmed_executor", "high_assessor"):
+        request, started = _current_bound_live_writer(state, role)
+        if request and started:
+            return _writer_liveness_binding(
+                state, role, request=request, agent_id=started.get("agent_id")
+            ), request, started
+    # A pending assessor reservation is not evidence that a child started,
+    # but a host-complete inventory can still prove this exact reservation is
+    # absent. Keep executors stricter: they still require a full Start.
+    if state.get("assessor_state") == "spawn_pending" and state.get("assessor_agent_id") is None:
+        pending = [
+            group.get("request") for group in subagent_lifecycle_groups(state)
+            if group.get("state") == "pending"
+            and isinstance(group.get("request"), dict)
+            and group["request"].get("role") == "high_assessor"
+            and group["request"].get("epoch_id") == current_task_epoch_id(state)
+            and group["request"].get("contract_id") == state.get("assessor_binding_id")
+            and safe_sequence(group["request"].get("attempt")) == safe_sequence(state.get("assessor_attempt"))
+            and group["request"].get("requested") is True
+            and group["request"].get("host_accepted") is not False
+        ]
+        if len(pending) == 1:
+            return _writer_liveness_binding(state, "high_assessor", request=pending[0]), pending[0], None
+    # A Start observed before its matching Post is live but mutation-locked.
+    # It can only be matched through its recorded epoch/request/agent triple,
+    # never through a later agent-id reuse.
+    if liveness.get("status") not in {"live", "unknown"}:
+        return None, None, None
+    role = liveness.get("role")
+    for group in subagent_lifecycle_groups(state):
+        request = group.get("request")
+        started = group.get("start")
+        if not (
+            group.get("state") == "live" and isinstance(request, dict)
+            and isinstance(started, dict) and request.get("role") == role
+            and started.get("role") == role
+            and request.get("epoch_id") == liveness.get("epoch_id")
+            and started.get("epoch_id") == liveness.get("epoch_id")
+            and request.get("request_fingerprint") == liveness.get("request_fingerprint")
+            and _lifecycle_agent_fingerprint(
+                started.get("agent_id"), request.get("request_fingerprint")
+            ) == liveness.get("agent_fingerprint")
+        ):
+            continue
+        expected = lifecycle_binding_fingerprint(
+            epoch_id=started.get("epoch_id"), role=role,
+            agent_id=started.get("agent_id"),
+            request_fingerprint=request.get("request_fingerprint"),
+            contract_id=request.get("contract_id"), attempt=request.get("attempt"),
+        )
+        if expected and started.get("lifecycle_fingerprint") == expected:
+            return _writer_liveness_binding(
+                state, role, request=request, agent_id=started.get("agent_id")
+            ), request, started
+    return None, None, None
+
+
+def _inventory_status_value(value: Any) -> str:
+    if isinstance(value, dict):
+        completed = [key for key in value if normalized_key(key) == "completed"]
+        if len(value) == len(completed) == 1:
+            return "terminal"
+        return "unknown"
+    if not isinstance(value, str):
+        return "unknown"
+    normalized = normalized_key(value)
+    if normalized in {"running", "live", "active", "working", "pending", "queued"}:
+        return "live"
+    if normalized in {"completed", "complete", "done", "succeeded", "failed", "cancelled", "canceled"}:
+        return "terminal"
+    if normalized in {"absent", "notfound", "agentnotfound", "capacity", "capacityerror", "sigkill", "killed"}:
+        return "absent"
+    return "unknown"
+
+
+def _inventory_response_is_complete(value: Any, depth: int = 0) -> bool:
+    """Accept an absence only from an explicit host-complete inventory fact."""
+    if depth > 4 or not isinstance(value, dict) or len(value) > 32:
+        return False
+    complete_fields = {
+        "complete", "inventorycomplete", "completeinventory", "iscomplete",
+    }
+    direct = [
+        raw for raw, item in value.items()
+        if normalized_key(raw) in complete_fields and item is True
+    ]
+    if len(direct) == 1:
+        return True
+    if direct:
+        return False
+    wrappers = {"receipt", "result", "response", "toolresponse", "structuredcontent"}
+    nested = [
+        _inventory_response_is_complete(item, depth + 1)
+        for raw, item in value.items()
+        if normalized_key(raw) in wrappers
+    ]
+    return len(nested) == 1 and nested[0]
+
+
+def writer_inventory_observation(
+    response: Any, binding: dict[str, Any], request: dict[str, Any]
+) -> str:
+    """Classify a structured host inventory; incomplete shapes are unknown."""
+    agents, ambiguous = _mailbox_agents_payload(response)
+    if ambiguous or agents is None:
+        return "unknown"
+    task = str(request.get("task_name") or "")
+    if not task:
+        return "unknown"
+    matches: list[str] = []
+    for item in agents:
+        if not isinstance(item, dict) or len(item) > 16:
+            return "unknown"
+        name_keys = [key for key in item if normalized_key(key) == "agentname"]
+        status_keys = [key for key in item if normalized_key(key) == "agentstatus"]
+        if len(name_keys) != 1:
+            continue
+        if not _mailbox_task_matches(item.get(name_keys[0]), task):
+            continue
+        if len(status_keys) != 1:
+            return "unknown"
+        matches.append(_inventory_status_value(item.get(status_keys[0])))
+    if not matches:
+        # A list that omits the task may be filtered or partial.  Releasing a
+        # writer needs an independently explicit complete/absent fact, not an
+        # inference from a convenient-looking list shape.
+        return "absent" if _inventory_response_is_complete(response) else "unknown"
+    return matches[0] if len(matches) == 1 else "unknown"
+
+
+def explicit_host_writer_absence(response: Any, depth: int = 0) -> str | None:
+    """Recognize only structured capacity/SIGKILL host facts, never stdout."""
+    if depth > 4 or not isinstance(response, dict) or len(response) > 32:
+        return None
+    values: set[str] = set()
+    direct_fields = {"status", "errorcode", "code", "reason"}
+    for raw_key, value in response.items():
+        key = normalized_key(raw_key)
+        if key in direct_fields and isinstance(value, str):
+            normalized = normalized_key(value)
+            if normalized in {"capacity", "capacityerror", "resourceexhausted"}:
+                values.add("capacity")
+            elif normalized in {"sigkill", "killed", "killedbyhost"}:
+                values.add("sigkill")
+        elif key in {"receipt", "result", "response", "toolresponse", "structuredcontent"}:
+            nested = explicit_host_writer_absence(value, depth + 1)
+            if nested:
+                values.add(nested)
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def reconcile_writer_inventory(
+    state: dict[str, Any], response: Any, payload: dict[str, Any]
+) -> str | None:
+    """Consume a host inventory observation without trusting child output."""
+    # wait_agent/wait_threads can report a completion notification but do not
+    # promise a complete writer inventory.  Only the dedicated list_agents
+    # host result can establish live/absent/unknown ownership facts; terminal
+    # mailbox payloads remain subject to the stricter result reconciler above.
+    if "listagents" not in normalized_key(payload.get("tool_name")):
+        return None
+    binding, request, _ = _inventory_live_binding(state)
+    if not binding or not request:
+        return None
+    observation = writer_inventory_observation(response, binding, request)
+    if observation == "live":
+        _set_writer_liveness(
+            state, status="live", binding=binding, source="host_inventory",
+            observation={"event": "PostToolUse", "status": "live"},
+        )
+        record_lifecycle_diagnostic(
+            state, "inventory_writer_live", level="info", role=binding.get("role"),
+            request_fingerprint=binding.get("request_fingerprint"),
+            contract_id=binding.get("contract_id"),
+        )
+        return "live"
+    if observation == "absent":
+        _release_writer_after_explicit_absence(
+            state, binding=binding, reason="absent", source="host_inventory",
+            observation={"event": "PostToolUse", "status": "absent"},
+        )
+        return "absent"
+    if observation == "terminal":
+        # A mailbox terminal result needs the stricter exact result protocol
+        # in ``reconcile_bound_mailbox_terminal`` above.  A bare completed
+        # status cannot close or release this writer, so retain it as unknown.
+        _mark_writer_inventory_unknown(
+            state, binding=binding, source="host_inventory",
+            observation={"event": "PostToolUse", "status": "terminal_unbound"},
+            preserve_writer=True,
+        )
+        return "unknown"
+    _mark_writer_inventory_unknown(
+        state, binding=binding, source="host_inventory",
+        observation={"event": "PostToolUse", "status": "unknown"},
+        preserve_writer=True,
+    )
+    return "unknown"
+
+
 def _mailbox_reported_recovery_facts(body: str) -> dict[str, Any]:
     """Extract only a unique typed failure identity from a terminal report."""
     explicit = {
@@ -15670,6 +16926,13 @@ def reconcile_bound_mailbox_terminal(
         {
             "at": utc_now(),
             "event": "mailbox_terminal",
+            "epoch_id": current_task_epoch_id(state),
+            "lifecycle_fingerprint": lifecycle_binding_fingerprint(
+                epoch_id=current_task_epoch_id(state), role="confirmed_executor",
+                agent_id=group.get("agent_id"),
+                request_fingerprint=request.get("request_fingerprint"),
+                contract_id=request.get("contract_id"), attempt=request.get("attempt"),
+            ),
             "turn_id": safe_label(payload.get("turn_id"), 120)
             if payload.get("turn_id")
             else None,
@@ -15702,6 +16965,15 @@ def reconcile_bound_mailbox_terminal(
             "fork_turns": started.get("fork_turns"),
             "attempt": request.get("attempt"),
         }
+    )
+    _set_writer_liveness(
+        state, status="terminal",
+        binding=_writer_liveness_binding(
+            state, "confirmed_executor", request=request,
+            agent_id=group.get("agent_id"),
+        ),
+        source="host_inventory",
+        observation={"event": "mailbox_terminal", "outcome": outcome},
     )
     state.setdefault("guards", []).append(
         {
@@ -15860,10 +17132,40 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             for marker in ("waitagent", "listagents", "waitthreads")
         )
     )
+    continuation_ack_key = (
+        trusted_posttool_continuation_ack(response)
+        if caller_id is None and not payload_claims_child_identity(payload)
+        else None
+    )
+    host_writer_absence = explicit_host_writer_absence(response)
     runtime_delivery: dict[str, str] = {}
     liveness_delivery: dict[str, str] = {}
 
     def update(state: dict[str, Any]) -> None:
+        if continuation_ack_key:
+            if consume_continuation_lease(
+                state, continuation_ack_key, source="host_posttool", receipt=response
+            ):
+                runtime_delivery["continuation_ack"] = "host_posttool"
+        bound_role, bound_request, bound_started = bound_writer_for_posttool(
+            state, payload
+        )
+        known_bound_roles = known_writer_roles(state, caller_id)
+        if caller_id and known_bound_roles and not bound_role:
+            tombstone_late_lifecycle_event(
+                state, payload, status="late_post",
+            )
+            record_lifecycle_diagnostic(
+                state, "late_event_epoch_ambiguous", level="warning",
+                role=(
+                    "confirmed_executor"
+                    if caller_id == state.get("executor_agent_id")
+                    else "high_assessor"
+                    if caller_id == state.get("assessor_agent_id")
+                    else None
+                ),
+            )
+            return
         # A parent wait/list is an observation only.  A child may explicitly
         # attach a bounded progress digest, but status/running/parent polling
         # and stale events never reset the idle clock.
@@ -15894,6 +17196,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                         {
                             "at": utc_now(),
                             "event": "stop",
+                            "epoch_id": current_task_epoch_id(state),
                             "agent_id": state.get("assessor_agent_id"),
                             "task_name": "high_assessor_followup",
                             "status": "failed",
@@ -15917,8 +17220,11 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         )
         epoch_before = safe_int(state.get("change_epoch"))
         active_executor_caller = bool(
-            caller_id and caller_id == state.get("executor_agent_id")
+            bound_role == "confirmed_executor"
+            and _safe_child_liveness(state.get("child_liveness")).get("status")
+            == "live"
         )
+        active_parent_writer = bool(caller_id is None and parent_writer_lease_current(state))
         recoverable_parent_candidate = bool(
             state.get("executor_state") == "recovery_required"
             and state.get("executor_failure_kind") == "incomplete_execution"
@@ -15949,7 +17255,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             and not command_risk_kind(payload, command or "")
             and not git_subcommand(command or "")
         )
-        bind_current_slice = active_executor_caller or parent_review_operation
+        bind_current_slice = active_executor_caller or active_parent_writer or parent_review_operation
         state.setdefault("operations", []).append(
             {
                 "at": utc_now(),
@@ -15980,9 +17286,10 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "plan_digest": active_plan_digest,
                 "execution_contract_id": (
                     state.get("execution_contract_id")
-                    if active_plan_digest and (active_executor_caller or parent_review_operation)
+                    if active_plan_digest and (active_executor_caller or active_parent_writer or parent_review_operation)
                     else None
                 ),
+                "epoch_id": current_task_epoch_id(state),
                 "slice_id": (
                     (current_execution_slice(state) or {}).get("id")
                     if active_plan_digest and bind_current_slice
@@ -15996,7 +17303,10 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "executor_agent_id": (
                     caller_id if active_executor_caller else None
                 ),
-                "assessor_binding_id": state.get("assessor_binding_id") if caller_id == state.get("assessor_agent_id") else None,
+                "assessor_binding_id": (
+                    state.get("assessor_binding_id")
+                    if bound_role == "high_assessor" else None
+                ),
                 "risk_kind": risk_kind,
                 **response_meta,
                 "budgeted": budgeted,
@@ -16005,14 +17315,50 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 "change_epoch": epoch_before,
             }
         )
-        failed = status_value.startswith("error") or status_value in ERROR_STATUSES
+        failed = bool(
+            status_value.startswith("error")
+            or status_value in ERROR_STATUSES
+            or host_writer_absence
+        )
+        if active_parent_writer:
+            lease = _safe_parent_writer_lease(state.get("parent_writer_lease"))
+            lease["last_operation_digest"] = fingerprint
+            state["parent_writer_lease"] = lease
+            if (not failed and category in {"verification", "evidence"}
+                    and slice_operation_evidence(state).get("change_evidence")):
+                candidate = stable_hash("workflow-manager-parent-writer-candidate-v1\0" + canonical_json({
+                    "attempt": state.get("executor_attempt"), "contract": state.get("execution_contract_id"),
+                    "operation": fingerprint, "slice": (current_execution_slice(state) or {}).get("id"),
+                }), 32)
+                state["executor_review"] = _safe_executor_review({
+                    "status": "review_required", "attempt": state.get("executor_attempt"),
+                    "execution_contract_id": state.get("execution_contract_id"),
+                    "slice_id": (current_execution_slice(state) or {}).get("id"),
+                    "slice_contract_id": slice_contract_id(state),
+                    "candidate_result_fingerprint": candidate,
+                    "candidate_agent_fingerprint": stable_hash("parent", 32),
+                    "candidate_evidence_digest": slice_operation_evidence(state).get("operation_digest"),
+                    "child_summary_digest": stable_hash("parent-writer-host-operations\0" + candidate, 32),
+                    "terminal_status": "completed", "terminal_status_source": "host_declared_success", "at": utc_now(),
+                })
+                state["executor_state"] = "verification_required"
+                state["executor_failure_kind"] = None
         # Only a completed implementation, build artifact, or deployment moves
         # the freshness boundary. Failed/denied probes never manufacture a new
         # epoch and therefore cannot weaken acceptance.
-        if not failed and category in {"implementation", "build_package", "delivery_device"}:
+        if (
+            not failed
+            and category in {"implementation", "build_package", "delivery_device"}
+            and (caller_id is None or active_executor_caller)
+        ):
             state["change_epoch"] = min(epoch_before + 1, MAX_EVENT_COUNT)
         pending_spawn = next(
-            (item for item in reversed(state.get("subagents", [])) if item.get("event") == "request" and item.get("request_fingerprint") == fingerprint),
+            (
+                item for item in reversed(state.get("subagents", []))
+                if item.get("event") == "request"
+                and item.get("epoch_id") == current_task_epoch_id(state)
+                and item.get("request_fingerprint") == fingerprint
+            ),
             None,
         )
         # PreToolUse is only a request reservation.  A matching PostToolUse is
@@ -16022,7 +17368,7 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 True
                 if status_value in SUCCESS_STATUSES | {"running"}
                 else False
-                if status_value.startswith("error") or status_value in ERROR_STATUSES
+                if failed
                 else None
             )
             receipt_digest = spawn_acceptance_receipt_digest(
@@ -16074,15 +17420,68 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             if safe_int(pending_spawn.get("attempt")) == safe_int(state.get("assessor_attempt")):
                 state["assessor_state"] = "recovery_required"
                 state["assessor_failure_kind"] = "model_unavailable"
+                absence = host_writer_absence
+                if absence:
+                    _release_writer_after_explicit_absence(
+                        state,
+                        binding=_writer_liveness_binding(
+                            state, "high_assessor", request=pending_spawn
+                        ),
+                        reason="capacity" if absence == "capacity" else "sigkill",
+                        source="host_lifecycle",
+                        observation={"event": "PostToolUse", "absence": absence},
+                    )
+                else:
+                    _mark_writer_inventory_unknown(
+                        state,
+                        binding=_writer_liveness_binding(
+                            state, "high_assessor", request=pending_spawn
+                        ),
+                        source="host_lifecycle",
+                        observation={"event": "PostToolUse", "absence": "unknown"},
+                    )
         if failed and pending_spawn and pending_spawn.get("role") == "confirmed_executor" and state.get("executor_state") == "spawn_pending":
             if safe_int(pending_spawn.get("attempt")) == safe_int(state.get("executor_attempt")):
                 state["executor_state"] = "recovery_required"
                 state["executor_failure_kind"] = "model_unavailable"
                 state["model_profile"] = "work_assessment"
+                absence = host_writer_absence
+                if absence:
+                    _release_writer_after_explicit_absence(
+                        state,
+                        binding=_writer_liveness_binding(
+                            state, "confirmed_executor", request=pending_spawn
+                        ),
+                        reason="capacity" if absence == "capacity" else "sigkill",
+                        source="host_lifecycle",
+                        observation={"event": "PostToolUse", "absence": absence},
+                    )
+                else:
+                    _mark_writer_inventory_unknown(
+                        state,
+                        binding=_writer_liveness_binding(
+                            state, "confirmed_executor", request=pending_spawn
+                        ),
+                        source="host_lifecycle",
+                        observation={"event": "PostToolUse", "absence": "unknown"},
+                    )
+        if host_writer_absence and bound_role and bound_request:
+            # A structured host SIGKILL/capacity result attached to the exact
+            # live child is an explicit writer-absence fact, not child prose.
+            # Tombstone and release it before any failed-operation routing can
+            # accidentally retain the old writer slot.
+            _release_writer_after_explicit_absence(
+                state,
+                binding=_writer_liveness_binding(
+                    state, bound_role, request=bound_request,
+                    agent_id=(bound_started or {}).get("agent_id"),
+                ),
+                reason=("capacity" if host_writer_absence == "capacity" else "sigkill"),
+                source="host_lifecycle",
+                observation={"event": "PostToolUse", "absence": host_writer_absence},
+            )
         executor_operation = bool(
-            caller_id
-            and caller_id == state.get("executor_agent_id")
-            and state.get("executor_state") == "running"
+            active_executor_caller and state.get("executor_state") == "running"
         )
         if executor_operation and failed:
             failure_by_category = {
@@ -16126,6 +17525,24 @@ def post_tool_use(payload: dict[str, Any]) -> None:
             )
             if mailbox_outcome:
                 runtime_delivery["mailbox_terminal"] = mailbox_outcome
+            if host_writer_absence:
+                inventory_binding, inventory_request, _ = _inventory_live_binding(state)
+                if inventory_binding and inventory_request:
+                    _release_writer_after_explicit_absence(
+                        state, binding=inventory_binding,
+                        reason=("capacity" if host_writer_absence == "capacity" else "sigkill"),
+                        source="host_inventory",
+                        observation={
+                            "event": "PostToolUse", "absence": host_writer_absence,
+                        },
+                    )
+                    inventory_outcome = "absent"
+                else:
+                    inventory_outcome = None
+            else:
+                inventory_outcome = reconcile_writer_inventory(state, response, payload)
+            if inventory_outcome:
+                runtime_delivery["writer_inventory"] = inventory_outcome
             role: str | None = None
             role_binding = ""
             if state.get("executor_state") in {
@@ -16180,6 +17597,11 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                     runtime_delivery["role"] = role
 
     updated_state, _ = mutate_state(payload, update)
+    if runtime_delivery.get("continuation_ack"):
+        emit_context(
+            "PostToolUse",
+            "Workflow Manager consumed one continuation lease from an exact structured host receipt; stdout alone never acknowledges it.",
+        )
     if liveness_delivery.get("action") == "unblock_required":
         emit_context(
             "PostToolUse",
@@ -16319,6 +17741,309 @@ def active_agent_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def lifecycle_binding_fingerprint(
+    *, epoch_id: Any, role: Any, agent_id: Any, request_fingerprint: Any,
+    contract_id: Any, attempt: Any,
+) -> str | None:
+    epoch = safe_fingerprint(epoch_id)
+    request = safe_fingerprint(request_fingerprint)
+    contract = _fingerprint32(contract_id)
+    agent = safe_label(agent_id, 120) if agent_id else ""
+    if not (
+        epoch and role in {"high_assessor", "confirmed_executor"}
+        and agent and request and contract and safe_sequence(attempt) > 0
+    ):
+        return None
+    return stable_hash(
+        "workflow-manager-lifecycle-binding-v1\0"
+        + canonical_json(
+            {
+                "agent": stable_hash(agent, 32), "attempt": safe_sequence(attempt),
+                "contract": contract, "epoch": epoch, "request": request,
+                "role": role,
+            }
+        ),
+        32,
+    )
+
+
+def _current_bound_live_writer(
+    state: dict[str, Any], role: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return one live record only when every current binding component agrees."""
+    task_epoch = _safe_task_epoch(state.get("task_epoch"))
+    epoch = task_epoch.get("id")
+    if not epoch or task_epoch.get("status") != "active":
+        return None, None
+    expected_contract = (
+        state.get("execution_contract_id")
+        if role == "confirmed_executor"
+        else state.get("assessor_binding_id")
+    )
+    expected_agent = (
+        state.get("executor_agent_id")
+        if role == "confirmed_executor"
+        else state.get("assessor_agent_id")
+    )
+    expected_attempt = (
+        state.get("executor_attempt")
+        if role == "confirmed_executor"
+        else state.get("assessor_attempt")
+    )
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for group in subagent_lifecycle_groups(state):
+        request = group.get("request")
+        started = group.get("start")
+        if (
+            group.get("state") != "live" or not isinstance(request, dict)
+            or not isinstance(started, dict) or request.get("role") != role
+            or started.get("role") != role
+            or request.get("epoch_id") != epoch or started.get("epoch_id") != epoch
+            or request.get("contract_id") != expected_contract
+            or started.get("contract_id") != expected_contract
+            or safe_sequence(request.get("attempt")) != safe_sequence(expected_attempt)
+            or safe_sequence(started.get("attempt")) != safe_sequence(expected_attempt)
+            or str(started.get("agent_id") or "") != str(expected_agent or "")
+        ):
+            continue
+        expected_fingerprint = lifecycle_binding_fingerprint(
+            epoch_id=epoch, role=role, agent_id=started.get("agent_id"),
+            request_fingerprint=request.get("request_fingerprint"),
+            contract_id=expected_contract, attempt=expected_attempt,
+        )
+        if not expected_fingerprint or started.get("lifecycle_fingerprint") != expected_fingerprint:
+            continue
+        candidates.append((request, started))
+    return candidates[0] if len(candidates) == 1 else (None, None)
+
+
+def lifecycle_event_matches_start(
+    payload: dict[str, Any], request: dict[str, Any], started: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> bool:
+    """Optional host fields constrain a Start/Stop/PostTool; none may widen it."""
+    payload_epoch = safe_fingerprint(
+        payload.get("task_epoch_id") or payload.get("epoch_id")
+    )
+    if payload_epoch and payload_epoch != started.get("epoch_id"):
+        return False
+    payload_request = safe_fingerprint(payload.get("request_fingerprint"))
+    if payload_request and payload_request != request.get("request_fingerprint"):
+        return False
+    payload_contract = _fingerprint32(
+        payload.get("execution_contract_id") or payload.get("contract_id")
+    )
+    if payload_contract and payload_contract != started.get("contract_id"):
+        return False
+    payload_role = payload.get("role")
+    if payload_role and payload_role != started.get("role"):
+        return False
+    raw_attempt = payload.get("attempt")
+    if raw_attempt not in (None, "") and safe_sequence(raw_attempt) != safe_sequence(started.get("attempt")):
+        return False
+    # A raw agent id is not a generation capability.  Older host events often
+    # omit the optional lifecycle fields, which is safe only while that id has
+    # never represented another writer binding.  Once an id was terminal (or
+    # otherwise recorded) for a different epoch/request/attempt, accepting an
+    # unqualified Stop/PostTool would let it terminate or mutate a successor.
+    if state is not None and writer_agent_has_prior_binding(
+        state, started.get("agent_id"), started
+    ):
+        return bool(
+            payload_epoch == started.get("epoch_id")
+            and payload_request == request.get("request_fingerprint")
+            and payload_contract == started.get("contract_id")
+            and payload_role == started.get("role")
+            and raw_attempt not in (None, "")
+            and safe_sequence(raw_attempt) == safe_sequence(started.get("attempt"))
+        )
+    return True
+
+
+def known_writer_roles(state: dict[str, Any], agent_id: Any) -> set[str]:
+    """Find historical writer roles without making an id an authorization."""
+    agent = safe_label(agent_id, 120) if agent_id else ""
+    if not agent:
+        return set()
+    roles: set[str] = set()
+    for item in as_list(state.get("subagents")):
+        if not isinstance(item, dict) or item.get("agent_id") != agent:
+            continue
+        role = item.get("role")
+        if role in {"high_assessor", "confirmed_executor"}:
+            roles.add(role)
+    expected_fingerprint = _lifecycle_agent_fingerprint(agent, None)
+    for raw in as_list(state.get("isolated_lifecycles")):
+        item = _safe_isolated_lifecycle(raw)
+        if item and item.get("agent_fingerprint") == expected_fingerprint:
+            roles.add(str(item.get("role")))
+    return roles
+
+
+def writer_agent_has_prior_binding(
+    state: dict[str, Any], agent_id: Any, current_started: dict[str, Any]
+) -> bool:
+    """Whether this id was already assigned to a different writer identity."""
+    agent = safe_label(agent_id, 120) if agent_id else ""
+    if not agent:
+        return False
+    current = (
+        current_started.get("epoch_id"), current_started.get("role"),
+        current_started.get("request_fingerprint"), current_started.get("contract_id"),
+        safe_sequence(current_started.get("attempt")),
+    )
+    for item in as_list(state.get("subagents")):
+        if not isinstance(item, dict) or item.get("agent_id") != agent:
+            continue
+        if item.get("role") not in {"high_assessor", "confirmed_executor"}:
+            continue
+        candidate = (
+            item.get("epoch_id"), item.get("role"),
+            item.get("request_fingerprint"), item.get("contract_id"),
+            safe_sequence(item.get("attempt")),
+        )
+        if candidate != current:
+            return True
+    return False
+
+
+def bound_writer_for_posttool(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    agent = next(
+        (
+            safe_label(payload.get(key), 120)
+            for key in ("agent_id", "subagent_id") if payload.get(key)
+        ),
+        None,
+    )
+    if not agent:
+        return None, None, None
+    for role in ("confirmed_executor", "high_assessor"):
+        request, started = _current_bound_live_writer(state, role)
+        if (
+            request and started and agent == started.get("agent_id")
+            and lifecycle_event_matches_start(payload, request, started, state)
+        ):
+            return role, request, started
+    return None, None, None
+
+
+def rejected_assessor_start_for_terminal(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve one current rejected Start solely so its real Stop can close it.
+
+    A profile-mismatched assessor never gains result authority and its flat
+    agent id is deliberately cleared. Even so, the host process remains live
+    until a real terminal event arrives. Select that generation only through
+    the complete persisted epoch/request/contract/attempt/agent tuple and the
+    matching unknown-liveness record. Optional Stop fields may narrow this
+    tuple but can never widen it; reused ids still require the full lifecycle
+    fields through ``lifecycle_event_matches_start``.
+    """
+    agent = next(
+        (
+            safe_label(payload.get(key), 120)
+            for key in ("agent_id", "subagent_id") if payload.get(key)
+        ),
+        None,
+    )
+    epoch = current_task_epoch_id(state)
+    contract = _fingerprint32(state.get("assessor_binding_id"))
+    attempt = safe_sequence(state.get("assessor_attempt"))
+    liveness = _safe_child_liveness(state.get("child_liveness"))
+    if not (
+        agent and epoch and contract and attempt > 0
+        and _safe_task_epoch(state.get("task_epoch")).get("status") == "active"
+        and state.get("assessor_state") == "recovery_required"
+        and state.get("assessor_failure_kind") == "start_mismatch"
+        and state.get("assessor_agent_id") is None
+        and state.get("assessor_observed_effective") is False
+        and liveness.get("status") == "unknown"
+        and liveness.get("role") == "high_assessor"
+        and liveness.get("epoch_id") == epoch
+        and liveness.get("agent_fingerprint")
+        == _lifecycle_agent_fingerprint(agent, liveness.get("request_fingerprint"))
+    ):
+        return None, None
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for group in subagent_lifecycle_groups(state):
+        request = group.get("request")
+        started = group.get("start")
+        if not (
+            group.get("state") == "live"
+            and isinstance(request, dict)
+            and isinstance(started, dict)
+            and request.get("role") == started.get("role") == "high_assessor"
+            and started.get("status") == "rejected"
+            and request.get("host_accepted") is True
+            and request.get("epoch_id") == started.get("epoch_id") == epoch
+            and request.get("contract_id") == started.get("contract_id") == contract
+            and safe_sequence(request.get("attempt"))
+            == safe_sequence(started.get("attempt")) == attempt
+            and request.get("request_fingerprint")
+            == started.get("request_fingerprint")
+            == liveness.get("request_fingerprint")
+            and started.get("agent_id") == agent
+        ):
+            continue
+        expected = lifecycle_binding_fingerprint(
+            epoch_id=epoch, role="high_assessor", agent_id=agent,
+            request_fingerprint=request.get("request_fingerprint"),
+            contract_id=contract, attempt=attempt,
+        )
+        if (
+            expected
+            and started.get("lifecycle_fingerprint") == expected
+            and lifecycle_event_matches_start(payload, request, started, state)
+        ):
+            candidates.append((request, started))
+    return candidates[0] if len(candidates) == 1 else (None, None)
+
+
+def tombstone_late_lifecycle_event(
+    state: dict[str, Any], payload: dict[str, Any], *, status: str,
+    role: str | None = None, request: dict[str, Any] | None = None,
+) -> None:
+    """Record replay/conflict facts without selecting a successor by agent id."""
+    record = request if isinstance(request, dict) else {}
+    inferred_role = role or record.get("role")
+    roles = (
+        {str(inferred_role)}
+        if inferred_role in {"high_assessor", "confirmed_executor"}
+        else known_writer_roles(
+            state, payload.get("agent_id") or payload.get("subagent_id")
+        )
+    )
+    for resolved_role in sorted(roles):
+        _append_isolated_lifecycle(
+            state,
+            status=status,
+            role=resolved_role,
+            agent_id=payload.get("agent_id") or payload.get("subagent_id"),
+            request_fingerprint=(
+                safe_fingerprint(payload.get("request_fingerprint"))
+                or record.get("request_fingerprint")
+            ),
+            contract_id=(
+                _fingerprint32(payload.get("execution_contract_id") or payload.get("contract_id"))
+                or record.get("contract_id")
+            ),
+            attempt=payload.get("attempt") or record.get("attempt"),
+            event_material={
+                "event": payload.get("hook_event_name"),
+                "epoch": safe_fingerprint(payload.get("task_epoch_id") or payload.get("epoch_id")),
+                "run": safe_label(payload.get("hook_run_id"), 120),
+                "status": status,
+            },
+            epoch_id=(
+                safe_fingerprint(payload.get("task_epoch_id") or payload.get("epoch_id"))
+                or record.get("epoch_id")
+            ),
+        )
+
+
 def active_agent_scope_summary(state: dict[str, Any]) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for item in active_agent_records(state):
@@ -16431,6 +18156,7 @@ def _slice_operations(state: dict[str, Any]) -> list[dict[str, Any]]:
         operation
         for operation in state.get("operations", [])
         if isinstance(operation, dict)
+        and operation.get("epoch_id") == current_task_epoch_id(state)
         and operation.get("execution_contract_id") == contract
         and operation.get("slice_id") == item.get("id")
         and operation.get("slice_contract_id") == bound_slice
@@ -16546,6 +18272,7 @@ def host_evidence_digest(
         "candidate": candidate_projection,
         "execution_contract_id": state.get("execution_contract_id"),
         "execution_profile_version": str(state.get("execution_profile_version") or ""),
+        "task_epoch_id": current_task_epoch_id(state),
         "outcome": outcome,
         "plan_digest": state.get("plan_digest"),
         "request_fingerprint": safe_fingerprint(request_fingerprint) or None,
@@ -16619,9 +18346,27 @@ def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> 
         group["request"]
         for group in subagent_lifecycle_groups(state)
         if group.get("state") == "pending" and isinstance(group.get("request"), dict)
+        and group["request"].get("epoch_id") == current_task_epoch_id(state)
     ]
     if not candidates:
         return None
+    # A delayed Start carrying binding identity must not fall through to a
+    # freshly reserved successor after its original request was isolated.
+    explicit_request = safe_fingerprint(payload.get("request_fingerprint"))
+    explicit_contract = _fingerprint32(
+        payload.get("contract_id") or payload.get("execution_contract_id")
+        or payload.get("assessor_binding_id")
+    )
+    raw_attempt = payload.get("attempt")
+    if explicit_request or explicit_contract or raw_attempt not in (None, ""):
+        candidates = [
+            item for item in candidates
+            if (not explicit_request or item.get("request_fingerprint") == explicit_request)
+            and (not explicit_contract or item.get("contract_id") == explicit_contract)
+            and (raw_attempt in (None, "") or safe_sequence(item.get("attempt")) == safe_sequence(raw_attempt))
+        ]
+        if not candidates:
+            return None
     turn_id = safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None
     if turn_id:
         same_turn = [item for item in candidates if item.get("turn_id") == turn_id]
@@ -16631,6 +18376,7 @@ def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> 
                 for item in same_turn
                 if item.get("role") == "confirmed_executor"
                 and item.get("contract_id") == state.get("execution_contract_id")
+                and item.get("epoch_id") == current_task_epoch_id(state)
                 and (
                     str(state.get("execution_profile_version")) != EXECUTION_PROFILE_VERSION
                     or item.get("slice_contract_id") == slice_contract_id(state)
@@ -16643,13 +18389,19 @@ def pending_subagent_request(state: dict[str, Any], payload: dict[str, Any]) -> 
         for item in candidates
         if item.get("role") == "confirmed_executor"
         and item.get("contract_id") == state.get("execution_contract_id")
+        and item.get("epoch_id") == current_task_epoch_id(state)
         and (
             str(state.get("execution_profile_version")) != EXECUTION_PROFILE_VERSION
             or item.get("slice_contract_id") == slice_contract_id(state)
         )
         and safe_int(item.get("attempt")) == safe_int(state.get("executor_attempt"))
     ]
-    assessor_pending = [item for item in candidates if item.get("role") == "high_assessor" and item.get("contract_id") == state.get("assessor_binding_id")]
+    assessor_pending = [
+        item for item in candidates
+        if item.get("role") == "high_assessor"
+        and item.get("contract_id") == state.get("assessor_binding_id")
+        and item.get("epoch_id") == current_task_epoch_id(state)
+    ]
     return (executor_pending or assessor_pending or candidates)[-1]
 
 
@@ -16668,6 +18420,7 @@ def unique_bound_start_request(
         if group.get("state") == "pending"
         and isinstance(group.get("request"), dict)
         and group["request"].get("role") == role
+        and group["request"].get("epoch_id") == current_task_epoch_id(state)
     ]
     if len(role_candidates) == 1:
         acceptance = role_candidates[0]
@@ -16697,6 +18450,7 @@ def unique_bound_start_request(
             item for item in candidates
             if state.get("assessor_state") == "spawn_pending"
             and item.get("contract_id") == state.get("assessor_binding_id")
+            and item.get("epoch_id") == current_task_epoch_id(state)
             and item.get("objective_fingerprint")
             == state.get("objective", {}).get("fingerprint")
             and item.get("model") == state.get("assessor_model")
@@ -16710,6 +18464,7 @@ def unique_bound_start_request(
             if state.get("executor_state") == "spawn_pending"
             and item.get("contract_id") == state.get("execution_contract_id")
             and item.get("contract_id") == execution_contract_id(state)
+            and item.get("epoch_id") == current_task_epoch_id(state)
             and item.get("objective_fingerprint")
             == state.get("objective", {}).get("fingerprint")
             and item.get("slice_id") == (current_execution_slice(state) or {}).get("id")
@@ -16761,6 +18516,25 @@ def subagent_start_conflict_reason(
 def subagent_start(payload: dict[str, Any]) -> None:
     previous = snapshot_state(payload)
     request = pending_subagent_request(previous, payload) or {}
+    payload_epoch = safe_fingerprint(
+        payload.get("task_epoch_id") or payload.get("epoch_id")
+    )
+    if payload_epoch and payload_epoch != current_task_epoch_id(previous):
+        def tombstone_old_epoch(state: dict[str, Any]) -> None:
+            tombstone_late_lifecycle_event(
+                state, payload, status="late_start", role=request.get("role"),
+                request=request,
+            )
+            record_lifecycle_diagnostic(
+                state, "late_event_isolated_epoch", level="warning",
+                role=request.get("role"),
+                request_fingerprint=request.get("request_fingerprint"),
+                contract_id=request.get("contract_id"),
+            )
+
+        mutate_state(payload, tombstone_old_epoch)
+        emit_continue()
+        return
     expected_request_fingerprint = safe_fingerprint(request.get("request_fingerprint"))
     scope_value = payload.get("prompt") or payload.get("task") or payload.get("message")
     scope_fingerprint = (stable_hash(scope_value) if scope_value else None) or request.get("scope_fingerprint")
@@ -16772,6 +18546,13 @@ def subagent_start(payload: dict[str, Any]) -> None:
         expected_role = expected_bound_role(previous)
 
         def record_unbound_start(state: dict[str, Any]) -> None:
+            # A delayed Start must never become an implicit claim on a newer
+            # reservation.  Preserve a writer tombstone whenever its id was
+            # previously bound, even after the flat fields were cleared.
+            tombstone_late_lifecycle_event(
+                state, payload, status="late_start", role=expected_role,
+                request=request or None,
+            )
             if expected_role and active_hard_lifecycle(state):
                 record_lifecycle_diagnostic(
                     state,
@@ -16831,12 +18612,33 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 else None
             )
         )
+        payload_request = safe_fingerprint(payload.get("request_fingerprint"))
+        payload_contract = _fingerprint32(
+            payload.get("execution_contract_id") or payload.get("contract_id")
+        )
+        raw_attempt = payload.get("attempt")
+        if not conflict and payload_request and payload_request != bound_request.get("request_fingerprint"):
+            conflict = "SubagentStart request fingerprint conflicts with the current reservation"
+        if not conflict and payload_contract and payload_contract != bound_request.get("contract_id"):
+            conflict = "SubagentStart contract conflicts with the current reservation"
+        if (
+            not conflict and raw_attempt not in (None, "")
+            and safe_sequence(raw_attempt) != safe_sequence(bound_request.get("attempt"))
+        ):
+            conflict = "SubagentStart attempt conflicts with the current reservation"
+        if not conflict and bound_request.get("epoch_id") != current_task_epoch_id(state):
+            conflict = "SubagentStart epoch conflicts with the current reservation"
         if not conflict:
             # A missing/rejected Post acceptance is recorded as a typed
             # capability failure below, rather than silently treated as a
             # profile conflict.  It still never becomes a running role.
             conflict = subagent_start_conflict_reason(state, agent_id, bound_request)
         if conflict:
+            tombstone_late_lifecycle_event(
+                state, payload, status="late_start",
+                role=("confirmed_executor" if executor_request else "high_assessor"),
+                request=bound_request or request or None,
+            )
             record_lifecycle_diagnostic(
                 state,
                 "contract_mismatch",
@@ -16914,10 +18716,17 @@ def subagent_start(payload: dict[str, Any]) -> None:
         )
         decision["locked_handoff"] = locked_handoff
         handoff_delivered = bool(contract_matches or locked_handoff)
-        state.setdefault("subagents", []).append(
-            {
+        lifecycle_fingerprint = lifecycle_binding_fingerprint(
+            epoch_id=current_task_epoch_id(state),
+            role=bound_request.get("role"), agent_id=agent_id,
+            request_fingerprint=bound_request.get("request_fingerprint"),
+            contract_id=request_contract, attempt=bound_request.get("attempt"),
+        )
+        start_record = {
                 "at": utc_now(),
                 "event": "start",
+                "epoch_id": current_task_epoch_id(state),
+                "lifecycle_fingerprint": lifecycle_fingerprint,
                 "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
                 "agent_id": agent_id,
                 "agent_type": safe_label(payload.get("agent_type"), 80),
@@ -16948,7 +18757,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 ),
                 "plan_handoff_delivered": handoff_delivered,
             }
-        )
+        state.setdefault("subagents", []).append(start_record)
         if (
             (executor_request or assessor_request)
             and observed_status in {"absent", "partial"}
@@ -16974,6 +18783,15 @@ def subagent_start(payload: dict[str, Any]) -> None:
                 state["executor_state"] = "running"
                 state["executor_agent_id"] = agent_id
                 state["executor_failure_kind"] = None
+                _set_writer_liveness(
+                    state, status="live",
+                    binding=_writer_liveness_binding(
+                        state, "confirmed_executor", request=bound_request,
+                        agent_id=agent_id,
+                    ),
+                    source="host_lifecycle",
+                    observation={"event": "SubagentStart", "profile": "full"},
+                )
             else:
                 state["executor_state"] = "recovery_required"
                 state["executor_agent_id"] = None
@@ -16995,6 +18813,26 @@ def subagent_start(payload: dict[str, Any]) -> None:
                         request_fingerprint=bound_request.get("request_fingerprint"),
                         agent_id=agent_id,
                         contract_id=request_contract,
+                    )
+                if locked_handoff or binding_error == "model_unavailable":
+                    _set_writer_liveness(
+                        state, status="live",
+                        binding=_writer_liveness_binding(
+                            state, "confirmed_executor", request=bound_request,
+                            agent_id=agent_id,
+                        ),
+                        source="host_lifecycle",
+                        observation={"event": "SubagentStart", "profile": "locked"},
+                    )
+                else:
+                    _mark_writer_inventory_unknown(
+                        state,
+                        binding=_writer_liveness_binding(
+                            state, "confirmed_executor", request=bound_request,
+                            agent_id=agent_id,
+                        ),
+                        source="host_lifecycle",
+                        observation={"event": "SubagentStart", "profile": "conflict"},
                     )
         if assessor_request:
             bound = bool(state.get("assessor_state") == "spawn_pending" and bound_request.get("contract_id") == state.get("assessor_binding_id") and objective_fingerprint == state.get("objective", {}).get("fingerprint") and safe_int(bound_request.get("attempt")) == safe_int(state.get("assessor_attempt")))
@@ -17035,6 +18873,39 @@ def subagent_start(payload: dict[str, Any]) -> None:
                     "last_progress_at": _liveness_now(), "last_observed_at": _liveness_now(),
                     "unblock": "none", "unblock_at": None, "recovery_from": None,
                 }
+                _set_writer_liveness(
+                    state, status="live",
+                    binding=_writer_liveness_binding(
+                        state, "high_assessor", request=bound_request,
+                        agent_id=agent_id,
+                    ),
+                    source="host_lifecycle",
+                    observation={"event": "SubagentStart", "profile": "full"},
+                )
+            elif binding_error == "model_unavailable":
+                _set_writer_liveness(
+                    state, status="live",
+                    binding=_writer_liveness_binding(
+                        state, "high_assessor", request=bound_request,
+                        agent_id=agent_id,
+                    ),
+                    source="host_lifecycle",
+                    observation={"event": "SubagentStart", "profile": "locked"},
+                )
+            else:
+                # The process exists but this profile-mismatched Start never
+                # gained assessor authority. Preserve that disposition so an
+                # exact real Stop can close only this rejected generation.
+                start_record["status"] = "rejected"
+                _mark_writer_inventory_unknown(
+                    state,
+                    binding=_writer_liveness_binding(
+                        state, "high_assessor", request=bound_request,
+                        agent_id=agent_id,
+                    ),
+                    source="host_lifecycle",
+                    observation={"event": "SubagentStart", "profile": "conflict"},
+                )
 
     _, changed = mutate_state(payload, update)
     if not decision["accepted"]:
@@ -17175,10 +19046,18 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     )
     agent_id = safe_label(payload.get("agent_id"), 120)
     previous = snapshot_state(payload)
-    started = next(
-        (item for item in reversed(active_agent_records(previous)) if item.get("agent_id") == agent_id),
-        None,
+    bound_role, bound_request, bound_started = bound_writer_for_posttool(
+        previous, payload
     )
+    started = bound_started
+    if started is None:
+        rejected_request, rejected_started = rejected_assessor_start_for_terminal(
+            previous, payload
+        )
+        if rejected_request and rejected_started:
+            bound_role = "high_assessor"
+            bound_request = rejected_request
+            started = rejected_started
     if started is None:
         result_group = next(
             (
@@ -17189,27 +19068,45 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             None,
         )
         started = (result_group or {}).get("request")
-    if started is None and agent_id not in {
-        previous.get("assessor_agent_id"),
-        previous.get("executor_agent_id"),
-    }:
+    if started is None:
+        # A known id without an exact current epoch/request/attempt binding is
+        # a delayed or replayed lifecycle event.  Keep a tombstone only.  Do
+        # this even after the active writer's flat id has been cleared: using
+        # agent-id reuse as a successor capability would let an old Stop end a
+        # new generation.
         expected_role = expected_bound_role(previous)
-        if expected_role and active_hard_lifecycle(previous):
-            def record_missing_start(state: dict[str, Any]) -> None:
+        known_roles = known_writer_roles(previous, agent_id)
+
+        def tombstone_unbound_terminal(state: dict[str, Any]) -> None:
+            tombstone_late_lifecycle_event(
+                state, payload, status="late_terminal",
+                role=bound_role or expected_role,
+                request=bound_request,
+            )
+            if known_roles or (expected_role and active_hard_lifecycle(state)):
                 record_lifecycle_diagnostic(
                     state,
-                    "start_missing",
-                    level="error",
-                    role=expected_role,
+                    "start_missing"
+                    if expected_role and active_hard_lifecycle(state)
+                    else "late_event_epoch_ambiguous",
+                    level="error" if expected_role and active_hard_lifecycle(state) else "warning",
+                    role=bound_role or expected_role or "lane",
                     agent_id=agent_id,
+                    request_fingerprint=(bound_request or {}).get("request_fingerprint"),
                     contract_id=(
-                        state.get("assessor_binding_id")
-                        if expected_role == "high_assessor"
-                        else state.get("execution_contract_id")
+                        (bound_request or {}).get("contract_id")
+                        or (
+                            state.get("assessor_binding_id")
+                            if expected_role == "high_assessor"
+                            else state.get("execution_contract_id")
+                            if expected_role == "confirmed_executor"
+                            else None
+                        )
                     ),
                 )
 
-            mutate_state(payload, record_missing_start)
+        if known_roles or (expected_role and active_hard_lifecycle(previous)):
+            mutate_state(payload, tombstone_unbound_terminal)
         emit_continue()
         return
     started_objective = str((started or {}).get("objective_fingerprint") or "")
@@ -17275,10 +19172,18 @@ def subagent_stop(payload: dict[str, Any]) -> None:
     def update(state: dict[str, Any]) -> None:
         reconcile_unknown_operations_from_transcript(payload, state)
         current_result_group = None
-        current_started = next(
-            (item for item in reversed(active_agent_records(state)) if item.get("agent_id") == agent_id),
-            None,
+        _, current_request, current_started = bound_writer_for_posttool(
+            state, payload
         )
+        current_rejected_terminal = False
+        if current_started is None:
+            rejected_request, rejected_started = rejected_assessor_start_for_terminal(
+                state, payload
+            )
+            if rejected_request and rejected_started:
+                current_request = rejected_request
+                current_started = rejected_started
+                current_rejected_terminal = True
         if current_started is None:
             current_result_group = next(
                 (
@@ -17365,6 +19270,11 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         )
         if not agent_id or (current_started is None and already_terminal):
             reason = "SubagentStop lacks a concrete agent_id" if not agent_id else "duplicate or late SubagentStop for a terminal agent"
+            if agent_id:
+                tombstone_late_lifecycle_event(
+                    state, payload, status="late_terminal", role=bound_role,
+                    request=current_request,
+                )
             state.setdefault("guards", []).append(
                 {
                     "at": utc_now(),
@@ -17391,6 +19301,10 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             )
             if not (exact_request or exact_turn or bound_stall):
                 reason = "SubagentStop is ambiguous after agent_id reuse and requires generation reconciliation"
+                tombstone_late_lifecycle_event(
+                    state, payload, status="late_terminal", role=bound_role,
+                    request=current_request,
+                )
                 state.setdefault("guards", []).append(
                     {
                         "at": utc_now(),
@@ -17421,6 +19335,17 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             {
                 "at": utc_now(),
                 "event": "stop",
+                "epoch_id": (effective_started or {}).get("epoch_id")
+                or current_task_epoch_id(state),
+                "lifecycle_fingerprint": lifecycle_binding_fingerprint(
+                    epoch_id=(effective_started or {}).get("epoch_id")
+                    or current_task_epoch_id(state),
+                    role=(effective_started or {}).get("role"),
+                    agent_id=agent_id,
+                    request_fingerprint=(effective_started or {}).get("request_fingerprint"),
+                    contract_id=(effective_started or {}).get("contract_id"),
+                    attempt=(effective_started or {}).get("attempt"),
+                ),
                 "agent_id": agent_id,
                 "agent_type": safe_label(payload.get("agent_type"), 80),
                 "task_name": task_name_from_payload(payload) or (effective_started or {}).get("task_name"),
@@ -17449,6 +19374,26 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         )
         decision["recorded"] = True
         decision["successful"] = successful
+        decision["rejected_terminal"] = current_rejected_terminal
+        if executor_agent or assessor_agent:
+            _set_writer_liveness(
+                state, status="terminal",
+                binding=_writer_liveness_binding(
+                    state,
+                    "confirmed_executor" if executor_agent else "high_assessor",
+                    request=(effective_started or current_request),
+                    agent_id=agent_id,
+                ),
+                source="host_lifecycle",
+                observation={"event": "SubagentStop", "status": status_value},
+            )
+        if current_rejected_terminal:
+            # Process termination is not result acceptance. Keep the typed
+            # mismatch so only a fresh monotonic assessor attempt can recover.
+            state["assessor_state"] = "recovery_required"
+            state["assessor_failure_kind"] = "start_mismatch"
+            state["assessor_agent_id"] = None
+            state["assessor_observed_effective"] = False
         if executor_agent and state.get("executor_agent_id") == agent_id:
             contract_current = bool(
                 not stale
@@ -17576,7 +19521,11 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["model_profile"] = "work_assessment"
             state["stall"] = stall
             return
-        if assessor_agent and state.get("assessor_agent_id") == agent_id:
+        if (
+            assessor_agent
+            and not current_rejected_terminal
+            and state.get("assessor_agent_id") == agent_id
+        ):
             mutated = any(item.get("assessor_binding_id") == state.get("assessor_binding_id") and item.get("category") in {"implementation", "build_package", "delivery_device", "git"} and item.get("status") in SUCCESS_STATUSES for item in state.get("operations", []))
             assessor_lifecycle, assessor_lifecycle_error = original_assessor_lifecycle(
                 state
@@ -17699,6 +19648,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             "SubagentStop",
             "Stale subagent result: the objective changed after this agent started. Use it only as verification; "
             "it must not drive mutation for the previous objective.",
+        )
+    elif decision.get("rejected_terminal"):
+        emit_context(
+            "SubagentStop",
+            "Workflow Manager recorded the exact real terminal boundary for the rejected assessor Start. "
+            "Its result remains non-authoritative; recovery_required/start_mismatch is preserved and one fresh "
+            "monotonic assessor attempt may now be reserved.",
         )
     elif assessor_agent:
         runtime_truth = bound_runtime_truth_summary(updated_state, "high_assessor")

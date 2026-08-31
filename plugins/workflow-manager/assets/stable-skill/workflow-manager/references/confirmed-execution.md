@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 32/writer 1.0.56 uses execution profile v11 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
+This reference applies only after a Hard plan is confirmed. Schema 33/writer 1.0.57 uses execution profile v12 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 
@@ -60,7 +60,11 @@ Desktop may omit Hook delivery for parent Stop or a programmatic delegated confi
 
 ## Executor and parent review
 
-The default first executor uses a current lower-tier model at `medium`, `fork_turns=1`. Explicit whole-session `highest_throughout` uses the highest available model at `ultra`. A request is reserved from trusted state; copied contract text in its message is neither required nor authoritative.
+Confirmation authorizes one writer, not necessarily one child executor. With a current canonical contract and no pending/live/unknown child writer or unfinished causal/stall diagnosis, the parent atomically acquires the current slice lease. While that lease is live, child spawn is denied; while a child is reserved or live, parent mutation is denied. The fixed mounted-tree Git, device, scope, risk, and irreversible-action gates remain unchanged.
+
+If the parent takes over a `verification_required` child candidate, it increments the attempt monotonically, clears the old review candidate, and binds later operations to the current epoch/contract/slice/attempt. A failed parent test does not change writers: the parent may correct and verify again in the same lease. Successful bound change and verification operations plus parent Stop may seal without a child Stop.
+
+When a child is chosen, the default first executor uses a current lower-tier model at `medium`, `fork_turns=1`. Explicit whole-session `highest_throughout` uses the highest available model at `ultra`. A request is reserved from trusted state; copied contract text in its message is neither required nor authoritative.
 
 Executor Stop may be ordinary nonempty native prose. `EXECUTION_RESULT` is optional; an exact line remains compatible. If marker-like intent is present and malformed, duplicated, or bound to the wrong contract, fail closed. A successful result becomes only `verification_required`, and only when the host operation ledger contains bounded verification for the current contract. Child claims cannot substitute for that evidence.
 
