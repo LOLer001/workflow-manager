@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.60
+
+- 对齐 Stable Skill 与 Hook 的 Simple/Hard 口径：`production`、`core`、`customer-visible` 或 `business-critical` 标签本身不再让模型把已知、单函数、可逆且验收明确的修复口头升级为 Hard；此类任务保持 Codex 原生 `Start=0`，不启动评估者，也不额外等待计划确认。
+- 增加真实“生产发货承诺时区边界”原文及中英文同义 Simple 回归，同时保留 production deployment、数据丢失、安全风险、未知根因加跨模块等 Hard 正例；Hook 分类器与全部 fail-closed 安全门不变。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.59 Tag/Release 保持不可变，发布采用 forward-only 1.0.60。
+
 ## 1.0.59
 
 - 修正正常父任务已完成修改和测试、但 Stop payload 不带 `turn_id` 时仍停在 `running` 的缺口：Stop 先从当前 live lease 的未知补丁操作枚举唯一宿主 turn，复用严格 rollout 对账并生成父审候选，当前 turn 可直接验收和封存，无需用户再发续接消息。

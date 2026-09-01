@@ -63,8 +63,10 @@ class SkillIdentityTests(unittest.TestCase):
             "`EXECUTION_RESULT` is optional",
             "`EXECUTION_REVIEW` is optional",
             "Start=0",
+            "labels alone do not upgrade a bounded known single-function bug",
         ):
             self.assertIn(phrase, self.skill_text)
+        self.assertIn("do not call an assessor or ask for plan confirmation", self.work_routing)
         for retired in (
             "ends with exactly",
             "standalone exact final",
@@ -128,7 +130,7 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn("inherits the existing strict confirmation", self.regression_continuity)
 
     def test_protocol_continuity_and_privacy_are_preserved(self) -> None:
-        self.assertIn("Schema 33/writer 1.0.59", self.confirmed_execution)
+        self.assertIn("Schema 33/writer 1.0.60", self.confirmed_execution)
         self.assertIn("execution profile v12", self.confirmed_execution)
         self.assertIn("canonical journal v3", self.confirmed_execution)
         self.assertIn("preserves its real profile/contract", self.confirmed_execution)
@@ -152,9 +154,9 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.59")
-        self.assertIn("/1.0.59/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.59\n")
+        self.assertEqual(self.manifest["version"], "1.0.60")
+        self.assertIn("/1.0.60/", readme)
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.60\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
     def test_ci_runs_python_without_bytecode_on_linux_and_windows(self) -> None:

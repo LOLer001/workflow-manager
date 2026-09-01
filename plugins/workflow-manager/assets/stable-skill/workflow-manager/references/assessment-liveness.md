@@ -1,6 +1,6 @@
 # Assessment liveness
 
-Schema 33/writer 1.0.59 records bounded progress and budget evidence for the one active Hard assessor. It has no total assessment deadline: 600 seconds is an activity observation, exactly 1200 seconds remains live, and elapsed time alone never produces `assessment_timeout`, `blocked`, `exhausted`, or a terminal recovery state.
+Schema 33/writer 1.0.60 records bounded progress and budget evidence for the one active Hard assessor. It has no total assessment deadline: 600 seconds is an activity observation, exactly 1200 seconds remains live, and elapsed time alone never produces `assessment_timeout`, `blocked`, `exhausted`, or a terminal recovery state.
 
 Only a new progress digest attached to the current binding, agent, and monotonic sequence resets idle. Repeated `running` status, parent wait/list calls, duplicate delivery results, stale lifecycle events, compaction/resume, and clock rollback do not. Strictly after 1200 seconds with no progress, inspect the current step and remaining byte/node budget, then issue an idempotent status/unblock request, diagnose the cause, or split the step within the same authorization envelope. Never lower acceptance to fit the budget.
 

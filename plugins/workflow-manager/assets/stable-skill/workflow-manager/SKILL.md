@@ -9,8 +9,8 @@ Workflow Manager is a narrow authorization and evidence layer, not a second task
 
 ## Route narrowly
 
-- Daily and non-Hard engineering work run natively. High-confidence Simple work has `Start=0`: no assessor and no executor created by this plugin.
-- Treat work as Hard only with high confidence: one critical production, irreversible, security, full-system, or host-continuity risk; or two independent strong signal groups where one is unknown-cause, cross-scope, or continuity. Build/deploy/device work, task length, multiple steps, shared resources, or ambiguity alone are not Hard.
+- Daily and Simple work run natively with `Start=0`: no assessor, executor, or confirmation.
+- Hard needs explicit evidence: production release/deployment, irreversible action, security/data loss, system-wide outage, host-continuity risk; or two strong groups including unknown-cause, cross-scope, or continuity. `production`, `core`, `customer-visible`, or `business-critical` labels alone do not upgrade a bounded known single-function bug with clear acceptance.
 - If uncertain, begin with bounded native read-only diagnosis and promote only when evidence crosses that threshold. See [work routing](references/work-routing.md).
 
 ## Keep only irreducible gates

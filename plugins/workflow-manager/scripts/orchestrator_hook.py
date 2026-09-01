@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.59", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.60", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)

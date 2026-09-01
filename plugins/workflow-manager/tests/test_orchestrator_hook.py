@@ -375,7 +375,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 33)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.59")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.60")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "12")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -470,7 +470,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.59"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.60"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -497,7 +497,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.59 active", context)
+        self.assertIn("Workflow Manager 1.0.60 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1153,7 +1153,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.59"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.60"))
         self.assertEqual(migrated["execution_profile_version"], "12")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1249,7 +1249,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (33, "1.0.59", "12"),
+                    (33, "1.0.60", "12"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1295,7 +1295,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (33, "1.0.59", "5", "verification_required", 1),
+            (33, "1.0.60", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1452,7 +1452,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (33, "1.0.59", "recovery_required", None),
+            (33, "1.0.60", "recovery_required", None),
         )
         self.assertEqual(migrated["subagents"], [])
         self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -1467,7 +1467,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.59", "recovery_required", None),
+            ("1.0.60", "recovery_required", None),
         )
         self.assertEqual(migrated_1052["subagents"], [])
         schema32 = json.loads(json.dumps(running))
@@ -1480,7 +1480,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1055["executor_state"],
                 migrated_1055["executor_agent_id"],
             ),
-            ("1.0.59", "recovery_required", None),
+            ("1.0.60", "recovery_required", None),
         )
         self.assertEqual(migrated_1055["subagents"], [])
         # The mailbox-recovery bridge applies only to the current trusted
@@ -4623,6 +4623,11 @@ class OrchestratorHookTests(unittest.TestCase):
             "修正 README 一个错字；risk_category=low；irreversible_action:none": ("work", "simple"),
             "Workflow Manager 1.0.48 fresh projectless 真实宿主 Simple 验收，只回复 SIMPLE_OK=42": ("work", "simple"),
             "Parser.java 增加空值判断并跑现有单测": ("work", "simple"),
+            (
+                "这是生产发货承诺的核心逻辑：UTC 下单时间在亚洲仓库截止线附近会被算到错误日期，"
+                "可能让客户看到提前一天的发货承诺。请定位根因、完成代码修复和测试，直到 README 中的验收全部通过。"
+            ): ("work", "simple"),
+            "Fix one customer-visible production function with a known boundary and clear acceptance": ("work", "simple"),
             "按给定输入输出写单文件 CSV 转 JSON 脚本": ("work", "simple"),
             "查看 Parser.java 当前实现并解释": ("work", "simple"),
             "排查 Android 设备反复重启并修复、编译部署实机验证": ("work", "hard"),
@@ -4634,6 +4639,8 @@ class OrchestratorHookTests(unittest.TestCase):
             "修复一个已知 Android 崩溃并跑单测": ("work", "simple"),
             "修改三个模块并完成回归": ("work", "simple"),
             "生产发布数据库迁移并提供回滚": ("work", "hard"),
+            "Production deployment may lose customer data; diagnose and fix it": ("work", "hard"),
+            "修复多个模块中根因未知的生产故障": ("work", "hard"),
             "继续修复 Workflow Manager 的计划容量与确认恢复缺陷，并发布 1.0.48": ("work", "hard"),
             "执行 Workflow Manager 1.0.48 真实 projectless Hard 宿主验收并核对恢复 lifecycle": ("work", "hard"),
             "Workflow Manager 1.0.48 fresh projectless 真实 Hard 宿主 lifecycle/continuity 验收": ("work", "hard"),
@@ -10642,7 +10649,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.59 active", context)
+        self.assertIn("Workflow Manager 1.0.60 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11331,7 +11338,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.59"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.60"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11687,7 +11694,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (33, "1.0.59", "recovery_required", None),
+                    (33, "1.0.60", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
