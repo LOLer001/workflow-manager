@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.63
+
+- 修正父级最终复核把“失败关闭 / fail closed / failure cases”等已验证的故障域说明误判为当前验收失败的问题：仅明确指向本次最终结果的“验收未通过、测试失败、发布未开始”等断言判负，显式 `outcome=failed` 仍无条件失败。
+- 父级验证证据采用有序 frontier：最后一次当前 epoch/contract/slice/attempt 的绑定验证必须成功；`error:127 → ok` 可在同一租约纠正并保留完整失败账本，`ok → error/unknown` 继续 fail-closed。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.62 Tag/Release 保持不可变，发布采用 forward-only 1.0.63。
+
 ## 1.0.62
 
 - 修正 Hard 评估完成后、首个 canonical revision 尚未提交时，Codex 原生 `update_plan` 界面投影被误判为 split-brain mutation 的流程断点：仅在父任务身份、评估回执、目标绑定和生命周期全部匹配时允许有界结构化投影。

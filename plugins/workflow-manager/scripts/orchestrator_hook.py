@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.62", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.63", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -18949,24 +18949,30 @@ def slice_operation_evidence(state: dict[str, Any]) -> dict[str, Any]:
         )
     ]
     last_change = max(host_recorded_change_indexes, default=-1)
-    successful_verification_indexes = [
+    verification_indexes = [
         index
         for index, item in enumerate(operations)
         if item.get("category") in verification
-        and item.get("status") in SUCCESS_STATUSES
         and (last_change < 0 or index > last_change)
     ]
+    verification_frontier = (
+        verification_indexes[-1] if verification_indexes else None
+    )
+    successful_verification_indexes = (
+        [verification_frontier]
+        if verification_frontier is not None
+        and operations[verification_frontier].get("status") in SUCCESS_STATUSES
+        else []
+    )
     # Executor verification proves only its candidate.  Terminal parent review
     # also requires a separate, host-recorded read-only parent operation.
     # executor_agent_id is populated only for the bound executor lane.
-    successful_parent_review_indexes = [
-        index
-        for index, item in enumerate(operations)
-        if item.get("category") in verification
-        and item.get("status") in SUCCESS_STATUSES
-        and item.get("executor_agent_id") is None
-        and (last_change < 0 or index > last_change)
-    ]
+    successful_parent_review_indexes = (
+        [verification_frontier]
+        if successful_verification_indexes
+        and operations[verification_frontier].get("executor_agent_id") is None
+        else []
+    )
     facts = [
         {
             "category": item.get("category"),
@@ -20519,6 +20525,52 @@ EXECUTION_REVIEW_V6_RE = re.compile(
 )
 
 
+def explicit_negative_parent_review(message: str) -> bool:
+    """Recognize a negative final result without matching failure-domain prose."""
+    text = " ".join(str(message or "").split())
+    if not text:
+        return False
+    if re.fullmatch(
+        r"(?i)(?:failed|failure|not\s+passed|not\s+started|失败|未通过|未开始)[.!。！]?",
+        text,
+    ):
+        return True
+
+    # Fail-closed behavior and failure-case coverage describe the system under
+    # test, not the acceptance outcome of the current execution.
+    english = re.sub(
+        r"(?i)\bfail(?:s|ed|ure)?(?:[- ]closed|\s+(?:cases?|scenarios?|paths?|handling))\b",
+        " expected-failure-domain ",
+        text,
+    )
+    chinese = re.sub(
+        r"(?:失败(?:关闭|封闭|用例|场景|路径|处理|分支|恢复|重试|注入|模拟))",
+        "预期失败域",
+        english,
+    )
+    if re.search(
+        r"(?i)\b(?:acceptance|verification|tests?|test\s+suite|review|build|"
+        r"release|deployment|installation|implementation|fix)\b"
+        r"(?:\s+(?:result|run|job|work|has|have|is|was|still|yet)){0,3}\s+"
+        r"(?:failed|did\s+not\s+pass|not\s+passed|not\s+completed|not\s+started)\b",
+        chinese,
+    ):
+        return True
+    if re.search(
+        r"(?:验收|验证|测试|复核|检查|构建|编译|发布|部署|安装|实现|修复)"
+        r"(?:结果|用例|套件|流程|任务|工作)?(?:仍然?|依然|尚|还)?"
+        r"(?:未通过|没有通过|没通过|没过|失败(?!关闭|封闭|用例|场景|路径|处理|分支|恢复|重试|注入|模拟)|未完成|未开始)",
+        chinese,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"(?:尚未|还未|并未|没有)(?:完成|通过|发布|部署|安装|开始)(?=$|[\s，,；;：:。.!！？?])",
+            chinese,
+        )
+    )
+
+
 def stop(payload: dict[str, Any]) -> None:
     assistant_message = str(payload.get("last_assistant_message") or "")
     previous = snapshot_state(payload)
@@ -20564,11 +20616,9 @@ def stop(payload: dict[str, Any]) -> None:
             # a candidate when it expressly records a negative acceptance or
             # says that the requested release has not begun.  This also wins
             # over a contradictory optional ``outcome=passed`` marker.
-            explicit_negative_review = bool(re.search(
-                r"(?i)(?:\\b(?:not\\s+passed|failed|failure|not\\s+started)\\b|"
-                r"未通过|失败|未开始|尚未发布|发布未开始)",
-                assistant_message,
-            ))
+            explicit_negative_review = explicit_negative_parent_review(
+                assistant_message
+            )
             if explicit_negative_review:
                 review_outcome = "failed"
             native_review = bool(

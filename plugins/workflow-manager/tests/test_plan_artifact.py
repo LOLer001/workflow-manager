@@ -674,7 +674,7 @@ class PlanArtifactTests(unittest.TestCase):
                 )
 
         for label, mutate in (
-            ("old-writer", lambda item: item.update({"writer_version": "1.0.61"})),
+            ("old-writer", lambda item: item.update({"writer_version": "1.0.62"})),
             ("binding", lambda item: item["plan_composition"].update({"assessor_binding_id": "f" * 32})),
             ("digest", lambda item: item.update({"plan_digest": "e" * 32})),
             ("confirmed", lambda item: item.update({"plan_state": "confirmed"})),

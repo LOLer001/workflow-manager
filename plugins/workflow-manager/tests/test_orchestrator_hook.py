@@ -375,7 +375,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 33)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.62")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.63")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "12")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -470,7 +470,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.62"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.63"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -497,7 +497,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.62 active", context)
+        self.assertIn("Workflow Manager 1.0.63 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1153,7 +1153,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.62"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.63"))
         self.assertEqual(migrated["execution_profile_version"], "12")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1249,7 +1249,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (33, "1.0.62", "12"),
+                    (33, "1.0.63", "12"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1295,7 +1295,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (33, "1.0.62", "5", "verification_required", 1),
+            (33, "1.0.63", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1452,7 +1452,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (33, "1.0.62", "recovery_required", None),
+            (33, "1.0.63", "recovery_required", None),
         )
         self.assertEqual(migrated["subagents"], [])
         self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -1467,7 +1467,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.62", "recovery_required", None),
+            ("1.0.63", "recovery_required", None),
         )
         self.assertEqual(migrated_1052["subagents"], [])
         schema32 = json.loads(json.dumps(running))
@@ -1480,7 +1480,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1055["executor_state"],
                 migrated_1055["executor_agent_id"],
             ),
-            ("1.0.62", "recovery_required", None),
+            ("1.0.63", "recovery_required", None),
         )
         self.assertEqual(migrated_1055["subagents"], [])
         # The mailbox-recovery bridge applies only to the current trusted
@@ -7342,6 +7342,21 @@ class OrchestratorHookTests(unittest.TestCase):
                          ("error:1", "ok", "error:1"))
 
     def test_native_parent_review_explicit_negative_never_seals(self) -> None:
+        for positive in (
+            "缺失、未知、重复 ID 和空列表均失败关闭；10/10 测试通过。",
+            "All fail-closed cases pass; verification succeeded.",
+            "Verification failure handling is covered; all tests passed.",
+        ):
+            with self.subTest(positive=positive):
+                self.assertFalse(HOOK.explicit_negative_parent_review(positive))
+        for negative in (
+            "验收未通过；发布未开始。",
+            "Verification failed; release not started.",
+            "修复失败，测试没过。",
+        ):
+            with self.subTest(negative=negative):
+                self.assertTrue(HOOK.explicit_negative_parent_review(negative))
+
         session = "negative-native-parent-review"
         candidate = self.create_executor_candidate(session, native_result=True)
         self.run_hook({
@@ -7359,6 +7374,85 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual((rejected["executor_state"], rejected["executor_review"]["status"]),
                          ("recovery_required", "failed"))
         self.assertNotEqual(rejected["last_execution_baseline"]["acceptance_status"], "passed")
+
+    def test_parent_writer_uses_latest_verification_and_accepts_fail_closed_prose(self) -> None:
+        session = "parent-verification-frontier"
+        self.create_confirmed_executor_state(session)
+        change = {
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "hook_run_id": "frontier-change-pre",
+            "tool_name": "apply_patch",
+            "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+        }
+        self.run_hook(change)
+        self.run_hook(
+            {
+                **change,
+                "hook_event_name": "PostToolUse",
+                "hook_run_id": "frontier-change-post",
+                "tool_response": {"status": "ok"},
+            }
+        )
+        failed_verify = {
+            "hook_event_name": "PostToolUse",
+            "session_id": session,
+            "hook_run_id": "frontier-python-missing",
+            "tool_name": "Bash",
+            "tool_input": {"command": "python -m unittest discover -v"},
+            "tool_response": {"status": "error", "exit_code": 127},
+        }
+        self.run_hook(failed_verify)
+        successful_verify = {
+            **failed_verify,
+            "hook_run_id": "frontier-python3-success",
+            "tool_input": {"command": "python3 -m unittest discover -v"},
+            "tool_response": {"status": "ok", "exit_code": 0},
+        }
+        self.run_hook(successful_verify)
+        candidate = self.load_only_state()
+        self.assertEqual(candidate["executor_state"], "verification_required")
+        self.assertEqual(
+            [
+                operation["status"]
+                for operation in candidate["operations"]
+                if operation.get("category") == "verification"
+            ],
+            ["error:127", "ok"],
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "frontier-positive-review",
+                "last_assistant_message": (
+                    "修复完成，README 验收全部通过。缺失、空值、未知、重复 ID、"
+                    "空列表均失败关闭。完整套件 10/10 通过。"
+                ),
+            }
+        )
+        completed = self.load_only_state()
+        self.assertEqual(
+            (
+                completed["executor_state"],
+                completed["executor_review"]["status"],
+                completed["execution_slices"]["items"][0]["status"],
+                completed["parent_writer_lease"]["status"],
+            ),
+            ("succeeded", "passed", "passed", "sealed"),
+        )
+
+        late_failure = json.loads(json.dumps(candidate))
+        late_failure["operations"].append(
+            {
+                **late_failure["operations"][-1],
+                "fingerprint": "f" * 32,
+                "status": "error:1",
+            }
+        )
+        evidence = HOOK.slice_operation_evidence(late_failure)
+        self.assertFalse(evidence["verification_evidence"])
+        self.assertFalse(evidence["parent_review_evidence"])
 
     def test_leased_stop_emits_key_once_and_concurrent_claims_share_it(self) -> None:
         payload = {
@@ -10649,7 +10743,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.62 active", context)
+        self.assertIn("Workflow Manager 1.0.63 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11473,7 +11567,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.62"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.63"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11829,7 +11923,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (33, "1.0.62", "recovery_required", None),
+                    (33, "1.0.63", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
