@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.64", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.65", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -15573,6 +15573,41 @@ def plan_details_request(prompt: str) -> bool:
     )
 
 
+def pure_read_only_status_query(prompt: str) -> bool:
+    """Recognize a bounded status report, never a plan/scope mutation."""
+    normalized = re.sub(r"[?!？！。,.，:：;；]+", " ", str(prompt or "").strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized or len(normalized) > 240 or explicit_new_objective(normalized):
+        return False
+    chinese_tail = (
+        r"(?: (?:不要|不得|禁止|请勿)(?:再)?(?:修改|写入|创建|启动|执行)"
+        r"(?:任何)?(?:文件|操作|命令|子(?:代理|智能体)|child)?)?"
+    )
+    chinese = (
+        r"(?:请)?(?:只读)?(?:报告|查询|查看|检查|核对|说明|告诉我)(?:一下)?"
+        r"(?:上次|当前|这个|该)?(?:任务|合同|执行|工作流)?(?:的)?(?:最终)?"
+        r"(?:状态|结果|进度|完成情况|是否完成)"
+        + chinese_tail
+    )
+    chinese_question = (
+        r"(?:上次|当前|这个|该)(?:任务|合同|执行|工作流)(?:现在)?(?:的)?(?:最终)?"
+        r"(?:状态|结果|进度|完成情况)(?:是什么|怎么样|如何|是否完成)?"
+        + chinese_tail
+    )
+    english = (
+        r"(?:please )?(?:read-only )?(?:report|show|check|inspect|tell me) "
+        r"(?:the )?(?:last|current|previous) (?:task|contract|execution|workflow) "
+        r"(?:final )?(?:status|result|progress|completion)"
+        r"(?: (?:without|do not) (?:modifying|modify|writing|write|starting|start) "
+        r"(?:any )?(?:files?|operations?|commands?|children?))?"
+    )
+    return bool(
+        re.fullmatch(chinese, normalized)
+        or re.fullmatch(chinese_question, normalized)
+        or re.fullmatch(english, normalized, re.I)
+    )
+
+
 def prompt_changes_pending_plan(prompt: str) -> bool:
     normalized = re.sub(r"\s+", " ", prompt.strip().lower())
     if re.search(r"(?:先不要|不要(?:再)?)(?:创建|新建|增加|删除|修改|变更|add|remove|change|create)", normalized, re.I):
@@ -15865,6 +15900,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     )
     pending_plan = confirmable_pending
     active_plan = confirmable_pending or repair_pending or previous.get("plan_state") == "confirmed"
+    status_query = bool(active_plan and pure_read_only_status_query(prompt))
     explicit_new = explicit_new_objective(prompt)
     failed_assessor_replan = bool(
         previous.get("assessor_state") in {"recovery_required", "failed"}
@@ -15897,7 +15933,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     # must never inherit confirmation, journal, or writer ownership.
     if cwd_changed and not (
         is_control_followup(prompt) or pure_plan_confirmation(prompt)
-        or same_assessor_objective_retry or recovery_followup
+        or same_assessor_objective_retry or recovery_followup or status_query
     ):
         new_objective = True
     epoch_switch_blocked = bool(new_objective and _epoch_has_live_writer(previous))
@@ -15968,6 +16004,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         active_plan
         and not causal_active
         and not recovery_followup
+        and not status_query
         and plan_replan_request(prompt)
     )
     plan_changed = (
@@ -15977,6 +16014,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and not causal_report
         and not acceptance_miss
         and not new_objective
+        and not status_query
         and prompt_changes_pending_plan(prompt)
         and not confirmed_plan
     )
@@ -16016,6 +16054,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     continuation = bool(root_continuation_key) or epoch_switch_blocked or (not new_objective and (
         preference_directive is not None
         or is_control_followup(prompt)
+        or status_query
         or (trusted_progress_context and is_progress_followup(prompt))
         or active_plan
         or reference_changed
@@ -16438,6 +16477,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or repair_pending
         or canonical_context_requested
         or recovery_marker_present
+        or status_query
         or (already_confirmed and pure_plan_confirmation(prompt))
         or (
             already_confirmed
@@ -16459,6 +16499,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             " Host activation/identity preflight is local control-plane work: child Start=0. "
             "Do not call tools, spawn an assessor, executor, or side lane, or mutate files/state; "
             "return only the marker requested by the user."
+        )
+    elif status_query:
+        context += (
+            " This is a read-only status report for the current contract, not a new objective or plan change. "
+            "Preserve the canonical plan and authorization; do not spawn an assessor or executor and do not mutate files. "
+            "If parent review is pending, inspect only existing host-bound evidence and report naturally; the parent Stop may seal it."
         )
     refreshed_for_assessor = snapshot_state(payload)
     canonical_artifact = _safe_plan_artifact(

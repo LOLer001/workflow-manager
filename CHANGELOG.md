@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.65
+
+- 修正已确认合同处于 `verification_required / review_required` 时，自然语言“只读报告上次任务最终状态、不要修改文件”被误当成计划约束变化，进而重开评估和待确认 revision 的问题。
+- 有界纯状态查询现在保持原 canonical 计划、授权、合同、评估代次和写入租约不变；禁止新评估者/执行者和文件修改，允许父级基于现有宿主证据自然报告并在 Stop 原子封存。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.64 Tag/Release 保持不可变，发布采用 forward-only 1.0.65。
+
 ## 1.0.64
 
 - 修正真实宿主已记录 `CommandExecution.exit_code`，但外层 `functions.exec` 只返回纯文本时，最后一次只读验收被错误记为 `unknown`、成功合同无法封存的问题。
