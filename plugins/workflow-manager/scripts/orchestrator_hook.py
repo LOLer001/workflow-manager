@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.58", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.59", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -10615,21 +10615,32 @@ def completed_file_change_receipt(
         if not target or target in manifest or not isinstance(change, dict):
             return None
         kind = str(change.get("type") or "").lower()
-        unified_diff = change.get("unified_diff")
         if (
             kind not in {"add", "update", "delete"}
             or change.get("move_path") not in (None, "")
-            or not isinstance(unified_diff, str)
-            or not unified_diff
         ):
             return None
         manifest[target] = kind
-        digest_changes[target] = {
-            "kind": kind,
-            "unified_diff_digest": stable_hash(
-                unified_diff.replace("\r\n", "\n").replace("\r", "\n"), 32
-            ),
-        }
+        if kind == "add":
+            content = change.get("content")
+            if not isinstance(content, str) or change.get("unified_diff") not in (None, ""):
+                return None
+            digest_changes[target] = {
+                "kind": kind,
+                "content_digest": stable_hash(
+                    content.replace("\r\n", "\n").replace("\r", "\n"), 32
+                ),
+            }
+        else:
+            unified_diff = change.get("unified_diff")
+            if not isinstance(unified_diff, str) or not unified_diff:
+                return None
+            digest_changes[target] = {
+                "kind": kind,
+                "unified_diff_digest": stable_hash(
+                    unified_diff.replace("\r\n", "\n").replace("\r", "\n"), 32
+                ),
+            }
     receipt_digest = stable_hash(
         "workflow-manager-completed-file-change-v1\0"
         + canonical_json(
@@ -10650,7 +10661,8 @@ def rollout_completed_file_change_after_patch(
     """Bind one missing apply_patch output to one immediately completed FileChange."""
     call_indexes: list[int] = []
     patch_calls = 0
-    outputs = 0
+    output_indexes: list[int] = []
+    output_values: list[Any] = []
     for index, record in enumerate(records):
         event = record.get("payload") or {}
         if not isinstance(event, dict) or _host_event_turn_id(event) != turn_id:
@@ -10667,11 +10679,19 @@ def rollout_completed_file_change_after_patch(
             event.get("type") == "custom_tool_call_output"
             and str(event.get("call_id") or "") == call_id
         ):
-            outputs += 1
-    if len(call_indexes) != 1 or patch_calls != 1 or outputs != 0:
+            output_indexes.append(index)
+            output_values.append(event.get("output"))
+    if (
+        len(call_indexes) != 1
+        or patch_calls != 1
+        or len(output_indexes) > 1
+        or output_indexes and output_indexes[0] <= call_indexes[0]
+        or output_values and not host_apply_patch_receipt_success(output_values[0])
+    ):
         return None
 
     file_changes: list[dict[str, Any]] = []
+    saw_output = False
     for record in records[call_indexes[0] + 1 :]:
         event = record.get("payload") or {}
         if not isinstance(event, dict):
@@ -10686,14 +10706,17 @@ def rollout_completed_file_change_after_patch(
         if event.get("type") == "custom_tool_call_output" and str(
             event.get("call_id") or ""
         ) == call_id:
-            return None
+            if not file_changes:
+                return None
+            saw_output = True
+            break
         if (
             event.get("type") == "item_completed"
             and isinstance(event.get("item"), dict)
             and event["item"].get("type") == "FileChange"
         ):
             file_changes.append(event)
-    if len(file_changes) != 1:
+    if len(file_changes) != 1 or bool(output_indexes) != saw_output:
         return None
     expected = literal_patch_target_kinds(patch_source, cwd)
     observed = completed_file_change_receipt(file_changes[0], cwd)
@@ -10705,6 +10728,7 @@ def rollout_completed_file_change_after_patch(
             {
                 "call_id": call_id,
                 "file_change_receipt": observed[1],
+                "outer_receipt": "host_success" if saw_output else "absent",
                 "patch_digest": host_patch_digest(patch_source),
                 "turn_id": turn_id,
             }
@@ -11286,7 +11310,7 @@ def promote_reconciled_parent_review(state: dict[str, Any]) -> bool:
 def reconcile_current_parent_rollout_on_resume(
     payload: dict[str, Any], state: dict[str, Any]
 ) -> int:
-    """Recover only current parent-lease writes from the pinned root rollout."""
+    """Recover current parent writes even when this Hook payload lacks a turn id."""
     trusted = trusted_current_root_rollout(payload, state)
     if trusted is None or not parent_writer_lease_current(state):
         return 0
@@ -11305,13 +11329,24 @@ def reconcile_current_parent_rollout_on_resume(
         and op.get("host_event_turn_id")
         and op.get("host_input_digest")
     )
-    reconciled = sum(
-        1
-        for turn_id in turn_ids
-        if reconcile_parent_filechange_turn(records, cwd, turn_id, state)
-    )
-    if reconciled:
-        promote_reconciled_parent_review(state)
+    reconciled = 0
+    for turn_id in turn_ids:
+        pending = [
+            op
+            for op in state.get("operations", [])
+            if isinstance(op, dict)
+            and normalized_key(op.get("tool")) == "applypatch"
+            and op.get("status") == "unknown"
+            and op.get("host_event_turn_id") == turn_id
+        ]
+        turn_payload = dict(payload)
+        turn_payload["turn_id"] = turn_id
+        turn_payload["cwd"] = cwd
+        reconcile_unknown_operations_from_transcript(turn_payload, state)
+        reconciled += sum(
+            1 for op in pending if op.get("status") in SUCCESS_STATUSES
+        )
+    promote_reconciled_parent_review(state)
     return reconciled
 
 
@@ -20275,7 +20310,9 @@ def stop(payload: dict[str, Any]) -> None:
     plan_ready = canonical_plan_message_ready(assistant_message)
 
     def update(state: dict[str, Any]) -> None:
+        reconcile_current_parent_rollout_on_resume(payload, state)
         reconcile_unknown_operations_from_transcript(payload, state)
+        promote_reconciled_parent_review(state)
         state["last_assistant"] = text_metadata(assistant_message)
         state["last_stop_at"] = utc_now()
         if (

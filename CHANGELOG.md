@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.0.59
+
+- 修正正常父任务已完成修改和测试、但 Stop payload 不带 `turn_id` 时仍停在 `running` 的缺口：Stop 先从当前 live lease 的未知补丁操作枚举唯一宿主 turn，复用严格 rollout 对账并生成父审候选，当前 turn 可直接验收和封存，无需用户再发续接消息。
+- 对齐真实 `FileChange` schema：新增文件绑定 `add + content` 摘要，更新/删除绑定 diff 摘要；外层回执只允许缺失或唯一明确成功，错误、空列表、重复、先于 FileChange、错路径、错类型、移动或跨 turn 证据继续 fail-closed。
+- 修正 Skill 容量门禁在 Windows CRLF checkout 下误把 6998 个规范化 UTF-8 字节计成 7043 文件字节的问题；门禁上限不变，只统一跨平台计量口径。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.58 Tag/Release 保持不可变，发布采用 forward-only 1.0.59。
+
 ## 1.0.58
 
 - 修正 Hard 评估者首次启动的宿主参数衔接：上下文直接给出当前支持的精确 `spawn_agent` 调用形态，并在预留生命周期前拒绝冲突的 `agent_type` 或旧式 `fork_context`，避免一次无效调用留下重复预约。

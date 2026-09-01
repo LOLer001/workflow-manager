@@ -375,7 +375,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 33)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.58")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.59")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "12")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -470,7 +470,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.58"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.59"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -497,7 +497,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.58 active", context)
+        self.assertIn("Workflow Manager 1.0.59 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1153,7 +1153,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.58"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.59"))
         self.assertEqual(migrated["execution_profile_version"], "12")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1249,7 +1249,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (33, "1.0.58", "12"),
+                    (33, "1.0.59", "12"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1295,7 +1295,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (33, "1.0.58", "5", "verification_required", 1),
+            (33, "1.0.59", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1452,7 +1452,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (33, "1.0.58", "recovery_required", None),
+            (33, "1.0.59", "recovery_required", None),
         )
         self.assertEqual(migrated["subagents"], [])
         self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -1467,7 +1467,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.58", "recovery_required", None),
+            ("1.0.59", "recovery_required", None),
         )
         self.assertEqual(migrated_1052["subagents"], [])
         schema32 = json.loads(json.dumps(running))
@@ -1480,7 +1480,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1055["executor_state"],
                 migrated_1055["executor_agent_id"],
             ),
-            ("1.0.58", "recovery_required", None),
+            ("1.0.59", "recovery_required", None),
         )
         self.assertEqual(migrated_1055["subagents"], [])
         # The mailbox-recovery bridge applies only to the current trusted
@@ -4123,7 +4123,10 @@ class OrchestratorHookTests(unittest.TestCase):
         prompts = manifest["interface"].get("defaultPrompt", [])
         self.assertLessEqual(len(prompts), 3)
         self.assertTrue(all(len(prompt) <= 128 for prompt in prompts), prompts)
-        self.assertLess(ORCHESTRATOR_SKILL.stat().st_size, 7000)
+        self.assertLess(
+            len(ORCHESTRATOR_SKILL.read_text(encoding="utf-8").encode("utf-8")),
+            7000,
+        )
 
     def test_stable_skill_sync_installs_updates_and_is_idempotent(self) -> None:
         first = HOOK.sync_stable_skill(PLUGIN_ROOT, self.codex_home)
@@ -10639,7 +10642,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.58 active", context)
+        self.assertIn("Workflow Manager 1.0.59 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11328,7 +11331,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.58"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.59"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11684,7 +11687,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (33, "1.0.58", "recovery_required", None),
+                    (33, "1.0.59", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -12011,6 +12014,155 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(completed["executor_state"], "succeeded")
         self.assertEqual(completed["parent_writer_lease"]["status"], "sealed")
 
+    def test_stop_without_turn_id_reconciles_current_patch_and_seals(self) -> None:
+        session = "parent-stop-reconcile"
+        self.create_confirmed_executor_state(session)
+        root_cwd = str(Path(self.temporary.name) / "stop-workspace")
+        patch_text = (
+            "*** Begin Patch\n"
+            f"*** Update File: {root_cwd}/a.py\n"
+            "@@\n-old\n+new\n"
+            "*** End Patch"
+        )
+        turn = "parent-stop-turn"
+        change = {
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "hook_run_id": "patch-pre",
+            "turn_id": turn,
+            "cwd": root_cwd,
+            "tool_name": "apply_patch",
+            "tool_input": {"patch": patch_text},
+        }
+        self.run_hook(change)
+        self.run_hook(
+            {
+                **change,
+                "hook_event_name": "PostToolUse",
+                "hook_run_id": "patch-opaque-post",
+                "tool_response": [],
+            }
+        )
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "verification",
+                "turn_id": turn,
+                "cwd": root_cwd,
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -B -m unittest -v"},
+                "tool_response": {"status": "ok", "exit_code": 0},
+            }
+        )
+        pending = self.load_only_state()
+        pending["root_cwd_fingerprint"] = HOOK.stable_hash(root_cwd)
+        pending["root_rollout_identity"] = None
+        patch_operation = next(
+            item for item in pending["operations"]
+            if HOOK.normalized_key(item.get("tool")) == "applypatch"
+        )
+        patch_operation["host_input_digest"] = "f" * 32
+        patch_operation["host_command_digest"] = HOOK.stable_hash(
+            "host-operation-command-text-v1\0" + patch_text, 32
+        )
+        self.state_files()[0].write_text(
+            json.dumps(pending, ensure_ascii=False), encoding="utf-8"
+        )
+        self.assertEqual((patch_operation["status"], pending["executor_state"]),
+                         ("unknown", "running"))
+
+        turn_meta = {"internal_chat_message_metadata_passthrough": {"turn_id": turn}}
+        transcript = Path(self.temporary.name) / "parent-stop-rollout.jsonl"
+        transcript.write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in (
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "session_id": session,
+                            "id": session,
+                            "cwd": root_cwd,
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "call_id": "patch-call",
+                            "input": f"await tools.apply_patch({json.dumps(patch_text)});",
+                            **turn_meta,
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "turn_id": turn,
+                            "item": {
+                                "type": "FileChange",
+                                "status": "completed",
+                                "changes": {
+                                    f"{root_cwd}/a.py": {
+                                        "type": "update",
+                                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                                        "move_path": None,
+                                    }
+                                },
+                                "stdout": "Success. Updated the following files:\nM a.py\n",
+                                "stderr": "",
+                            },
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "patch-call",
+                            "output": [
+                                {
+                                    "type": "input_text",
+                                    "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                                },
+                                {"type": "input_text", "text": "{}"},
+                            ],
+                            **turn_meta,
+                        },
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stopped = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "native-parent-stop",
+                "cwd": root_cwd,
+                "transcript_path": str(transcript),
+                "last_assistant_message": "修复与完整验收均已通过。",
+            }
+        )
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        sealed = self.load_only_state()
+        recovered = next(
+            item for item in sealed["operations"]
+            if HOOK.normalized_key(item.get("tool")) == "applypatch"
+        )
+        self.assertEqual(
+            (recovered["status"], recovered["reconciliation_source"]),
+            ("ok", "host_rollout_exact_completed_file_change_v1"),
+        )
+        self.assertEqual(recovered["legacy_host_input_digest"], "f" * 32)
+        self.assertRegex(recovered["host_receipt_digest"], r"^[0-9a-f]{32}$")
+        self.assertEqual(sealed["executor_state"], "succeeded")
+        self.assertEqual(sealed["last_execution_baseline"]["acceptance_status"],
+                         "passed")
+        self.assertEqual(sealed["parent_writer_lease"]["status"], "sealed")
+
     def test_parent_filechange_recovery_rejects_ambiguous_or_mismatched_receipts(self) -> None:
         cwd = "/tmp/workflow-manager-filechange-negative"
         turn = "negative-filechange-turn"
@@ -12042,15 +12194,71 @@ class OrchestratorHookTests(unittest.TestCase):
                 },
             }
 
-        output = {
+        successful_output = {
             "type": "response_item",
             "payload": {"type": "custom_tool_call_output", "call_id": "p1", "output": {}, **meta},
         }
+        error_output = {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output", "call_id": "p1",
+                "output": {"status": "error"}, **meta,
+            },
+        }
+        early_output = [call, successful_output, file_change(f"{cwd}/a.py")]
+        add_patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {cwd}/a.py\n"
+            "@@\n-old\n+new\n"
+            f"*** Add File: {cwd}/b.py\n"
+            "+added\n"
+            "*** End Patch"
+        )
+        add_call = {
+            **call,
+            "payload": {
+                **call["payload"],
+                "input": f"await tools.apply_patch({json.dumps(add_patch)});",
+            },
+        }
+        add_change = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed", "turn_id": turn,
+                "item": {
+                    "type": "FileChange", "status": "completed",
+                    "changes": {
+                        f"{cwd}/a.py": {
+                            "type": "update", "unified_diff": "@@\n-old\n+new\n",
+                            "move_path": None,
+                        },
+                        f"{cwd}/b.py": {"type": "add", "content": "added\n"},
+                    },
+                    "stdout": "Success. Updated the following files:\n",
+                    "stderr": "",
+                },
+            },
+        }
+        self.assertRegex(
+            HOOK.rollout_completed_file_change_after_patch(
+                [add_call, add_change, successful_output],
+                turn_id=turn,
+                call_id="p1",
+                patch_source=add_patch,
+                cwd=cwd,
+            ) or "",
+            r"^[0-9a-f]{32}$",
+        )
         cases = {
             "path_mismatch": [call, file_change(f"{cwd}/b.py")],
             "kind_mismatch": [call, file_change(f"{cwd}/a.py", "delete")],
             "duplicate_filechange": [call, file_change(f"{cwd}/a.py"), file_change(f"{cwd}/a.py")],
-            "output_present": [call, file_change(f"{cwd}/a.py"), output],
+            "error_output": [call, file_change(f"{cwd}/a.py"), error_output],
+            "early_output": early_output,
+            "duplicate_output": [
+                call, file_change(f"{cwd}/a.py"), successful_output,
+                successful_output,
+            ],
             "sibling_patch": [call, {**call, "payload": {**call["payload"], "call_id": "p2"}}, file_change(f"{cwd}/a.py")],
         }
         for label, records in cases.items():
