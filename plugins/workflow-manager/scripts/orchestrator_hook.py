@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.63", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.64", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -10834,6 +10834,41 @@ def host_exec_output_status(output: Any) -> str:
     return leaf or "unknown"
 
 
+def completed_command_execution_status(
+    event: dict[str, Any], command: str, cwd: str
+) -> str | None:
+    """Read one exact host-owned CommandExecution terminal receipt."""
+    if event.get("type") != "item_completed" or not isinstance(event.get("item"), dict):
+        return None
+    item = event["item"]
+    argv = item.get("command")
+    observed_command = (
+        argv
+        if isinstance(argv, str)
+        else argv[-1]
+        if isinstance(argv, list) and argv and all(isinstance(part, str) for part in argv)
+        else None
+    )
+    source = str(item.get("source") or "")
+    if (
+        item.get("type") != "CommandExecution"
+        or item.get("status") != "completed"
+        or not source.startswith("unified_exec")
+        or observed_command != command
+        or not isinstance(item.get("exit_code"), int)
+    ):
+        return None
+    if cwd:
+        observed_cwd = str(item.get("cwd") or "")
+        if observed_cwd.startswith("file://"):
+            observed_cwd = observed_cwd[7:]
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:[/\\\\]", observed_cwd):
+                observed_cwd = observed_cwd[1:]
+        if "%" in observed_cwd or os.path.normcase(os.path.normpath(observed_cwd)) != os.path.normcase(os.path.normpath(cwd)):
+            return None
+    return "ok" if item["exit_code"] == 0 else f"error:{item['exit_code']}"
+
+
 def host_apply_patch_receipt_success(response: Any) -> bool:
     """Recognize only the current supported empty patch receipt shape."""
     if response == {}:
@@ -10903,30 +10938,55 @@ def rollout_turn_structured_exec_results(
     records: list[dict[str, Any]], turn_id: str
 ) -> list[tuple[str, str, str]]:
     """Return exact exec chains from an already bounded host rollout."""
-    calls: dict[str, list[str]] = {}
-    outputs: dict[str, list[Any]] = {}
-    for item in records:
+    calls: dict[str, list[tuple[int, str]]] = {}
+    outputs: dict[str, list[tuple[int, Any]]] = {}
+    for index, item in enumerate(records):
         event = item.get("payload") or {}
         if not isinstance(event, dict) or _host_event_turn_id(event) != turn_id:
             continue
         if event.get("type") == "custom_tool_call" and event.get("name") == "exec":
             calls.setdefault(str(event.get("call_id") or ""), []).append(
-                str(event.get("input") or "")
+                (index, str(event.get("input") or ""))
             )
         elif event.get("type") == "custom_tool_call_output":
             outputs.setdefault(str(event.get("call_id") or ""), []).append(
-                event.get("output")
+                (index, event.get("output"))
             )
     parsed: list[tuple[str, str, str]] = []
-    for call_id, sources in calls.items():
-        if not call_id or len(sources) != 1 or len(outputs.get(call_id, [])) != 1:
+    for call_id, call_items in calls.items():
+        output_items = outputs.get(call_id, [])
+        if not call_id or len(call_items) != 1 or len(output_items) != 1:
             continue
-        parsed_source = literal_exec_command_source(sources[0])
+        call_index, source = call_items[0]
+        output_index, output = output_items[0]
+        if output_index <= call_index:
+            continue
+        parsed_source = literal_exec_command_source(source)
         if not parsed_source:
             continue
         command, cwd = parsed_source
-        output = outputs[call_id][0]
-        status = host_exec_output_status(output)
+        command_events = [
+            (item.get("payload") or {})
+            for item in records[call_index + 1 : output_index]
+            if isinstance(item.get("payload"), dict)
+            and (item.get("payload") or {}).get("type") == "item_completed"
+            and isinstance((item.get("payload") or {}).get("item"), dict)
+            and (item.get("payload") or {})["item"].get("type") == "CommandExecution"
+        ]
+        output_status = host_exec_output_status(output)
+        if command_events:
+            if len(command_events) != 1:
+                continue
+            command_status = completed_command_execution_status(
+                command_events[0], command, cwd
+            )
+            if command_status is None or (
+                output_status != "unknown" and output_status != command_status
+            ):
+                continue
+            status = command_status
+        else:
+            status = output_status
         if status == "unknown":
             continue
         digest = stable_hash(

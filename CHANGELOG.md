@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.64
+
+- 修正真实宿主已记录 `CommandExecution.exit_code`，但外层 `functions.exec` 只返回纯文本时，最后一次只读验收被错误记为 `unknown`、成功合同无法封存的问题。
+- 仅在 call id、turn、命令文本、工作目录和唯一宿主事件全部精确绑定时采用最内层退出码；重复事件、命令或目录不一致、内外状态冲突继续 fail-closed。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.63 Tag/Release 保持不可变，发布采用 forward-only 1.0.64。
+
 ## 1.0.63
 
 - 修正父级最终复核把“失败关闭 / fail closed / failure cases”等已验证的故障域说明误判为当前验收失败的问题：仅明确指向本次最终结果的“验收未通过、测试失败、发布未开始”等断言判负，显式 `outcome=failed` 仍无条件失败。
