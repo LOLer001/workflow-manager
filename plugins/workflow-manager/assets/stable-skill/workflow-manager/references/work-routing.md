@@ -24,7 +24,7 @@ Examples:
 
 ## Hard assessment
 
-Request one read-only highest-available assessor at `reasoning_effort=max`, `fork_turns=1`; only explicit whole-session `highest_throughout` uses `ultra`. Any concise safe ASCII task name is acceptable and carries no semantics.
+Request one read-only `gpt-5.6-sol` assessor at `reasoning_effort=max`, `fork_turns=1`. Any concise safe ASCII task name is acceptable and carries no semantics. The current Hard authorization envelope has one assessor slot; a failed lifecycle remains fail-closed rather than starting a same-envelope replacement.
 
 The assessor may return ordinary prose. Do not require a binding line, exact keywords, JSON, numbered table, fixed ending, or plugin marker. Its unique request + accepted Post + full Start establish provenance; the parent model judges the substance and writes the only plan.
 
@@ -36,7 +36,7 @@ The parent presents one human-readable plan sufficient for the task and acceptan
 
 The Hook appends the complete bounded plan to `plans/<session-token>/hard-plan.md`. Before `plan_state` may become `awaiting_confirmation`, the revision and state transaction must commit. The current trusted revision is the plan-content authority. After a fully bound assessor completes but before revision 1 commits, a bounded parent-native `update_plan` may project the pending plan into the UI without changing state or authority; the following parent Stop still creates revision 1. Once a canonical revision exists, `update_plan` is allowed only as `projection_only canonical_revision_digest=<digest>`. It is never a second plan store.
 
-A machine-readable `workflow-manager-execution-slices` block is optional. Without one, the complete native plan becomes one logical slice. With one, total 196608-byte / 1024-node budgets protect state capacity without a separate item cap. Budget pressure may stop or split work but never reduce acceptance.
+A machine-readable `workflow-manager-execution-slices` block is optional. Without a valid one, the complete native plan becomes one logical slice; malformed projection data is not a format gate. With a valid one, total 196608-byte / 1024-node budgets protect state capacity without a separate item cap. Budget pressure may stop or split work but never reduce acceptance.
 
 ## Confirmation
 

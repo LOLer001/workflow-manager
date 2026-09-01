@@ -117,6 +117,61 @@ class PlanArtifactTests(unittest.TestCase):
             "```\n"
         )
 
+    def seed_corrupt_hard_journal(
+        self, session: str
+    ) -> tuple[Path, bytes, Path, bytes, dict]:
+        payload = {"session_id": session}
+        objective = {"fingerprint": "a" * 16, "length": 1}
+        state = HOOK.new_state(payload)
+        state.update(
+            {
+                "task_domain": "work",
+                "work_difficulty": "hard",
+                "difficulty_decision_id": "b" * 24,
+                "objective": objective,
+                "plan_state": "analyzing",
+            }
+        )
+        self.assertTrue(HOOK.rotate_task_epoch(state, payload, objective))
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.assertTrue(HOOK.write_plan_artifact(state, payload, self.hard_body("stale")))
+        state["plan_state"] = "awaiting_confirmation"
+        HOOK.sync_plan_artifact_lifecycle(state)
+        path = HOOK.state_path(payload)
+        self.assertIsNotNone(path)
+        HOOK.atomic_write(path, state)
+        journal = self.artifact_path(state)
+        corrupted = journal.read_bytes() + b"stale-content-drift\n"
+        journal.write_bytes(corrupted)
+        session_token = journal.parent.name
+        marker = journal.parent / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        marker_bytes = (
+            json.dumps(
+                {
+                    "schema": 1,
+                    "transaction_id": "c" * 32,
+                    "session_token": session_token,
+                    "journal_name": HOOK.PLAN_JOURNAL_NAME,
+                    "backup_name": "none",
+                    "cleanup_kind": "none",
+                    "old_journal_digest": state["plan_artifact"]["journal_digest"],
+                    "new_journal_digest": "d" * 32,
+                    "old_generation": state["plan_artifact"]["generation"],
+                    "new_generation": state["plan_artifact"]["generation"] + 1,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+        marker.write_bytes(marker_bytes)
+        return journal, corrupted, marker, marker_bytes, state
+
     @staticmethod
     def legacy_document(
         generation: int,
@@ -337,17 +392,16 @@ class PlanArtifactTests(unittest.TestCase):
             )
         self.assertEqual(invalid.exception.code, "slice_id_invalid")
 
-    def test_native_plan_is_one_slice_but_explicit_malformed_manifest_is_rejected(self) -> None:
+    def test_native_and_malformed_optional_manifest_both_use_one_slice(self) -> None:
         native = HOOK.execution_slice_manifest_for_plan(
             "Inspect the bounded cause, implement the reversible correction, "
             "and independently verify the confirmed acceptance before reporting."
         )
         self.assertEqual((native["count"], native["items"][0]["id"]), (1, "s01"))
-        with self.assertRaises(HOOK.PlanArtifactError) as malformed:
-            HOOK.execution_slice_manifest_for_plan(
-                "Native plan text\n```workflow-manager-execution-slices\n{bad}\n```\n"
-            )
-        self.assertEqual(malformed.exception.code, "manifest_json_invalid")
+        malformed = HOOK.execution_slice_manifest_for_plan(
+            "Native plan text\n```workflow-manager-execution-slices\n{bad}\n```\n"
+        )
+        self.assertEqual((malformed["count"], malformed["items"][0]["id"]), (1, "s01"))
 
     def test_c01_hard_plan_uses_one_bound_v2_canonical_journal(self) -> None:
         state, _ = self.accept_assessor_plan("c01")
@@ -795,6 +849,108 @@ class PlanArtifactTests(unittest.TestCase):
             (self.artifact_path(stable).parent / HOOK.PLAN_TRANSACTION_MARKER_NAME).exists()
         )
 
+    def test_c14a_new_daily_epoch_retires_corrupt_hard_authority_before_pre_post(self) -> None:
+        session = "c14a-retired-hard-authority"
+        journal, journal_bytes, marker, marker_bytes, old = self.seed_corrupt_hard_journal(
+            session
+        )
+        successor = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "new-daily-objective",
+                "prompt": "换个问题，生成今天的日报",
+            }
+        )
+        self.assertEqual(successor.returncode, 0, successor.stderr)
+        state = self.state()
+        self.assertEqual(state["task_domain"], "daily")
+        self.assertEqual(state["work_difficulty"], "not_applicable")
+        self.assertNotEqual(
+            state["task_epoch"]["id"], old["task_epoch"]["id"]
+        )
+        self.assertEqual(state["plan_state"], "none")
+        self.assertEqual(state["plan_artifact"]["write_status"], "none")
+        self.assertIsNone(state["execution_contract_id"])
+        self.assertEqual(
+            state["retired_plan_authorities"][-1]["journal_digest"],
+            old["plan_artifact"]["journal_digest"],
+        )
+        self.assertTrue(old["plan_artifact"]["root_identity_digest"])
+        self.assertTrue(old["plan_artifact"]["authority_identity"])
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+
+        pre = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "ordinary-file-change-pre",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        self.assertNotIn('"permissionDecision":"deny"', pre.stdout)
+        post = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "ordinary-file-change-post",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+                "tool_response": {"status": "ok"},
+            }
+        )
+        self.assertEqual(post.returncode, 0, post.stderr)
+        assessor = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "ordinary-read-only-assessor",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": "readonly_check",
+                    "message": "read-only assessor",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "max",
+                    "fork_turns": "1",
+                },
+            }
+        )
+        self.assertNotIn('"permissionDecision":"deny"', assessor.stdout)
+        final = self.state()
+        self.assertEqual(final["plan_artifact"]["warning_code"], "none")
+        self.assertNotEqual(
+            final.get("persistence", {}).get("outcome"),
+            "transaction_recovery_failed",
+        )
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+
+    def test_c14b_matching_active_hard_corrupt_journal_still_fails_closed(self) -> None:
+        session = "c14b-active-hard-authority"
+        journal, journal_bytes, marker, marker_bytes, _ = self.seed_corrupt_hard_journal(
+            session
+        )
+        denied = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "active-hard-pre",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+            }
+        )
+        decision = json.loads(denied.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        state = self.state()
+        self.assertEqual(
+            state["plan_artifact"]["write_status"],
+            "transaction_recovery_failed",
+        )
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+
     def test_c15_state_replace_then_failure_leaves_recoverable_new_new_transaction(self) -> None:
         session = "c15"
         self.begin_hard_plan(session)
@@ -954,6 +1110,7 @@ class PlanArtifactTests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
+        objective = {"fingerprint": "a" * 16, "length": 1}
 
         def first_change(state: dict) -> None:
             state.update(
@@ -961,10 +1118,11 @@ class PlanArtifactTests(unittest.TestCase):
                     "task_domain": "work",
                     "work_difficulty": "hard",
                     "difficulty_decision_id": "b" * 24,
-                    "objective": {"fingerprint": "a" * 16, "length": 1},
+                    "objective": objective,
                     "plan_state": "analyzing",
                 }
             )
+            self.assertTrue(HOOK.rotate_task_epoch(state, payload, objective))
             self.assertTrue(
                 HOOK.write_plan_artifact(state, payload, self.hard_body("first"))
             )
@@ -1906,7 +2064,7 @@ class PlanArtifactTests(unittest.TestCase):
         )
         state, _ = self.accept_assessor_plan("m03", body=body)
         text = self.artifact_path(state).read_text(encoding="utf-8")
-        for forbidden in ("hunter2", "abc.def.ghi", "sk-live-super-secret-value", secret, "WORK_ASSESSMENT", "\x00", "\x01"):
+        for forbidden in ("hunter2", "abc.def.ghi", "sk-live-super-secret-value", secret, "\x00", "\x01"):
             self.assertNotIn(forbidden, text)
         self.assertIn("[REDACTED]", text)
         parsed = HOOK.parse_plan_journal(text.encode("utf-8"))
@@ -2165,6 +2323,8 @@ class PlanArtifactTests(unittest.TestCase):
                 "journal_digest",
                 "journal_prefix_digest",
                 "journal_prefix_bytes",
+                "root_identity_digest",
+                "authority_identity",
                 "generation",
                 "revision_count",
                 "lifecycle_status",
@@ -2230,7 +2390,7 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(source.read_text(encoding="utf-8"), "original")
         self.assertEqual(hard.read_text(encoding="utf-8"), "original")
 
-    def test_s03_sanitizer_removes_bidi_all_protocol_markers_and_bounds_bytes(self) -> None:
+    def test_s03_sanitizer_removes_controls_but_preserves_native_marker_like_text(self) -> None:
         markers = (
             "WORK_ASSESSMENT binding_id=" + "a" * 32,
             "EXECUTION_STALL stall_id=" + "d" * 32,
@@ -2240,7 +2400,7 @@ class PlanArtifactTests(unittest.TestCase):
         raw = "1. safe plan\n" + "\n".join(markers) + "\n\u202e\u2066hidden\u2069\n"
         body = HOOK.sanitize_plan_artifact_body(raw)
         for marker in markers:
-            self.assertNotIn(marker, body)
+            self.assertIn(marker, body)
         for control in ("\u202e", "\u2066", "\u2069"):
             self.assertNotIn(control, body)
         self.assertLessEqual(len(body.encode("utf-8")), HOOK.MAX_PLAN_REVISION_BYTES)
@@ -2376,6 +2536,9 @@ class PlanArtifactTests(unittest.TestCase):
                 "plan_difficulty_decision_id": "b" * 24,
             }
         )
+        self.assertTrue(
+            HOOK.rotate_task_epoch(state, payload, state["objective"])
+        )
         outside = self.root / "outside-write"
         outside.mkdir()
         parked = self.root / "parked-write-session"
@@ -2407,7 +2570,9 @@ class PlanArtifactTests(unittest.TestCase):
             HOOK.write_plan_artifact(state, payload, self.hard_body("swap-write"))
         self.assertEqual(list(outside.iterdir()), [])
         observed_directory = (
-            self.data / "plans" / HOOK.plan_artifact_session_id("s09")
+            self.data
+            / "plans"
+            / HOOK.plan_artifact_session_id("s09", state["task_epoch"]["id"])
             if rename_blocked
             else parked
         )
@@ -2583,6 +2748,9 @@ class PlanArtifactTests(unittest.TestCase):
                 "plan_objective_fingerprint": "a" * 16,
                 "plan_difficulty_decision_id": "b" * 24,
             }
+        )
+        self.assertTrue(
+            HOOK.rotate_task_epoch(state, payload, state["objective"])
         )
         environment = patch.dict(
             os.environ,

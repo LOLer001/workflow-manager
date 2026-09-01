@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 33/writer 1.0.65 uses execution profile v12 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
+This reference applies only after a Hard plan is confirmed. Schema 34/writer 1.0.66 uses execution profile v13 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 
@@ -11,7 +11,7 @@ Only four boundaries grant or deny mutation:
 3. one live writer with no child nesting or terminal-child revival;
 4. unchanged external-safety authority.
 
-Task names and request prose are opaque host data. Any concise safe ASCII `task_name` is valid; it does not encode the contract, slice, attempt, failure fingerprint, or review digest. Native plan, executor, and review prose need no plugin marker. Explicit malformed marker intent still fails closed, because it is contradictory evidence rather than a missing format.
+Task names and request prose are opaque host data. Any concise safe ASCII `task_name` is valid; it does not encode the contract, slice, attempt, failure fingerprint, or review digest. Native plan, executor, and review prose need no plugin marker, fixed keyword, closing sentence, or minimum length beyond being nonempty and bounded; marker-like text has no protocol authority.
 
 ## Host lifecycle truth
 
@@ -25,7 +25,7 @@ These sources and flattened state must agree on current objective/contract, mono
 
 The Hook may privately inject the verified plan and host-issued `execution_contract_id` at Start without reading plugin state from the child. A Start seen before Post remains mutation-locked; only the later exact Post plus an in-lock journal recheck can make it running.
 
-If Desktop omits `SubagentStop` but a parent `list_agents` result exposes one structured `completed` mailbox entry for the uniquely bound executor, the Hook may append a separate `mailbox_terminal` equivalent boundary. It requires the current request, accepted Post, full Start, agent/task, contract, slice, and attempt to agree and the completed body to end with one exact matching `EXECUTION_RESULT`. It never fabricates or increments `SubagentStop`; `wait_agent` update summaries, running snapshots, commentary, ordinary unbound agents, duplicates, ambiguity, malformed markers, and drift remain non-terminal.
+If Desktop omits `SubagentStop` but a parent `list_agents` result exposes one structured `completed` mailbox entry for the uniquely bound executor, the Hook may append a separate `mailbox_terminal` equivalent boundary. It requires the current request, accepted Post, full Start, agent/task, contract, slice, attempt, and a nonempty bounded completed body to agree. It never fabricates or increments `SubagentStop`; `wait_agent` updates, running snapshots, commentary, ordinary unbound agents, duplicates, ambiguity, and drift remain non-terminal.
 
 ## Native plan and journal
 
@@ -34,7 +34,8 @@ The parent writes one bounded ordinary plan to private plugin data at `plans/<ep
 Plan formatting is native Codex behavior. A `workflow-manager-execution-slices` JSON block is optional:
 
 - without one, the Hook projects the complete parent plan as one logical slice;
-- with one, the plan may use any useful number of slices within the inclusive 196608-byte / 1024-node total budget;
+- with a valid one, the plan may use any useful number of slices within the inclusive 196608-byte / 1024-node total budget;
+- malformed optional projection data falls back to the native one-slice plan and never becomes a format gate;
 - 3–5 slices are a normal model choice, not a gate;
 - no separate slice or list-count ceiling exists;
 - insufficient budget means stop or split, never weaken acceptance.
@@ -64,17 +65,19 @@ Confirmation authorizes one writer, not necessarily one child executor. With a c
 
 If the parent takes over a `verification_required` child candidate, it increments the attempt monotonically, clears the old review candidate, and binds later operations to the current epoch/contract/slice/attempt. A failed parent test does not change writers: the parent may correct and verify again in the same lease. The latest bound verification after the last change is authoritative: a later success may correct an earlier failure, while a later failure or unknown result cannot inherit an older success. Final-result negatives must be explicit; verified fail-closed behavior and failure-case coverage are not themselves failed acceptance. Successful bound change and verification operations plus parent Stop may seal without a child Stop.
 
-When a child is chosen, the default first executor uses a current lower-tier model at `medium`, `fork_turns=1`. Explicit whole-session `highest_throughout` uses the highest available model at `ultra`. A request is reserved from trusted state; copied contract text in its message is neither required nor authoritative.
+When a child is chosen, every executor—including a recovery executor—uses a current lower-tier model at `medium`, `fork_turns=1`. A request is reserved from trusted state; copied contract text in its message is neither required nor authoritative.
 
-Executor Stop may be ordinary nonempty native prose. `EXECUTION_RESULT` is optional; an exact line remains compatible. If marker-like intent is present and malformed, duplicated, or bound to the wrong contract, fail closed. A successful result becomes only `verification_required`, and only when the host operation ledger contains bounded verification for the current contract. Child claims cannot substitute for that evidence.
+The Hard parent remains `gpt-5.6-sol` at `max` and is the sole summary, independent review, recovery, and final-acceptance entry. Execution-child progress is event-driven and limited to location complete, mutation start, verification end, or a blocker.
 
-The high-reasoning parent independently reviews artifacts and acceptance evidence. Its Stop may also be ordinary nonempty native prose. `EXECUTION_REVIEW` is optional. A pass requires current candidate binding plus independent host-recorded verification. Missing host verification remains incomplete even when prose sounds confident. Another slice advances only after review; only the final accepted slice seals global `succeeded`.
+Executor Stop is ordinary nonempty bounded native prose. Its wording and formatting never grant or deny authority. A successful host-bound terminal result becomes only `verification_required`; the parent must still supply current, bounded host verification. Child claims cannot substitute for that evidence.
+
+The high-reasoning parent independently reviews artifacts and acceptance evidence. Its Stop is ordinary nonempty bounded native prose. A pass requires current candidate binding plus independent host-recorded verification. Missing host verification remains incomplete even when prose sounds confident. Another slice advances only after review; only the final accepted slice seals global `succeeded`.
 
 For shell verification, preserve the complete structured host result, including the underlying exit status. For `apply_patch`, bind the exact host call to its unique success receipt. When a parent operation remains unknown, the same identity-pinned root rollout may reconcile one literal patch to the immediately following unique completed `FileChange` only when epoch, contract, slice, live parent lease, turn, patch digest, path, operation kind, and the FileChange content/diff receipt all agree. The outer receipt must be absent or uniquely successful; errors, duplicates, early receipts, cross-turn or moved-path evidence remain unknown. Stop may enumerate the current lease's exact unknown turn before review, so a normal completed turn seals without another user message. Recovery upgrades the original operation in place and never replays the patch; independent parent verification is still required.
 
 ## Typed recovery
 
-All failure, stall, incomplete, and verification recovery uses the same production path. After the unique original assessor lifecycle is proven, typed recovery uses the current highest available `gpt-5.6-sol` at `max`, `fork_turns=1`; explicit `highest_throughout` remains highest plus `ultra`.
+All failure, stall, incomplete, and verification recovery enters through the high-reasoning parent. After the unique original assessor lifecycle is proven, any newly chosen execution child still uses a current lower-tier model at `medium`, `fork_turns=1`.
 
 At each boundary the Hook derives one host-generated evidence digest and failure fingerprint from lifecycle, terminal, operation-ledger, and review facts. Never search state files or infer them from child prose. Recovery state does not force another turn or child: the parent may diagnose, independently verify, replan, or finish natively. Only if the model chooses an encrypted or plaintext recovery spawn, the parent supplies those Hook-issued facts plus the diagnosed root cause and material correction. The Hook persists only digests and atomically reserves that fresh child inside the existing authorization envelope; this is not another confirmation.
 

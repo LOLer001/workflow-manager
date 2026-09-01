@@ -16,7 +16,8 @@ SPEC.loader.exec_module(HOOK)
 
 class LeanPolicyBoundaryTests(unittest.TestCase):
     def test_source_has_no_retired_generic_workflow_handlers(self) -> None:
-        tree = ast.parse(HOOK_PATH.read_text(encoding="utf-8"))
+        source = HOOK_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
         functions = {
             node.name
             for node in ast.walk(tree)
@@ -34,6 +35,16 @@ class LeanPolicyBoundaryTests(unittest.TestCase):
             }
             & functions
         )
+        for retired_gate in (
+            "highest_throughout",
+            "work_executor_highest_available",
+            "ASSESSMENT_WAIT_SECONDS",
+            "ASSESSMENT_IDLE_SECONDS",
+            "EXECUTION_RESULT",
+            "EXECUTION_REVIEW",
+            "WORK_ASSESSMENT",
+        ):
+            self.assertNotIn(retired_gate, source)
 
     def test_authorization_result_has_no_native_execution_policy(self) -> None:
         simple = HOOK.classify_prompt("修改 Parser.py 一个错字并运行已有单测")

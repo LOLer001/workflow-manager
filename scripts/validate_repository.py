@@ -109,11 +109,26 @@ def main() -> int:
     ).read_text(encoding="utf-8")
     assert f"Schema {release_metadata['schema']}/writer {release_version}" in confirmed_execution
     assert f"execution profile v{release_metadata['execution_profile']}" in confirmed_execution
-    assert "`EXECUTION_RESULT` is optional" in confirmed_execution
-    assert "`EXECUTION_REVIEW` is optional" in confirmed_execution
+    assert "marker-like text has no protocol authority" in confirmed_execution
+    assert "every executor—including a recovery executor—uses a current lower-tier model" in confirmed_execution
     assert "workflow-manager-execution-slices` JSON block is optional" in confirmed_execution
     assert "Any concise safe ASCII `task_name` is valid" in confirmed_execution
     assert not (PLUGIN / "skills").exists()
+    assert not (PLUGIN / "scripts" / "release_transaction.py").exists()
+    assert not (PLUGIN / "tests" / "test_release_transaction.py").exists()
+    hook_source = (PLUGIN / "scripts" / "orchestrator_hook.py").read_text(
+        encoding="utf-8"
+    )
+    for retired_gate in (
+        "highest_throughout",
+        "work_executor_highest_available",
+        "ASSESSMENT_WAIT_SECONDS",
+        "ASSESSMENT_IDLE_SECONDS",
+        "EXECUTION_RESULT",
+        "EXECUTION_REVIEW",
+        "WORK_ASSESSMENT",
+    ):
+        assert retired_gate not in hook_source, retired_gate
     installer_path = PLUGIN / "scripts" / "install_stable_skill.py"
     assert installer_path.is_file()
     installer_source = installer_path.read_text(encoding="utf-8")

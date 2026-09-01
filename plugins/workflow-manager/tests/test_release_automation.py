@@ -35,10 +35,10 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(
             constants,
             {
-                "SCHEMA_VERSION": "33",
-                "WRITER_VERSION": "1.0.65",
-                "EXECUTION_PROFILE_VERSION": "12",
-                "STABLE_SKILL_SCHEMA": "9",
+                "SCHEMA_VERSION": "34",
+                "WRITER_VERSION": "1.0.66",
+                "EXECUTION_PROFILE_VERSION": "13",
+                "STABLE_SKILL_SCHEMA": "10",
             },
         )
         self.assertEqual(manifest["version"], constants["WRITER_VERSION"])

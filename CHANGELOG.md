@@ -1,5 +1,13 @@
 # 更新记录
 
+## 1.0.66
+
+- 引入 contract+epoch 维度的计划权威隔离：新 Simple/Daily 目标会退休不再适用的 Hard journal authority，同时保留有界摘要与原始 journal/transaction 字节；匹配的活动 Hard journal 继续 fail-closed，不读取、修补或清理其内容。
+- 收紧当前 Hard 生命周期为宿主可验证的 `gpt-5.6-sol/max` 评估与 lower-tier/`medium`、`fork_turns=1` 执行器；主线程仍是唯一审查、恢复与最终验收入口。
+- 每个 Hard 授权包络只允许一次 assessor；删除 600/1200 秒时钟动作、`highest_throughout`/`ultra` 子执行分支及固定 marker、关键词、结尾、最小长度和 JSON fence 内容门，普通有界原生计划/结果直接有效。
+- 删除已废弃的本地 release transaction 脚本，发布安全由宿主事实、明确授权、单写者、外部操作边界和强验收证据共同保证。
+- 升级 Schema 34 / writer 1.0.66 / execution profile v13 / stable-skill schema 10；保留历史 sealed success 的真实 profile，采用 forward-only 发布。
+
 ## 1.0.65
 
 - 修正已确认合同处于 `verification_required / review_required` 时，自然语言“只读报告上次任务最终状态、不要修改文件”被误当成计划约束变化，进而重开评估和待确认 revision 的问题。

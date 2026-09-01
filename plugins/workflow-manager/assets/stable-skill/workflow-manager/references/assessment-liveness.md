@@ -1,9 +1,9 @@
 # Assessment liveness
 
-Schema 33/writer 1.0.65 records bounded progress and budget evidence for the one active Hard assessor. It has no total assessment deadline: 600 seconds is an activity observation, exactly 1200 seconds remains live, and elapsed time alone never produces `assessment_timeout`, `blocked`, `exhausted`, or a terminal recovery state.
+Schema 34/writer 1.0.66 records bounded event evidence for the one active Hard assessor. It has no elapsed-time policy: clocks, waits, polling, and repeated status observations never produce a workflow action, replacement assessor, `assessment_timeout`, `blocked`, `exhausted`, or recovery authority.
 
-Only a new progress digest attached to the current binding, agent, and monotonic sequence resets idle. Repeated `running` status, parent wait/list calls, duplicate delivery results, stale lifecycle events, compaction/resume, and clock rollback do not. Strictly after 1200 seconds with no progress, inspect the current step and remaining byte/node budget, then issue an idempotent status/unblock request, diagnose the cause, or split the step within the same authorization envelope. Never lower acceptance to fit the budget.
+Only a new progress digest attached to the current binding, agent, and sequence is recorded as progress. The model natively decides whether to keep waiting, diagnose, or report a blocker. Workflow Manager changes authority only from exact host lifecycle facts, never from silence or elapsed time.
 
-If the live assessor has actually stopped with a typed failure, recovery follows the shared evidence-driven sequence contract rather than a time-based replacement: never revive the terminal child or overlap a replacement; reject the same failure fingerprint without new evidence; allow a fresh sequence when evidence, root cause, or material correction changed. Three or more distinct fingerprints remain recoverable while the bounded state budget permits.
+If the assessor actually stops or its host lifecycle conflicts, the current Hard envelope remains fail-closed. Never revive it, overlap it, or reserve a second assessor for the same envelope. A materially new authorization envelope may start its own single assessment.
 
-Schema 27 migration preserves the canonical journal, authorization envelope, confirmation, accepted slices, and profile-v10 evidence. An active verified assessor is re-anchored at its first Schema 28 observation, so historical elapsed time cannot retroactively stall it.
+Historical liveness timestamps are bounded migration evidence only and have no execution semantics.

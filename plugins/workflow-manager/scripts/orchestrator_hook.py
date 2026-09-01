@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.65", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.66", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -62,10 +62,9 @@ WRITER_VERSION = RELEASE_METADATA["version"]
 DOMAIN_CLASSIFIER_VERSION = "2"
 DIFFICULTY_CLASSIFIER_VERSION = "3"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
-# The assessor is the hard-work safety gate: use the highest generally exposed
-# effort (max); ultra is reserved for the explicit whole-session policy.
+# The assessor is the one read-only high-tier boundary for Hard work.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
-HIGHEST_SESSION_REASONING_EFFORT = "ultra"
+ASSESSOR_MODEL = "gpt-5.6-sol"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = RELEASE_METADATA["stable_skill_schema"]
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -135,9 +134,8 @@ MODEL_PROFILES = {
     "current",
     "work_assessment",
     "work_executor_low_latest",
-    "work_executor_highest_available",
 }
-SESSION_EXECUTION_PREFERENCES = {"default", "highest_throughout"}
+SESSION_EXECUTION_PREFERENCES = {"default"}
 EXECUTOR_STATES = {
     "none",
     "spawn_required",
@@ -172,8 +170,6 @@ EXECUTOR_FAILURE_KINDS = {
 TERMINAL_SUBAGENT_EVENTS = frozenset({"stop", "mailbox_terminal"})
 # Executor and assessor sequence values are monotonic identities, never retry
 # budgets.  Persistence byte/node budgets are the only generic growth bound.
-RECOVERY_EXECUTOR_MODEL = "gpt-5.6-sol"
-RECOVERY_EXECUTOR_REASONING_EFFORT = "max"
 STALL_STATES = {
     "none",
     "diagnosis_required",
@@ -186,11 +182,8 @@ STALL_STATES = {
 }
 STALL_RESUME_PROFILES = {
     "work_executor_low_latest",
-    "work_executor_highest_available",
 }
 ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "hard_plan_ready", "recovery_required", "failed"}
-ASSESSMENT_WAIT_SECONDS = 600
-ASSESSMENT_IDLE_SECONDS = 1200
 
 
 def _empty_assessment_liveness() -> dict[str, Any]:
@@ -230,6 +223,7 @@ ISOLATED_LIFECYCLE_STATES = frozenset(
     {"isolated_incomplete", "late_start", "late_terminal", "late_post"}
 )
 MAX_ISOLATED_LIFECYCLES = 8
+MAX_RETIRED_PLAN_AUTHORITIES = 8
 BASELINE_ACCEPTANCE_STATUSES = {"passed", "failed", "incomplete", "unknown"}
 REFERENCE_ACCEPTANCE_STATES = {"disabled", "planned", "candidate", "accepted", "failed"}
 PLAN_ARTIFACT_LIFECYCLE_STATUSES = {
@@ -392,13 +386,7 @@ def _safe_assessment_liveness(value: Any) -> dict[str, Any]:
 
 def assessment_liveness_tick(state: dict[str, Any], *, now: float | None = None,
                              progress_digest: str | None = None) -> str | None:
-    """Advance the assessor liveness state without treating polls as progress.
-
-    A digest is accepted only from the current binding, current live agent and
-    current attempt.  The function intentionally has no total wall-clock
-    deadline: a 600s tick is merely an observation, exactly 1200s is still
-    live, and only strictly later time starts the one bounded unblock path.
-    """
+    """Record current assessor progress without deriving policy from time."""
     if state.get("assessor_state") != "running":
         return None
     current = _safe_assessment_liveness(state.get("assessment_liveness"))
@@ -427,33 +415,10 @@ def assessment_liveness_tick(state: dict[str, Any], *, now: float | None = None,
         current["unblock_at"] = None
         state["assessment_liveness"] = current
         return "progress"
-    last_progress = current.get("last_progress_at")
-    if last_progress is None:
+    if current.get("last_progress_at") is None:
         current["last_progress_at"] = observed
-        state["assessment_liveness"] = current
-        return None
-    idle = observed - last_progress
-    if idle <= ASSESSMENT_IDLE_SECONDS:
-        state["assessment_liveness"] = current
-        return "observe" if idle >= ASSESSMENT_WAIT_SECONDS else None
-    if current["unblock"] == "none":
-        current["unblock"] = "pending"
-        current["unblock_at"] = observed
-        state["assessment_liveness"] = current
-        return "unblock_required"
-    # The caller must record delivery and prove the old child has stopped. A
-    # later observation may open one fresh, non-overlapping sequence; there is
-    # no semantic v1/v2 retry ceiling.
-    if current["unblock"] == "delivered" and observed - float(current["unblock_at"] or observed) > ASSESSMENT_WAIT_SECONDS:
-        live = any(item.get("agent_id") == agent for item in active_agent_records(state))
-        if not live:
-            state["assessor_state"] = "recovery_required"
-            state["assessor_failure_kind"] = "assessment_stalled"
-            current["recovery_from"] = "assessment_stalled"
-            state["assessment_liveness"] = current
-            return "recovery_required"
     state["assessment_liveness"] = current
-    return "observe"
+    return None
 
 
 def stable_hash(value: Any, length: int = 16) -> str:
@@ -540,10 +505,6 @@ EXECUTION_SLICES_FENCE_RE = re.compile(
 EXECUTION_SLICES_FENCE_INTENT_RE = re.compile(
     r"(?m)^\s*```workflow-manager-execution-slices\b"
 )
-EXECUTION_SLICES_JSON_FENCE_RE = re.compile(
-    r"(?ms)^```json[ \t]*\n(.*?)^```[ \t]*(?:\n)?\Z"
-)
-EXECUTION_SLICES_JSON_FENCE_INTENT_RE = re.compile(r"(?m)^\s*```json\b")
 EXECUTION_SLICE_FIELDS = (
     "title",
     "scope",
@@ -665,10 +626,8 @@ def execution_slice_manifest_for_plan(plan_body: str) -> dict[str, Any]:
     try:
         return parse_execution_slice_manifest(plan_body)
     except PlanArtifactError:
-        # Absence means native planning. Explicit malformed manifest intent is
-        # contradictory data and must not be silently reinterpreted.
-        if EXECUTION_SLICES_FENCE_INTENT_RE.search(str(plan_body or "")):
-            raise
+        # Formatting never grants or denies authority. Missing or malformed
+        # optional projection data is simply one native logical slice.
         plan_reference = stable_hash(str(plan_body or ""), 16)
         implicit = {
             "version": EXECUTION_SLICE_SCHEMA,
@@ -703,38 +662,6 @@ def execution_slice_manifest_for_plan(plan_body: str) -> dict[str, Any]:
             + "\n```\n"
         )
         return parse_execution_slice_manifest(projected)
-
-
-def normalize_execution_slice_manifest_fence(plan_body: str) -> str:
-    """Canonicalize an unambiguous tail JSON manifest from a bound assessor.
-
-    Current Codex models occasionally emit the exact execution-slice schema in a
-    generic ``json`` fence. Requiring a fresh highest-tier assessor merely to
-    relabel that already-validated payload wastes quota and does not add trust:
-    the bound Start/Stop lifecycle and strict schema remain authoritative.
-    """
-    normalized = str(plan_body or "").replace("\r\n", "\n").replace("\r", "\n")
-    if EXECUTION_SLICES_FENCE_INTENT_RE.search(normalized):
-        return normalized
-    matches = list(EXECUTION_SLICES_JSON_FENCE_RE.finditer(normalized))
-    intents = EXECUTION_SLICES_JSON_FENCE_INTENT_RE.findall(normalized)
-    if len(matches) != 1 or len(intents) != 1:
-        return normalized
-    match = matches[0]
-    try:
-        decoded = json.loads(match.group(1), object_pairs_hook=_strict_json_object_pairs)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return normalized
-    if not isinstance(decoded, dict) or set(decoded) != {
-        "version",
-        "global_constraints",
-        "slices",
-    }:
-        return normalized
-    replacement = (
-        "```workflow-manager-execution-slices\n" + match.group(1) + "```\n"
-    )
-    return normalized[: match.start()] + replacement
 
 
 def _safe_execution_slices(value: Any) -> dict[str, Any]:
@@ -989,6 +916,9 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
         state.get("execution_profile_version") or EXECUTION_PROFILE_VERSION,
         16,
     )
+    preference = safe_session_execution_preference(
+        state.get("session_execution_preference")
+    )
     if profile_version == EXECUTION_PROFILE_VERSION:
         lineage = _safe_causal_lineage(state.get("causal_lineage"))
         if (
@@ -1001,9 +931,6 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
             or journal_prefix_bytes <= 0
         ):
             return None
-    preference = safe_session_execution_preference(
-        state.get("session_execution_preference")
-    )
     material = (
         f"{profile_version}\0{preference}\0{epoch_id or 'legacy'}\0{objective}\0{difficulty}"
         f"\0{generation}\0{plan}\0{canonical_path}\0{revision_digest}\0{journal_digest}"
@@ -1011,11 +938,6 @@ def execution_contract_id(state: dict[str, Any]) -> str | None:
     )
     if profile_version == EXECUTION_PROFILE_VERSION:
         material += f"\0prefix_bytes={journal_prefix_bytes}"
-    if preference == "highest_throughout":
-        material += (
-            f"\0{highest_execution_model(state) or 'unresolved'}"
-            f"\0{highest_execution_effort(state) or 'unresolved'}"
-        )
     review = state.get("causal_review") if isinstance(state.get("causal_review"), dict) else {}
     review_id = safe_fingerprint(review.get("review_id"))
     if review.get("state") == "resolved" and review_id:
@@ -1337,31 +1259,12 @@ def reset_executor_binding(state: dict[str, Any], *, preserve_failure: bool = Fa
 
 
 def safe_session_execution_preference(value: Any) -> str:
-    return str(value) if value in SESSION_EXECUTION_PREFERENCES else "default"
+    return "default"
 
 
 def requested_assessor_reasoning_effort(state: dict[str, Any]) -> str:
-    """Request the default max planning effort; preserve an explicit session-highest override."""
-    return (
-        HIGHEST_SESSION_REASONING_EFFORT
-        if safe_session_execution_preference(
-            state.get("session_execution_preference")
-        )
-        == "highest_throughout"
-        else DEFAULT_PLAN_REASONING_EFFORT
-    )
-
-
-def highest_execution_model(state: dict[str, Any]) -> str | None:
-    """Return only the model proved by the original assessor lifecycle."""
-    lifecycle, _ = original_assessor_lifecycle(state)
-    return str(lifecycle.get("model") or "") or None
-
-
-def highest_execution_effort(state: dict[str, Any]) -> str | None:
-    lifecycle, _ = original_assessor_lifecycle(state)
-    effort = str(lifecycle.get("reasoning_effort") or "").lower()
-    return effort if effort in {"high", "xhigh", "max", "ultra"} else None
+    """Every Hard assessor uses the single high-tier max profile."""
+    return DEFAULT_PLAN_REASONING_EFFORT
 
 
 def original_assessor_lifecycle(
@@ -1457,7 +1360,7 @@ def original_assessor_lifecycle(
         or not start_matches
         or not model
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{1,79}", model)
-        or effort not in {"high", "xhigh", "max", "ultra"}
+        or effort != DEFAULT_PLAN_REASONING_EFFORT
     ):
         return {}, "start_mismatch"
     return {
@@ -1632,30 +1535,14 @@ def executor_is_typed_recovery(
 def expected_executor_profile(
     state: dict[str, Any], request: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    preference = safe_session_execution_preference(
-        state.get("session_execution_preference")
-    )
-    if preference == "highest_throughout":
-        lifecycle, error = original_assessor_lifecycle(state)
-        return {
-            "profile": "work_executor_highest_available",
-            "model": lifecycle.get("model"),
-            "reasoning_effort": HIGHEST_SESSION_REASONING_EFFORT,
-            "error": error,
-        }
+    error = None
     if executor_is_typed_recovery(state, request):
         _, error = original_assessor_lifecycle(state)
-        return {
-            "profile": "work_executor_highest_available",
-            "model": RECOVERY_EXECUTOR_MODEL,
-            "reasoning_effort": RECOVERY_EXECUTOR_REASONING_EFFORT,
-            "error": error,
-        }
     return {
         "profile": "work_executor_low_latest",
         "model": None,
         "reasoning_effort": "medium",
-        "error": None,
+        "error": error,
     }
 
 
@@ -1870,8 +1757,6 @@ def reconcile_post_accepted_bound_start(
     current_slice = current_execution_slice(state) or {}
     profile = expected_executor_profile(state, request)
     expected_effort = str(profile.get("reasoning_effort") or "").lower()
-    expected_model = safe_label(profile.get("model"), 80) if profile.get("model") else None
-    highest_profile = profile.get("profile") == "work_executor_highest_available"
     exact = bool(
         not profile.get("error")
         and request.get("contract_id") == state.get("execution_contract_id")
@@ -1889,7 +1774,6 @@ def reconcile_post_accepted_bound_start(
         and str(request.get("fork_turns") or "")
         == str(state.get("executor_fork_turns") or "")
         == "1"
-        and (not highest_profile or request.get("model") == expected_model)
         and started.get("contract_id") == request.get("contract_id")
         and started.get("objective_fingerprint") == request.get("objective_fingerprint")
         and started.get("slice_id") == request.get("slice_id")
@@ -1933,11 +1817,6 @@ def reconcile_post_accepted_bound_start(
 
 def confirmed_executor_model_profile(state: dict[str, Any]) -> str:
     return str(expected_executor_profile(state).get("profile"))
-
-
-def incomplete_execution_highest_recovery(state: dict[str, Any]) -> bool:
-    """Compatibility alias retained for callers; evidence is lifecycle-derived."""
-    return executor_is_typed_recovery(state)
 
 
 def _safe_authorization_scope(value: Any) -> dict[str, str | None]:
@@ -3485,6 +3364,202 @@ def plan_artifact_session_id(value: Any, epoch_id: Any = None) -> str:
     return f"session-{stable_hash('plan-artifact-session' + chr(0) + scope)}"
 
 
+def _payload_rollout_fingerprint(payload: dict[str, Any]) -> str:
+    """Bind one root rollout slot without persisting its path or contents."""
+    source = payload.get("transcript_path")
+    if source in (None, ""):
+        source = "session:" + str(payload.get("session_id") or payload.get("hook_run_id") or "unknown")
+    return stable_hash("workflow-manager-root-rollout-v1\0" + str(source), 32)
+
+
+def root_authority_identity(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> str | None:
+    """Bind the immutable root/session facts used by one canonical journal."""
+    session = stable_hash(payload.get("session_id") or payload.get("hook_run_id"))
+    root_session = safe_fingerprint(state.get("root_session_fingerprint"))
+    root_cwd = safe_fingerprint(state.get("root_cwd_fingerprint"))
+    rollout = safe_fingerprint(state.get("root_rollout_fingerprint"))
+    epoch = current_task_epoch_id(state)
+    # Replanning may refine the mutable prompt/objective metadata inside one
+    # epoch.  Journal ownership stays anchored to the epoch's original
+    # objective so that an authorized replan can append its next revision.
+    objective = safe_fingerprint(
+        _safe_task_epoch(state.get("task_epoch")).get("objective_fingerprint")
+    )
+    if not all((root_session, root_cwd, rollout, epoch, objective)):
+        return None
+    if session != root_session:
+        return None
+    # Later executor and tool events may legitimately run from another cwd.
+    # Their cwd is operation context, never a replacement for the root cwd
+    # pinned at epoch creation, so it cannot retarget journal authority.
+    # Child lifecycle events likewise may carry their own transcript without
+    # replacing the parent rollout identity.
+    return stable_hash(
+        "workflow-manager-root-authority-v1\0"
+        + canonical_json(
+            {
+                "session": root_session,
+                "rollout": rollout,
+                "cwd": root_cwd,
+                "task_epoch": epoch,
+                "objective": objective,
+            }
+        ),
+        32,
+    )
+
+
+def plan_authority_identity(
+    state: dict[str, Any], payload: dict[str, Any], journal_digest: Any
+) -> tuple[str | None, str | None]:
+    root = root_authority_identity(state, payload)
+    journal = safe_fingerprint(journal_digest)
+    return (
+        root,
+        stable_hash(f"workflow-manager-plan-authority-v1\0{root}\0{journal}", 32)
+        if root and journal
+        else None,
+    )
+
+
+def _safe_retired_plan_authority(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    relative = str(value.get("relative_path") or "")
+    if not re.fullmatch(
+        r"plans/[A-Za-z0-9._-]+-[0-9a-f]{16}/hard-plan\.md", relative
+    ):
+        return None
+    journal = safe_fingerprint(value.get("journal_digest"))
+    authority = safe_fingerprint(value.get("authority_identity"))
+    epoch = safe_fingerprint(value.get("task_epoch_id"))
+    objective = safe_fingerprint(value.get("objective_fingerprint"))
+    if not all((journal, epoch, objective)):
+        return None
+    return {
+        "relative_path": relative,
+        "journal_digest": journal,
+        "authority_identity": authority or None,
+        "task_epoch_id": epoch,
+        "objective_fingerprint": objective,
+        "difficulty_decision_id": safe_fingerprint(
+            value.get("difficulty_decision_id")
+        )
+        or None,
+        "retired_reason": safe_label(value.get("retired_reason"), 48),
+        "retired_at": str(value.get("retired_at") or "")[:40] or None,
+    }
+
+
+def _writer_blocks_authority_retirement(state: dict[str, Any]) -> bool:
+    if parent_writer_lease_current(state):
+        return True
+    if _safe_child_liveness(state.get("child_liveness")).get("status") in {
+        "live",
+        "unknown",
+    }:
+        return True
+    return any(
+        group.get("state") in {"pending", "result_pending", "live"}
+        for group in subagent_lifecycle_groups(state)
+    )
+
+
+def retire_current_plan_authority(
+    state: dict[str, Any], *, reason: str
+) -> bool:
+    """Revoke current authority while leaving every journal byte untouched."""
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    epoch = current_task_epoch_id(state)
+    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    if not (
+        artifact.get("format_version") == 2
+        and artifact.get("relative_path")
+        and artifact.get("journal_digest")
+        and epoch
+        and objective
+    ):
+        return False
+    retired = [
+        item
+        for raw in as_list(state.get("retired_plan_authorities"))
+        if (item := _safe_retired_plan_authority(raw)) is not None
+    ]
+    candidate = _safe_retired_plan_authority(
+        {
+            "relative_path": artifact.get("relative_path"),
+            "journal_digest": artifact.get("journal_digest"),
+            "authority_identity": artifact.get("authority_identity"),
+            "task_epoch_id": epoch,
+            "objective_fingerprint": objective,
+            "difficulty_decision_id": state.get("difficulty_decision_id"),
+            "retired_reason": reason,
+            "retired_at": utc_now(),
+        }
+    )
+    if candidate and not any(
+        item.get("authority_identity") == candidate.get("authority_identity")
+        and item.get("journal_digest") == candidate.get("journal_digest")
+        for item in retired
+    ):
+        retired.append(candidate)
+    state["retired_plan_authorities"] = retired[-MAX_RETIRED_PLAN_AUTHORITIES:]
+    state["plan_state"] = "none"
+    state["plan_generation"] = 0
+    state["plan_digest"] = None
+    state["plan_objective_fingerprint"] = None
+    state["plan_difficulty_decision_id"] = None
+    state["confirmed_plan_digest"] = None
+    state["confirmed_at"] = None
+    state["plan_artifact"] = empty_plan_artifact()
+    state["execution_slices"] = _empty_execution_slices()
+    reset_executor_binding(state)
+    state["parent_writer_lease"] = _safe_parent_writer_lease(None)
+    state["child_liveness"] = _safe_child_liveness(None)
+    state["assessor_state"] = "none"
+    state["assessor_agent_id"] = None
+    state["assessor_model"] = None
+    state["assessor_reasoning_effort"] = None
+    state["assessor_input_fingerprint"] = None
+    state["assessor_binding_id"] = None
+    state["assessor_failure_kind"] = None
+    state["assessor_observed_effective"] = False
+    state["assessor_observed_model"] = None
+    state["assessor_observed_reasoning_effort"] = None
+    state["assessor_start_observed"] = "absent"
+    state["assessor_observation_source"] = None
+    state["assessor_fork_turns"] = None
+    state["assessor_attempt"] = 0
+    state["plan_composition"] = _safe_plan_composition(None)
+    state["authorization_envelope"] = _safe_authorization_envelope(None)
+    state["pending_confirmation_receipt"] = None
+    state["causal_review"] = _safe_causal_review(None)
+    state["pending_causal_revision"] = {}
+    return True
+
+
+def detach_non_hard_successor_authority(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> bool:
+    """Detach an old Hard journal before any recovery for a proven successor."""
+    hint = payload.get("_prospective_non_hard_successor")
+    if payload.get("hook_event_name") != "UserPromptSubmit" or not isinstance(hint, dict):
+        return False
+    if hint.get("task_domain") not in {"daily", "work"}:
+        return False
+    if hint.get("work_difficulty") not in {"not_applicable", "simple"}:
+        return False
+    successor = safe_fingerprint(hint.get("objective_fingerprint"))
+    current = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    if not successor or not current or successor == current:
+        return False
+    if _writer_blocks_authority_retirement(state):
+        return False
+    return retire_current_plan_authority(state, reason="non_hard_successor")
+
+
 def _safe_task_epoch(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {"id": None, "sequence": 0, "status": "none", "objective_fingerprint": None}
@@ -3715,7 +3790,7 @@ def _active_legacy_lifecycle(value: dict[str, Any]) -> dict[str, Any] | None:
 def isolate_legacy_writer(
     state: dict[str, Any], value: dict[str, Any], *, source_writer: str
 ) -> bool:
-    """Tombstone one pre-v12 owner and require a fresh current lifecycle.
+    """Tombstone one pre-v13 owner and require a fresh current lifecycle.
 
     The tombstone keeps only bounded routing identities.  It lets a late
     Start/Stop be attributed to the old epoch after transient lifecycle rows
@@ -3751,7 +3826,7 @@ def isolate_legacy_writer(
             "request_fingerprint": isolated.get("request_fingerprint"),
             "source": "schema_migration",
             "observation_digest": stable_hash(
-                f"schema33-isolation\0{source_writer}\0{isolated['agent_fingerprint']}",
+                f"schema34-isolation\0{source_writer}\0{isolated['agent_fingerprint']}",
                 32,
             ),
             "at": utc_now(),
@@ -3806,6 +3881,7 @@ def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective:
             "plan_digest": safe_fingerprint(state.get("plan_digest")) or None,
             "execution_contract_id": safe_fingerprint(state.get("execution_contract_id")) or None,
         })
+    retire_current_plan_authority(state, reason="task_epoch_rotated")
     sequence = max(current.get("sequence", 0), 0) + 1
     state["task_epoch"] = {
         "id": task_epoch_id(payload, sequence, objective.get("fingerprint")),
@@ -3815,6 +3891,7 @@ def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective:
     state["cwd_fingerprint"] = stable_hash(payload.get("cwd"))
     state["root_cwd_fingerprint"] = state["cwd_fingerprint"]
     state["root_session_fingerprint"] = stable_hash(payload.get("session_id") or payload.get("hook_run_id"))
+    state["root_rollout_fingerprint"] = _payload_rollout_fingerprint(payload)
     state["root_rollout_identity"] = None
     state["archived_epochs"] = archive[-8:]
     return True
@@ -4777,6 +4854,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         # observe a different cwd or rollout, but can never retarget recovery.
         "root_session_fingerprint": stable_hash(payload.get("session_id") or payload.get("hook_run_id")),
         "root_cwd_fingerprint": stable_hash(payload.get("cwd")),
+        "root_rollout_fingerprint": _payload_rollout_fingerprint(payload),
         "root_rollout_identity": None,
         # Epoch 0 is intentionally unbound until UserPromptSubmit supplies an
         # objective.  Schema-31 migration keeps its legacy journal untouched.
@@ -4822,6 +4900,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "confirmed_plan_digest": None,
         "confirmed_at": None,
         "plan_artifact": empty_plan_artifact(),
+        "retired_plan_authorities": [],
         "execution_slices": _empty_execution_slices(),
         "execution_profile_version": EXECUTION_PROFILE_VERSION,
         "executor_state": "none",
@@ -5606,6 +5685,8 @@ def empty_plan_artifact() -> dict[str, Any]:
         "journal_digest": None,
         "journal_prefix_digest": None,
         "journal_prefix_bytes": 0,
+        "root_identity_digest": None,
+        "authority_identity": None,
         "generation": 0,
         "revision_count": 0,
         "lifecycle_status": "none",
@@ -5644,6 +5725,14 @@ def _safe_plan_artifact(item: Any) -> dict[str, Any]:
             "journal_digest": safe_fingerprint(item.get("journal_digest")) or None,
             "journal_prefix_digest": safe_fingerprint(item.get("journal_prefix_digest")) or None,
             "journal_prefix_bytes": max(safe_int(item.get("journal_prefix_bytes")), 0),
+            "root_identity_digest": safe_fingerprint(
+                item.get("root_identity_digest")
+            )
+            or None,
+            "authority_identity": safe_fingerprint(
+                item.get("authority_identity")
+            )
+            or None,
             "generation": max(safe_int(item.get("generation")), 0),
             "revision_count": max(safe_int(item.get("revision_count")), 0),
             "lifecycle_status": item.get("lifecycle_status") if item.get("lifecycle_status") in PLAN_ARTIFACT_LIFECYCLE_STATUSES else "none",
@@ -5723,26 +5812,11 @@ def sanitize_plan_artifact_body(value: Any) -> str:
             continue
         characters.append(character)
     text = "".join(characters)
-    protocol = re.compile(
-        r"^\s*(?:WORK_ASSESSMENT|EXECUTION_STALL|"
-        r"STALL_DIAGNOSIS|CAUSAL_REVIEW)\b",
-        re.I,
-    )
-    lines = [
-        line
-        for line in text.splitlines()
-        if not protocol.match(line)
-        and not re.fullmatch(
-            r"\s*计划已就绪，等待确认后执行[。.!！\s]*",
-            line,
-        )
-    ]
-    body = redact_text("\n".join(lines))
+    body = redact_text(text)
     body = body.replace("<redacted-token>", "[REDACTED]").replace(
         "<redacted>", "[REDACTED]"
     )
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
-    body = normalize_execution_slice_manifest_fence(body)
     body = body.rstrip() + "\n"
     if len(body.encode("utf-8")) > MAX_PLAN_REVISION_BYTES:
         raise PlanArtifactError("revision_too_large")
@@ -5772,10 +5846,6 @@ def native_assessor_result_digest(value: Any) -> str | None:
     source = str(value or "").strip()
     size = len(source.encode("utf-8"))
     if not 0 < size <= MAX_PLAN_REVISION_BYTES:
-        return None
-    if re.search(r"(?i)\bWORK_ASSESSMENT\b", source):
-        return None
-    if EXECUTION_SLICES_FENCE_INTENT_RE.search(source):
         return None
     return stable_hash("workflow-manager-native-assessor-result-v1\0" + source, 32)
 
@@ -7658,6 +7728,12 @@ def _persisted_plan_transaction_side(
 
 
 def recover_plan_transaction(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    # A retired journal has no current state capability. Its bytes and any
+    # interrupted marker stay untouched for forensic retention; recovery is
+    # meaningful only while state still names that exact journal authority.
+    if artifact.get("format_version") != 2 or not artifact.get("journal_digest"):
+        return True
     try:
         try:
             root = _canonical_plan_data_root(payload)
@@ -7925,6 +8001,16 @@ def migrate_legacy_plan_artifacts(
     # routing, and private handoff bindings only; re-verify the journal below
     # instead of treating a valid v2 artifact as an unavailable legacy mirror.
     if source_schema >= 20:
+        if artifact.get("format_version") == 2 and artifact.get("journal_digest"):
+            root_identity, authority_identity = plan_authority_identity(
+                state, payload, artifact.get("journal_digest")
+            )
+            if not root_identity or not authority_identity:
+                invalidate_plan_authority(state, warning_code="content_drift")
+                return False
+            artifact["root_identity_digest"] = root_identity
+            artifact["authority_identity"] = authority_identity
+            state["plan_artifact"] = artifact
         return True
     if source_schema != 19 or artifact.get("format_version") != 1:
         if state.get("plan_state") in {
@@ -8076,6 +8162,11 @@ def migrate_legacy_plan_artifacts(
             old_plan_state = legacy_plan_state
             old_executor_state = legacy_executor_state
             revision_digest = parsed["current_revision_digest"]
+            root_identity, authority_identity = plan_authority_identity(
+                state, payload, parsed["journal_digest"]
+            )
+            if not root_identity or not authority_identity:
+                raise PlanArtifactError("legacy_unavailable")
             state["plan_generation"] = parsed["generation"]
             state["plan_digest"] = revision_digest
             state["plan_objective_fingerprint"] = parsed["objective_fingerprint"]
@@ -8093,6 +8184,8 @@ def migrate_legacy_plan_artifacts(
                 "journal_digest": parsed["journal_digest"],
                 "journal_prefix_digest": parsed["journal_prefix_digest"],
                 "journal_prefix_bytes": parsed["journal_prefix_bytes"],
+                "root_identity_digest": root_identity,
+                "authority_identity": authority_identity,
                 "generation": parsed["generation"],
                 "revision_count": parsed["revision_count"],
                 "lifecycle_status": "ready",
@@ -8197,6 +8290,8 @@ def _plan_artifact_binding_valid(
         == safe_fingerprint(state.get("plan_objective_fingerprint"))
         and artifact.get("difficulty_decision_id")
         == safe_fingerprint(state.get("plan_difficulty_decision_id"))
+        and artifact.get("root_identity_digest")
+        and artifact.get("authority_identity")
     )
 
 
@@ -8253,6 +8348,9 @@ def write_plan_artifact(
         if not objective or not difficulty:
             raise PlanArtifactError("write_error")
         root = _canonical_plan_data_root(payload)
+        root_identity = root_authority_identity(state, payload)
+        if not root_identity:
+            raise PlanArtifactError("write_error")
         directory = root / "plans" / session
         target = directory / PLAN_JOURNAL_NAME
         generation = max(
@@ -8318,6 +8416,11 @@ def write_plan_artifact(
                     {**pending_causal, "creation_state": "executable"}
                     if pending_causal else None
                 ),
+            )
+            authority_identity = stable_hash(
+                "workflow-manager-plan-authority-v1\0"
+                f"{root_identity}\0{parsed['journal_digest']}",
+                32,
             )
             prepared_backup_name = (
                 _transaction_name(target, "backup", directory_fd)
@@ -8418,6 +8521,8 @@ def write_plan_artifact(
                 "journal_digest": parsed["journal_digest"],
                 "journal_prefix_digest": parsed["journal_prefix_digest"],
                 "journal_prefix_bytes": parsed["journal_prefix_bytes"],
+                "root_identity_digest": root_identity,
+                "authority_identity": authority_identity,
                 "generation": generation,
                 "revision_count": parsed["revision_count"],
                 "lifecycle_status": "ready",
@@ -8504,6 +8609,11 @@ def append_runtime_plan_record(
             if not _stored_artifact_matches_journal(artifact, parsed):
                 raise PlanArtifactError("content_drift")
             document, updated = append_plan_journal_record(existing, record_type=record_type, data=data)
+            root_identity, authority_identity = plan_authority_identity(
+                state, payload, updated["journal_digest"]
+            )
+            if not root_identity or not authority_identity:
+                raise PlanArtifactError("content_drift")
             transaction = _atomic_write_plan_file(
                 target, document, expected_old_bytes=existing,
                 directory_fd=guard["directory_fd"], verify_binding=guard["verify"],
@@ -8516,6 +8626,8 @@ def append_runtime_plan_record(
         artifact["journal_digest"] = updated["journal_digest"]
         artifact["journal_prefix_digest"] = updated["journal_prefix_digest"]
         artifact["journal_prefix_bytes"] = updated["journal_prefix_bytes"]
+        artifact["root_identity_digest"] = root_identity
+        artifact["authority_identity"] = authority_identity
         artifact["updated_at"] = utc_now()
         state["plan_artifact"] = artifact
         latest = updated["records"][-1]
@@ -8592,6 +8704,16 @@ def verify_plan_artifact(state: dict[str, Any], payload: dict[str, Any]) -> bool
             )
             parsed = parse_plan_journal(document, expected_session=session)
             guard["verify"]()
+        root_identity, authority_identity = plan_authority_identity(
+            state, payload, parsed.get("journal_digest")
+        )
+        if (
+            not root_identity
+            or not authority_identity
+            or artifact.get("root_identity_digest") != root_identity
+            or artifact.get("authority_identity") != authority_identity
+        ):
+            raise PlanArtifactError("content_drift")
         active_binding = state.get("plan_state") in {
             "plan_ready",
             "awaiting_confirmation",
@@ -8768,7 +8890,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     base["created_at"] = value.get("created_at") or base["created_at"]
     for key in (
         "session_fingerprint", "cwd_fingerprint", "root_session_fingerprint",
-        "root_cwd_fingerprint",
+        "root_cwd_fingerprint", "root_rollout_fingerprint",
     ):
         fingerprint = safe_fingerprint(value.get(key))
         if fingerprint:
@@ -8780,6 +8902,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         base["root_session_fingerprint"] = base["session_fingerprint"]
     if not safe_fingerprint(value.get("root_cwd_fingerprint")):
         base["root_cwd_fingerprint"] = base["cwd_fingerprint"]
+    if not safe_fingerprint(value.get("root_rollout_fingerprint")):
+        base["root_rollout_fingerprint"] = _payload_rollout_fingerprint(payload)
     # Do not invent an epoch id for schema-31 state: its journal path is part
     # of the historical evidence.  It becomes an explicit successor only on a
     # later safe new-objective boundary.
@@ -8928,6 +9052,11 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if safe_int(value.get("schema_version")) >= 18
         else _legacy_plan_artifact(base)
     )
+    base["retired_plan_authorities"] = [
+        item
+        for raw in as_list(value.get("retired_plan_authorities"))
+        if (item := _safe_retired_plan_authority(raw)) is not None
+    ][-MAX_RETIRED_PLAN_AUTHORITIES:]
     source_schema = safe_int(value.get("schema_version"))
     base["execution_slices"] = (
         _safe_execution_slices(value.get("execution_slices"))
@@ -8989,7 +9118,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and value.get("executor_state") in {"running", "verification_required"}
     )
     # v11 lifecycle records remain audit evidence only.  They must not gain
-    # v12 write authority during a schema migration.
+    # v13 write authority during a schema migration.
     active_profile11_continuity = False
     # Active and failed contracts rebind to the current profile. A completed,
     # baseline-sealed contract keeps the profile it actually executed under;
@@ -9237,7 +9366,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and base.get("plan_state") == "confirmed"
     ):
         # A currently active v11 writer is not terminal proof.  Isolate it
-        # and require a v12 recovery lifecycle instead of silently reusing it.
+        # and require a v13 recovery lifecycle instead of silently reusing it.
         base["executor_state"] = "recovery_required"
         base["executor_failure_kind"] = "stale_contract"
         base["executor_agent_id"] = None
@@ -9464,8 +9593,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             base["assessor_fork_turns"] = None
             base["assessor_attempt"] = 0
         if legacy_writer_isolated:
-            # The current plan/contract can be repaired by a fresh v12
-            # recovery child, but the pre-v12 process is only a tombstone.
+            # The current plan/contract can be repaired by a fresh v13
+            # recovery child, but the pre-v13 process is only a tombstone.
             # Do not reopen assessment or overwrite the explicit recovery.
             pass
         elif (
@@ -9599,6 +9728,11 @@ def trim_state(state: dict[str, Any]) -> None:
         for raw in as_list(state.get("isolated_lifecycles"))
         if (item := _safe_isolated_lifecycle(raw)) is not None
     ][-MAX_ISOLATED_LIFECYCLES:]
+    state["retired_plan_authorities"] = [
+        item
+        for raw in as_list(state.get("retired_plan_authorities"))
+        if (item := _safe_retired_plan_authority(raw)) is not None
+    ][-MAX_RETIRED_PLAN_AUTHORITIES:]
     state["child_liveness"] = _safe_child_liveness(state.get("child_liveness"))
     state["processed_hook_runs"] = list(state.get("processed_hook_runs", []))[-MAX_PROCESSED_RUNS:]
     state["duplicate_notices"] = list(state.get("duplicate_notices", []))[-MAX_DUPLICATE_NOTICES:]
@@ -9713,6 +9847,12 @@ def reconcile_missed_parent_controls_from_rollout(
     bound_identity = state.get("root_rollout_identity")
     if bound_identity is None:
         state["root_rollout_identity"] = root_identity
+        if not _safe_plan_artifact(state.get("plan_artifact")).get(
+            "journal_digest"
+        ):
+            state["root_rollout_fingerprint"] = _payload_rollout_fingerprint(
+                payload
+            )
     elif bound_identity != root_identity:
         record_lifecycle_diagnostic(state, "root_identity_mismatch", level="error")
         return False
@@ -9825,7 +9965,10 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
             if state.get("_state_load_failure"):
                 state["_snapshot_failure"] = "invalid_state"
                 return state
-            if not recover_plan_transaction(state, payload):
+            detached_successor = detach_non_hard_successor_authority(
+                state, payload
+            )
+            if not detached_successor and not recover_plan_transaction(state, payload):
                 state["_snapshot_failure"] = "transaction_recovery_failed"
                 state.pop("_source_schema_version", None)
                 state.pop("_legacy_plan_state", None)
@@ -9846,8 +9989,12 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
                     migrate_legacy_plan_artifacts(
                         state, payload, source_schema
                     )
-                artifact_valid = verify_plan_artifact(state, payload)
-                if reconcile_missed_parent_controls_from_rollout(payload, state):
+                artifact_valid = (
+                    False
+                    if detached_successor
+                    else verify_plan_artifact(state, payload)
+                )
+                if not detached_successor and reconcile_missed_parent_controls_from_rollout(payload, state):
                     artifact_valid = verify_plan_artifact(state, payload)
                 if payload.get("_read_canonical_plan_body") and artifact_valid:
                     canonical_current_body = _read_verified_current_plan_revision(
@@ -9858,7 +10005,12 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
             pending = state.pop("_plan_transaction", None)
             after = json.dumps(state, ensure_ascii=False, sort_keys=True)
             try:
-                if normalized_state_changed or after != before or pending is not None:
+                if (
+                    normalized_state_changed
+                    or detached_successor
+                    or after != before
+                    or pending is not None
+                ):
                     atomic_write(path, state)
             except Exception:
                 if pending is not None:
@@ -9975,7 +10127,10 @@ def mutate_state(
                     payload, path_resolved=True, outcome="invalid_state"
                 )
                 return state, False
-            if not recover_plan_transaction(state, payload):
+            detached_successor = detach_non_hard_successor_authority(
+                state, payload
+            )
+            if not detached_successor and not recover_plan_transaction(state, payload):
                 state.pop("_source_schema_version", None)
                 state.pop("_legacy_plan_state", None)
                 state.pop("_legacy_executor_state", None)
@@ -10023,7 +10178,8 @@ def mutate_state(
                     migrate_legacy_plan_artifacts(
                         state, payload, source_schema
                     )
-                verify_plan_artifact(state, payload)
+                if not detached_successor:
+                    verify_plan_artifact(state, payload)
                 increment_event_count(state, payload)
                 change(state)
             except Exception:
@@ -11238,6 +11394,12 @@ def trusted_current_root_rollout(
         return None
     if bound_identity is None:
         state["root_rollout_identity"] = identity
+        if not _safe_plan_artifact(state.get("plan_artifact")).get(
+            "journal_digest"
+        ):
+            state["root_rollout_fingerprint"] = _payload_rollout_fingerprint(
+                payload
+            )
     return records, cwd
 
 
@@ -11444,38 +11606,20 @@ def reconcile_current_parent_rollout_on_resume(
     return reconciled
 
 
-def transcript_has_exact_parent_review_pass(
-    path_value: Any, contract_id: str, slice_id: str
-) -> bool:
-    """Accept only the host transcript's latest assistant final marker."""
-    marker = f"EXECUTION_REVIEW execution_contract_id={contract_id} slice_id={slice_id} outcome=passed"
-    for raw in reversed(read_transcript_tail(path_value)):
-        try:
-            item = json.loads(raw)
-            payload = item.get("payload") or {}
-            if item.get("type") != "response_item" or payload.get("type") != "message":
-                continue
-            if payload.get("role") != "assistant" or payload.get("phase") != "final_answer":
-                continue
-            content = payload.get("content")
-            if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
-                return False
-            return str(content[0].get("text") or "").rstrip("\r\n") == marker
-        except Exception:
-            continue
-    return False
-
-
 def latest_parent_review_host_success(path_value: Any, contract_id: str, slice_id: str) -> tuple[str, str] | None:
-    """Bind a final parent-pass marker to its sole structured host exec result."""
-    marker = f"EXECUTION_REVIEW execution_contract_id={contract_id} slice_id={slice_id} outcome=passed"
+    """Bind one native final parent turn to its sole structured host result."""
     for raw in reversed(read_transcript_tail(path_value)):
         try:
             item = json.loads(raw); payload = item.get("payload") or {}
             if item.get("type") != "response_item" or payload.get("type") != "message" or payload.get("role") != "assistant" or payload.get("phase") != "final_answer":
                 continue
             content = payload.get("content")
-            if not (isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict) and str(content[0].get("text") or "").rstrip("\r\n") == marker):
+            if not (
+                isinstance(content, list)
+                and len(content) == 1
+                and isinstance(content[0], dict)
+                and str(content[0].get("text") or "").strip()
+            ):
                 return None
             turn_id = _host_event_turn_id(payload)
             if not turn_id:
@@ -11497,7 +11641,7 @@ def completed_parent_review_rollout(
     This bridge exists for Desktop builds whose Stop payload omits the final
     assistant body/status even though the durable rollout contains it.  It
     deliberately requires the full regular rollout, one same-session meta,
-    one exact final marker, and the matching task_complete record.
+    one nonempty native final answer, and the matching task_complete record.
     """
     session_id = safe_label(payload.get("session_id"), 120)
     if not session_id:
@@ -11538,19 +11682,9 @@ def completed_parent_review_rollout(
         ):
             continue
         message = content[0]["text"]
-        match, body, intent = _strict_terminal_marker(
-            message, "EXECUTION_REVIEW", EXECUTION_REVIEW_RE
-        )
-        if not intent:
+        body = message.strip()
+        if not body:
             continue
-        if not match:
-            if contract_id in message and f"slice_id={slice_id}" in message:
-                return None
-            continue
-        if match.group(1) != contract_id or match.group(2) != slice_id:
-            continue
-        if match.group(3) != "passed":
-            return None
         turn_id = _host_event_turn_id(event)
         if not turn_id:
             return None
@@ -13431,14 +13565,8 @@ def confirmed_executor_request(
     profile = expected_executor_profile(state)
     if profile.get("error"):
         return False, str(profile["error"])
-    if profile.get("profile") == "work_executor_highest_available":
-        if (
-            model != str(profile.get("model") or "")
-            or effort != str(profile.get("reasoning_effort") or "")
-        ):
-            return False, "executor profile does not match the typed recovery/session policy"
-    elif model == RECOVERY_EXECUTOR_MODEL or effort != "medium":
-        return False, "normal executor requires a lower-tier model at medium"
+    if model == ASSESSOR_MODEL or effort != "medium":
+        return False, "executor requires a lower-tier model at medium"
     return True, None
 
 
@@ -13454,8 +13582,8 @@ def confirmed_assessor_request(
         return False, f"assessor {resolution['error']}"
     if envelope_error := bound_spawn_envelope_conflict(payload):
         return False, f"assessor spawn envelope conflict: {envelope_error}"
-    if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
-        return False, "duplicate assessor"
+    if state.get("assessor_state") != "spawn_required":
+        return False, "this Hard envelope already consumed its assessor slot"
     if writer_liveness_blocks_successor(state):
         return False, "writer inventory is live or unknown; do not overlap a successor"
 
@@ -13468,13 +13596,13 @@ def confirmed_assessor_request(
 
     options = subagent_request_options(payload)
     model = str(options.get("model") or "").strip()
-    if model != RECOVERY_EXECUTOR_MODEL:
+    if model != ASSESSOR_MODEL:
         return False, "assessor requires the current highest available model"
     if (
         str(options.get("reasoning_effort") or "").lower()
-        != requested_assessor_reasoning_effort(state)
+        != DEFAULT_PLAN_REASONING_EFFORT
     ):
-        return False, "assessor reasoning_effort does not match session policy"
+        return False, "assessor reasoning_effort must be max"
     if str(options.get("fork_turns") or "") != "1":
         return False, "every bound assessor requires fork_turns=1"
     return True, None
@@ -15169,13 +15297,6 @@ def session_start(payload: dict[str, Any]) -> None:
         "compaction, and subagent scheduling; Workflow Manager adds only Hard authorization, canonical "
         "contracts, runtime-truth evidence, and fixed safety boundaries."
     )
-    if preference == "highest_throughout":
-        base += (
-            " Session execution preference=highest_throughout: request explicit highest_available child "
-            "contracts matching the bound highest assessor model/reasoning profile. Daily remains current. "
-            "This Hook cannot switch the parent or prove that the host applied a requested override; "
-            "record request and observed start metadata separately."
-        )
     if stable_skill.get("status") not in {"installed", "updated", "current"}:
         base += (
             " Stable Workflow Manager Skill activation is not verified "
@@ -15462,54 +15583,6 @@ def _normalized_control_candidate(prompt: str) -> str:
     if not value or "\n" in value or "\r" in value or "```" in value or "`" in value:
         return ""
     return re.sub(r"[ \t]+", " ", value).strip().lower()
-
-
-def session_execution_preference_directive(prompt: str) -> str | None:
-    """Recognize only explicit, session-scoped policy commands; retain no raw text."""
-    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
-    if not normalized or re.search(
-        r"^(?:解释|说明|分析|判断|告诉我|what|why|how|does|is|explain|document)\b",
-        normalized,
-        re.I,
-    ):
-        return None
-    chinese_scope = bool(re.search(r"(?:本|当前|这个|整个|此|该)(?:次)?会话", normalized))
-    english_scope = bool(
-        re.search(
-            r"\b(?:this|current)(?: entire| whole)? session\b|"
-            r"\b(?:entire|whole) session\b|"
-            r"\b(?:rest|remainder) of (?:this|the current) session\b",
-            normalized,
-            re.I,
-        )
-    )
-    if not (chinese_scope or english_scope):
-        return None
-    restore = bool(
-        re.search(
-            r"(?:恢复|改回|切回|回到).{0,20}默认.{0,20}(?:模型|推理|执行|档位|策略|配置)|"
-            r"(?:restore|reset|revert|switch back).{0,24}default.{0,24}"
-            r"(?:model|reasoning|execution|profile|policy|setting)",
-            normalized,
-            re.I,
-        )
-    )
-    if restore:
-        return "default"
-    if re.search(r"(?:不要|无需|不再|do not|don't|without)", normalized, re.I):
-        return None
-    throughout = bool(
-        re.search(r"(?:全程|始终|一直|整个会话|接下来.{0,10}(?:都|全程))", normalized)
-        or re.search(r"\b(?:throughout|always|for the (?:entire|whole|rest of the))\b", normalized)
-    )
-    highest_model = bool(
-        re.search(r"最高(?:可用)?(?:的)?模型|\bhighest(?: available)? (?:codex )?model\b", normalized)
-    )
-    highest_reasoning = bool(
-        re.search(r"最高(?:可用)?(?:的)?推理(?:强度|力度|等级)?", normalized)
-        or re.search(r"\b(?:highest|maximum|max) reasoning(?: effort| level| intensity)?\b", normalized)
-    )
-    return "highest_throughout" if throughout and highest_model and highest_reasoning else None
 
 
 def pure_plan_confirmation(prompt: str) -> bool:
@@ -15844,6 +15917,18 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or plan_replan_request(prompt)
         or prompt_changes_pending_plan(prompt)
     )
+    prospective_route = classify_prompt(prompt)
+    if (
+        explicit_new_objective(prompt)
+        and prospective_route.get("task_domain") in {"daily", "work"}
+        and prospective_route.get("work_difficulty")
+        in {"not_applicable", "simple"}
+    ):
+        payload["_prospective_non_hard_successor"] = {
+            "objective_fingerprint": text_metadata(prompt).get("fingerprint"),
+            "task_domain": prospective_route.get("task_domain"),
+            "work_difficulty": prospective_route.get("work_difficulty"),
+        }
     snapshot_payload = dict(payload)
     if canonical_context_requested:
         snapshot_payload["_read_canonical_plan_body"] = True
@@ -15882,8 +15967,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and previous.get("assessor_state")
         in {"spawn_required", "spawn_pending", "running", "recovery_required", "failed"}
     )
-    preference_directive = session_execution_preference_directive(prompt)
-    preference_changed = preference_directive not in {None, previous.get("session_execution_preference", "default")}
     requested_reference = reference_requested(prompt)
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     confirmable_pending = previous.get("plan_state") == "awaiting_confirmation"
@@ -16052,8 +16135,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     )
     trusted_progress_context = has_trusted_prior_task_context(previous, payload)
     continuation = bool(root_continuation_key) or epoch_switch_blocked or (not new_objective and (
-        preference_directive is not None
-        or is_control_followup(prompt)
+        is_control_followup(prompt)
         or status_query
         or (trusted_progress_context and is_progress_followup(prompt))
         or active_plan
@@ -16110,8 +16192,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 ),
             }
         )
-    if preference_directive is not None and previous.get("last_route"):
-        classification = merge_followup_route(previous["last_route"], classification)
     if identity_preflight:
         # A fresh host-identity probe is control-plane work, never a continuation
         # of a prior Hard route. Re-apply this after all continuation/preference
@@ -16150,19 +16230,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             )
         if epoch_switch_blocked:
             record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
-        if preference_directive is not None:
-            if preference_changed and _epoch_has_live_writer(state):
-                record_lifecycle_diagnostic(
-                    state, "epoch_switch_live_writer", level="error",
-                    role=("confirmed_executor" if state.get("executor_agent_id") else "high_assessor"),
-                )
-            else:
-                state["session_execution_preference"] = preference_directive
-                if preference_changed and state.get("plan_state") == "confirmed":
-                    reset_executor_binding(state)
-                    state["execution_contract_id"] = execution_contract_id(state)
-                    state["executor_state"] = "spawn_required"
-                    state["model_profile"] = confirmed_executor_model_profile(state)
         if causal_report:
             baseline = _safe_execution_baseline(state.get("last_execution_baseline"))
             review_id = stable_hash(
@@ -16465,7 +16532,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     )
     should_inject = (
         identity_preflight
-        or preference_directive is not None
         or causal_report
         or reference_failure
         or causal_active
@@ -16534,27 +16600,14 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 f"{canonical_current_body}"
                 "END_WORKFLOW_MANAGER_CANONICAL_PLAN"
             )
-    if preference_directive is not None:
-        context += (
-            f" Session execution preference request recorded as {preference_directive}; this is policy "
-            "state only and does not prove that the host changed the parent model or reasoning settings."
-        )
     if classification.get("task_domain") == "work" and refreshed_for_assessor.get("assessor_state") == "spawn_required":
         assessor_task = bound_assessor_task_name(refreshed_for_assessor)
-        assessor_effort = requested_assessor_reasoning_effort(
-            refreshed_for_assessor
-        )
-        assessor_effort_policy = (
-            "explicit session-highest override"
-            if assessor_effort == HIGHEST_SESSION_REASONING_EFFORT
-            else "default second-highest reasoning tier"
-        )
         context += (
             " Hard work needs one read-only high-tier assessment before mutation. Make exactly this collaboration "
             "call shape: collaboration.spawn_agent("
-            f"task_name=\"{assessor_task}\", fork_turns=\"1\", model=\"{RECOVERY_EXECUTOR_MODEL}\", "
-            f"reasoning_effort=\"{assessor_effort}\", message=<read-only assessment>). "
-            f"This is the highest available Codex model at {assessor_effort} ({assessor_effort_policy}). "
+            f"task_name=\"{assessor_task}\", fork_turns=\"1\", model=\"{ASSESSOR_MODEL}\", "
+            "reasoning_effort=\"max\", message=<read-only assessment>). "
+            "This is the single high-tier assessor slot for the current Hard envelope. "
             "Omit agent_type and do not construct fork_context; either option can be rejected by the host before "
             "a lifecycle receipt exists. "
             "Let the assessor judge objective/scope, acceptance, risk, rollback, and stop conditions natively. "
@@ -16599,16 +16652,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "child writer or unfinished causal/stall diagnosis, the parent may acquire the slice lease directly. "
             "If a child is chosen, the Hook privately delivers the verified plan; task_name is only an opaque host label."
         )
-        if refreshed_for_assessor.get("session_execution_preference") == "highest_throughout":
-            context += (
-                " Spawn one executor with the bound highest model, ultra reasoning, fork_turns=1, and any safe "
-                f"ASCII task_name (suggestion: {executor_task})."
-            )
-        else:
-            context += (
-                " Spawn one executor with a current lower-tier Codex model, reasoning_effort=medium, fork_turns=1, "
-                f"and any safe ASCII task_name (suggestion: {executor_task})."
-            )
+        context += (
+            " Spawn one executor with a current lower-tier Codex model, reasoning_effort=medium, fork_turns=1, "
+            f"and any safe ASCII task_name (suggestion: {executor_task})."
+        )
     elif early_confirmation:
         context += (
             " Early host-bound confirmation receipt recorded for the current objective and assessor binding. "
@@ -16630,7 +16677,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             if pending:
                 context += (
                     " A fresh recovery child is already host-bound if native diagnosis chooses that path; use "
-                    f"model={RECOVERY_EXECUTOR_MODEL}, reasoning_effort={RECOVERY_EXECUTOR_REASONING_EFFORT}, "
+                    "a current lower-tier model, reasoning_effort=medium, "
                     "fork_turns=1 and any safe ASCII task_name. Parent-side diagnosis or verification may instead "
                     "finish without a child. Never follow up a terminal child."
                 )
@@ -16653,7 +16700,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             context += (
                 " Executor completion is only a candidate. Independently inspect the artifacts and run the acceptance "
                 "verification, then report the result naturally. Host-recorded verification plus parent Stop seals the "
-                "review; EXECUTION_REVIEW is optional. A material failure uses a fresh typed child and never revives a terminal child."
+                "review. A material failure uses a fresh typed child and never revives a terminal child."
             )
         elif refreshed_for_assessor.get("executor_state") == "running":
             staged = _safe_pending_recovery_reservation(
@@ -16663,8 +16710,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 context += (
                     " The exact recovery claim arrived before the bound terminal lifecycle. It is retained as "
                     "digest-only terminal_pending evidence and carries no mutation or spawn authority. A unique "
-                    "matching mailbox completed result plus final EXECUTION_RESULT must form the terminal boundary "
-                    "before the reservation can bind automatically."
+                    "matching mailbox completed result must form the terminal boundary before the reservation can "
+                    "bind automatically; result prose has no protocol authority."
                 )
     elif classification.get("work_difficulty") == "hard" and not pending_plan:
         context += (
@@ -16672,7 +16719,11 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "risk, and rollback. Do not mutate before confirmation."
         )
     elif repair_pending:
-        context += " Canonical plan repair is pending; confirmation or clarification cannot unlock execution. Explicitly replan to request one new assessor."
+        context += (
+            " Canonical plan repair is pending; confirmation or clarification cannot unlock execution. "
+            "Reuse the current envelope's completed assessment and let the parent write a trusted replacement revision; "
+            "a materially new authorization envelope starts a separate Hard assessment."
+        )
     elif pending_plan and not confirmed_plan:
         context += " Awaiting strict plan confirmation; answer plan questions but do not mutate, build, or deploy."
     emit_context("UserPromptSubmit", context)
@@ -16832,14 +16883,9 @@ def record_confirmed_executor_pretool(
             f"{decision['reason']}. Diagnose or use new evidence/root cause/material correction before replay."
         )
         return True
-    profile_text = (
-        "highest_available gpt-5.6-sol/max recovery request"
-        if decision.get("profile") == "work_executor_highest_available"
-        else "lower-tier model and medium reasoning request"
-    )
     emit_context(
         "PreToolUse",
-        f"Executor request reserved with the {profile_text} and fork_turns=1. task_name/prose are opaque; "
+        "Executor request reserved with the lower-tier model and medium reasoning request and fork_turns=1. task_name/prose are opaque; "
         "authority still requires the matching host acceptance and full Start before mutation.",
     )
     return True
@@ -17280,18 +17326,10 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             # current sequence, failure identity, and profile unchanged.
 
         mutate_state(payload, record_executor_guard)
-        expected_profile = expected_executor_profile(state)
-        if expected_profile.get("profile") == "work_executor_highest_available":
-            profile_instruction = (
-                "Use profile_resolution=highest_available and explicitly request "
-                f"model={expected_profile.get('model')} with reasoning_effort="
-                f"{expected_profile.get('reasoning_effort')}"
-            )
-        else:
-            profile_instruction = (
-                "Resolve the newest actually available lower-tier model and explicitly request "
-                "reasoning_effort=medium"
-            )
+        profile_instruction = (
+            "resolve the newest actually available lower-tier model and explicitly request "
+            "reasoning_effort=medium"
+        )
         emit_pretool_deny(
             f"Workflow Manager blocked {executor_block}: this confirmed Hard contract permits exactly one "
             "writer at a time. The parent may write only while no child is reserved, live, or unknown; "
@@ -17732,7 +17770,7 @@ def reconcile_bound_mailbox_terminal(
 
     This never manufactures a SubagentStop event.  It accepts only the one
     current request/Post/full-Start executor and one host-structured completed
-    mailbox result whose final marker matches its contract and slice.
+    mailbox result bound to the current contract and slice.
     """
     staged = _safe_pending_recovery_reservation(
         state.get("pending_recovery_reservation")
@@ -17747,25 +17785,19 @@ def reconcile_bound_mailbox_terminal(
     result = mailbox_completed_result(response, str(request.get("task_name") or ""))
     if result is None:
         return None
-    marker, body, intent = _strict_terminal_marker(
-        result, "EXECUTION_RESULT", EXECUTION_RESULT_RE
-    )
+    body = str(result or "").strip()
     current = current_execution_slice(state) or {}
     if not (
-        intent
-        and marker
-        and marker.group(1) == state.get("execution_contract_id")
-        and marker.group(2) == current.get("id")
+        body
         and request.get("contract_id") == state.get("execution_contract_id")
+        and request.get("slice_id") == current.get("id")
         and request.get("slice_contract_id") == slice_contract_id(state)
         and safe_sequence(request.get("attempt"))
         == safe_sequence(state.get("executor_attempt"))
     ):
         return None
-    outcome = marker.group(3)
-    reported = (
-        _mailbox_reported_recovery_facts(body) if outcome == "failed" else {}
-    )
+    outcome = "succeeded"
+    reported: dict[str, Any] = {}
     candidate_evidence = host_evidence_digest(
         domain="executor-result-v1",
         state=state,
@@ -18001,7 +18033,6 @@ def post_tool_use(payload: dict[str, Any]) -> None:
     )
     host_writer_absence = explicit_host_writer_absence(response)
     runtime_delivery: dict[str, str] = {}
-    liveness_delivery: dict[str, str] = {}
 
     def update(state: dict[str, Any]) -> None:
         if continuation_ack_key:
@@ -18028,25 +18059,13 @@ def post_tool_use(payload: dict[str, Any]) -> None:
                 ),
             )
             return
-        # A parent wait/list is an observation only.  A child may explicitly
-        # attach a bounded progress digest, but status/running/parent polling
-        # and stale events never reset the idle clock.
+        # Progress is event-driven metadata only. Elapsed time and parent
+        # polling never manufacture a replacement assessor or workflow gate.
         progress = None
         if caller_id and caller_id == state.get("assessor_agent_id"):
             candidate = payload.get("assessment_progress_digest")
             progress = candidate if isinstance(candidate, str) else None
-        action = assessment_liveness_tick(state, progress_digest=progress)
-        if action in {"unblock_required", "recovery_required"}:
-            liveness_delivery["action"] = action
-        liveness = _safe_assessment_liveness(state.get("assessment_liveness"))
-        if (
-            caller_id is None and tool_key.endswith("followuptask")
-            and liveness.get("unblock") == "pending"
-            and liveness.get("agent_id") == state.get("assessor_agent_id")
-        ):
-            liveness["unblock"] = "failed" if status_value in ERROR_STATUSES or status_value.startswith("error") else "delivered"
-            liveness["unblock_at"] = _liveness_now()
-            state["assessment_liveness"] = liveness
+        assessment_liveness_tick(state, progress_digest=progress)
         if stall_followup_fingerprint:
             stall = _safe_stall(state.get("stall"))
             if (
@@ -18463,16 +18482,6 @@ def post_tool_use(payload: dict[str, Any]) -> None:
         emit_context(
             "PostToolUse",
             "Workflow Manager consumed one continuation lease from an exact structured host receipt; stdout alone never acknowledges it.",
-        )
-    if liveness_delivery.get("action") == "unblock_required":
-        emit_context(
-            "PostToolUse",
-            "Workflow Manager assessor liveness: the current bound sequence has no new progress digest for strictly more than 1200 seconds. Deliver one idempotent diagnosis/unblock request to the live assessor; polling alone is not progress and no successor may overlap it.",
-        )
-    elif liveness_delivery.get("action") == "recovery_required":
-        emit_context(
-            "PostToolUse",
-            "Workflow Manager assessor liveness: the delivered unblock received a further 600-second observation without progress and the prior Stop is verified. Start one materially corrected non-overlapping successor with any safe ASCII task_name.",
         )
     if runtime_delivery.get("mailbox_terminal"):
         outcome = runtime_delivery["mailbox_terminal"]
@@ -18921,51 +18930,12 @@ def active_agent_scope_summary(state: dict[str, Any]) -> list[dict[str, Any]]:
     return summaries[:8]
 
 
-EXECUTION_STALL_RE = re.compile(
-    r"^EXECUTION_STALL contract_id=([0-9a-f]{32}) "
-    r"failure_kind=([a-z_]+) evidence_digest=([0-9a-f]{32})$"
-)
-EXECUTION_RESULT_RE = re.compile(
-    r"^EXECUTION_RESULT execution_contract_id=([0-9a-f]{32}) "
-    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) "
-    r"outcome=(succeeded|failed)$"
-)
-EXECUTION_RESULT_V6_RE = re.compile(
-    r"^EXECUTION_RESULT execution_contract_id=([0-9a-f]{32}) "
-    r"outcome=(succeeded|failed) evidence_digest=([0-9a-f]{32})$"
-)
-EXECUTION_ACCEPTANCE_SUMMARY_RE = re.compile(
-    r"^EXECUTION_ACCEPTANCE_SUMMARY execution_contract_id=([0-9a-f]{32}) "
-    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) checklist_digest=([0-9a-f]{32}) "
-    r"required=([0-9]{1,10}) completed=([0-9]{1,10}) pending=([0-9]{1,10})$"
-)
-
-
-def _bound_acceptance_summary(body: str, state: dict[str, Any]) -> bool:
-    """Accept exactly one bounded summary immediately before the result marker."""
-    item = current_execution_slice(state) or {}
-    contract = _fingerprint32(state.get("execution_contract_id"))
-    lines = [line for line in str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()]
-    matches = [EXECUTION_ACCEPTANCE_SUMMARY_RE.fullmatch(line) for line in lines]
-    matches = [match for match in matches if match]
-    if len(matches) != 1 or not lines or not EXECUTION_ACCEPTANCE_SUMMARY_RE.fullmatch(lines[-1]):
-        return False
-    match = matches[0]
-    required, completed, pending = (int(match.group(i)) for i in (4, 5, 6))
-    return bool(
-        contract and match.group(1) == contract and match.group(2) == item.get("id")
-        and match.group(3) == item.get("checklist_digest") and required == safe_int(item.get("required_count"))
-        and completed + pending == required and completed == required and pending == 0
-    )
-
-
 def _acceptance_summary_digest(body: str, state: dict[str, Any]) -> str | None:
     """Bind the canonical checklist without requiring child prose repetition."""
     item = current_execution_slice(state) or {}
     contract = _fingerprint32(state.get("execution_contract_id"))
     if not contract or not item.get("id") or not item.get("checklist_digest"):
         return None
-    explicit = _bound_acceptance_summary(body, state)
     return stable_hash(
         "workflow-manager-child-candidate-checklist-v2\0"
         + canonical_json(
@@ -18974,7 +18944,7 @@ def _acceptance_summary_digest(body: str, state: dict[str, Any]) -> str | None:
                 "contract": contract,
                 "required": safe_int(item.get("required_count")),
                 "slice": item.get("id"),
-                "source": "explicit" if explicit else "canonical_manifest",
+                "source": "canonical_manifest",
             }
         ),
         32,
@@ -18984,28 +18954,6 @@ STALL_DIAGNOSIS_RE = re.compile(
     r"outcome=(resume|replan) plan_digest=([0-9a-f]{32}) "
     r"execution_contract_id=([0-9a-f]{32}) remediation_digest=([0-9a-f]{32})$"
 )
-
-
-def _strict_terminal_marker(
-    message: Any, keyword: str, exact: re.Pattern[str]
-) -> tuple[re.Match[str] | None, str, bool]:
-    """Return one unindented exact marker only when it is the final non-empty line."""
-    normalized = str(message or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = normalized.split("\n")
-    intent_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if re.match(rf"^\s*{re.escape(keyword)}\b", line)
-    ]
-    nonempty = [index for index, line in enumerate(lines) if line.strip()]
-    if len(intent_indexes) != 1:
-        return None, normalized, bool(intent_indexes)
-    index = intent_indexes[0]
-    match = exact.fullmatch(lines[index])
-    if match is None or not nonempty or index != nonempty[-1]:
-        return None, normalized, True
-    body = "\n".join(line for item, line in enumerate(lines) if item != index).strip()
-    return match, body, True
 
 
 def _slice_operations(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -19530,18 +19478,9 @@ def subagent_start(payload: dict[str, Any]) -> None:
         decision["accepted"] = True
         request_contract = bound_request.get("contract_id")
         executor_profile = expected_executor_profile(state, bound_request)
-        expected_model = (
-            safe_label(executor_profile.get("model"), 80)
-            if executor_profile.get("model")
-            else None
-        )
         expected_effort = str(
             executor_profile.get("reasoning_effort") or ""
         ).lower()
-        highest_profile = (
-            executor_profile.get("profile")
-            == "work_executor_highest_available"
-        )
         echoed_model = payload_model
         echoed_effort = observed_effort
         identity = state.setdefault("identity_evidence", {})
@@ -19561,7 +19500,6 @@ def subagent_start(payload: dict[str, Any]) -> None:
             and bound_request.get("slice_contract_id") == slice_contract_id(state)
             and bound_request.get("model") == state.get("executor_model")
             and bound_request.get("reasoning_effort") == expected_effort
-            and (not highest_profile or bound_request.get("model") == expected_model)
             and not executor_profile.get("error")
             and not bound_request.get("host_acceptance_conflict")
             and observed_status == "full"
@@ -19987,43 +19925,13 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         and agent_id == previous.get("assessor_agent_id")
     )
     assessor_agent = bool((started or {}).get("role") == "high_assessor") or stall_assessor
-    assessment = re.search(r"(?im)^\s*WORK_ASSESSMENT\s+binding_id=([0-9a-f]{32})\s+outcome=(hard)\s+evidence_digest=([0-9a-f]{32})\s*$", str(result or ""))
-    derived_assessment_binding: str | None = None
-    derived_assessment_digest: str | None = None
-    if assessor_agent and assessment is None:
-        try:
-            derived_plan_body = sanitize_plan_artifact_body(result)
-            execution_slice_manifest_for_plan(derived_plan_body)
-        except PlanArtifactError:
-            pass
-        else:
-            if re.search(
-                r"计划已就绪，等待确认后执行[。.!！\s]*$",
-                str(result or ""),
-            ):
-                derived_assessment_binding = safe_fingerprint(
-                    previous.get("assessor_binding_id")
-                )
-                derived_assessment_digest = stable_hash(
-                    "workflow-manager-derived-assessment-v1\0" + derived_plan_body,
-                    32,
-                )
     native_assessment_digest = (
         native_assessor_result_digest(result) if assessor_agent else None
     )
     # The assessor supplies read-only judgment only. The parent owns the native
     # plan, so assessor prose never doubles as a second plan protocol.
     canonical_assessor_plan = False
-    stall_lines = [line for line in str(result or "").splitlines() if line.startswith("EXECUTION_STALL")]
-    stall_matches = [match for line in stall_lines if (match := EXECUTION_STALL_RE.fullmatch(line))]
-    execution_stall_intent = bool(stall_lines)
-    execution_stall = stall_matches[0] if len(stall_lines) == len(stall_matches) == 1 else None
     result_profile_current = str(previous.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
-    execution_result, execution_result_body, execution_result_intent = _strict_terminal_marker(
-        result,
-        "EXECUTION_RESULT",
-        EXECUTION_RESULT_RE if result_profile_current else EXECUTION_RESULT_V6_RE,
-    )
     diagnosis_lines = [line for line in str(result or "").splitlines() if line.startswith("STALL_DIAGNOSIS")]
     diagnosis_matches = [match for line in diagnosis_lines if (match := STALL_DIAGNOSIS_RE.fullmatch(line))]
     stall_diagnosis = diagnosis_matches[0] if len(diagnosis_lines) == len(diagnosis_matches) == 1 else None
@@ -20085,28 +19993,15 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["assessor_state"] = "recovery_required"
                 state["assessor_failure_kind"] = "start_mismatch"
                 state["assessor_agent_id"] = None
-        marker_result_current = bool(
-            execution_result
-            and execution_result.group(1) == state.get("execution_contract_id")
-            and (
-                not result_profile_current
-                or execution_result.group(2) == (current_execution_slice(state) or {}).get("id")
-            )
-        )
         native_result_current = bool(
             executor_agent
             and current_started is not None
             and not start_missing
-            and not execution_result_intent
             and str(result or "").strip()
         )
-        execution_result_current = marker_result_current or native_result_current
+        execution_result_current = native_result_current
         execution_result_outcome = (
-            execution_result.group(3)
-            if execution_result and result_profile_current
-            else execution_result.group(2)
-            if execution_result
-            else "failed"
+            "failed"
             if status_value in ERROR_STATUSES or explicit_unknown_status
             else "succeeded"
             if native_result_current
@@ -20115,14 +20010,10 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         execution_result_succeeded = bool(
             execution_result_current and execution_result_outcome == "succeeded"
         )
-        effective_execution_body = (
-            execution_result_body
-            if execution_result
-            else str(result or "").strip()
-        )
+        effective_execution_body = str(result or "").strip()
         if executor_agent:
             # Native child prose is a candidate when the separately bound host
-            # lifecycle is current. Explicit malformed marker intent or a host
+            # lifecycle is current. Formatting has no authority; a host
             # failed/cancelled status still fails closed.
             successful = bool(
                 current_started is not None
@@ -20130,7 +20021,6 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 and execution_result_succeeded
                 and status_value not in ERROR_STATUSES
                 and not explicit_unknown_status
-                and not (marker_result_current and execution_result_outcome == "failed")
             )
         already_terminal = any(
             group.get("state") == "terminal" and group.get("agent_id") == agent_id
@@ -20257,7 +20147,8 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             )
         if current_rejected_terminal:
             # Process termination is not result acceptance. Keep the typed
-            # mismatch so only a fresh monotonic assessor attempt can recover.
+            # mismatch. The current envelope has consumed its assessor slot and
+            # remains fail-closed; only a materially new envelope can assess.
             state["assessor_state"] = "recovery_required"
             state["assessor_failure_kind"] = "start_mismatch"
             state["assessor_agent_id"] = None
@@ -20275,26 +20166,6 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                     == slice_contract_id(state)
                 )
             )
-            if execution_stall_intent:
-                valid_stall = bool(
-                    not successful
-                    and contract_current
-                    and execution_stall
-                    and execution_stall.group(1) == state.get("execution_contract_id")
-                    and execution_stall.group(2) in EXECUTOR_FAILURE_KINDS
-                )
-                if valid_stall:
-                    record_explicit_executor_stall(
-                        state,
-                        execution_stall.group(1),
-                        execution_stall.group(2),
-                        execution_stall.group(3),
-                    )
-                else:
-                    state["executor_state"] = "recovery_required"
-                    state["executor_failure_kind"] = "executor_failed"
-                    state["model_profile"] = "work_assessment"
-                return
             if not contract_current:
                 state["executor_state"] = "recovery_required"
                 state["executor_failure_kind"] = "stale_contract"
@@ -20405,20 +20276,11 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 == state.get("assessor_binding_id")
             )
             assessment_binding = (
-                assessment.group(1)
-                if assessment
-                else derived_assessment_binding
-                or (
-                    safe_fingerprint(state.get("assessor_binding_id"))
-                    if native_assessment_digest
-                    else None
-                )
+                safe_fingerprint(state.get("assessor_binding_id"))
+                if native_assessment_digest
+                else None
             )
-            assessment_digest = (
-                assessment.group(3)
-                if assessment
-                else derived_assessment_digest or native_assessment_digest
-            )
+            assessment_digest = native_assessment_digest
             valid = bool(
                 not stale
                 and successful
@@ -20430,7 +20292,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
             if start_missing:
                 state["assessor_state"] = "recovery_required"
                 state["assessor_failure_kind"] = "start_mismatch"
-            elif assessment and mutated:
+            elif mutated:
                 state["assessor_state"] = "failed"
                 state["assessor_failure_kind"] = "hard_mutation_before_confirmation"
             elif assessor_lifecycle_error:
@@ -20440,11 +20302,7 @@ def subagent_stop(payload: dict[str, Any]) -> None:
                 state["assessor_state"] = "recovery_required"
                 state["assessor_failure_kind"] = "assessment_result_invalid"
             else:
-                detailed = bool(
-                    canonical_assessor_plan
-                    or native_assessment_digest
-                    or assessment_digest
-                )
+                detailed = bool(native_assessment_digest)
                 if not detailed:
                     state["assessor_state"] = "recovery_required"
                     state["assessor_failure_kind"] = "hard_plan_incomplete"
@@ -20521,8 +20379,8 @@ def subagent_stop(payload: dict[str, Any]) -> None:
         emit_context(
             "SubagentStop",
             "Workflow Manager recorded the exact real terminal boundary for the rejected assessor Start. "
-            "Its result remains non-authoritative; recovery_required/start_mismatch is preserved and one fresh "
-            "monotonic assessor attempt may now be reserved.",
+            "Its result remains non-authoritative; recovery_required/start_mismatch is preserved and the current "
+            "Hard envelope cannot reserve another assessor.",
         )
     elif assessor_agent:
         runtime_truth = bound_runtime_truth_summary(updated_state, "high_assessor")
@@ -20569,39 +20427,9 @@ CAUSAL_REVIEW_RESULT_RE = re.compile(
     r"explanatory_conclusion|unrelated_new_objective|introduced|unrelated)\s+"
     r"evidence_digest=([0-9a-f]{32})\s*$"
 )
-EXECUTION_REVIEW_RE = re.compile(
-    r"^EXECUTION_REVIEW execution_contract_id=([0-9a-f]{32}) "
-    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) "
-    r"outcome=(passed|failed)$"
-)
-EXECUTION_REVIEW_SUMMARY_RE = re.compile(
-    r"^EXECUTION_REVIEW_SUMMARY execution_contract_id=([0-9a-f]{32}) "
-    r"slice_id=(s(?:0[1-9]|[1-9][0-9]+)) checklist_digest=([0-9a-f]{32}) "
-    r"required=([0-9]{1,10}) completed=([0-9]{1,10}) pending=([0-9]{1,10})$"
-)
-
-
 def _bound_parent_review_summary(body: str, state: dict[str, Any]) -> str | None:
     item = current_execution_slice(state) or {}
     contract = _fingerprint32(state.get("execution_contract_id"))
-    matches = [EXECUTION_REVIEW_SUMMARY_RE.fullmatch(line) for line in str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-    matches = [match for match in matches if match]
-    explicit = False
-    if len(matches) == 1:
-        match = matches[0]
-        required, completed, pending = (
-            int(match.group(index)) for index in (4, 5, 6)
-        )
-        explicit = bool(
-            contract
-            and match.group(1) == contract
-            and match.group(2) == item.get("id")
-            and match.group(3) == item.get("checklist_digest")
-            and required == safe_int(item.get("required_count"))
-            and completed == required
-            and pending == 0
-            and completed + pending == required
-        )
     evidence = slice_operation_evidence(state)
     if (
         not contract
@@ -20620,74 +20448,15 @@ def _bound_parent_review_summary(body: str, state: dict[str, Any]) -> str | None
                 "operation_digest": evidence.get("operation_digest"),
                 "required": safe_int(item.get("required_count")),
                 "slice": item.get("id"),
-                "source": "explicit" if explicit else "canonical_manifest",
+                "source": "canonical_manifest",
             }
         ),
         32,
     )
-EXECUTION_REVIEW_V6_RE = re.compile(
-    r"^EXECUTION_REVIEW execution_contract_id=([0-9a-f]{32}) "
-    r"outcome=(passed|failed) evidence_digest=([0-9a-f]{32})$"
-)
-
-
-def explicit_negative_parent_review(message: str) -> bool:
-    """Recognize a negative final result without matching failure-domain prose."""
-    text = " ".join(str(message or "").split())
-    if not text:
-        return False
-    if re.fullmatch(
-        r"(?i)(?:failed|failure|not\s+passed|not\s+started|失败|未通过|未开始)[.!。！]?",
-        text,
-    ):
-        return True
-
-    # Fail-closed behavior and failure-case coverage describe the system under
-    # test, not the acceptance outcome of the current execution.
-    english = re.sub(
-        r"(?i)\bfail(?:s|ed|ure)?(?:[- ]closed|\s+(?:cases?|scenarios?|paths?|handling))\b",
-        " expected-failure-domain ",
-        text,
-    )
-    chinese = re.sub(
-        r"(?:失败(?:关闭|封闭|用例|场景|路径|处理|分支|恢复|重试|注入|模拟))",
-        "预期失败域",
-        english,
-    )
-    if re.search(
-        r"(?i)\b(?:acceptance|verification|tests?|test\s+suite|review|build|"
-        r"release|deployment|installation|implementation|fix)\b"
-        r"(?:\s+(?:result|run|job|work|has|have|is|was|still|yet)){0,3}\s+"
-        r"(?:failed|did\s+not\s+pass|not\s+passed|not\s+completed|not\s+started)\b",
-        chinese,
-    ):
-        return True
-    if re.search(
-        r"(?:验收|验证|测试|复核|检查|构建|编译|发布|部署|安装|实现|修复)"
-        r"(?:结果|用例|套件|流程|任务|工作)?(?:仍然?|依然|尚|还)?"
-        r"(?:未通过|没有通过|没通过|没过|失败(?!关闭|封闭|用例|场景|路径|处理|分支|恢复|重试|注入|模拟)|未完成|未开始)",
-        chinese,
-    ):
-        return True
-    return bool(
-        re.search(
-            r"(?:尚未|还未|并未|没有)(?:完成|通过|发布|部署|安装|开始)(?=$|[\s，,；;：:。.!！？?])",
-            chinese,
-        )
-    )
-
-
 def stop(payload: dict[str, Any]) -> None:
     assistant_message = str(payload.get("last_assistant_message") or "")
     previous = snapshot_state(payload)
-    review_profile_current = (
-        str(previous.get("execution_profile_version")) == EXECUTION_PROFILE_VERSION
-    )
-    execution_review, execution_review_body, execution_review_intent = _strict_terminal_marker(
-        assistant_message,
-        "EXECUTION_REVIEW",
-        EXECUTION_REVIEW_RE if review_profile_current else EXECUTION_REVIEW_V6_RE,
-    )
+    execution_review_body = assistant_message.strip()
     causal_match = CAUSAL_REVIEW_RESULT_RE.search(assistant_message)
     plan_ready = canonical_plan_message_ready(assistant_message)
 
@@ -20709,43 +20478,28 @@ def stop(payload: dict[str, Any]) -> None:
             )
             current_slice = current_execution_slice(state)
             current_slice_contract = slice_contract_id(state)
+            parent_review_operations = [
+                operation
+                for operation in _slice_operations(state)
+                if operation.get("executor_agent_id") is None
+                and operation.get("category") in {"verification", "evidence"}
+            ]
+            latest_parent_status = (
+                str(parent_review_operations[-1].get("status") or "")
+                if parent_review_operations
+                else ""
+            )
             review_outcome = (
-                execution_review.group(3)
-                if execution_review and profile_current
-                else execution_review.group(2)
-                if execution_review
+                "failed"
+                if latest_parent_status
+                and latest_parent_status not in SUCCESS_STATUSES
                 else "passed"
-                if not execution_review_intent and assistant_message.strip()
+                if execution_review_body
                 else None
             )
-            # Native parent prose is allowed, but it cannot accidentally seal
-            # a candidate when it expressly records a negative acceptance or
-            # says that the requested release has not begun.  This also wins
-            # over a contradictory optional ``outcome=passed`` marker.
-            explicit_negative_review = explicit_negative_parent_review(
-                assistant_message
-            )
-            if explicit_negative_review:
-                review_outcome = "failed"
-            native_review = bool(
-                not execution_review_intent and assistant_message.strip()
-            )
-            marker_binding_valid = bool(
-                execution_review
-                and execution_review.group(1) == contract_id
-                and (
-                    contract_id == execution_contract_id(state)
-                    if profile_current
-                    else str(state.get("execution_profile_version")) in {"5", "6"}
-                )
-                and (
-                    not profile_current
-                    or current_slice
-                    and execution_review.group(2) == current_slice.get("id")
-                )
-            )
+            native_review = bool(execution_review_body)
             binding_valid = bool(
-                (marker_binding_valid or native_review)
+                native_review
                 and (
                     contract_id == execution_contract_id(state)
                     if profile_current
@@ -20765,20 +20519,6 @@ def stop(payload: dict[str, Any]) -> None:
                 and review.get("child_summary_digest")
             )
             if not binding_valid:
-                if execution_review_intent:
-                    state.setdefault("guards", []).append(
-                        {
-                            "at": utc_now(),
-                            "turn_id": (
-                                safe_label(payload.get("turn_id"), 120)
-                                if payload.get("turn_id")
-                                else None
-                            ),
-                            "kind": "executor_review",
-                            "action": "deny",
-                            "fingerprint": stable_hash(assistant_message, 32),
-                        }
-                    )
                 return
             if not profile_current:
                 # A durable Schema 23/profile 5 or 6 candidate is review-only
