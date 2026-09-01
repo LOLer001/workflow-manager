@@ -34,7 +34,7 @@ Before a confirmed plan exists, allow targeted reads and diagnosis but deny muta
 
 The parent presents one human-readable plan sufficient for the task and acceptance. It may choose one step, 3–5 slices, or a longer structure. No list or slice count is independently gated.
 
-The Hook appends the complete bounded plan to `plans/<session-token>/hard-plan.md`. Before `plan_state` may become `awaiting_confirmation`, the revision and state transaction must commit. The current trusted revision is the plan-content authority. `update_plan` may only be a UI projection with `projection_only canonical_revision_digest=<digest>`; it is not a second plan store.
+The Hook appends the complete bounded plan to `plans/<session-token>/hard-plan.md`. Before `plan_state` may become `awaiting_confirmation`, the revision and state transaction must commit. The current trusted revision is the plan-content authority. After a fully bound assessor completes but before revision 1 commits, a bounded parent-native `update_plan` may project the pending plan into the UI without changing state or authority; the following parent Stop still creates revision 1. Once a canonical revision exists, `update_plan` is allowed only as `projection_only canonical_revision_digest=<digest>`. It is never a second plan store.
 
 A machine-readable `workflow-manager-execution-slices` block is optional. Without one, the complete native plan becomes one logical slice. With one, total 196608-byte / 1024-node budgets protect state capacity without a separate item cap. Budget pressure may stop or split work but never reduce acceptance.
 

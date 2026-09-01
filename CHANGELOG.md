@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.62
+
+- 修正 Hard 评估完成后、首个 canonical revision 尚未提交时，Codex 原生 `update_plan` 界面投影被误判为 split-brain mutation 的流程断点：仅在父任务身份、评估回执、目标绑定和生命周期全部匹配时允许有界结构化投影。
+- 预 canonical 投影在 `PreToolUse` 与 `PostToolUse` 都保持只读，不写计划、状态、授权、租约或操作账本；外层 `functions.exec` 文本、子任务调用、非法结构、超限内容及任一身份/生命周期漂移继续拒绝。首个可信 revision 仍只能由随后父级 Stop 原子写入，已有 canonical revision 的投影仍须绑定当前 digest。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.61 Tag/Release 保持不可变，发布采用 forward-only 1.0.62。
+
 ## 1.0.61
 
 - 修正全新会话首条需求含“已经 / already”等进度词时被误当作旧任务续接、从而跳过 Hard 评估与 canonical 计划初始化的问题：只有同 session/root、完整 objective/route、匹配活动 task epoch（或完整的 epoch-less 迁移状态）且 cwd/rollout 身份无冲突时，进度文本才可继承上一任务。

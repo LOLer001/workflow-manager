@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.61", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.62", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -9905,6 +9905,40 @@ def snapshot_state(payload: dict[str, Any]) -> dict[str, Any]:
         return state
 
 
+def read_current_state_without_mutation(
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Read one current persisted state without migration or reconciliation.
+
+    Native ``update_plan`` is only a UI projection at the narrow pre-canonical
+    boundary. Looking up that boundary must not itself refresh rollout facts,
+    migrate state, recover transactions, or write timestamps.
+    """
+    path = state_path(payload)
+    if path is None:
+        return None
+    try:
+        with state_lock(path):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
+                return None
+            with path.open("r", encoding="utf-8") as stream:
+                raw = stream.read(MAX_STATE_BYTES + 1)
+            if len(raw.encode("utf-8")) > MAX_STATE_BYTES:
+                return None
+            state = json.loads(raw)
+            if not isinstance(state, dict) or (
+                state.get("schema_version") != SCHEMA_VERSION
+                or state.get("writer_version") != WRITER_VERSION
+                or state.get("execution_profile_version")
+                != EXECUTION_PROFILE_VERSION
+            ):
+                return None
+            return state
+    except (FileNotFoundError, OSError, TimeoutError, ValueError, TypeError):
+        return None
+
+
 def mutate_state(
     payload: dict[str, Any], change: Callable[[dict[str, Any]], None]
 ) -> tuple[dict[str, Any], bool]:
@@ -13591,11 +13625,116 @@ def request_touches_shared_resource(request: str) -> bool:
     return not bool(negated or read_existing)
 
 
+def bounded_update_plan_input(payload: dict[str, Any]) -> dict[str, Any] | None:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict) or not set(tool_input).issubset(
+        {"explanation", "plan"}
+    ):
+        return None
+    explanation = tool_input.get("explanation")
+    if explanation is not None and not isinstance(explanation, str):
+        return None
+    items = tool_input.get("plan")
+    if not isinstance(items, list) or not items:
+        return None
+    try:
+        if (
+            len(canonical_json(tool_input).encode("utf-8"))
+            > MAX_EXECUTION_MANIFEST_BYTES
+            or state_node_count(tool_input) > MAX_EXECUTION_MANIFEST_NODES
+        ):
+            return None
+    except (TypeError, ValueError):
+        return None
+    in_progress = 0
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"step", "status"}:
+            return None
+        step = item.get("step")
+        status = item.get("status")
+        if not isinstance(step, str) or not step.strip() or status not in {
+            "pending", "in_progress", "completed",
+        }:
+            return None
+        in_progress += int(status == "in_progress")
+        if in_progress > 1:
+            return None
+    return tool_input
+
+
+def precanonical_update_plan_projection(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> bool:
+    """Allow a bounded parent UI projection after proven assessment only.
+
+    The projection is never plan authority.  A later ordinary parent Stop must
+    still commit the first canonical revision before confirmation is possible.
+    """
+    if bounded_update_plan_input(payload) is None or payload_claims_child_identity(payload):
+        return False
+    if (
+        state.get("schema_version") != SCHEMA_VERSION
+        or state.get("writer_version") != WRITER_VERSION
+        or state.get("execution_profile_version") != EXECUTION_PROFILE_VERSION
+        or state.get("task_domain") != "work"
+        or state.get("work_difficulty") != "hard"
+        or state.get("assessor_state") != "hard_plan_ready"
+        or state.get("plan_state") not in {"analyzing", "repair_required"}
+        or state.get("executor_state") != "none"
+        or state.get("plan_generation") != 0
+        or any(
+            state.get(key)
+            for key in (
+                "plan_digest", "plan_objective_fingerprint",
+                "plan_difficulty_decision_id", "confirmed_plan_digest",
+                "confirmed_at", "execution_contract_id",
+            )
+        )
+    ):
+        return False
+    artifact = _safe_plan_artifact(state.get("plan_artifact"))
+    if (
+        artifact.get("write_status") == "written"
+        or artifact.get("format_version")
+        or artifact.get("generation")
+        or artifact.get("current_revision_digest")
+        or artifact.get("journal_digest")
+        or artifact.get("revision_count")
+    ):
+        return False
+    receipt = original_assessor_result_receipt(state)
+    composition = _safe_plan_composition(state.get("plan_composition"))
+    if not receipt or not (
+        composition.get("status") == "pending"
+        and composition.get("assessor_binding_id") == state.get("assessor_binding_id")
+        and composition.get("objective_fingerprint")
+        == state.get("objective", {}).get("fingerprint")
+        and composition.get("assessment_receipt") == receipt
+    ):
+        return False
+    if (
+        _safe_parent_writer_lease(state.get("parent_writer_lease")).get("status")
+        != "none"
+        or _safe_child_liveness(state.get("child_liveness")).get("status")
+        not in {"none", "absent", "terminal"}
+        or any(
+            group.get("state") in {"pending", "result_pending", "live"}
+            for group in subagent_lifecycle_groups(state)
+        )
+        or _safe_causal_review(state.get("causal_review")).get("state")
+        not in {"none", "resolved"}
+        or _safe_stall(state.get("stall")).get("state")
+        not in {"none", "resolved"}
+    ):
+        return False
+    return True
+
+
 def canonical_update_plan_projection(
     payload: dict[str, Any], state: dict[str, Any]
 ) -> bool:
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
+    tool_input = bounded_update_plan_input(payload)
+    if tool_input is None:
         return False
     artifact = _safe_plan_artifact(state.get("plan_artifact"))
     digest = safe_fingerprint(artifact.get("current_revision_digest"))
@@ -13610,9 +13749,7 @@ def canonical_update_plan_projection(
         or "projection_only" not in explanation.lower()
     ):
         return False
-    items = tool_input.get("plan")
-    if not isinstance(items, list) or not items:
-        return False
+    items = tool_input["plan"]
     try:
         canonical = read_current_plan_revision(state, payload)
     except (OSError, PlanArtifactError):
@@ -13635,7 +13772,10 @@ def plan_confirmation_guard(payload: dict[str, Any], state: dict[str, Any]) -> s
     if "updateplan" in tool_key:
         return (
             None
-            if canonical_update_plan_projection(payload, state)
+            if (
+                precanonical_update_plan_projection(payload, state)
+                or canonical_update_plan_projection(payload, state)
+            )
             else "unbound update_plan split-brain mutation outside the canonical journal"
         )
     if "requestuserinput" in tool_key:
@@ -16721,6 +16861,12 @@ def terminal_executor_followup_reason(
 
 def pre_tool_use(payload: dict[str, Any]) -> None:
     fingerprint, tool = tool_fingerprint(payload)
+    if "updateplan" in normalized_key(payload.get("tool_name")):
+        projection_state = read_current_state_without_mutation(payload)
+        if projection_state is not None and precanonical_update_plan_projection(
+            payload, projection_state
+        ):
+            return
     state = snapshot_state(payload)
     snapshot_failure = str(state.get("_snapshot_failure") or "")
     # A host may legitimately deliver PreToolUse before UserPromptSubmit/SessionStart.
@@ -17684,9 +17830,17 @@ def reconcile_bound_mailbox_terminal(
 
 
 def post_tool_use(payload: dict[str, Any]) -> None:
+    tool_key = normalized_key(payload.get("tool_name"))
+    if "updateplan" in tool_key:
+        projection_state = read_current_state_without_mutation(payload)
+        if projection_state is not None and precanonical_update_plan_projection(
+            payload, projection_state
+        ):
+            # This native UI projection is deliberately absent from the
+            # operation ledger and cannot mutate lifecycle state.
+            return
     fingerprint, tool = tool_fingerprint(payload)
     response = payload.get("tool_response")
-    tool_key = normalized_key(payload.get("tool_name"))
     status_value = (
         apply_patch_response_status(response)
         if tool_key == "applypatch"

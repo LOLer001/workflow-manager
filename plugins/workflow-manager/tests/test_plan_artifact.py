@@ -530,6 +530,184 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(projection.returncode, 0, projection.stderr)
         self.assertEqual(projection.stdout, "")
 
+    def test_c06a_completed_assessor_allows_state_free_precanonical_ui_projection(self) -> None:
+        session = "c06a"
+        self.begin_hard_plan(session)
+        native_projection = {
+            "explanation": "Hard 任务实施计划（等待用户确认后执行）。",
+            "plan": [
+                {"step": "运行完整测试并记录 README 验收基线", "status": "pending"},
+                {"step": "补充顺序、重复 ID 和损坏快照回归", "status": "pending"},
+                {"step": "统一按 current_job_id 唯一匹配并 fail closed", "status": "pending"},
+                {"step": "运行目标与完整测试并逐项核对 README", "status": "pending"},
+            ],
+        }
+        early = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "precanonical-too-early",
+                "tool_name": "update_plan",
+                "tool_input": native_projection,
+            }
+        )
+        self.assertEqual(
+            json.loads(early.stdout)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+        binding, agent_id = self.start_bound_assessor(
+            session, suffix="precanonical"
+        )
+        assessor_stop = self.run_hook(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": session,
+                "hook_run_id": "precanonical-assessor-stop",
+                "agent_id": agent_id,
+                "status": "completed",
+                "last_assistant_message": self.assessor_result(
+                    binding, self.hard_body("assessed")
+                ),
+            }
+        )
+        self.assertEqual(assessor_stop.returncode, 0, assessor_stop.stderr)
+        ready = self.state()
+        self.assertTrue(
+            HOOK.precanonical_update_plan_projection(
+                {"tool_name": "update_plan", "tool_input": native_projection},
+                ready,
+            )
+        )
+        self.assertEqual(
+            (ready["assessor_state"], ready["plan_state"]),
+            ("hard_plan_ready", "analyzing"),
+        )
+        self.assertIsNone(ready["plan_digest"])
+        self.assertEqual(ready["plan_artifact"]["write_status"], "none")
+        before = self.state_path().read_bytes()
+
+        post_only = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "precanonical-post-only",
+                "tool_name": "update_plan",
+                "tool_input": native_projection,
+                "tool_response": {"status": "ok"},
+            }
+        )
+        self.assertEqual(post_only.returncode, 0, post_only.stderr)
+        self.assertEqual(post_only.stdout, "")
+        self.assertEqual(self.state_path().read_bytes(), before)
+
+        allowed = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "precanonical-projection",
+                "tool_name": "update_plan",
+                "tool_input": native_projection,
+            }
+        )
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(allowed.stdout, "")
+        completed = self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "precanonical-projection-post",
+                "tool_name": "update_plan",
+                "tool_input": native_projection,
+                "tool_response": {"status": "ok"},
+            }
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(self.state_path().read_bytes(), before)
+
+        child = {
+            "tool_name": "update_plan",
+            "tool_input": native_projection,
+            "agent_id": "unbound-child",
+        }
+        self.assertFalse(HOOK.precanonical_update_plan_projection(child, ready))
+        outer_javascript = {
+            "tool_name": "functions.exec",
+            "tool_input": {
+                "input": "const r = await tools.update_plan({plan: []});"
+            },
+        }
+        self.assertFalse(
+            HOOK.precanonical_update_plan_projection(outer_javascript, ready)
+        )
+
+        for label, tool_input in (
+            ("empty", {"plan": []}),
+            ("bad-status", {"plan": [{"step": "x", "status": "running"}]}),
+            ("non-string", {"plan": [{"step": 1, "status": "pending"}]}),
+            ("extra-key", {"plan": [{"step": "x", "status": "pending", "owner": "child"}]}),
+            (
+                "two-active",
+                {"plan": [
+                    {"step": "x", "status": "in_progress"},
+                    {"step": "y", "status": "in_progress"},
+                ]},
+            ),
+            (
+                "too-large",
+                {"plan": [{"step": "x" * (HOOK.MAX_EXECUTION_MANIFEST_BYTES + 1), "status": "pending"}]},
+            ),
+            (
+                "too-many-nodes",
+                {"plan": [
+                    {"step": f"step-{index}", "status": "pending"}
+                    for index in range(HOOK.MAX_EXECUTION_MANIFEST_NODES)
+                ]},
+            ),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(
+                    HOOK.bounded_update_plan_input(
+                        {"tool_name": "update_plan", "tool_input": tool_input}
+                    )
+                )
+
+        for label, mutate in (
+            ("old-writer", lambda item: item.update({"writer_version": "1.0.61"})),
+            ("binding", lambda item: item["plan_composition"].update({"assessor_binding_id": "f" * 32})),
+            ("digest", lambda item: item.update({"plan_digest": "e" * 32})),
+            ("confirmed", lambda item: item.update({"plan_state": "confirmed"})),
+            ("child-unknown", lambda item: item.update({"child_liveness": {"status": "unknown"}})),
+            ("parent-lease", lambda item: item.update({"parent_writer_lease": {"status": "live"}})),
+            ("stall", lambda item: item.update({"stall": {"state": "diagnosis_required"}})),
+        ):
+            candidate = json.loads(json.dumps(ready))
+            mutate(candidate)
+            with self.subTest(state=label):
+                self.assertFalse(
+                    HOOK.precanonical_update_plan_projection(
+                        {"tool_name": "update_plan", "tool_input": native_projection},
+                        candidate,
+                    )
+                )
+
+        parent_body = self.hard_body("canonical-after-projection")
+        written = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session,
+                "hook_run_id": "precanonical-parent-plan",
+                "last_assistant_message": parent_body,
+            }
+        )
+        self.assertEqual(written.returncode, 0, written.stderr)
+        canonical = self.state()
+        self.assertEqual(canonical["plan_generation"], 1)
+        self.assertEqual(canonical["plan_state"], "awaiting_confirmation")
+        self.assertTrue(canonical["plan_digest"])
+        self.assertEqual(canonical["plan_artifact"]["revision_count"], 1)
+
     def test_c13_plan_details_and_resume_point_to_canonical_current_revision(self) -> None:
         session = "c13"
         self.begin_hard_plan(session)

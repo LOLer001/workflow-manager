@@ -1,6 +1,6 @@
 {
   "name": "workflow-manager",
-  "version": "1.0.61",
+  "version": "1.0.62",
   "description": "A lean Hard-work authorization and runtime-evidence layer for current Codex.",
   "author": {
     "name": "Cong"
