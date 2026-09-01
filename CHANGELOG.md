@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.61
+
+- 修正全新会话首条需求含“已经 / already”等进度词时被误当作旧任务续接、从而跳过 Hard 评估与 canonical 计划初始化的问题：只有同 session/root、完整 objective/route、匹配活动 task epoch（或完整的 epoch-less 迁移状态）且 cwd/rollout 身份无冲突时，进度文本才可继承上一任务。
+- 增加真实“生产调度器恢复已完成旧任务”原文，以及缺 objective、缺 route、session/root/epoch/cwd 冲突、同会话新目标和合法进度续接回归；分类器与 Hard fail-closed 门禁不变。
+- Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9；1.0.60 Tag/Release 保持不可变，发布采用 forward-only 1.0.61。
+
 ## 1.0.60
 
 - 对齐 Stable Skill 与 Hook 的 Simple/Hard 口径：`production`、`core`、`customer-visible` 或 `business-critical` 标签本身不再让模型把已知、单函数、可逆且验收明确的修复口头升级为 Hard；此类任务保持 Codex 原生 `Start=0`，不启动评估者，也不额外等待计划确认。

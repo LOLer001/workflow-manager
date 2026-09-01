@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.60", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.61", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -15490,6 +15490,75 @@ def is_progress_followup(prompt: str) -> bool:
     return False
 
 
+def has_trusted_prior_task_context(
+    previous: dict[str, Any], payload: dict[str, Any]
+) -> bool:
+    """Require a real same-session task before progress prose may continue it.
+
+    Words such as ``already``/``已经`` describe both task progress and the bug
+    being reported.  They can therefore preserve an existing route, but must
+    never manufacture a continuation in a fresh session or from partial state.
+    """
+    if previous.get("_snapshot_failure"):
+        return False
+    session_id = payload.get("session_id")
+    if not session_id:
+        return False
+    session_fingerprint = stable_hash(session_id)
+    if (
+        previous.get("session_fingerprint") != session_fingerprint
+        or previous.get("root_session_fingerprint") != session_fingerprint
+    ):
+        return False
+
+    objective = safe_fingerprint(
+        (previous.get("objective") or {}).get("fingerprint")
+        if isinstance(previous.get("objective"), dict)
+        else None
+    )
+    route = safe_route(previous.get("last_route"))
+    if not objective or not route:
+        return False
+    for key in (
+        "task_domain",
+        "work_difficulty",
+        "domain_decision_id",
+        "difficulty_decision_id",
+    ):
+        if not route.get(key) or route.get(key) != previous.get(key):
+            return False
+
+    epoch = _safe_task_epoch(previous.get("task_epoch"))
+    if epoch.get("id"):
+        if (
+            epoch.get("status") != "active"
+            or epoch.get("objective_fingerprint") != objective
+        ):
+            return False
+    elif epoch != _safe_task_epoch(None):
+        return False
+    # Schema 31 may legitimately be epoch-less.  Its complete session,
+    # objective, and route bindings above are the compatibility authority;
+    # incomplete legacy state is deliberately treated as a new task.
+
+    if "cwd" in payload:
+        observed_cwd = stable_hash(payload.get("cwd"))
+        if any(
+            bound and bound != observed_cwd
+            for bound in (
+                previous.get("cwd_fingerprint"),
+                previous.get("root_cwd_fingerprint"),
+            )
+        ):
+            return False
+
+    bound_rollout = previous.get("root_rollout_identity")
+    if bound_rollout is not None and payload.get("transcript_path"):
+        if root_rollout_regular_file_identity(payload.get("transcript_path")) != bound_rollout:
+            return False
+    return True
+
+
 def merge_followup_route(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     prior = safe_route(previous)
     if not prior:
@@ -15743,10 +15812,11 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         if completed_direct_followup
         else {}
     )
+    trusted_progress_context = has_trusted_prior_task_context(previous, payload)
     continuation = bool(root_continuation_key) or epoch_switch_blocked or (not new_objective and (
         preference_directive is not None
         or is_control_followup(prompt)
-        or is_progress_followup(prompt)
+        or (trusted_progress_context and is_progress_followup(prompt))
         or active_plan
         or reference_changed
         or same_assessor_objective_retry

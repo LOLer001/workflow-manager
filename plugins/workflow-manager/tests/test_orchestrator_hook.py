@@ -375,7 +375,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 33)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.60")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.61")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "12")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -470,7 +470,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.60"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.61"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -497,7 +497,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.60 active", context)
+        self.assertIn("Workflow Manager 1.0.61 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1153,7 +1153,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.60"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.61"))
         self.assertEqual(migrated["execution_profile_version"], "12")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1249,7 +1249,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (33, "1.0.60", "12"),
+                    (33, "1.0.61", "12"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1295,7 +1295,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (33, "1.0.60", "5", "verification_required", 1),
+            (33, "1.0.61", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1452,7 +1452,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (33, "1.0.60", "recovery_required", None),
+            (33, "1.0.61", "recovery_required", None),
         )
         self.assertEqual(migrated["subagents"], [])
         self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -1467,7 +1467,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.60", "recovery_required", None),
+            ("1.0.61", "recovery_required", None),
         )
         self.assertEqual(migrated_1052["subagents"], [])
         schema32 = json.loads(json.dumps(running))
@@ -1480,7 +1480,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1055["executor_state"],
                 migrated_1055["executor_agent_id"],
             ),
-            ("1.0.60", "recovery_required", None),
+            ("1.0.61", "recovery_required", None),
         )
         self.assertEqual(migrated_1055["subagents"], [])
         # The mailbox-recovery bridge applies only to the current trusted
@@ -10649,7 +10649,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.60 active", context)
+        self.assertIn("Workflow Manager 1.0.61 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10985,6 +10985,141 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertNotIn("label", changed["last_route"])
         self.assertEqual(changed["task_domain"], "daily")
         self.assertNotEqual(changed["domain_decision_id"], first_decision)
+
+    def test_fresh_progress_words_cannot_skip_hard_lifecycle_initialization(self) -> None:
+        prompt = (
+            "生产任务调度器在进程重启后间歇性恢复已经完成的旧任务，根因未知，可能跨 "
+            "persistence、recovery、scheduler 多个模块并导致重复执行。请定位根因、完成修复和测试，"
+            "直到 README 验收全部通过。"
+        )
+        for with_session_start in (False, True):
+            with self.subTest(with_session_start=with_session_start):
+                data = Path(self.temporary.name) / f"fresh-progress-{with_session_start}"
+                session = f"fresh-progress-{with_session_start}"
+                if with_session_start:
+                    self.run_hook(
+                        {
+                            "hook_event_name": "SessionStart",
+                            "session_id": session,
+                            "hook_run_id": "start",
+                            "source": "startup",
+                            "cwd": "/tmp/fresh-progress",
+                        },
+                        data=data,
+                    )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session,
+                        "hook_run_id": "objective",
+                        "prompt": prompt,
+                        "cwd": "/tmp/fresh-progress",
+                    },
+                    data=data,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = self.load_only_state(data)
+                self.assertEqual((state["task_domain"], state["work_difficulty"]), ("work", "hard"))
+                self.assertEqual((state["plan_state"], state["assessor_state"]), ("analyzing", "spawn_required"))
+                self.assertEqual(state["assessor_generation"], 1)
+                self.assertTrue(state["assessor_binding_id"])
+                self.assertEqual(state["task_epoch"]["status"], "active")
+                self.assertEqual(
+                    state["task_epoch"]["objective_fingerprint"],
+                    state["objective"]["fingerprint"],
+                )
+                context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("collaboration.spawn_agent(", context)
+
+    def test_progress_continuation_requires_complete_same_task_identity(self) -> None:
+        session = "trusted-progress-context"
+        cwd = "/tmp/trusted-progress-context"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": "排查反复重启，同时独立审查现有测试和日志",
+                "cwd": cwd,
+            }
+        )
+        state = self.load_only_state()
+        payload = {"session_id": session, "cwd": cwd}
+        self.assertTrue(HOOK.has_trusted_prior_task_context(state, payload))
+
+        invalid_variants = []
+        for label, mutate in (
+            ("snapshot", lambda item: item.update({"_snapshot_failure": "invalid_state"})),
+            ("objective", lambda item: item.update({"objective": {}})),
+            ("route", lambda item: item.update({"last_route": {}})),
+            ("session", lambda item: item.update({"session_fingerprint": "a" * 16})),
+            ("root-session", lambda item: item.update({"root_session_fingerprint": "b" * 16})),
+            ("route-decision", lambda item: item["last_route"].update({"difficulty_decision_id": "c" * 24})),
+            ("epoch-objective", lambda item: item["task_epoch"].update({"objective_fingerprint": "d" * 16})),
+            ("archived-epoch", lambda item: item["task_epoch"].update({"status": "archived"})),
+        ):
+            candidate = json.loads(json.dumps(state))
+            mutate(candidate)
+            invalid_variants.append((label, candidate, payload))
+        invalid_variants.append(("cwd", state, {"session_id": session, "cwd": "/tmp/other-task"}))
+        for label, candidate, candidate_payload in invalid_variants:
+            with self.subTest(label=label):
+                self.assertFalse(
+                    HOOK.has_trusted_prior_task_context(candidate, candidate_payload)
+                )
+
+        epochless = json.loads(json.dumps(state))
+        epochless["task_epoch"] = HOOK._safe_task_epoch(None)
+        self.assertTrue(HOOK.has_trusted_prior_task_context(epochless, payload))
+
+        bound_rollout = Path(self.temporary.name) / "bound-progress-rollout.jsonl"
+        other_rollout = Path(self.temporary.name) / "other-progress-rollout.jsonl"
+        bound_rollout.write_text("{}\n", encoding="utf-8")
+        other_rollout.write_text("{}\n", encoding="utf-8")
+        rollout_bound_state = json.loads(json.dumps(state))
+        rollout_bound_state["root_rollout_identity"] = (
+            HOOK.root_rollout_regular_file_identity(bound_rollout)
+        )
+        self.assertTrue(
+            HOOK.has_trusted_prior_task_context(
+                rollout_bound_state, {**payload, "transcript_path": str(bound_rollout)}
+            )
+        )
+        self.assertFalse(
+            HOOK.has_trusted_prior_task_context(
+                rollout_bound_state, {**payload, "transcript_path": str(other_rollout)}
+            )
+        )
+
+        generation = state["assessor_generation"]
+        objective = state["objective"]["fingerprint"]
+        epoch = state["task_epoch"]["id"]
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "progress",
+                "prompt": "我已经重启了",
+                "cwd": cwd,
+            }
+        )
+        continued = self.load_only_state()
+        self.assertEqual(continued["objective"]["fingerprint"], objective)
+        self.assertEqual(continued["task_epoch"]["id"], epoch)
+        self.assertEqual(continued["assessor_generation"], generation)
+
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "new-objective-with-progress-word",
+                "prompt": "另一个任务：已经确认支付回调有重复记录，请修复这个新问题",
+                "cwd": cwd,
+            }
+        )
+        successor = self.load_only_state()
+        self.assertNotEqual(successor["objective"]["fingerprint"], objective)
+        self.assertNotEqual(successor["task_epoch"]["id"], epoch)
 
     def test_legacy_state_migrates_with_safe_domain_defaults(self) -> None:
         legacy = {
@@ -11338,7 +11473,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.60"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.61"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11694,7 +11829,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (33, "1.0.60", "recovery_required", None),
+                    (33, "1.0.61", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
