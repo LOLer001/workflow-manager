@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.58
+
+- 修正 Hard 评估者首次启动的宿主参数衔接：上下文直接给出当前支持的精确 `spawn_agent` 调用形态，并在预留生命周期前拒绝冲突的 `agent_type` 或旧式 `fork_context`，避免一次无效调用留下重复预约。
+- 修正父级 `apply_patch` 已由宿主完成、但外层工具回执因会话中断缺失时的永久停顿：仅在同 session/turn、当前 epoch/contract/slice/live lease、唯一字面补丁和紧邻唯一成功 `FileChange` 全部一致时升级原操作；歧义、错路径、错类型、已有回执、同 turn 多补丁或跨 turn 一律拒绝。
+- 父级完成独立验证和 Stop 后封存写入租约，恢复过程保持幂等；Schema 维持 33、execution profile 维持 v12、stable-skill schema 维持 9，并保留 1.0.57 活跃父级合同的严格迁移恢复。
+
 ## 1.0.57
 
 - 将 Hard 合同从“必须一个子执行器”收敛为“同一时刻恰好一个写入者”：严格确认且当前无 pending/live/unknown 子写入者、无未完成 causal/stall 诊断时，父任务原子取得当前 contract/slice 的唯一租约，可连续实现、失败修正、验证与发布；租约存活时拒绝 child spawn，子写入者存在时父写入 fail-closed。

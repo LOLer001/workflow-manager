@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 33/writer 1.0.57 uses execution profile v12 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
+This reference applies only after a Hard plan is confirmed. Schema 33/writer 1.0.58 uses execution profile v12 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 
@@ -70,7 +70,7 @@ Executor Stop may be ordinary nonempty native prose. `EXECUTION_RESULT` is optio
 
 The high-reasoning parent independently reviews artifacts and acceptance evidence. Its Stop may also be ordinary nonempty native prose. `EXECUTION_REVIEW` is optional. A pass requires current candidate binding plus independent host-recorded verification. Missing host verification remains incomplete even when prose sounds confident. Another slice advances only after review; only the final accepted slice seals global `succeeded`.
 
-For shell verification, preserve the complete structured host result, including the underlying exit status. For `apply_patch`, bind the exact host call to its unique success receipt. If Desktop omits only the generic status, a PostToolUse mutation bound to the exact executor, contract, slice, input, command, and turn may count as change evidence only after independent parent verification succeeds; it does not force another recovery child. Multiple calls bind one-to-one; missing, duplicate, conflicting, cross-turn, or ambiguous evidence remains unknown.
+For shell verification, preserve the complete structured host result, including the underlying exit status. For `apply_patch`, bind the exact host call to its unique success receipt. If an interrupted parent turn loses only the outer custom-tool output, the same identity-pinned root rollout may reconcile one literal patch to the immediately following unique completed `FileChange` only when epoch, contract, slice, live parent lease, turn, patch digest, path, operation kind, and the FileChange diff receipt all agree. It upgrades the original operation in place and never replays the patch. Independent parent verification and Stop are still required, and terminal success seals the parent lease. Missing, duplicate, conflicting, cross-turn, moved-path, or otherwise ambiguous evidence remains unknown.
 
 ## Typed recovery
 

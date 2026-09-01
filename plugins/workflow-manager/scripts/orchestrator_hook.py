@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.57", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
+        value = {"version": "1.0.58", "schema": 33, "execution_profile": "12", "stable_skill_schema": 9}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -219,6 +219,7 @@ LIFECYCLE_DIAGNOSTIC_CODES = frozenset({
     "legacy_writer_isolated", "late_event_isolated_epoch",
     "late_event_epoch_ambiguous", "inventory_writer_absent",
     "inventory_writer_unknown", "inventory_writer_live",
+    "spawn_envelope_conflict", "parent_filechange_reconciled",
 })
 LIFECYCLE_DIAGNOSTIC_LEVELS = frozenset({"info", "warning", "error"})
 CHILD_LIVENESS_STATES = frozenset(
@@ -4940,7 +4941,8 @@ def _safe_operation(item: Any) -> dict[str, Any] | None:
         "host_input_digest": safe_fingerprint(item.get("host_input_digest")) or None,
         "host_command_digest": safe_fingerprint(item.get("host_command_digest")) or None,
         "legacy_host_input_digest": safe_fingerprint(item.get("legacy_host_input_digest")) or None,
-        "reconciliation_source": item.get("reconciliation_source") if item.get("reconciliation_source") in {"legacy_unique_turn_patch_event_v1", "host_rollout_exact_patch_digest_v1", "host_rollout_exact_patch_receipt_v2", "host_posttool_patch_receipt_v2", "host_rollout_exact_command_text_v1"} else None,
+        "reconciliation_source": item.get("reconciliation_source") if item.get("reconciliation_source") in {"legacy_unique_turn_patch_event_v1", "host_rollout_exact_patch_digest_v1", "host_rollout_exact_patch_receipt_v2", "host_posttool_patch_receipt_v2", "host_rollout_exact_command_text_v1", "host_rollout_exact_completed_file_change_v1"} else None,
+        "host_receipt_digest": _fingerprint32(item.get("host_receipt_digest")),
         "tool": safe_label(item.get("tool"), 120),
         "fingerprint": fingerprint[:64],
         "status": status_value,
@@ -10539,6 +10541,178 @@ def literal_apply_patch_source(source: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _normalized_patch_target(path_value: Any, cwd: str) -> str | None:
+    """Resolve one apply_patch/FileChange path lexically and portably."""
+    if not isinstance(path_value, str) or not path_value or "\x00" in path_value:
+        return None
+    if path_value != path_value.strip() or not isinstance(cwd, str) or not cwd:
+        return None
+    try:
+        root = os.path.normpath(cwd)
+        if not os.path.isabs(root):
+            return None
+        if os.path.isabs(path_value):
+            resolved = os.path.normpath(path_value)
+        else:
+            resolved = os.path.normpath(os.path.join(root, path_value))
+            if os.path.normcase(os.path.commonpath((root, resolved))) != os.path.normcase(root):
+                return None
+        return os.path.normcase(resolved)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def literal_patch_target_kinds(patch: str, cwd: str) -> dict[str, str] | None:
+    """Return the exact path/kind manifest for one non-moving literal patch."""
+    normalized = patch.replace("\r\n", "\n").replace("\r", "\n")
+    if (
+        normalized.count("*** Begin Patch") != 1
+        or normalized.count("*** End Patch") != 1
+        or re.search(r"(?m)^\*\*\* Move to:", normalized)
+    ):
+        return None
+    headers = re.findall(
+        r"(?m)^\*\*\* (Add|Update|Delete) File: ([^\n]+)$", normalized
+    )
+    visible_headers = re.findall(
+        r"(?m)^\*\*\* (?:Add|Update|Delete) File:", normalized
+    )
+    if not headers or len(headers) != len(visible_headers):
+        return None
+    kind_map = {"Add": "add", "Update": "update", "Delete": "delete"}
+    result: dict[str, str] = {}
+    for action, raw_path in headers:
+        target = _normalized_patch_target(raw_path, cwd)
+        if not target or target in result:
+            return None
+        result[target] = kind_map[action]
+    return result
+
+
+def completed_file_change_receipt(
+    event: dict[str, Any], cwd: str
+) -> tuple[dict[str, str], str] | None:
+    """Validate one host-owned completed FileChange and return its digest."""
+    if event.get("type") != "item_completed" or not isinstance(event.get("item"), dict):
+        return None
+    item = event["item"]
+    changes = item.get("changes")
+    stdout = item.get("stdout")
+    if not (
+        item.get("type") == "FileChange"
+        and item.get("status") == "completed"
+        and item.get("stderr") == ""
+        and isinstance(stdout, str)
+        and stdout.startswith("Success.")
+        and isinstance(changes, dict)
+        and changes
+    ):
+        return None
+    manifest: dict[str, str] = {}
+    digest_changes: dict[str, dict[str, str]] = {}
+    for raw_path, change in changes.items():
+        target = _normalized_patch_target(raw_path, cwd)
+        if not target or target in manifest or not isinstance(change, dict):
+            return None
+        kind = str(change.get("type") or "").lower()
+        unified_diff = change.get("unified_diff")
+        if (
+            kind not in {"add", "update", "delete"}
+            or change.get("move_path") not in (None, "")
+            or not isinstance(unified_diff, str)
+            or not unified_diff
+        ):
+            return None
+        manifest[target] = kind
+        digest_changes[target] = {
+            "kind": kind,
+            "unified_diff_digest": stable_hash(
+                unified_diff.replace("\r\n", "\n").replace("\r", "\n"), 32
+            ),
+        }
+    receipt_digest = stable_hash(
+        "workflow-manager-completed-file-change-v1\0"
+        + canonical_json(
+            {
+                "changes": digest_changes,
+                "stdout_digest": stable_hash(stdout, 32),
+            }
+        ),
+        32,
+    )
+    return manifest, receipt_digest
+
+
+def rollout_completed_file_change_after_patch(
+    records: list[dict[str, Any]], *, turn_id: str, call_id: str,
+    patch_source: str, cwd: str,
+) -> str | None:
+    """Bind one missing apply_patch output to one immediately completed FileChange."""
+    call_indexes: list[int] = []
+    patch_calls = 0
+    outputs = 0
+    for index, record in enumerate(records):
+        event = record.get("payload") or {}
+        if not isinstance(event, dict) or _host_event_turn_id(event) != turn_id:
+            continue
+        if event.get("type") == "custom_tool_call" and event.get("name") == "exec":
+            parsed_patch = literal_apply_patch_source(str(event.get("input") or ""))
+            if parsed_patch is not None:
+                patch_calls += 1
+            if str(event.get("call_id") or "") == call_id:
+                call_indexes.append(index)
+                if parsed_patch != patch_source:
+                    return None
+        elif (
+            event.get("type") == "custom_tool_call_output"
+            and str(event.get("call_id") or "") == call_id
+        ):
+            outputs += 1
+    if len(call_indexes) != 1 or patch_calls != 1 or outputs != 0:
+        return None
+
+    file_changes: list[dict[str, Any]] = []
+    for record in records[call_indexes[0] + 1 :]:
+        event = record.get("payload") or {}
+        if not isinstance(event, dict):
+            continue
+        event_turn = _host_event_turn_id(event)
+        if event_turn and event_turn != turn_id:
+            break
+        if record.get("type") in {"compacted", "context_compacted"}:
+            break
+        if event.get("type") == "custom_tool_call":
+            break
+        if event.get("type") == "custom_tool_call_output" and str(
+            event.get("call_id") or ""
+        ) == call_id:
+            return None
+        if (
+            event.get("type") == "item_completed"
+            and isinstance(event.get("item"), dict)
+            and event["item"].get("type") == "FileChange"
+        ):
+            file_changes.append(event)
+    if len(file_changes) != 1:
+        return None
+    expected = literal_patch_target_kinds(patch_source, cwd)
+    observed = completed_file_change_receipt(file_changes[0], cwd)
+    if expected is None or observed is None or observed[0] != expected:
+        return None
+    return stable_hash(
+        "workflow-manager-parent-patch-file-change-receipt-v1\0"
+        + canonical_json(
+            {
+                "call_id": call_id,
+                "file_change_receipt": observed[1],
+                "patch_digest": host_patch_digest(patch_source),
+                "turn_id": turn_id,
+            }
+        ),
+        32,
+    )
+
+
 def host_exec_receipt_statuses(output: Any) -> tuple[str, str | None]:
     """Separate an outer ``functions.exec`` envelope from its one tool leaf.
 
@@ -10897,6 +11071,248 @@ def reconcile_unknown_operations_from_transcript(payload: dict[str, Any], state:
         op["host_command_digest"] = command_digest
         op["status"] = status
         op["category"] = command_category({"tool_name": op.get("tool")}, command)
+    trusted = trusted_current_root_rollout(payload, state)
+    if trusted is not None:
+        records, root_cwd = trusted
+        if reconcile_parent_filechange_turn(
+            records, root_cwd, turn_id, state
+        ):
+            promote_reconciled_parent_review(state)
+
+
+def trusted_current_root_rollout(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str] | None:
+    """Return one identity-pinned same-session parent rollout and its root cwd."""
+    session_id = safe_label(payload.get("session_id"), 120)
+    if (
+        not session_id
+        or state.get("root_session_fingerprint") != stable_hash(session_id)
+    ):
+        return None
+    identity = root_rollout_regular_file_identity(payload.get("transcript_path"))
+    if identity is None:
+        return None
+    bound_identity = state.get("root_rollout_identity")
+    if bound_identity is not None and bound_identity != identity:
+        record_lifecycle_diagnostic(
+            state, "root_identity_mismatch", level="error"
+        )
+        return None
+    records = read_host_rollout_records(payload.get("transcript_path"))
+    metas = [
+        item.get("payload")
+        for item in records
+        if item.get("type") == "session_meta"
+        and isinstance(item.get("payload"), dict)
+    ]
+    if len(metas) != 1:
+        return None
+    meta = metas[0]
+    cwd = meta.get("cwd")
+    if (
+        meta.get("id") != session_id
+        or meta.get("session_id") != session_id
+        or not isinstance(cwd, str)
+        or not cwd
+        or state.get("root_cwd_fingerprint") != stable_hash(cwd)
+    ):
+        return None
+    if bound_identity is None:
+        state["root_rollout_identity"] = identity
+    return records, cwd
+
+
+def reconcile_parent_filechange_turn(
+    records: list[dict[str, Any]], cwd: str, turn_id: str,
+    state: dict[str, Any],
+) -> bool:
+    """Upgrade one interrupted parent apply_patch from exact host FileChange truth."""
+    if not parent_writer_lease_current(state):
+        return False
+    lease = _safe_parent_writer_lease(state.get("parent_writer_lease"))
+    current = current_execution_slice(state) or {}
+    acquired_at = str(lease.get("acquired_at") or "")
+    candidates = [
+        op
+        for op in state.get("operations", [])
+        if isinstance(op, dict)
+        and normalized_key(op.get("tool")) == "applypatch"
+        and op.get("status") == "unknown"
+        and op.get("executor_agent_id") is None
+        and op.get("host_event_turn_id") == turn_id
+        and _fingerprint32(op.get("host_input_digest"))
+        and op.get("epoch_id") == lease.get("epoch_id")
+        and op.get("execution_contract_id") == lease.get("execution_contract_id")
+        and op.get("slice_id") == current.get("id") == lease.get("slice_id")
+        and op.get("slice_contract_id") == lease.get("slice_contract_id")
+        and op.get("plan_digest") == state.get("plan_digest")
+        and acquired_at
+        and str(op.get("at") or "") >= acquired_at
+    ]
+    if len(candidates) != 1:
+        return False
+    patch_calls: list[tuple[str, str]] = []
+    for record in records:
+        event = record.get("payload") or {}
+        if not isinstance(event, dict) or _host_event_turn_id(event) != turn_id:
+            continue
+        if event.get("type") != "custom_tool_call" or event.get("name") != "exec":
+            continue
+        patch_source = literal_apply_patch_source(str(event.get("input") or ""))
+        if patch_source is not None:
+            patch_calls.append((str(event.get("call_id") or ""), patch_source))
+    if len(patch_calls) != 1:
+        return False
+    call_id, patch_source = patch_calls[0]
+    operation = candidates[0]
+    patch_digest = host_patch_digest(patch_source)
+    command_digest = stable_hash(
+        "host-operation-command-text-v1\0"
+        + patch_source.replace("\r\n", "\n").replace("\r", "\n"),
+        32,
+    )
+    if (
+        not call_id
+        or (
+            operation.get("host_input_digest") != patch_digest
+            and operation.get("host_command_digest") != command_digest
+        )
+    ):
+        return False
+    receipt_digest = rollout_completed_file_change_after_patch(
+        records,
+        turn_id=turn_id,
+        call_id=call_id,
+        patch_source=patch_source,
+        cwd=cwd,
+    )
+    if not receipt_digest:
+        return False
+    if operation.get("host_input_digest") != patch_digest:
+        operation["legacy_host_input_digest"] = operation.get("host_input_digest")
+        operation["host_input_digest"] = patch_digest
+    operation["host_command_digest"] = command_digest
+    operation["status"] = "ok"
+    operation["category"] = "implementation"
+    operation["reconciliation_source"] = (
+        "host_rollout_exact_completed_file_change_v1"
+    )
+    operation["host_receipt_digest"] = receipt_digest
+    record_lifecycle_diagnostic(
+        state,
+        "parent_filechange_reconciled",
+        level="info",
+        role="confirmed_executor",
+        contract_id=state.get("execution_contract_id"),
+    )
+    return True
+
+
+def promote_reconciled_parent_review(state: dict[str, Any]) -> bool:
+    """Rebuild the parent candidate after change and later verification agree."""
+    if (
+        not parent_writer_lease_current(state)
+        or state.get("plan_state") != "confirmed"
+        or state.get("confirmed_plan_digest") != state.get("plan_digest")
+        or state.get("executor_state") not in {"running", "verification_required"}
+    ):
+        return False
+    operations = _slice_operations(state)
+    change_indexes = [
+        index
+        for index, item in enumerate(operations)
+        if item.get("category")
+        in {"implementation", "build_package", "delivery_device"}
+        and item.get("status") in SUCCESS_STATUSES
+    ]
+    if not change_indexes:
+        return False
+    last_change = max(change_indexes)
+    parent_verifications = [
+        item
+        for index, item in enumerate(operations)
+        if index > last_change
+        and item.get("category") in {"verification", "evidence"}
+        and item.get("status") in SUCCESS_STATUSES
+        and item.get("executor_agent_id") is None
+    ]
+    if not parent_verifications:
+        return False
+    evidence = slice_operation_evidence(state)
+    if not (
+        evidence.get("change_evidence")
+        and evidence.get("verification_evidence")
+        and evidence.get("parent_review_evidence")
+    ):
+        return False
+    operation = parent_verifications[-1]
+    current = current_execution_slice(state) or {}
+    candidate = stable_hash(
+        "workflow-manager-parent-writer-candidate-v1\0"
+        + canonical_json(
+            {
+                "attempt": state.get("executor_attempt"),
+                "contract": state.get("execution_contract_id"),
+                "operation": operation.get("fingerprint"),
+                "slice": current.get("id"),
+            }
+        ),
+        32,
+    )
+    state["executor_review"] = _safe_executor_review(
+        {
+            "status": "review_required",
+            "attempt": state.get("executor_attempt"),
+            "execution_contract_id": state.get("execution_contract_id"),
+            "slice_id": current.get("id"),
+            "slice_contract_id": slice_contract_id(state),
+            "candidate_result_fingerprint": candidate,
+            "candidate_agent_fingerprint": stable_hash("parent", 32),
+            "candidate_evidence_digest": evidence.get("operation_digest"),
+            "child_summary_digest": stable_hash(
+                "parent-writer-host-operations\0" + candidate, 32
+            ),
+            "terminal_status": "completed",
+            "terminal_status_source": "host_declared_success",
+            "at": utc_now(),
+        }
+    )
+    state["executor_state"] = "verification_required"
+    state["executor_failure_kind"] = None
+    return True
+
+
+def reconcile_current_parent_rollout_on_resume(
+    payload: dict[str, Any], state: dict[str, Any]
+) -> int:
+    """Recover only current parent-lease writes from the pinned root rollout."""
+    trusted = trusted_current_root_rollout(payload, state)
+    if trusted is None or not parent_writer_lease_current(state):
+        return 0
+    records, cwd = trusted
+    current = current_execution_slice(state) or {}
+    turn_ids = dict.fromkeys(
+        str(op["host_event_turn_id"])
+        for op in state.get("operations", [])
+        if isinstance(op, dict)
+        and normalized_key(op.get("tool")) == "applypatch"
+        and op.get("status") == "unknown"
+        and op.get("executor_agent_id") is None
+        and op.get("execution_contract_id") == state.get("execution_contract_id")
+        and op.get("slice_id") == current.get("id")
+        and op.get("slice_contract_id") == slice_contract_id(state)
+        and op.get("host_event_turn_id")
+        and op.get("host_input_digest")
+    )
+    reconciled = sum(
+        1
+        for turn_id in turn_ids
+        if reconcile_parent_filechange_turn(records, cwd, turn_id, state)
+    )
+    if reconciled:
+        promote_reconciled_parent_review(state)
+    return reconciled
 
 
 def transcript_has_exact_parent_review_pass(
@@ -11525,6 +11941,17 @@ def resume_completed_parent_review_once(
     state["executor_failure_kind"] = None
     state["model_profile"] = confirmed_executor_model_profile(state)
     state["causal_review"] = _safe_causal_review(None)
+    parent_lease = _safe_parent_writer_lease(state.get("parent_writer_lease"))
+    if (
+        parent_lease.get("status") == "live"
+        and parent_lease.get("execution_contract_id") == contract
+        and parent_lease.get("slice_id") == current.get("id")
+        and parent_lease.get("slice_contract_id") == review.get("slice_contract_id")
+        and parent_lease.get("attempt")
+        == safe_sequence(state.get("executor_attempt"))
+    ):
+        parent_lease["status"] = "sealed"
+        state["parent_writer_lease"] = parent_lease
     repair_fingerprint = stable_hash(
         f"completed-parent-review-rollout-v1\0{contract}\0{current['id']}\0{proof['turn_id']}\0{evidence_digest}",
         32,
@@ -12771,6 +13198,55 @@ def subagent_request_options(payload: dict[str, Any]) -> dict[str, str | None]:
     return result
 
 
+def bound_spawn_envelope_conflict(payload: dict[str, Any]) -> str | None:
+    """Reject host-incompatible fork controls before reserving a writer.
+
+    Current Desktop's collaboration API represents bounded history with
+    ``fork_turns``.  Supplying the legacy ``fork_context`` switch or an
+    explicit ``agent_type`` alongside that request can be rejected by the host
+    before PostToolUse.  Reserving first would leave an unprovable orphan, so
+    detect only those structured option keys (never prose) up front.
+    """
+    root = payload.get("tool_input") if "tool_input" in payload else payload
+    pending: list[tuple[Any, int]] = [(root, 0)]
+    seen: set[int] = set()
+    nodes = 0
+    while pending:
+        value, depth = pending.pop(0)
+        nodes += 1
+        if nodes > SUBAGENT_REQUEST_MAX_NODES or depth > SUBAGENT_REQUEST_MAX_DEPTH:
+            return "spawn envelope exceeds bounded inspection limits"
+        if isinstance(value, str):
+            if not _json_container_text(value):
+                continue
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if isinstance(value, list):
+            if len(value) > SUBAGENT_REQUEST_MAX_LIST_ITEMS:
+                return "spawn envelope exceeds bounded inspection limits"
+            pending.extend((item, depth + 1) for item in value)
+            continue
+        if not isinstance(value, dict):
+            continue
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        for key, child in list(value.items())[:SUBAGENT_REQUEST_MAX_LIST_ITEMS]:
+            normalized = normalized_key(key)
+            if normalized == "agenttype" and child not in (None, ""):
+                return "omit agent_type when fork_turns is used"
+            if normalized == "forkcontext":
+                return "omit legacy fork_context; use only fork_turns=1"
+            if normalized in {
+                "args", "arguments", "input", "toolinput", "content"
+            }:
+                pending.append((child, depth + 1))
+    return None
+
+
 def confirmed_executor_request(
     payload: dict[str, Any], state: dict[str, Any]
 ) -> tuple[bool, str | None]:
@@ -12781,6 +13257,8 @@ def confirmed_executor_request(
     resolution = subagent_request_resolution(payload)
     if resolution.get("error"):
         return False, f"executor {resolution['error']}"
+    if envelope_error := bound_spawn_envelope_conflict(payload):
+        return False, f"executor spawn envelope conflict: {envelope_error}"
     if (
         state.get("plan_state") != "confirmed"
         or state.get("confirmed_plan_digest") != state.get("plan_digest")
@@ -12845,6 +13323,8 @@ def confirmed_assessor_request(
     resolution = subagent_request_resolution(payload)
     if resolution.get("error"):
         return False, f"assessor {resolution['error']}"
+    if envelope_error := bound_spawn_envelope_conflict(payload):
+        return False, f"assessor spawn envelope conflict: {envelope_error}"
     if state.get("assessor_state") not in {"spawn_required", "recovery_required"}:
         return False, "duplicate assessor"
     if writer_liveness_blocks_successor(state):
@@ -14418,7 +14898,9 @@ def session_start(payload: dict[str, Any]) -> None:
         if source in {"compact", "resume"}:
             reconcile_host_rollout_compactions(payload, state)
             resume_compaction_gate_misclassification_once(payload, state)
+            reconcile_current_parent_rollout_on_resume(payload, state)
             reconcile_current_parent_review_on_resume(payload, state)
+            promote_reconciled_parent_review(state)
             reconcile_current_executor_rollout_on_resume(payload, state)
             resume_completed_parent_review_once(payload, state)
             resume_failed_parent_probe_once(state, payload)
@@ -15717,9 +16199,13 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             else "default second-highest reasoning tier"
         )
         context += (
-            " Hard work needs one read-only high-tier assessment before mutation. Spawn one child with the host's "
-            f"highest available Codex model, reasoning_effort={assessor_effort} ({assessor_effort_policy}), "
-            f"fork_turns=1, and any concise safe ASCII task_name (suggestion: {assessor_task}). "
+            " Hard work needs one read-only high-tier assessment before mutation. Make exactly this collaboration "
+            "call shape: collaboration.spawn_agent("
+            f"task_name=\"{assessor_task}\", fork_turns=\"1\", model=\"{RECOVERY_EXECUTOR_MODEL}\", "
+            f"reasoning_effort=\"{assessor_effort}\", message=<read-only assessment>). "
+            f"This is the highest available Codex model at {assessor_effort} ({assessor_effort_policy}). "
+            "Omit agent_type and do not construct fork_context; either option can be rejected by the host before "
+            "a lifecycle receipt exists. "
             "Let the assessor judge objective/scope, acceptance, risk, rollback, and stop conditions natively. "
             "After it returns, the parent presents one ordinary human-readable plan; no plugin marker, JSON fence, "
             "fixed wording, or task-name encoding is required."
@@ -16374,6 +16860,17 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             return
         request_text = subagent_request_text(payload)
         if assessor_intent:
+            if assessor_reason and "spawn envelope conflict" in assessor_reason:
+                def record_spawn_envelope_conflict(current: dict[str, Any]) -> None:
+                    record_lifecycle_diagnostic(
+                        current,
+                        "spawn_envelope_conflict",
+                        level="warning",
+                        role="high_assessor",
+                        contract_id=current.get("assessor_binding_id"),
+                    )
+
+                mutate_state(payload, record_spawn_envelope_conflict)
             emit_pretool_deny(
                 f"Workflow Manager blocked assessor spawn: {assessor_reason or 'invalid assessor request'}."
             )
@@ -20048,6 +20545,20 @@ def stop(payload: dict[str, Any]) -> None:
                         state["executor_review"] = review
                         state["model_profile"] = "work_assessment"
                         return
+                    parent_lease = _safe_parent_writer_lease(
+                        state.get("parent_writer_lease")
+                    )
+                    if (
+                        parent_lease.get("status") == "live"
+                        and parent_lease.get("execution_contract_id") == contract_id
+                        and parent_lease.get("slice_id") == current_slice.get("id")
+                        and parent_lease.get("slice_contract_id")
+                        == current_slice_contract
+                        and parent_lease.get("attempt")
+                        == safe_sequence(state.get("executor_attempt"))
+                    ):
+                        parent_lease["status"] = "sealed"
+                        state["parent_writer_lease"] = parent_lease
                     stall = _safe_stall(state.get("stall"))
                     if (
                         stall.get("state") == "resuming"

@@ -24,7 +24,7 @@ Everything else is advisory. Let the model decide whether a plan needs one step 
 
 ## Hard flow
 
-- Request one highest-available read-only assessor at `max`, `fork_turns=1`; only explicit whole-session `highest_throughout` uses `ultra`. Its safe ASCII `task_name` is an opaque host label, not an encoded contract.
+- Spawn one read-only assessor exactly as `collaboration.spawn_agent(task_name=<safe ASCII>, fork_turns="1", model="gpt-5.6-sol", reasoning_effort="max", message=<read-only assessment>)`. Omit `agent_type` and `fork_context`; only `highest_throughout` uses `ultra`. Its safe ASCII `task_name` is an opaque host label.
 - The assessor may answer with any nonempty bounded native result. No `WORK_ASSESSMENT`, JSON fence, fixed keywords, closing sentence, or minimum prose length is required. The host-bound lifecycle proves provenance; the parent model judges the content and writes one nonempty bounded native plan.
 - Store the complete bounded parent plan in the private append-only canonical journal. v3 typed terminal seals and durable conclusions may follow the immutable executable-revision prefix; they never grant execution authority. A machine-readable slice manifest is optional. If absent, the Hook treats the native plan as one logical execution slice; if present, it may expand within the total 196608-byte / 1024-node budget with no independent list or slice cap. A normal model-generated plan may still choose 3–5 slices.
 - Before confirmation, permit read-only diagnosis but deny mutation. A pure confirmation that arrives after assessor completion but before parent Stop is stored only as a digest receipt; preserve Hard/repair state and automatically bind it after the matching trusted revision commits. Do not ask the user to repeat it.

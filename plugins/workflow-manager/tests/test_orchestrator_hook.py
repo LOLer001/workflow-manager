@@ -375,7 +375,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_highest_preference_is_explicit_and_daily_stays_current(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 33)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.57")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.58")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "12")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 9)
@@ -470,7 +470,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.57"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.58"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -497,7 +497,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.57 active", context)
+        self.assertIn("Workflow Manager 1.0.58 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -995,7 +995,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("reasoning_effort=max", context)
+        self.assertIn('reasoning_effort="max"', context)
         self.assertIn("default second-highest reasoning tier", context)
 
     def test_assessor_start_model_only_is_running_but_not_full_profile_evidence(self) -> None:
@@ -1153,7 +1153,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.57"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.58"))
         self.assertEqual(migrated["execution_profile_version"], "12")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1249,7 +1249,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (33, "1.0.57", "12"),
+                    (33, "1.0.58", "12"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1295,7 +1295,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (33, "1.0.57", "5", "verification_required", 1),
+            (33, "1.0.58", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -1452,7 +1452,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_agent_id"],
             ),
-            (33, "1.0.57", "recovery_required", None),
+            (33, "1.0.58", "recovery_required", None),
         )
         self.assertEqual(migrated["subagents"], [])
         self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -1467,7 +1467,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1052["executor_state"],
                 migrated_1052["executor_agent_id"],
             ),
-            ("1.0.57", "recovery_required", None),
+            ("1.0.58", "recovery_required", None),
         )
         self.assertEqual(migrated_1052["subagents"], [])
         schema32 = json.loads(json.dumps(running))
@@ -1480,7 +1480,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated_1055["executor_state"],
                 migrated_1055["executor_agent_id"],
             ),
-            ("1.0.57", "recovery_required", None),
+            ("1.0.58", "recovery_required", None),
         )
         self.assertEqual(migrated_1055["subagents"], [])
         # The mailbox-recovery bridge applies only to the current trusted
@@ -5681,7 +5681,9 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(started.stdout)["hookSpecificOutput"]["additionalContext"]
-        assessor_task = re.search(r"suggestion: (assessor_[0-9a-f]{12}_q[1-9][0-9]*)", context).group(1)
+        assessor_task = re.search(
+            r'task_name="(assessor_[0-9a-f]{12}_q[1-9][0-9]*)"', context
+        ).group(1)
         encrypted_message = base64.urlsafe_b64encode(b"\x80" + (b"\x00" * 72)).decode("ascii")
         self.run_hook(
             {
@@ -10637,7 +10639,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.57 active", context)
+        self.assertIn("Workflow Manager 1.0.58 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11326,7 +11328,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.57"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (33, "1.0.58"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11682,7 +11684,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (33, "1.0.57", "recovery_required", None),
+                    (33, "1.0.58", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -11741,6 +11743,327 @@ class OrchestratorHookTests(unittest.TestCase):
                          ("verification_required", 1))
         completed = self.parent_execution_review(candidate, session, run_id="parent-terminal")
         self.assertEqual(completed["executor_state"], "succeeded")
+
+    def test_assessor_exact_spawn_shape_rejects_conflict_before_reservation(self) -> None:
+        session = "assessor-envelope-conflict"
+        routed = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": "排查跨模块状态恢复错误并修复、完成强杀恢复与全量回归",
+            }
+        )
+        context = json.loads(routed.stdout)["hookSpecificOutput"]["additionalContext"]
+        state = self.load_only_state()
+        task_name = HOOK.bound_assessor_task_name(state)
+        self.assertIn("collaboration.spawn_agent(", context)
+        self.assertIn(f'task_name="{task_name}"', context)
+        self.assertIn('fork_turns="1"', context)
+        self.assertIn('model="gpt-5.6-sol"', context)
+        self.assertIn('reasoning_effort="max"', context)
+        self.assertIn("Omit agent_type", context)
+        self.assertIn("do not construct fork_context", context)
+
+        conflicting = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "conflicting-request",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": task_name,
+                    "message": "Read-only Hard assessment",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "max",
+                    "fork_turns": "1",
+                    "agent_type": "default",
+                    "fork_context": True,
+                },
+            }
+        )
+        conflict_output = json.loads(conflicting.stdout)["hookSpecificOutput"]
+        self.assertEqual(conflict_output["permissionDecision"], "deny")
+        self.assertIn("spawn envelope conflict", conflict_output["permissionDecisionReason"])
+        unreserved = self.load_only_state()
+        self.assertEqual((unreserved["assessor_state"], unreserved["assessor_attempt"]),
+                         ("spawn_required", 0))
+        self.assertFalse(unreserved["subagents"])
+        self.assertEqual(unreserved["lifecycle_diagnostics"][-1]["code"],
+                         "spawn_envelope_conflict")
+
+        legacy_fork = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "legacy-fork-request",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": task_name,
+                    "message": "Read-only Hard assessment",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "max",
+                    "fork_turns": "1",
+                    "fork_context": True,
+                },
+            }
+        )
+        legacy_output = json.loads(legacy_fork.stdout)["hookSpecificOutput"]
+        self.assertEqual(legacy_output["permissionDecision"], "deny")
+        self.assertIn("omit legacy fork_context", legacy_output["permissionDecisionReason"])
+        still_unreserved = self.load_only_state()
+        self.assertEqual((still_unreserved["assessor_state"], still_unreserved["assessor_attempt"]),
+                         ("spawn_required", 0))
+        self.assertFalse(still_unreserved["subagents"])
+
+        accepted = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "exact-request",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": task_name,
+                    "message": "Read-only Hard assessment",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "max",
+                    "fork_turns": "1",
+                },
+            }
+        )
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}),
+        )
+        reserved = self.load_only_state()
+        self.assertEqual((reserved["assessor_state"], reserved["assessor_attempt"]),
+                         ("spawn_pending", 1))
+        self.assertEqual(len(reserved["subagents"]), 1)
+
+    def test_interrupted_parent_patch_reconciles_from_exact_filechange_and_seals(self) -> None:
+        session = "parent-filechange-resume"
+        state = self.create_confirmed_executor_state(session)
+        root_cwd = str(Path(self.temporary.name) / "workspace")
+        patch_text = (
+            "*** Begin Patch\n"
+            f"*** Update File: {root_cwd}/a.py\n"
+            "@@\n-old\n+new\n"
+            "*** End Patch"
+        )
+        turn = "interrupted-patch-turn"
+        change = {
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "hook_run_id": "patch-pre",
+            "turn_id": turn,
+            "tool_name": "apply_patch",
+            "tool_input": {"patch": patch_text},
+        }
+        self.run_hook(change)
+        self.run_hook(
+            {
+                **change,
+                "hook_event_name": "PostToolUse",
+                "hook_run_id": "patch-opaque-post",
+                "tool_response": [],
+            }
+        )
+        interrupted = self.load_only_state()
+        interrupted["writer_version"] = "1.0.57"
+        interrupted["root_cwd_fingerprint"] = HOOK.stable_hash(root_cwd)
+        interrupted["root_rollout_identity"] = None
+        interrupted["operations"][-1]["host_input_digest"] = "f" * 32
+        interrupted["operations"][-1]["host_command_digest"] = HOOK.stable_hash(
+            "host-operation-command-text-v1\0" + patch_text, 32
+        )
+        self.state_files()[0].write_text(
+            json.dumps(interrupted, ensure_ascii=False), encoding="utf-8"
+        )
+        operation = interrupted["operations"][-1]
+        self.assertEqual((operation["status"], interrupted["executor_state"]),
+                         ("unknown", "running"))
+
+        wrong_transcript = Path(self.temporary.name) / "wrong-root-rollout.jsonl"
+        wrong_transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "session_id": session,
+                        "id": session,
+                        "cwd": root_cwd + "-other",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        identity_probe = json.loads(json.dumps(interrupted))
+        self.assertIsNone(
+            HOOK.trusted_current_root_rollout(
+                {
+                    "session_id": session,
+                    "transcript_path": str(wrong_transcript),
+                },
+                identity_probe,
+            )
+        )
+        self.assertIsNone(identity_probe["root_rollout_identity"])
+
+        meta = {
+            "type": "session_meta",
+            "payload": {"session_id": session, "id": session, "cwd": root_cwd},
+        }
+        turn_meta = {"internal_chat_message_metadata_passthrough": {"turn_id": turn}}
+        call = {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "patch-call",
+                "input": f"await tools.apply_patch({json.dumps(patch_text)});",
+                **turn_meta,
+            },
+        }
+        file_change = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "FileChange",
+                    "status": "completed",
+                    "changes": {
+                        f"{root_cwd}/a.py": {
+                            "type": "update",
+                            "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                            "move_path": None,
+                        }
+                    },
+                    "stdout": "Success. Updated the following files:\nM a.py\n",
+                    "stderr": "",
+                },
+                "turn_id": turn,
+            },
+        }
+        next_turn = {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "resume-turn"},
+        }
+        transcript = Path(self.temporary.name) / "parent-filechange-rollout.jsonl"
+        transcript.write_text(
+            "\n".join(json.dumps(row) for row in (meta, call, file_change, next_turn))
+            + "\n",
+            encoding="utf-8",
+        )
+        resumed = self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+                "session_id": session,
+                "hook_run_id": "resume",
+                "transcript_path": str(transcript),
+            }
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        reconciled = self.load_only_state()
+        reconciled_operation = reconciled["operations"][-1]
+        self.assertEqual(reconciled_operation["status"], "ok")
+        self.assertEqual(
+            reconciled_operation["reconciliation_source"],
+            "host_rollout_exact_completed_file_change_v1",
+        )
+        self.assertEqual(reconciled_operation["legacy_host_input_digest"], "f" * 32)
+        self.assertEqual(
+            reconciled_operation["host_input_digest"], HOOK.host_patch_digest(patch_text)
+        )
+        self.assertRegex(reconciled_operation["host_receipt_digest"], r"^[0-9a-f]{32}$")
+        self.assertEqual(reconciled["executor_state"], "running")
+        operation_count = len(reconciled["operations"])
+        receipt_digest = reconciled_operation["host_receipt_digest"]
+        self.run_hook(
+            {
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+                "session_id": session,
+                "hook_run_id": "resume-idempotent",
+                "transcript_path": str(transcript),
+            }
+        )
+        replayed = self.load_only_state()
+        self.assertEqual(len(replayed["operations"]), operation_count)
+        self.assertEqual(replayed["operations"][-1]["host_receipt_digest"], receipt_digest)
+
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": session,
+                "hook_run_id": "verification",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -m unittest bounded_acceptance"},
+                "tool_response": {"status": "ok", "exit_code": 0},
+            }
+        )
+        candidate = self.load_only_state()
+        self.assertEqual(candidate["executor_state"], "verification_required")
+        completed = self.parent_execution_review(
+            candidate, session, run_id="parent-filechange-terminal"
+        )
+        self.assertEqual(completed["executor_state"], "succeeded")
+        self.assertEqual(completed["parent_writer_lease"]["status"], "sealed")
+
+    def test_parent_filechange_recovery_rejects_ambiguous_or_mismatched_receipts(self) -> None:
+        cwd = "/tmp/workflow-manager-filechange-negative"
+        turn = "negative-filechange-turn"
+        patch_text = (
+            "*** Begin Patch\n"
+            f"*** Update File: {cwd}/a.py\n"
+            "@@\n-old\n+new\n"
+            "*** End Patch"
+        )
+        meta = {"internal_chat_message_metadata_passthrough": {"turn_id": turn}}
+        call = {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call", "name": "exec", "call_id": "p1",
+                "input": f"await tools.apply_patch({json.dumps(patch_text)});", **meta,
+            },
+        }
+
+        def file_change(path: str, kind: str = "update") -> dict:
+            return {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed", "turn_id": turn,
+                    "item": {
+                        "type": "FileChange", "status": "completed",
+                        "changes": {path: {"type": kind, "unified_diff": "@@\n-x\n+y\n", "move_path": None}},
+                        "stdout": "Success. Updated the following files:\n", "stderr": "",
+                    },
+                },
+            }
+
+        output = {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "p1", "output": {}, **meta},
+        }
+        cases = {
+            "path_mismatch": [call, file_change(f"{cwd}/b.py")],
+            "kind_mismatch": [call, file_change(f"{cwd}/a.py", "delete")],
+            "duplicate_filechange": [call, file_change(f"{cwd}/a.py"), file_change(f"{cwd}/a.py")],
+            "output_present": [call, file_change(f"{cwd}/a.py"), output],
+            "sibling_patch": [call, {**call, "payload": {**call["payload"], "call_id": "p2"}}, file_change(f"{cwd}/a.py")],
+        }
+        for label, records in cases.items():
+            with self.subTest(label=label):
+                self.assertIsNone(
+                    HOOK.rollout_completed_file_change_after_patch(
+                        records,
+                        turn_id=turn,
+                        call_id="p1",
+                        patch_source=patch_text,
+                        cwd=cwd,
+                    )
+                )
 
     def test_parent_writer_refuses_pending_child_and_blocks_spawn_while_leased(self) -> None:
         pending_session = "parent-pending-child"
