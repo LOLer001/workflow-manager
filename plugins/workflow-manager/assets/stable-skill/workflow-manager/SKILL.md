@@ -11,6 +11,7 @@ Workflow Manager is a narrow authorization and evidence layer, not a second task
 
 - Daily and Simple work run natively with `Start=0`: no assessor, executor, or confirmation.
 - Hard needs explicit evidence: production release/deployment, irreversible action, security/data loss, system-wide outage, host-continuity risk; or two strong groups including unknown-cause, cross-scope, or continuity. `production`, `core`, `customer-visible`, or `business-critical` labels alone do not upgrade a bounded known single-function bug with clear acceptance.
+- Explicit exclusions or no-risk bounds—such as “do not modify, test, publish, or write Git”—are not positive Hard evidence. They do not erase genuine production-release, irreversible, or cross-scope evidence elsewhere in the same request.
 - If uncertain, begin with bounded native read-only diagnosis and promote only when evidence crosses that threshold. See [work routing](references/work-routing.md).
 
 ## Keep only irreducible gates

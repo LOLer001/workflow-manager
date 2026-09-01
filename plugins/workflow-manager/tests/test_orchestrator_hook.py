@@ -443,8 +443,9 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.66")
-        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "3")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.67")
+        self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
+        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "4")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "13")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 10)
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
@@ -530,7 +531,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.66"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.67"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -557,7 +558,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.66 active", context)
+        self.assertIn("Workflow Manager 1.0.67 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1181,7 +1182,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.66"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.67"))
         self.assertEqual(migrated["execution_profile_version"], "13")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1277,7 +1278,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.66", "13"),
+                    (34, "1.0.67", "13"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1323,7 +1324,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.66", "5", "verification_required", 1),
+            (34, "1.0.67", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -9812,7 +9813,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.66 active", context)
+        self.assertIn("Workflow Manager 1.0.67 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10630,7 +10631,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.66"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.67"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -10985,7 +10986,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.66", "recovery_required", None),
+                    (34, "1.0.67", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -11628,6 +11629,56 @@ class ConfirmationNormalizationV1049Tests(unittest.TestCase):
         mixed = HOOK.classify_work_difficulty("不可逆外部动作无；发布 Workflow Manager 插件 1.0.49", domain, route)
         self.assertNotIn("critical_irreversible_or_production", no_action["difficulty_rule_codes"])
         self.assertIn("critical_workflow_manager_versioned_release", mixed["difficulty_rule_codes"])
+
+    def test_negated_actions_are_boundaries_not_requested_hard_work(self) -> None:
+        smoke = (
+            "只读检查 Workflow Manager 1.0.67 的 release_metadata.json；"
+            "不得修改、不得运行测试、不得执行发布或 Git 写操作"
+        )
+        actual = HOOK.classify_prompt(smoke)
+        self.assertEqual(actual["work_difficulty"], "simple")
+        self.assertNotIn("critical_workflow_manager_versioned_release", actual["difficulty_rule_codes"])
+        self.assertNotIn("hard_three_phase_chain", actual["difficulty_rule_codes"])
+        self.assertEqual(actual["phase_hints"], [])
+
+        english = HOOK.classify_prompt(
+            "Read only inspect Workflow Manager 1.0.67 release_metadata.json; "
+            "do not modify, run tests, publish, release, or perform Git write operations."
+        )
+        self.assertEqual(english["work_difficulty"], "simple")
+        self.assertEqual(english["phase_hints"], [])
+        self.assertNotIn("critical_workflow_manager_versioned_release", english["difficulty_rule_codes"])
+
+        compact_chinese = HOOK.classify_prompt(
+            "只读检查 Workflow Manager 代码；不修改、不测试、不发布、不进行 Git 写入"
+        )
+        self.assertEqual(compact_chinese["work_difficulty"], "simple")
+        self.assertEqual(compact_chinese["phase_hints"], [])
+
+        excluded_risk = HOOK.classify_prompt(
+            "只读检查 Workflow Manager 代码；不得生产发布，不得执行不可逆动作，不得销毁数据"
+        )
+        self.assertEqual(excluded_risk["work_difficulty"], "simple")
+        self.assertNotIn("critical_irreversible_or_production", excluded_risk["difficulty_rule_codes"])
+
+        excluded_risk_english = HOOK.classify_prompt(
+            "Read only inspect orchestrator_hook.py; do not publish a production release "
+            "or perform irreversible actions."
+        )
+        self.assertEqual(excluded_risk_english["work_difficulty"], "simple")
+        self.assertNotIn(
+            "critical_irreversible_or_production", excluded_risk_english["difficulty_rule_codes"]
+        )
+
+        mixed = HOOK.classify_prompt(
+            "只读检查 release_metadata.json；不得修改或测试；然后发布 Workflow Manager 插件 1.0.67"
+        )
+        self.assertEqual(mixed["work_difficulty"], "hard")
+        self.assertIn("critical_workflow_manager_versioned_release", mixed["difficulty_rule_codes"])
+
+        positive = HOOK.classify_prompt("发布 Workflow Manager 插件 release 1.0.67，并执行正式部署")
+        self.assertEqual(positive["work_difficulty"], "hard")
+        self.assertIn("critical_workflow_manager_versioned_release", positive["difficulty_rule_codes"])
 
 
 if __name__ == "__main__":

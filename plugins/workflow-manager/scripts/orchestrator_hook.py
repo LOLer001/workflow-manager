@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.66", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
+        value = {"version": "1.0.67", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -59,8 +59,8 @@ def _release_metadata() -> dict[str, Any]:
 RELEASE_METADATA = _release_metadata()
 SCHEMA_VERSION = RELEASE_METADATA["schema"]
 WRITER_VERSION = RELEASE_METADATA["version"]
-DOMAIN_CLASSIFIER_VERSION = "2"
-DIFFICULTY_CLASSIFIER_VERSION = "3"
+DOMAIN_CLASSIFIER_VERSION = "3"
+DIFFICULTY_CLASSIFIER_VERSION = "4"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the one read-only high-tier boundary for Hard work.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
@@ -12422,7 +12422,7 @@ DAILY_EXACT_PATTERNS = (
     ("daily_chat", r"^(?:你好|您好|嗨|hello|hi|聊聊|陪我聊天|谢谢|早上好|晚上好)[!！。,.，\s]*$"),
 )
 WORK_STRONG_PATTERNS = (
-    ("work_workflow_manager_maintenance", r"(?:workflow[ -]?manager|工作流管理器).{0,80}(?:修复|fix|测试|test|版本|release|发布|publish|代码)"),
+    ("work_workflow_manager_maintenance", r"(?:workflow[ -]?manager|工作流管理器).{0,80}(?:修复|\bfix\b|测试|\btest\b|版本|\brelease\b|发布|\bpublish\b|代码)"),
     ("work_device_customization", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:定制|需求|适配|开发|修改|实现)"),
     ("work_device_bug", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:bug|问题|异常|故障|崩溃|重启|修复|排查|诊断)"),
     (
@@ -12454,7 +12454,7 @@ WORK_STRONG_PATTERNS = (
 WORK_CONTEXT_PATTERNS = (
     ("work_source_symbol", r"(?:\.java|\.kt|\.py|\.js|\.ts|\.cpp|\.c|\.h|方法|函数|类|源码文件)"),
     ("work_toolchain", r"(?:adb|gradle|maven|ninja|make|编译器|构建服务器|设备日志|logcat)"),
-    ("work_product_delivery", r"(?:客户需求|交付|验收|版本发布|release|production|线上故障)"),
+    ("work_product_delivery", r"(?:客户需求|交付|验收|版本发布|\brelease\b|\bproduction\b|线上故障)"),
     (
         "work_repository_artifact",
         r"(?:(?:readme|changelog|仓库文档|代码文档).{0,24}(?:错字|链接|修改|修正|更新|typo|link|fix|update)|"
@@ -12468,6 +12468,63 @@ def _english_hits(text: str, terms: tuple[str, ...]) -> int:
     return sum(1 for term in terms if re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", text))
 
 
+def classification_action_scan(prompt: str) -> str:
+    """Return a transient classifier view with prohibited actions neutralized.
+
+    This is deliberately not a prompt normalizer: callers must retain the
+    original prompt for objective fingerprints, authorization, and journals.
+    It only prevents a bounded prohibition such as ``不得发布`` or ``do not
+    run tests`` from being counted as a requested phase or critical action.
+    Separators and later affirmative clauses remain intact.
+    """
+    text = re.sub(r"\s+", " ", str(prompt or "").strip())
+    english_actions = (
+        r"(?:create|write|modify|edit|change|fix|implement|build|compile|package|"
+        r"test|verify|validate|install|reboot|flash|"
+        r"run(?:ning)?\s+(?:any\s+)?tests?|"
+        r"publish(?:ing)?(?:\s+(?:a\s+)?production\s+(?:release|deployment)|"
+        r"\s+(?:to|into)\s+(?:the\s+)?production)?|"
+        r"release(?:ing)?(?:\s+(?:to|into)\s+(?:the\s+)?production)?|"
+        r"deploy(?:ing)?(?:\s+(?:to|into)\s+(?:the\s+)?production)?|"
+        r"execute\s+(?:a\s+)?(?:release|deployment)|"
+        r"perform(?:ing)?\s+(?:any\s+)?irreversible\s+actions?|"
+        r"wipe|erase|force[- ]push|rewrite\s+(?:git\s+)?history|"
+        r"rotate\s+(?:production\s+)?credentials?|"
+        r"perform\s+git\s+(?:write\s+)?operations?|git\s+write\s+operations?)"
+    )
+    chinese_actions = (
+        r"(?:创建|写入|修改|编辑|变更|修复|实现|编译|构建|打包|合包|"
+        r"(?:运行|执行|进行)?测试|验证|验收|生产发布|(?:执行|进行)?发布|发布|部署|"
+        r"安装|重启|烧录|刷机|(?:执行|进行)?不可逆(?:外部)?动作|"
+        r"(?:造成)?数据丢失|销毁|擦除|清空|强推|强制推送|重写(?:git\s*)?历史|"
+        r"轮换(?:生产)?凭据|(?:执行|进行)?git\s*写(?:操作|入)?)"
+    )
+    # Only consume an action phrase after a negative operator.  Do not consume
+    # the following object or clause, so "do not test; then deploy" retains the
+    # genuine deploy request while the forbidden test cannot add a phase.
+    english_negative_list = (
+        rf"(?:{english_actions})(?:(?:\s*(?:,|;)?\s*(?:and|or|and/or)\s*|\s*,\s*)"
+        rf"(?:{english_actions}))*"
+    )
+    chinese_negative_list = (
+        rf"(?:{chinese_actions})(?:(?:\s*(?:、|,|，|;|；)?\s*(?:和|或|及|以及)\s*|\s*(?:、|,|，)\s*)"
+        rf"(?:{chinese_actions}))*"
+    )
+    text = re.sub(
+        rf"\b(?:do\s+not|don't|never|must\s+not|should\s+not|without)\s*{english_negative_list}",
+        " ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        rf"(?:严禁|不得|禁止|不要|请勿|无需|无须|不需要|不可|不能|勿|不)\s*{chinese_negative_list}",
+        " ",
+        text,
+        flags=re.I,
+    )
+    return text
+
+
 def classify_task_domain(prompt: str) -> dict[str, Any]:
     """Classify the user objective without storing its raw text.
 
@@ -12476,34 +12533,18 @@ def classify_task_domain(prompt: str) -> dict[str, Any]:
     """
     normalized = re.sub(r"\s+", " ", prompt.strip())
     lower = normalized.lower()
-    # A prohibition is a boundary, not an engineering deliverable. Remove only
-    # bounded negative file/artifact clauses before evaluating positive Work
-    # signals; later affirmative clauses remain available to the classifier.
-    work_scan = re.sub(
-        r"\b(?:do not|don't|never)\s+"
-        r"(?:creat(?:e|es|ing)|write|modify|edit|verify|test)"
-        r"(?:\s+(?:or|and)\s+(?:creat(?:e|es|ing)|write|modify|edit|verify|test))*"
-        r"\s+(?:any\s+)?(?:[a-z0-9_-]+\s+){0,3}(?:files?|artifacts?)\b",
-        " ",
-        lower,
-        flags=re.I,
-    )
-    work_scan = re.sub(
-        r"(?:不要|禁止|无需)(?:创建|写入|修改|编辑|验证|测试)"
-        r"(?:(?:或|和|、)(?:创建|写入|修改|编辑|验证|测试))*"
-        r"(?:任何|任意|这些|该)?[^，。；;]{0,8}(?:文件|产物)",
-        " ",
-        work_scan,
-    )
+    # A prohibition is a boundary, not an engineering deliverable.  This view
+    # is transient and must never replace the raw prompt's fingerprint.
+    work_scan = classification_action_scan(normalized)
     daily_codes = [code for code, pattern in DAILY_EXACT_PATTERNS if re.search(pattern, lower, re.I)]
     work_codes = [code for code, pattern in WORK_STRONG_PATTERNS if re.search(pattern, work_scan, re.I)]
-    context_codes = [code for code, pattern in WORK_CONTEXT_PATTERNS if re.search(pattern, lower, re.I)]
+    context_codes = [code for code, pattern in WORK_CONTEXT_PATTERNS if re.search(pattern, work_scan, re.I)]
     report_with_separate_work = bool(
         re.search(
             r"(?:然后|同时|并且|此外|还要|再|then|also|and then).{0,40}"
             r"(?:修改|修复|实现|开发|编译|构建|部署|测试|验证|代码|app|设备|"
             r"modify|fix|implement|develop|build|compile|deploy|test|verify)",
-            lower,
+            work_scan,
             re.I,
         )
     )
@@ -12548,10 +12589,10 @@ CRITICAL_HARD_PATTERNS = (
     (
         "critical_workflow_manager_versioned_release",
         r"(?:workflow[ -]?manager|工作流管理器).{0,120}(?:插件|plugin|hook|skill).{0,120}"
-        r"(?:发布|publish|release).{0,48}(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)"
-        r"|(?:发布|publish|release).{0,120}(?:workflow[ -]?manager|工作流管理器).{0,120}"
+        r"(?:发布|\bpublish\b|\brelease\b).{0,48}(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)"
+        r"|(?:发布|\bpublish\b|\brelease\b).{0,120}(?:workflow[ -]?manager|工作流管理器).{0,120}"
         r"(?:插件|plugin|hook|skill).{0,48}(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)"
-        r"|(?:workflow[ -]?manager|工作流管理器).{0,120}(?:发布|publish|release).{0,48}"
+        r"|(?:workflow[ -]?manager|工作流管理器).{0,120}(?:发布|\bpublish\b|\brelease\b).{0,48}"
         r"(?:\b(?:v?\d+\.\d+\.\d+)\b|版本)",
     ),
     (
@@ -12610,6 +12651,7 @@ def classify_work_difficulty(
     """Classify work difficulty independently from execution shape and agent count."""
     normalized = re.sub(r"\s+", " ", prompt.strip())
     lower = normalized.lower()
+    action_scan = classification_action_scan(normalized)
     if domain.get("task_domain") != "work":
         difficulty = "not_applicable"
         confidence = "high"
@@ -12621,7 +12663,7 @@ def classify_work_difficulty(
             r"(?:irreversible[_ -]?action|不可逆(?:外部)?动作)\s*(?:[:=：]\s*)?"
             r"(?:none|no|false|无|否|不适用|n/?a)(?=$|[\s,;，；])",
             "",
-            lower,
+            action_scan,
             flags=re.I,
         )
         critical_codes = [
@@ -12630,7 +12672,7 @@ def classify_work_difficulty(
             if re.search(pattern, critical_text, re.I)
         ]
         hard_codes = [
-            code for code, pattern in HARD_WORK_PATTERNS if re.search(pattern, lower, re.I)
+            code for code, pattern in HARD_WORK_PATTERNS if re.search(pattern, action_scan, re.I)
         ]
         question_only = bool(
             re.search(r"^(?:what|why|how|when|where|who|is|are|can|could|would)\b", lower)
@@ -12638,7 +12680,7 @@ def classify_work_difficulty(
         )
         if question_only and not re.search(
             r"(?:修改|修复|实现|开发|编写|执行|部署|迁移|回滚|fix|implement|develop|write|execute|deploy|migrate|rollback)",
-            lower,
+            action_scan,
             re.I,
         ):
             critical_codes = []
@@ -12673,7 +12715,7 @@ def classify_work_difficulty(
             rule_codes = list(dict.fromkeys([*critical_codes, *hard_codes]))[:8]
         else:
             simple_codes = [
-                code for code, pattern in SIMPLE_WORK_PATTERNS if re.search(pattern, lower, re.I)
+                code for code, pattern in SIMPLE_WORK_PATTERNS if re.search(pattern, action_scan, re.I)
             ]
             bounded_shape = len(phases) <= 2
             if bounded_shape:
@@ -12711,16 +12753,18 @@ def classify_work_difficulty(
 
 
 def phase_hints(prompt: str) -> list[str]:
-    lower = prompt.lower()
+    scan = classification_action_scan(prompt)
+    lower = scan.lower()
     result: list[str] = []
     for phase, (english, chinese) in PHASE_TERMS.items():
-        if _english_hits(lower, english) or any(term in prompt for term in chinese):
+        if _english_hits(lower, english) or any(term in scan for term in chinese):
             result.append(phase)
     return result
 
 
 def prompt_dependency_signal(prompt: str) -> str:
-    lower = prompt.lower()
+    scan = classification_action_scan(prompt)
+    lower = scan.lower()
     ordered = bool(
         re.search(r"\bfirst\b.{0,100}\b(?:then|afterwards?|next)\b", lower)
         or re.search(
@@ -12730,8 +12774,8 @@ def prompt_dependency_signal(prompt: str) -> str:
         )
         or re.search(r"\b(?:after|before|once)\b.{0,80}\b(?:build|compile|deploy|install|verify|test|record)", lower)
         or re.search(r"\b(?:depends? on|requires? (?:the )?(?:output|result|artifact)|using (?:the )?(?:output|artifact))\b", lower)
-        or re.search(r"(?:先).{0,100}(?:再|然后|之后|后)", prompt)
-        or re.search(r"(?:依赖|必须等|基于).{0,40}(?:产物|结果|完成|之后|以后)", prompt)
+        or re.search(r"(?:先).{0,100}(?:再|然后|之后|后)", scan)
+        or re.search(r"(?:依赖|必须等|基于).{0,40}(?:产物|结果|完成|之后|以后)", scan)
     )
     shared = bool(
         re.search(
@@ -12740,7 +12784,7 @@ def prompt_dependency_signal(prompt: str) -> str:
             lower,
         )
         or re.search(r"\b(?:shared resource|shared device|one device)\b", lower)
-        or re.search(r"(?:唯一|同一|共享).{0,12}(?:设备|资源|工作区|文件|产物|账号|构建服务器)", prompt)
+        or re.search(r"(?:唯一|同一|共享).{0,12}(?:设备|资源|工作区|文件|产物|账号|构建服务器)", scan)
     )
     if ordered and shared:
         return "ordered_shared"

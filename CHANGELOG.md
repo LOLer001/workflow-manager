@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.0.67
+
+- 修正只读元数据 smoke 的路由：`不得修改`、`不测试`、`不发布`、`不进行 Git 写入` 等明确禁止/排除/无风险边界不再单独产生正向 Hard 信号；同一请求中的真实生产发布、不可逆动作或跨范围证据仍保留并按原阈值判定。
+- Schema 34、execution profile v13 与 stable-skill schema 10 保持不变；采用 forward-only 1.0.67 发布，不宣称普通只读请求绝对零风险。
+
 ## 1.0.66
 
 - 引入 contract+epoch 维度的计划权威隔离：新 Simple/Daily 目标会退休不再适用的 Hard journal authority，同时保留有界摘要与原始 journal/transaction 字节；匹配的活动 Hard journal 继续 fail-closed，不读取、修补或清理其内容。
