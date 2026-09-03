@@ -443,9 +443,9 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.67")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.68")
         self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
-        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "4")
+        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "13")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 10)
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
@@ -531,7 +531,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.67"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.68"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -558,7 +558,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.67 active", context)
+        self.assertIn("Workflow Manager 1.0.68 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1182,7 +1182,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.67"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.68"))
         self.assertEqual(migrated["execution_profile_version"], "13")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1278,7 +1278,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.67", "13"),
+                    (34, "1.0.68", "13"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1324,7 +1324,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.67", "5", "verification_required", 1),
+            (34, "1.0.68", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -3059,6 +3059,48 @@ class OrchestratorHookTests(unittest.TestCase):
         changed = json.loads(next((self.data / "sessions").glob("reference-replan-*.json")).read_text(encoding="utf-8"))
         self.assertNotEqual(changed["reference_acceptance"]["contract_digest"], old_digest)
         self.assertEqual(changed["plan_state"], "analyzing")
+
+    def test_historical_reference_material_summary_stays_native(self) -> None:
+        result = self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "historical-reference-summary",
+            "hook_run_id": "summary",
+            "prompt": (
+                "在保持 Unity 原始主题资源不变的前提下，逐项对齐 AndroidNativeDemo "
+                "主题0、主题6并完成构建、安装和录屏验证。"
+                "这是我上个月的工作内容，请总结一份工作成果说明。"
+            ),
+        })
+        self.assertEqual(result.stdout, "")
+        state = self.load_only_state()
+        self.assertEqual(
+            (state["task_domain"], state["work_difficulty"], state["assessor_state"]),
+            ("work", "simple", "none"),
+        )
+        self.assertFalse(state["reference_acceptance"]["enabled"])
+        self.assertIsNone(state["assessor_binding_id"])
+
+    def test_direct_reference_alignment_stays_hard(self) -> None:
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "direct-reference-alignment",
+            "hook_run_id": "direct",
+            "prompt": "AndroidNativeDemo 对齐 Unity 主题0",
+        })
+        state = self.load_only_state()
+        self.assertEqual((state["work_difficulty"], state["assessor_state"]), ("hard", "spawn_required"))
+        self.assertTrue(state["reference_acceptance"]["enabled"])
+
+    def test_summary_then_continue_reference_alignment_stays_hard(self) -> None:
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "summary-then-reference-alignment",
+            "hook_run_id": "mixed",
+            "prompt": "以上是上月工作内容，请先总结成果说明，然后继续对齐 Unity 主题0",
+        })
+        state = self.load_only_state()
+        self.assertEqual((state["work_difficulty"], state["assessor_state"]), ("hard", "spawn_required"))
+        self.assertTrue(state["reference_acceptance"]["enabled"])
 
     def test_reference_negative_feedback_replans_or_opens_causal_review_and_resumes_bounded_state(self) -> None:
         session = "reference-negative"
@@ -9813,7 +9855,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.67 active", context)
+        self.assertIn("Workflow Manager 1.0.68 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10631,7 +10673,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.67"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.68"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -10986,7 +11028,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.67", "recovery_required", None),
+                    (34, "1.0.68", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")

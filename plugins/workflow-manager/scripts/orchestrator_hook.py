@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.67", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
+        value = {"version": "1.0.68", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -60,7 +60,7 @@ RELEASE_METADATA = _release_metadata()
 SCHEMA_VERSION = RELEASE_METADATA["schema"]
 WRITER_VERSION = RELEASE_METADATA["version"]
 DOMAIN_CLASSIFIER_VERSION = "3"
-DIFFICULTY_CLASSIFIER_VERSION = "4"
+DIFFICULTY_CLASSIFIER_VERSION = "5"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the one read-only high-tier boundary for Hard work.
 DEFAULT_PLAN_REASONING_EFFORT = "max"
@@ -967,6 +967,33 @@ def reference_requested(prompt: str) -> bool:
         or bool(re.search(r"(?:对齐|复刻|还原)\s*[A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff -]{1,28}\s*(?:效果|界面|动画|视觉|行为|主题\d*)", prompt))
         or bool(re.search(r"与\s*[A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff -]{1,28}\s*(?:效果|界面|动画|视觉|行为|主题\d*)\s*一致", prompt))
     )
+
+
+def historical_material_summary_only(prompt: str) -> bool:
+    """Keep reference phrases inside historical report material out of Hard routing."""
+    normalized = re.sub(r"\s+", " ", str(prompt or "").strip())
+    historical = re.search(
+        r"(?:这是|以下|以上|上述).{0,16}(?:我)?"
+        r"(?:上月|上个月|过去(?:一个)?月|历史|已完成).{0,24}"
+        r"(?:工作(?:内容|清单|记录|成果)|材料)",
+        normalized,
+        re.I,
+    )
+    summaries = list(
+        re.finditer(
+            r"(?:请|帮我|给我|需要)?(?:先|只)?"
+            r"(?:总结|汇总|整理|撰写|生成|写).{0,24}"
+            r"(?:工作成果说明|成果说明|月度(?:工作)?总结|工作总结|汇报材料|月报)",
+            normalized,
+            re.I,
+        )
+    )
+    if not historical or not summaries:
+        return False
+    summary = summaries[-1]
+    if summary.start() < historical.start():
+        return False
+    return not reference_requested(normalized[summary.end():])
 
 
 def reference_contract_changed(prompt: str) -> bool:
@@ -16011,7 +16038,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and previous.get("assessor_state")
         in {"spawn_required", "spawn_pending", "running", "recovery_required", "failed"}
     )
-    requested_reference = reference_requested(prompt)
+    requested_reference = reference_requested(prompt) and not historical_material_summary_only(prompt)
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     confirmable_pending = previous.get("plan_state") == "awaiting_confirmation"
     repair_pending = previous.get("plan_state") == "repair_required"
