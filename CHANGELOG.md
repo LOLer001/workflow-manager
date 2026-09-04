@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.69
+
+- 修复旧 canonical v2 journal 仍位于同 session 的 epoch-less 路径时，事务恢复在 schema migration 与 authority retirement 前错误使用当前 task epoch 重算目录、从而误报 `transaction_recovery_failed` 并永久阻断后续 mutation 的问题。
+- 恢复阶段只从严格 canonical 的 `plan_artifact.relative_path` 提取已绑定 token，仅接受当前 epoch 或同一 session 的 epoch-less token；跨 session、旧 epoch-bound token、非法路径、symlink、目录 identity、digest 与 transaction marker 不一致继续 fail-closed，旧确认和旧 authority 仍按既有规则失效或退休。
+- Schema 34、execution profile v13 与 stable-skill schema 10 保持不变；仅执行新增升级回归、直接相关 transaction/path/security 定向测试和仓库校验，并采用 forward-only 1.0.69 发布。
+
 ## 1.0.68
 
 - 修正历史工作材料中的“对齐参考/主题”等完成态描述被误当成当前参考复刻请求、从而无条件进入 Hard 的问题；明确的直接参考对齐，以及总结后继续对齐的混合请求仍保持 reference Hard。

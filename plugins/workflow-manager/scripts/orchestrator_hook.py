@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.68", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
+        value = {"version": "1.0.69", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -7754,6 +7754,33 @@ def _persisted_plan_transaction_side(
     return "unknown"
 
 
+def _recoverable_plan_artifact_session_token(
+    state: dict[str, Any], payload: dict[str, Any], artifact: dict[str, Any]
+) -> str:
+    """Resolve only the exact current or same-session legacy journal token.
+
+    Transaction recovery runs before schema migration and authority retirement.
+    The persisted artifact path is therefore the location evidence for an old
+    epoch-less journal, but accepting it here never makes that journal current
+    authority: normal migration and artifact verification still run next.
+    """
+    relative = artifact.get("relative_path")
+    match = re.fullmatch(
+        rf"plans/(session-[0-9a-f]{{16}})/{re.escape(PLAN_JOURNAL_NAME)}",
+        str(relative or ""),
+    )
+    if match is None or relative != match.group(0):
+        raise PlanArtifactError("transaction_incomplete")
+    session = match.group(1)
+    raw_session = payload.get("session_id")
+    epoch = _safe_task_epoch(state.get("task_epoch")).get("id")
+    current = plan_artifact_session_id(raw_session, epoch)
+    legacy = plan_artifact_session_id(raw_session)
+    if session not in {current, legacy}:
+        raise PlanArtifactError("transaction_incomplete")
+    return session
+
+
 def recover_plan_transaction(state: dict[str, Any], payload: dict[str, Any]) -> bool:
     artifact = _safe_plan_artifact(state.get("plan_artifact"))
     # A retired journal has no current state capability. Its bytes and any
@@ -7762,6 +7789,9 @@ def recover_plan_transaction(state: dict[str, Any], payload: dict[str, Any]) -> 
     if artifact.get("format_version") != 2 or not artifact.get("journal_digest"):
         return True
     try:
+        session = _recoverable_plan_artifact_session_token(
+            state, payload, artifact
+        )
         try:
             root = _canonical_plan_data_root(payload)
         except PlanArtifactError:
@@ -7769,7 +7799,6 @@ def recover_plan_transaction(state: dict[str, Any], payload: dict[str, Any]) -> 
             if not artifact.get("journal_digest"):
                 return True
             raise
-        session = plan_artifact_session_id(payload.get("session_id"), _safe_task_epoch(state.get("task_epoch")).get("id"))
         directory = root / "plans" / session
         try:
             directory_info = directory.lstat()

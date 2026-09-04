@@ -951,6 +951,216 @@ class PlanArtifactTests(unittest.TestCase):
         self.assertEqual(journal.read_bytes(), journal_bytes)
         self.assertEqual(marker.read_bytes(), marker_bytes)
 
+    def test_c14c_markerless_epochless_v2_journal_does_not_block_upgrade(self) -> None:
+        session = "c14c-epochless-v2-upgrade"
+        payload = {
+            "hook_event_name": "SessionStart",
+            "session_id": session,
+            "hook_run_id": "legacy-upgrade",
+            "cwd": str(self.root / "workspace"),
+        }
+        objective = "a" * 16
+        difficulty = "b" * 24
+        epoch = "e" * 32
+        legacy_token = HOOK.plan_artifact_session_id(session)
+        current_token = HOOK.plan_artifact_session_id(session, epoch)
+        body = self.hard_body("legacy-v2")
+        document, parsed = HOOK.append_plan_journal_revision(
+            None,
+            session=legacy_token,
+            generation=1,
+            body=body,
+            objective_fingerprint=objective,
+            difficulty_decision_id=difficulty,
+            created_at="2026-09-03T00:00:00+00:00",
+        )
+        legacy_directory = self.data / "plans" / legacy_token
+        legacy_directory.mkdir(parents=True)
+        journal = legacy_directory / HOOK.PLAN_JOURNAL_NAME
+        journal.write_bytes(document)
+        marker = legacy_directory / HOOK.PLAN_TRANSACTION_MARKER_NAME
+        current_directory = self.data / "plans" / current_token
+
+        legacy = HOOK.new_state(payload)
+        legacy.update(
+            {
+                "schema_version": 32,
+                "writer_version": "1.0.55",
+                "execution_profile_version": "11",
+                "task_domain": "work",
+                "work_difficulty": "hard",
+                "difficulty_decision_id": difficulty,
+                "objective": {"fingerprint": objective, "length": 1},
+                "task_epoch": {
+                    "id": epoch,
+                    "sequence": 1,
+                    "status": "active",
+                    "objective_fingerprint": objective,
+                },
+                "plan_state": "confirmed",
+                "plan_generation": 1,
+                "plan_digest": parsed["current_revision_digest"],
+                "plan_objective_fingerprint": objective,
+                "plan_difficulty_decision_id": difficulty,
+                "confirmed_plan_digest": parsed["current_revision_digest"],
+                "confirmed_at": "2026-09-03T00:01:00+00:00",
+                "executor_state": "spawn_required",
+                "execution_contract_id": "c" * 32,
+                "plan_artifact": {
+                    "relative_path": f"plans/{legacy_token}/{HOOK.PLAN_JOURNAL_NAME}",
+                    "format_version": 2,
+                    "objective_fingerprint": objective,
+                    "difficulty_decision_id": difficulty,
+                    "plan_digest": parsed["current_revision_digest"],
+                    "content_digest": parsed["current_revision_digest"],
+                    "current_revision_digest": parsed["current_revision_digest"],
+                    "journal_digest": parsed["journal_digest"],
+                    "journal_prefix_digest": parsed["journal_prefix_digest"],
+                    "journal_prefix_bytes": parsed["journal_prefix_bytes"],
+                    "generation": 1,
+                    "revision_count": 1,
+                    "lifecycle_status": "ready",
+                    "write_status": "written",
+                    "warning_code": "none",
+                },
+            }
+        )
+        environment = patch.dict(
+            os.environ,
+            {"PLUGIN_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        state_path = HOOK.state_path(payload)
+        self.assertIsNotNone(state_path)
+        HOOK.atomic_write(state_path, legacy)
+
+        self.assertFalse(marker.exists())
+        self.assertFalse(current_directory.exists())
+        self.assertEqual(
+            HOOK.stable_hash(journal.read_bytes(), 32),
+            legacy["plan_artifact"]["journal_digest"],
+        )
+
+        recovered = HOOK.snapshot_state(payload)
+
+        self.assertNotEqual(
+            recovered.get("_snapshot_failure"), "transaction_recovery_failed"
+        )
+        self.assertNotEqual(
+            recovered["plan_artifact"]["write_status"],
+            "transaction_recovery_failed",
+        )
+        self.assertEqual(recovered["plan_state"], "invalidated")
+        self.assertIsNone(recovered["confirmed_plan_digest"])
+        self.assertIsNone(recovered["execution_contract_id"])
+        self.assertEqual(journal.read_bytes(), document)
+        self.assertFalse(marker.exists())
+        self.assertFalse(current_directory.exists())
+
+        successor = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "legacy-upgrade-successor",
+                "prompt": "另一个任务：生成今天的日报",
+                "cwd": payload["cwd"],
+            }
+        )
+        self.assertEqual(successor.returncode, 0, successor.stderr)
+        retired = self.state()
+        self.assertEqual(retired["plan_state"], "none")
+        self.assertIsNone(retired["confirmed_plan_digest"])
+        self.assertEqual(
+            retired["retired_plan_authorities"][-1]["relative_path"],
+            f"plans/{legacy_token}/{HOOK.PLAN_JOURNAL_NAME}",
+        )
+        self.assertEqual(
+            retired["retired_plan_authorities"][-1]["journal_digest"],
+            parsed["journal_digest"],
+        )
+        mutation = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": "legacy-upgrade-successor-mutation",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"},
+                "cwd": payload["cwd"],
+            }
+        )
+        self.assertNotIn('"permissionDecision":"deny"', mutation.stdout)
+        self.assertEqual(journal.read_bytes(), document)
+        self.assertFalse(marker.exists())
+        self.assertFalse(current_directory.exists())
+
+    def test_c14d_recovery_session_token_and_path_checks_stay_fail_closed(self) -> None:
+        session = "c14d-recovery-token-binding"
+        payload = {"hook_event_name": "SessionStart", "session_id": session}
+        epoch = "e" * 32
+        state = HOOK.new_state(payload)
+        state["task_epoch"] = {
+            "id": epoch,
+            "sequence": 2,
+            "status": "active",
+            "objective_fingerprint": "a" * 16,
+        }
+        current = HOOK.plan_artifact_session_id(session, epoch)
+        legacy = HOOK.plan_artifact_session_id(session)
+        wrong_tokens = (
+            HOOK.plan_artifact_session_id(session, "d" * 32),
+            HOOK.plan_artifact_session_id("other-session"),
+            HOOK.plan_artifact_session_id("other-session", epoch),
+        )
+
+        for token in (current, legacy):
+            with self.subTest(accepted_token=token):
+                artifact = {
+                    "relative_path": f"plans/{token}/{HOOK.PLAN_JOURNAL_NAME}"
+                }
+                self.assertEqual(
+                    HOOK._recoverable_plan_artifact_session_token(
+                        state, payload, artifact
+                    ),
+                    token,
+                )
+
+        for relative in (
+            f"/plans/{legacy}/{HOOK.PLAN_JOURNAL_NAME}",
+            f"plans/{legacy}/nested/{HOOK.PLAN_JOURNAL_NAME}",
+            f"plans/{legacy}/../{HOOK.PLAN_JOURNAL_NAME}",
+            f"plans\\{legacy}\\{HOOK.PLAN_JOURNAL_NAME}",
+            f"plans/{legacy}/hard-plan-other.md",
+            f"plans/session-{'f' * 15}/{HOOK.PLAN_JOURNAL_NAME}",
+        ):
+            with self.subTest(rejected_path=relative):
+                with self.assertRaises(HOOK.PlanArtifactError) as raised:
+                    HOOK._recoverable_plan_artifact_session_token(
+                        state, payload, {"relative_path": relative}
+                    )
+                self.assertEqual(raised.exception.code, "transaction_incomplete")
+
+        with patch.dict(os.environ, {"PLUGIN_DATA": str(self.data)}):
+            for token in wrong_tokens:
+                with self.subTest(rejected_token=token):
+                    candidate = json.loads(json.dumps(state))
+                    candidate["plan_artifact"] = {
+                        "relative_path": f"plans/{token}/{HOOK.PLAN_JOURNAL_NAME}",
+                        "format_version": 2,
+                        "journal_digest": "f" * 32,
+                        "lifecycle_status": "ready",
+                        "write_status": "written",
+                        "warning_code": "none",
+                    }
+                    self.assertFalse(
+                        HOOK.recover_plan_transaction(candidate, payload)
+                    )
+                    self.assertEqual(
+                        candidate["plan_artifact"]["write_status"],
+                        "transaction_recovery_failed",
+                    )
+                    self.assertFalse((self.data / "plans" / token).exists())
+
     def test_c15_state_replace_then_failure_leaves_recoverable_new_new_transaction(self) -> None:
         session = "c15"
         self.begin_hard_plan(session)
