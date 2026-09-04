@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 34/writer 1.0.69 uses execution profile v13 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
+This reference applies only after a Hard plan is confirmed. Schema 34/writer 1.0.70 uses execution profile v13 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 
@@ -52,6 +52,8 @@ Strict confirmation binds a normalized authorization envelope containing only:
 - explicit acceptance;
 - risk category;
 - irreversible external action.
+
+Once the canonical revision is committed and awaiting confirmation, bounded contextual assent and explicit execution intent are both valid. Before that boundary, only explicit execution intent may form an early receipt. The parser remains deterministic and state-aware: negation, conditions, questions, quotation or retelling, code blocks, and scope changes fail closed, while no active Hard plan means no assent can grant authority.
 
 It does not bind plan prose, slice layout, or manifest digest. Repair, autosplit, verification, typed recovery, and compaction successors inherit confirmation while that envelope is unchanged. Only a material change to one of its four fields requires new confirmation.
 

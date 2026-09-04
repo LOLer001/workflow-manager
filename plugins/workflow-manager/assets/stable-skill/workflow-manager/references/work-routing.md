@@ -41,7 +41,9 @@ A machine-readable `workflow-manager-execution-slices` block is optional. Withou
 
 ## Confirmation
 
-Accept an unambiguous pure confirmation of the presented plan. Confirmation binds only objective plus explicit acceptance, risk category, and irreversible external action. It does not bind wording, layout, slices, or manifest digest. Same-envelope repair, autosplit, verification, recovery, and compaction inherit it.
+Accept an unambiguous semantic confirmation of the presented plan without prescribing an exact phrase. A committed plan awaiting confirmation accepts bounded contextual assent such as “可以” or “yes” as well as explicit execution intent. Before the canonical revision exists, only explicit execution intent may create an early receipt. Negation, conditions, questions, quotation or retelling, code blocks, and scope changes never confirm.
+
+Confirmation binds only objective plus explicit acceptance, risk category, and irreversible external action. It does not bind wording, layout, slices, or manifest digest. Same-envelope repair, autosplit, verification, recovery, and compaction inherit it.
 
 If pure confirmation arrives after the assessor completes but before parent Stop lands, preserve the pending plan, repair, Hard route, and assessor lifecycle. Persist a host-bound confirmation-receipt digest only and automatically bind it after the matching trusted revision commits. Do not reset to Daily and do not ask the user to repeat confirmation.
 

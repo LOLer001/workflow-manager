@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.69", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
+        value = {"version": "1.0.70", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -9935,7 +9935,10 @@ def reconcile_missed_parent_controls_from_rollout(
         user_text = _rollout_user_message(record)
         if user_text is not None:
             delegated = codex_delegation_input(user_text)
-            if pure_plan_confirmation(delegated if delegated is not None else user_text):
+            if pure_plan_confirmation(
+                delegated if delegated is not None else user_text,
+                allow_contextual=True,
+            ):
                 confirmations.append(index)
         value = record.get("payload")
         if (
@@ -15626,15 +15629,47 @@ def is_control_followup(prompt: str) -> bool:
     return normalized in FOLLOWUP_CONTROLS
 
 
+CONFIRMATION_NONE = "none"
+CONFIRMATION_CONTEXTUAL_ASSENT = "contextual_assent"
+CONFIRMATION_EXPLICIT_EXECUTE = "explicit_execute"
 PLAN_CONFIRM_PATTERNS = (
-    r"(?:继续(?:啊|吧)?(?:我)?[，, ]*)?(?:严格)?确认执行",
-    r"(?:严格)?确认执行",
-    r"(?:严格)?确认按(?:这个|上述|该|此|新)计划执行",
-    r"同意按(?:这个|上述|该|此|新)计划执行",
-    r"按(?:这个|上述|该|此|新)计划执行",
-    r"开始执行(?:这个|上述|该|此|新)计划",
-    r"confirm and execute (?:this|the) plan",
-    r"execute (?:this|the) plan",
+    r"(?:继续(?:啊|吧)?\s*)?(?:我)?(?:严格)?确认(?:按(?:这个|上述|该|此|新)?(?:计划|方案))?(?:继续)?执行",
+    r"(?:我)?(?:严格)?确认(?:继续|开始)(?:执行)?",
+    r"(?:我)?同意(?:按(?:这个|上述|该|此|新)?(?:计划|方案))?(?:继续)?执行",
+    r"(?:我)?同意(?:继续|开始)(?:执行)?",
+    r"(?:请)?可以(?:继续|开始)(?:执行)?",
+    r"(?:请)?可以按(?:这个|上述|该|此|新)?(?:计划|方案)(?:继续)?执行",
+    r"(?:请)?(?:继续执行|开始执行|执行|开始)(?:这个|上述|该|此|新)?(?:计划|方案)?(?:吧)?",
+    r"就按(?:这个|上述|该|此|新)?(?:计划|方案)(?:执行|做|来)(?:吧)?",
+    r"按(?:这个|上述|该|此|新)?(?:计划|方案)(?:继续)?(?:执行|做)(?:吧)?",
+    r"confirm(?: and)? (?:execute|proceed|continue)(?: (?:this|the) plan)?",
+    r"(?:yes|ok|okay|approved) (?:please )?(?:proceed|continue|execute(?: (?:this|the) plan)?)",
+    r"(?:please )?(?:go ahead|proceed with (?:this|the) plan|execute (?:this|the) plan|start execution)",
+)
+CONTEXTUAL_CONFIRM_PATTERNS = (
+    r"好(?:的)?",
+    r"可以",
+    r"同意",
+    r"确认",
+    r"批准",
+    r"继续(?:吧)?",
+    r"就这样",
+    r"就这么办",
+    r"yes(?: please)?",
+    r"ok(?:ay)?",
+    r"approved",
+    r"confirmed",
+    r"proceed",
+    r"continue",
+    r"go ahead",
+    r"sounds good",
+    r"looks good",
+)
+SAFE_NEGATED_CONFIRM_PATTERNS = (
+    (CONFIRMATION_CONTEXTUAL_ASSENT, r"没问题"),
+    (CONFIRMATION_EXPLICIT_EXECUTE, r"没问题(?:继续|执行|开始)(?:执行)?"),
+    (CONFIRMATION_CONTEXTUAL_ASSENT, r"no problem"),
+    (CONFIRMATION_EXPLICIT_EXECUTE, r"no problem (?:please )?(?:proceed|continue|execute)"),
 )
 PLAN_CHANGE_MARKERS = (
     "但是",
@@ -15680,17 +15715,55 @@ def _normalized_control_candidate(prompt: str) -> str:
     if not raw or len(raw.encode("utf-8")) > 512:
         return ""
     value = re.sub(r"(?:&#(?:32|x20);|&nbsp;)", " ", raw, flags=re.I).strip()
-    if not value or "\n" in value or "\r" in value or "```" in value or "`" in value:
+    if not value or "\n" in value or "\r" in value or "```" in value:
+        return ""
+    inline_code = re.fullmatch(r"`([^`\r\n]+)`", value)
+    if inline_code:
+        value = inline_code.group(1).strip()
+    elif "`" in value:
         return ""
     return re.sub(r"[ \t]+", " ", value).strip().lower()
 
 
-def pure_plan_confirmation(prompt: str) -> bool:
-    normalized = re.sub(r"[?!？！。,.，]+", "", _normalized_control_candidate(prompt))
+def plan_confirmation_intent(prompt: str) -> str:
+    """Classify bounded assent without granting authority outside plan state."""
+    candidate = _normalized_control_candidate(prompt)
+    if not candidate:
+        return CONFIRMATION_NONE
+    if (
+        re.search(r"[?？]", candidate)
+        or re.search(r"(?:吗|么|呢)\s*[。.!！]*$", candidate)
+        or re.search(r"\b(?:can|could|should|would|may|will)\b.*[?？]?\s*$", candidate, re.I)
+    ):
+        return CONFIRMATION_NONE
+    if re.search(r"[\"'“”‘’]", candidate):
+        return CONFIRMATION_NONE
+    normalized = re.sub(r"[!！。,.，:：;；]+", " ", candidate)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", normalized)
     if not normalized or contains_plan_change_marker(normalized):
-        return False
-    return any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_CONFIRM_PATTERNS)
+        return CONFIRMATION_NONE
+    for intent, pattern in SAFE_NEGATED_CONFIRM_PATTERNS:
+        if re.fullmatch(pattern, normalized, re.I):
+            return intent
+    if (
+        re.search(r"(?:如果|若|除非|前提|只要|等.{0,24}(?:后|之后|再)|\bif\b|\bunless\b|\bprovided\b|\bafter\b|\bwhen\b)", normalized, re.I)
+        or re.search(r"(?:请)?回复|(?:用户|他|她|他们)说|这句话|表示|意味着|例如|示例|原文|引用|\b(?:reply|respond|said|says|means|example|quote|type|send)\b", normalized, re.I)
+        or re.search(r"(?:不|别|勿|未|取消|停止|暂停|暂缓|反对|\bno\b|\bnot\b|\bdon't\b|\bdo not\b|\bwait\b|\bhold\b)", normalized, re.I)
+    ):
+        return CONFIRMATION_NONE
+    if any(re.fullmatch(pattern, normalized, re.I) for pattern in PLAN_CONFIRM_PATTERNS):
+        return CONFIRMATION_EXPLICIT_EXECUTE
+    if any(re.fullmatch(pattern, normalized, re.I) for pattern in CONTEXTUAL_CONFIRM_PATTERNS):
+        return CONFIRMATION_CONTEXTUAL_ASSENT
+    return CONFIRMATION_NONE
+
+
+def pure_plan_confirmation(prompt: str, *, allow_contextual: bool = False) -> bool:
+    intent = plan_confirmation_intent(prompt)
+    return intent == CONFIRMATION_EXPLICIT_EXECUTE or (
+        allow_contextual and intent == CONFIRMATION_CONTEXTUAL_ASSENT
+    )
 
 
 def contains_plan_change_marker(normalized: str) -> bool:
@@ -16071,15 +16144,29 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     confirmable_pending = previous.get("plan_state") == "awaiting_confirmation"
     repair_pending = previous.get("plan_state") == "repair_required"
-    early_confirmation = bool(
-        pure_plan_confirmation(prompt)
-        and previous.get("task_domain") == "work"
+    confirmation_intent = plan_confirmation_intent(prompt)
+    explicit_confirmation = confirmation_intent == CONFIRMATION_EXPLICIT_EXECUTE
+    confirmed_plan = bool(
+        confirmable_pending
+        and confirmation_intent
+        in {CONFIRMATION_CONTEXTUAL_ASSENT, CONFIRMATION_EXPLICIT_EXECUTE}
+    )
+    early_confirmation_context = bool(
+        previous.get("task_domain") == "work"
         and previous.get("work_difficulty") == "hard"
         and previous.get("plan_state") in {"analyzing", "repair_required"}
         and previous.get("assessor_state")
         in {"spawn_pending", "running", "hard_plan_ready"}
         and previous.get("assessor_binding_id")
         and previous.get("objective", {}).get("fingerprint")
+    )
+    early_confirmation = bool(
+        explicit_confirmation
+        and early_confirmation_context
+    )
+    contextual_early_assent = bool(
+        confirmation_intent == CONFIRMATION_CONTEXTUAL_ASSENT
+        and early_confirmation_context
     )
     pending_plan = confirmable_pending
     active_plan = confirmable_pending or repair_pending or previous.get("plan_state") == "confirmed"
@@ -16115,7 +16202,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     # may be a worktree migration.  But ordinary new work in another workspace
     # must never inherit confirmation, journal, or writer ownership.
     if cwd_changed and not (
-        is_control_followup(prompt) or pure_plan_confirmation(prompt)
+        is_control_followup(prompt) or confirmed_plan or early_confirmation
         or same_assessor_objective_retry or recovery_followup or status_query
     ):
         new_objective = True
@@ -16182,7 +16269,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     )
     reference_failure = acceptance_miss or (reference_rejection and not causal_report)
     already_confirmed = previous.get("plan_state") == "confirmed"
-    confirmed_plan = confirmable_pending and pure_plan_confirmation(prompt)
     replan = (
         active_plan
         and not causal_active
@@ -16243,6 +16329,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or same_assessor_objective_retry
         or delegated_control_followup
         or early_confirmation
+        or contextual_early_assent
         or recovery_followup
     ))
     classification = classify_prompt(prompt)
@@ -16260,7 +16347,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         )
     if continuation and previous.get("last_route"):
         classification = merge_followup_route(previous["last_route"], classification)
-    if (confirmable_pending or early_confirmation) and pure_plan_confirmation(prompt):
+    if confirmed_plan or early_confirmation:
         classification["difficulty_decision_id"] = previous.get("difficulty_decision_id")
         classification["work_difficulty"] = previous.get("work_difficulty", "hard")
         classification["task_domain"] = previous.get("task_domain", "work")
@@ -16637,6 +16724,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or causal_active
         or confirmed_plan
         or early_confirmation
+        or contextual_early_assent
         or replan
         or plan_changed
         or pending_plan
@@ -16761,6 +16849,12 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             " Early host-bound confirmation receipt recorded for the current objective and assessor binding. "
             "Keep the pending plan or repair intact; the receipt will be consumed automatically only after the "
             "matching canonical revision commits and verifies. The user does not need to repeat confirmation."
+        )
+    elif contextual_early_assent:
+        context += (
+            " Contextual assent arrived before a canonical plan revision exists. Preserve the current Hard "
+            "assessment and pending plan work, but do not record authorization or mutate. Only explicit execution "
+            "intent may bind an early receipt; contextual assent becomes sufficient after the canonical plan commits."
         )
     elif replan or plan_changed:
         context += " Pending plan invalidated by changed constraints; re-analyze and present a replacement plan before mutation."

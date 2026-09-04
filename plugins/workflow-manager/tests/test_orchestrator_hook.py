@@ -443,7 +443,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.69")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.70")
         self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "13")
@@ -531,7 +531,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.69"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.70"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -558,7 +558,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.69 active", context)
+        self.assertIn("Workflow Manager 1.0.70 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1182,7 +1182,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.69"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.70"))
         self.assertEqual(migrated["execution_profile_version"], "13")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1278,7 +1278,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.69", "13"),
+                    (34, "1.0.70", "13"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1324,7 +1324,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.69", "5", "verification_required", 1),
+            (34, "1.0.70", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -4001,7 +4001,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "vague",
-                "prompt": "可以",
+                "prompt": "可以继续吗？",
             }
         )
         self.assertIn("Awaiting strict plan confirmation", vague.stdout)
@@ -4012,7 +4012,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "confirmed",
-                "prompt": "同意按这个计划执行",
+                "prompt": "可以",
             }
         )
         self.assertIn("Confirmation is bound", confirmed.stdout)
@@ -4034,6 +4034,10 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(repeated_state["plan_state"], "confirmed")
         self.assertEqual(repeated_state["plan_digest"], state["plan_digest"])
         self.assertEqual(repeated_state["plan_generation"], state["plan_generation"])
+        self.assertEqual(
+            repeated_state["authorization_envelope"]["confirmation_count"],
+            state["authorization_envelope"]["confirmation_count"],
+        )
 
         parent_write = self.run_hook(
             {
@@ -6182,6 +6186,54 @@ class OrchestratorHookTests(unittest.TestCase):
                 self.assertRegex(confirmed["execution_contract_id"] or "", r"^[0-9a-f]{32}$")
                 self.assertNotIn("确认执行", self.state_files(data)[0].read_text(encoding="utf-8"))
 
+    def test_contextual_assent_needs_a_committed_plan_and_preserves_early_assessment(self) -> None:
+        fresh_data = Path(self.temporary.name) / "contextual-without-plan"
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "contextual-without-plan",
+                "hook_run_id": "assent",
+                "prompt": "可以",
+            },
+            data=fresh_data,
+        )
+        fresh = self.load_only_state(fresh_data)
+        self.assertEqual((fresh["plan_state"], fresh["executor_state"]), ("none", "none"))
+        self.assertIsNone(fresh.get("pending_confirmation_receipt"))
+
+        session = "contextual-before-plan"
+        data = Path(self.temporary.name) / session
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "objective",
+                "prompt": "修复跨模块生产故障、定位未知根因并完成严格验证",
+            },
+            data=data,
+        )
+        running = self.start_running_assessor(session, run_id="assessor", data=data)
+        assent = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session,
+                "hook_run_id": "early-contextual-assent",
+                "prompt": "可以",
+            },
+            data=data,
+        )
+        self.assertIn("Contextual assent arrived before a canonical plan", assent.stdout)
+        preserved = self.load_only_state(data)
+        self.assertEqual(preserved["assessor_state"], running["assessor_state"])
+        self.assertEqual(
+            (preserved["plan_state"], preserved["executor_state"]),
+            ("analyzing", "none"),
+        )
+        self.assertIsNone(preserved.get("pending_confirmation_receipt"))
+        self.assertEqual(
+            preserved["authorization_envelope"]["confirmation_count"], 0
+        )
+
     def test_host_rollout_recovers_missed_parent_stop_and_confirmation_without_protocol_gates(self) -> None:
         session = "rollout-parent-control-recovery"
         cwd = str(Path(self.temporary.name) / "projectless")
@@ -6220,7 +6272,7 @@ class OrchestratorHookTests(unittest.TestCase):
         wrapped_confirmation = (
             "<codex_delegation>\n"
             "  <source_thread_id>01a00000-0000-7000-8000-000000000000</source_thread_id>\n"
-            "  <input>确认执行</input>\n"
+            "  <input>可以</input>\n"
             "</codex_delegation>"
         )
         rollout = Path(self.temporary.name) / "parent-controls.jsonl"
@@ -6280,7 +6332,7 @@ class OrchestratorHookTests(unittest.TestCase):
             any(item.get("kind") == "host_rollout_parent_control_reconciled" for item in confirmed["guards"])
         )
         persisted = self.state_files()[0].read_text(encoding="utf-8")
-        self.assertNotIn("确认执行", persisted)
+        self.assertNotIn("可以", persisted)
         self.assertNotIn(native_plan, persisted)
 
         accepted = self.run_hook(
@@ -9855,7 +9907,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.69 active", context)
+        self.assertIn("Workflow Manager 1.0.70 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10673,7 +10725,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.69"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.70"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11028,7 +11080,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.69", "recovery_required", None),
+                    (34, "1.0.70", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -11655,14 +11707,97 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(self.load_only_state(guard_data)["parent_writer_lease"]["status"], "none")
 
 
-class ConfirmationNormalizationV1049Tests(unittest.TestCase):
+class ConfirmationSemanticsV1070Tests(unittest.TestCase):
     def test_outer_desktop_newlines_are_allowed_but_internal_controls_are_not(self) -> None:
-        for value in ("确认执行\n", "\r\n 确认执行 \r\n", "继续啊，我确认执行\n"):
+        for value in (
+            "确认执行\n",
+            "\r\n 确认执行 \r\n",
+            "继续啊，我确认执行\n",
+            "`确认执行`",
+        ):
             with self.subTest(value=value):
                 self.assertTrue(HOOK.pure_plan_confirmation(value))
         for value in ("确认\n执行", "```确认执行```", "确认执行，但是增加发布"):
             with self.subTest(value=value):
                 self.assertFalse(HOOK.pure_plan_confirmation(value))
+
+    def test_state_aware_confirmation_intent_accepts_semantics_and_rejects_ambiguity(self) -> None:
+        explicit = (
+            "确认继续",
+            "确认，继续执行",
+            "我确认按上述计划执行",
+            "同意继续执行",
+            "可以，按计划执行",
+            "开始吧",
+            "执行吧",
+            "就按这个方案做",
+            "go ahead",
+            "yes, proceed",
+            "confirm and execute the plan",
+            "没问题，继续",
+            "no problem, proceed",
+        )
+        for value in explicit:
+            with self.subTest(intent="explicit", value=value):
+                self.assertEqual(
+                    HOOK.plan_confirmation_intent(value),
+                    HOOK.CONFIRMATION_EXPLICIT_EXECUTE,
+                )
+                self.assertTrue(HOOK.pure_plan_confirmation(value))
+
+        contextual = (
+            "好",
+            "好的",
+            "可以",
+            "同意",
+            "确认",
+            "继续",
+            "yes",
+            "ok",
+            "approved",
+            "没问题",
+        )
+        for value in contextual:
+            with self.subTest(intent="contextual", value=value):
+                self.assertEqual(
+                    HOOK.plan_confirmation_intent(value),
+                    HOOK.CONFIRMATION_CONTEXTUAL_ASSENT,
+                )
+                self.assertFalse(HOOK.pure_plan_confirmation(value))
+                self.assertTrue(
+                    HOOK.pure_plan_confirmation(value, allow_contextual=True)
+                )
+
+        rejected = (
+            "可以继续吗？",
+            "确认执行吗",
+            "不要执行",
+            "确认执行，但是增加发布",
+            "如果测试通过就执行",
+            "等检查之后再执行",
+            "请回复“确认执行”",
+            "用户说已确认执行",
+            "这句话表示确认执行",
+            "例如：确认执行",
+            '"确认执行"',
+            "```确认执行```",
+            "确认\n执行",
+            "no, proceed",
+            "do not execute",
+            "can we proceed?",
+            "if tests pass, proceed",
+            "reply confirm and execute",
+            "`确认执行` 然后发布",
+            "a" * 513,
+        )
+        for value in rejected:
+            with self.subTest(intent="rejected", value=value):
+                self.assertEqual(
+                    HOOK.plan_confirmation_intent(value), HOOK.CONFIRMATION_NONE
+                )
+                self.assertFalse(
+                    HOOK.pure_plan_confirmation(value, allow_contextual=True)
+                )
 
     def test_no_irreversible_clause_does_not_mask_positive_release_risk(self) -> None:
         domain = {"task_domain": "work"}

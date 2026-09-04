@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.0.70
+
+- 将 Hard 计划确认从少量整句模板扩展为状态感知的确定性语义分类：已提交且处于 `awaiting_confirmation` 的 canonical 计划可接受“好/可以/同意/确认/继续”、`yes/ok/proceed` 等上下文同意，也可接受“确认继续/开始吧/就按方案做/go ahead”等明确执行表达；计划提交前仍只有明确执行表达能够形成 early receipt，无活动 Hard 计划时任何同意短语都不授予权限。
+- 接受完整单反引号包装的明确确认，继续限制原始输入为 512 bytes、单行且非代码块；否定、暂停、条件、疑问、引用/转述、附加计划变更和不完整 Markdown 仍 fail-closed。“没问题，继续”与 `no problem, proceed` 只作为完整安全习语处理。
+- 新增中英文正反例、无计划/早到/待确认状态、重复确认幂等、rollout 恢复和原文不持久化回归；旧 digest-only 恢复白名单不扩大，不新增持久字段。Schema 34、execution profile v13 与 stable-skill schema 10 保持不变，并采用 forward-only 1.0.70 发布。
+
 ## 1.0.69
 
 - 修复旧 canonical v2 journal 仍位于同 session 的 epoch-less 路径时，事务恢复在 schema migration 与 authority retirement 前错误使用当前 task epoch 重算目录、从而误报 `transaction_recovery_failed` 并永久阻断后续 mutation 的问题。
