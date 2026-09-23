@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.70", "schema": 34, "execution_profile": "13", "stable_skill_schema": 10}
+        value = {"version": "1.0.71", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -63,8 +63,9 @@ DOMAIN_CLASSIFIER_VERSION = "3"
 DIFFICULTY_CLASSIFIER_VERSION = "5"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the one read-only high-tier boundary for Hard work.
-DEFAULT_PLAN_REASONING_EFFORT = "max"
-ASSESSOR_MODEL = "gpt-5.6-sol"
+DEFAULT_PLAN_REASONING_EFFORT = "ultra"
+ASSESSOR_MODEL = "gpt-6-sol"
+EXECUTOR_MODEL = "gpt-6-sol"
 STABLE_SKILL_NAME = "workflow-manager"
 STABLE_SKILL_SCHEMA = RELEASE_METADATA["stable_skill_schema"]
 STABLE_SKILL_MARKER = ".workflow-manager-managed.json"
@@ -133,6 +134,8 @@ DISPATCH_RUNNER_KINDS = frozenset({"posix_direct", "posix_cached", "windows_py",
 MODEL_PROFILES = {
     "current",
     "work_assessment",
+    "work_executor_sol_medium",
+    # Accept prior serialized state during migration; new requests use the key above.
     "work_executor_low_latest",
 }
 SESSION_EXECUTION_PREFERENCES = {"default"}
@@ -181,6 +184,7 @@ STALL_STATES = {
     "exhausted",
 }
 STALL_RESUME_PROFILES = {
+    "work_executor_sol_medium",
     "work_executor_low_latest",
 }
 ASSESSOR_STATES = {"none", "spawn_required", "spawn_pending", "running", "hard_plan_ready", "recovery_required", "failed"}
@@ -1549,7 +1553,7 @@ def executor_is_typed_recovery(
     if isinstance(request, dict):
         # A persisted request is the sequence authority.  Do not let the
         # temporary fail-closed state created by a Start-before-Post ordering
-        # retroactively turn a normal lower-tier request into typed recovery.
+        # retroactively turn a normal executor request into typed recovery.
         return request.get("recovery_from") in EXECUTOR_FAILURE_KINDS
     return bool(
         state.get("executor_failure_kind") in EXECUTOR_FAILURE_KINDS
@@ -1566,8 +1570,8 @@ def expected_executor_profile(
     if executor_is_typed_recovery(state, request):
         _, error = original_assessor_lifecycle(state)
     return {
-        "profile": "work_executor_low_latest",
-        "model": None,
+        "profile": "work_executor_sol_medium",
+        "model": EXECUTOR_MODEL,
         "reasoning_effort": "medium",
         "error": error,
     }
@@ -1795,6 +1799,7 @@ def reconcile_post_accepted_bound_start(
         and safe_sequence(request.get("attempt"))
         == safe_sequence(state.get("executor_attempt"))
         and request.get("model") == state.get("executor_model")
+        and request.get("model") == profile.get("model")
         and str(request.get("reasoning_effort") or "").lower() == expected_effort
         and str(state.get("executor_reasoning_effort") or "").lower()
         == expected_effort
@@ -9173,8 +9178,8 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         and source_contract
         and value.get("executor_state") in {"running", "verification_required"}
     )
-    # v11 lifecycle records remain audit evidence only.  They must not gain
-    # v13 write authority during a schema migration.
+    # v11 lifecycle records remain audit evidence only. They must not gain
+    # current write authority during a schema migration.
     active_profile11_continuity = False
     # Active and failed contracts rebind to the current profile. A completed,
     # baseline-sealed contract keeps the profile it actually executed under;
@@ -9416,13 +9421,34 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             else confirmed_executor_model_profile(base)
         )
     if (
+        source_profile == "13"
+        and base["plan_state"] == "confirmed"
+        and not sealed_historical_success
+        and value.get("executor_state") in {"spawn_pending", "running", "verification_required"}
+    ):
+        # A v13 child may have been reserved under the old model policy. Do
+        # not reuse that reservation as a v14 writer or discard evidence of a
+        # child that may already have run. Lifecycle inventory still blocks a
+        # successor while the old child is pending, live, or unknown.
+        pending_only = value.get("executor_state") == "spawn_pending"
+        base["executor_state"] = "spawn_required" if pending_only else "recovery_required"
+        base["executor_failure_kind"] = None if pending_only else "stale_contract"
+        base["executor_agent_id"] = None
+        base["executor_model"] = None
+        base["executor_reasoning_effort"] = None
+        base["executor_fork_turns"] = None
+        base["executor_review"] = _empty_executor_review()
+        base["model_profile"] = (
+            confirmed_executor_model_profile(base) if pending_only else "work_assessment"
+        )
+    if (
         source_profile == "11"
         and not sealed_historical_success
         and value.get("executor_state") in {"spawn_pending", "running", "verification_required"}
         and base.get("plan_state") == "confirmed"
     ):
         # A currently active v11 writer is not terminal proof.  Isolate it
-        # and require a v13 recovery lifecycle instead of silently reusing it.
+        # and require a current recovery lifecycle instead of silently reusing it.
         base["executor_state"] = "recovery_required"
         base["executor_failure_kind"] = "stale_contract"
         base["executor_agent_id"] = None
@@ -9649,7 +9675,7 @@ def normalize_state(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             base["assessor_fork_turns"] = None
             base["assessor_attempt"] = 0
         if legacy_writer_isolated:
-            # The current plan/contract can be repaired by a fresh v13
+            # The current plan/contract can be repaired by a fresh current-profile
             # recovery child, but the pre-v13 process is only a tombstone.
             # Do not reopen assessment or overwrite the explicit recovery.
             pass
@@ -10221,7 +10247,7 @@ def mutate_state(
                 ] = current_root
             # SubagentStart model/effort fields describe the child runtime echo;
             # they must never replace the parent session model used to resolve a
-            # lower-tier recovery profile.
+            # bound executor recovery profile.
             if payload.get("model") and payload.get("hook_event_name") not in {
                 "SubagentStart",
                 "SubagentStop",
@@ -12993,6 +13019,9 @@ def classify_prompt(prompt: str) -> dict[str, Any]:
         "route_source": "authorization_classifier",
     }
     route.update(classify_work_difficulty(normalized, domain, route))
+    if route.get("work_difficulty") != "hard":
+        # Simple and Daily tasks retain the model selected in the input UI.
+        route["model_profile"] = "current"
     return decorate_route(route)
 COMMAND_REQUEST_WRAPPERS = ("args", "arguments", "input", "tool_input")
 COMMAND_REQUEST_MAX_DEPTH = 4
@@ -13668,8 +13697,8 @@ def confirmed_executor_request(
     profile = expected_executor_profile(state)
     if profile.get("error"):
         return False, str(profile["error"])
-    if model == ASSESSOR_MODEL or effort != "medium":
-        return False, "executor requires a lower-tier model at medium"
+    if model != EXECUTOR_MODEL or effort != "medium":
+        return False, f"executor requires {EXECUTOR_MODEL} at medium"
     return True, None
 
 
@@ -13705,7 +13734,7 @@ def confirmed_assessor_request(
         str(options.get("reasoning_effort") or "").lower()
         != DEFAULT_PLAN_REASONING_EFFORT
     ):
-        return False, "assessor reasoning_effort must be max"
+        return False, "assessor reasoning_effort must be ultra"
     if str(options.get("fork_turns") or "") != "1":
         return False, "every bound assessor requires fork_turns=1"
     return True, None
@@ -16794,7 +16823,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             " Hard work needs one read-only high-tier assessment before mutation. Make exactly this collaboration "
             "call shape: collaboration.spawn_agent("
             f"task_name=\"{assessor_task}\", fork_turns=\"1\", model=\"{ASSESSOR_MODEL}\", "
-            "reasoning_effort=\"max\", message=<read-only assessment>). "
+            "reasoning_effort=\"ultra\", message=<read-only assessment>). "
             "This is the single high-tier assessor slot for the current Hard envelope. "
             "Omit agent_type and do not construct fork_context; either option can be rejected by the host before "
             "a lifecycle receipt exists. "
@@ -16841,7 +16870,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             "If a child is chosen, the Hook privately delivers the verified plan; task_name is only an opaque host label."
         )
         context += (
-            " Spawn one executor with a current lower-tier Codex model, reasoning_effort=medium, fork_turns=1, "
+            f" Spawn one executor with model={EXECUTOR_MODEL}, reasoning_effort=medium, fork_turns=1, "
             f"and any safe ASCII task_name (suggestion: {executor_task})."
         )
     elif early_confirmation:
@@ -16871,7 +16900,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
             if pending:
                 context += (
                     " A fresh recovery child is already host-bound if native diagnosis chooses that path; use "
-                    "a current lower-tier model, reasoning_effort=medium, "
+                    f"model={EXECUTOR_MODEL}, reasoning_effort=medium, "
                     "fork_turns=1 and any safe ASCII task_name. Parent-side diagnosis or verification may instead "
                     "finish without a child. Never follow up a terminal child."
                 )
@@ -17079,7 +17108,7 @@ def record_confirmed_executor_pretool(
         return True
     emit_context(
         "PreToolUse",
-        "Executor request reserved with the lower-tier model and medium reasoning request and fork_turns=1. task_name/prose are opaque; "
+        f"Executor request reserved with {EXECUTOR_MODEL} at medium and fork_turns=1. task_name/prose are opaque; "
         "authority still requires the matching host acceptance and full Start before mutation.",
     )
     return True
@@ -17520,10 +17549,7 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
             # current sequence, failure identity, and profile unchanged.
 
         mutate_state(payload, record_executor_guard)
-        profile_instruction = (
-            "resolve the newest actually available lower-tier model and explicitly request "
-            "reasoning_effort=medium"
-        )
+        profile_instruction = f"request model={EXECUTOR_MODEL}, reasoning_effort=medium"
         emit_pretool_deny(
             f"Workflow Manager blocked {executor_block}: this confirmed Hard contract permits exactly one "
             "writer at a time. The parent may write only while no child is reserved, live, or unknown; "
@@ -17566,12 +17592,6 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         if fixed_guard:
             _, reason = fixed_guard
             emit_pretool_deny(reason)
-            return
-        parent_command = extract_command(payload) or ""
-        if command_mutates_device(parent_command):
-            emit_pretool_deny(
-                "Workflow Manager blocked device mutation: a parent writer lease does not relax the fixed device boundary."
-            )
             return
         decision = {"acquired": False, "reason": None}
         def reserve_parent(current: dict[str, Any]) -> None:
@@ -19693,6 +19713,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
             == (current_execution_slice(state) or {}).get("id")
             and bound_request.get("slice_contract_id") == slice_contract_id(state)
             and bound_request.get("model") == state.get("executor_model")
+            and bound_request.get("model") == executor_profile.get("model")
             and bound_request.get("reasoning_effort") == expected_effort
             and not executor_profile.get("error")
             and not bound_request.get("host_acceptance_conflict")

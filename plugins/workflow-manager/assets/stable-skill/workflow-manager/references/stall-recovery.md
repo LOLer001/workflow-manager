@@ -4,7 +4,7 @@ Use recovery only for a current confirmed Hard contract with a terminal prior wr
 
 The Hook derives failure fingerprint and evidence digest from the current request/Post/full Start, terminal facts, operation ledger, and parent review. The parent adds a diagnosed root cause and material correction. Persist only digests.
 
-Recovery enters through the high-reasoning parent. If it chooses a fresh execution child, that child uses a current lower-tier model, `medium`, `fork_turns=1`. Any safe ASCII task name is valid and carries no authorization semantics.
+Recovery enters through the high-reasoning parent. If it chooses a fresh execution child, that child uses `gpt-6-sol`, `medium`, `fork_turns=1`. Any safe ASCII task name is valid and carries no authorization semantics.
 
 Before reserving a fresh child, atomically reject the same failure fingerprint only when there is no new evidence, progress, root cause, or material correction. Different fingerprints or a genuine evidence/correction delta may advance the positive monotonic sequence. There is no fixed attempt ceiling; three or more distinct failures remain recoverable within bounded state byte/node budget.
 

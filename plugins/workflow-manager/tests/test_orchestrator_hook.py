@@ -443,10 +443,10 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.70")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.71")
         self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
-        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "13")
+        self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "14")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 10)
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         self.assertFalse(hasattr(HOOK, "session_execution_preference_directive"))
@@ -456,6 +456,34 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(state["session_execution_preference"], "default")
         self.assertEqual((state["task_domain"], state["model_profile"]), ("daily", "current"))
         self.assertNotIn(prompt, json.dumps(state, ensure_ascii=False))
+
+    def test_daily_and_simple_keep_the_root_model_selection_unrestricted(self) -> None:
+        cases = (
+            ("daily", "今天天气怎么样", "gpt-6-astra", "low", "daily"),
+            ("simple", "修复一个代码错字，已有单测", "gpt-6-luna", "xhigh", "work"),
+        )
+        for label, prompt, model, effort, expected_domain in cases:
+            with self.subTest(label=label):
+                data = Path(self.temporary.name) / f"unrestricted-{label}"
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": f"unrestricted-{label}",
+                        "hook_run_id": "prompt",
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "prompt": prompt,
+                    },
+                    data=data,
+                )
+                self.assertEqual(result.stdout, "")
+                state = self.load_only_state(data)
+                self.assertEqual(state["task_domain"], expected_domain)
+                self.assertIn(state["work_difficulty"], {"not_applicable", "simple"})
+                self.assertEqual(state["model_profile"], "current")
+                self.assertEqual(state["assessor_state"], "none")
+                self.assertEqual(state["executor_state"], "none")
+                self.assertEqual(state["subagents"], [])
 
     def test_native_codex_owns_non_hard_work_and_generic_subagents(self) -> None:
         session = "native-non-hard"
@@ -531,7 +559,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.70"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.71"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -558,7 +586,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.70 active", context)
+        self.assertIn("Workflow Manager 1.0.71 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -712,23 +740,65 @@ class OrchestratorHookTests(unittest.TestCase):
             HOOK.stable_hash(os.path.normpath(str(second_root)), 32),
         )
 
-    def test_confirmed_executor_is_always_lower_tier_medium(self) -> None:
-        session = "fixed-lower-executor"
+    def test_confirmed_executor_is_exactly_gpt_6_sol_medium(self) -> None:
+        session = "fixed-gpt-6-sol-executor"
         state = self.create_confirmed_executor_state(session)
         self.assertEqual(state["session_execution_preference"], "default")
-        self.assertEqual(state["model_profile"], "work_executor_low_latest")
+        self.assertEqual(state["model_profile"], "work_executor_sol_medium")
         for index, payload in enumerate((
-            self.executor_spawn_payload(state, session=session, hook_run_id="assessor-model", model="gpt-5.6-sol", effort="medium"),
-            self.executor_spawn_payload(state, session=session, hook_run_id="wrong-effort", model="gpt-5.6-terra", effort="max"),
+            self.executor_spawn_payload(state, session=session, hook_run_id="old-model", model="gpt-5.6-sol", effort="medium"),
+            self.executor_spawn_payload(state, session=session, hook_run_id="wrong-effort", model="gpt-6-sol", effort="max"),
         )):
             denied = self.run_hook(payload)
             self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny", index)
-        accepted = self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="lower-medium", model="gpt-5.6-terra", effort="medium"))
+        accepted = self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="sol-medium", model="gpt-6-sol", effort="medium"))
         self.assertNotIn("permissionDecision", json.loads(accepted.stdout)["hookSpecificOutput"])
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "lower-start", "agent_id": "lower-medium-agent", "model": "gpt-5.6-terra", "reasoning_effort": "medium"})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "sol-start", "agent_id": "sol-medium-agent", "model": "gpt-6-sol", "reasoning_effort": "medium"})
         running = self.load_only_state()
         self.assertTrue(running["executor_observed_effective"])
         self.assertEqual(running["executor_state"], "running")
+
+    def test_hard_assessor_is_exactly_gpt_6_sol_ultra(self) -> None:
+        session = "fixed-gpt-6-sol-assessor"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": session,
+            "hook_run_id": "objective",
+            "prompt": "排查 Android 跨模块反复崩溃，根因未知并验证",
+        })
+        state = self.load_only_state()
+
+        def assessor_payload(run_id: str, model: str, effort: str) -> dict:
+            return {
+                "hook_event_name": "PreToolUse",
+                "session_id": session,
+                "hook_run_id": run_id,
+                "tool_name": "collaboration.spawn_agent",
+                "tool_input": {
+                    "task_name": HOOK.bound_assessor_task_name(state),
+                    "message": "Read-only Hard assessment",
+                    "model": model,
+                    "reasoning_effort": effort,
+                    "fork_turns": "1",
+                },
+            }
+
+        for index, payload in enumerate((
+            assessor_payload("old-model", "gpt-5.6-sol", "ultra"),
+            assessor_payload("wrong-effort", "gpt-6-sol", "max"),
+        )):
+            denied = self.run_hook(payload)
+            self.assertEqual(
+                json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                index,
+            )
+        accepted = self.run_hook(assessor_payload("sol-ultra", "gpt-6-sol", "ultra"))
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}),
+        )
+        self.assertEqual(self.load_only_state()["assessor_state"], "spawn_pending")
 
     def test_retired_highest_preference_migrates_to_default(self) -> None:
         session = "fixed-profile-resume"
@@ -759,12 +829,12 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 设置与 framework 反复崩溃，根因未知并验证"}, data=work_data)
         state = self.load_only_state(work_data)
         self.assertEqual(state["assessor_state"], "spawn_required")
-        self.assertEqual(HOOK.requested_assessor_reasoning_effort(state), "max")
+        self.assertEqual(HOOK.requested_assessor_reasoning_effort(state), "ultra")
         binding = state["assessor_binding_id"]
         self.assertRegex(binding, r"^[0-9a-f]{32}$")
         self.assertEqual(state["assessor_input_fingerprint"], state["objective"]["fingerprint"])
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        payload = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+        payload = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}
         accepted = self.run_hook(payload, data=work_data)
         self.assertNotIn("permissionDecision", json.loads(accepted.stdout or "{}").get("hookSpecificOutput", {}))
         self.run_hook(
@@ -798,7 +868,7 @@ class OrchestratorHookTests(unittest.TestCase):
         stop_context = json.loads(stopped.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("host_accepted=true", stop_context)
         self.assertIn("Start=full", stop_context)
-        self.assertIn("observed model=gpt-5.6-sol, effort=max", stop_context)
+        self.assertIn("observed model=gpt-6-sol, effort=ultra", stop_context)
         self.assertIn("do not describe the runtime echo as absent", stop_context)
         planned = self.load_only_state(work_data)
         self.assertEqual((planned["assessor_state"], planned["work_difficulty"]), ("hard_plan_ready", "hard"))
@@ -828,7 +898,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn("parent-visible", parent_context)
         self.assertIn("host_accepted=true", parent_context)
         self.assertIn("Start=full", parent_context)
-        self.assertIn("observed model=gpt-5.6-sol, effort=max", parent_context)
+        self.assertIn("observed model=gpt-6-sol, effort=ultra", parent_context)
         self.assertIn("do not describe the runtime echo as absent", parent_context)
         duplicate = self.run_hook(
             {
@@ -842,7 +912,7 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(duplicate.stdout, "")
 
-    def test_bound_assessor_accepts_native_plan_without_json_fence_gate(self) -> None:
+    def test_bound_sol_ultra_assessor_accepts_native_plan_without_json_fence_gate(self) -> None:
         session = "assessor-structural-plan"
         self.run_hook(
             {
@@ -866,8 +936,8 @@ class OrchestratorHookTests(unittest.TestCase):
                     f"{state['objective']['fingerprint']} profile_resolution=highest_available "
                     "Hard read-only plan then confirmation"
                 ),
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
                 "fork_turns": "1",
             },
         }
@@ -886,8 +956,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "start",
                 "agent_id": "structural-assessor",
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
             }
         )
         generic_manifest = self.execution_slices_block().replace(
@@ -1007,12 +1077,12 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertNotIn("foreground deadline from process start", context)
         self.assertNotIn("bounded self-repair protocol", context)
 
-    def test_assessor_planning_effort_is_always_max(self) -> None:
+    def test_assessor_planning_effort_is_always_ultra(self) -> None:
         default = HOOK.new_state({"session_id": "default-planning-effort"})
-        self.assertEqual(HOOK.DEFAULT_PLAN_REASONING_EFFORT, "max")
-        self.assertEqual(HOOK.requested_assessor_reasoning_effort(default), "max")
+        self.assertEqual(HOOK.DEFAULT_PLAN_REASONING_EFFORT, "ultra")
+        self.assertEqual(HOOK.requested_assessor_reasoning_effort(default), "ultra")
         default["session_execution_preference"] = "highest_throughout"
-        self.assertEqual(HOOK.requested_assessor_reasoning_effort(default), "max")
+        self.assertEqual(HOOK.requested_assessor_reasoning_effort(default), "ultra")
         self.assertEqual(HOOK.safe_session_execution_preference("highest_throughout"), "default")
 
         result = self.run_hook(
@@ -1024,7 +1094,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('reasoning_effort="max"', context)
+        self.assertIn('reasoning_effort="ultra"', context)
         self.assertIn("single high-tier assessor slot", context)
 
     def test_assessor_start_model_only_is_running_but_not_full_profile_evidence(self) -> None:
@@ -1182,12 +1252,63 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.70"))
-        self.assertEqual(migrated["execution_profile_version"], "13")
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.71"))
+        self.assertEqual(migrated["execution_profile_version"], "14")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
         self.assertIsNone(migrated["assessor_failure_kind"])
         self.assertEqual(migrated["subagents"], [])
+
+    def test_profile_v13_active_writer_rebinds_to_v14_but_sealed_history_is_preserved(self) -> None:
+        active_data = Path(self.temporary.name) / "profile-v13-active"
+        session = "profile-v13-active"
+        active = self.create_confirmed_executor_state(session, active_data)
+        active.update({
+            "writer_version": "1.0.70",
+            "execution_profile_version": "13",
+            "executor_state": "spawn_pending",
+            "executor_model": "gpt-5.6-sol",
+            "executor_reasoning_effort": "medium",
+            "executor_fork_turns": "1",
+        })
+        migrated = HOOK.normalize_state(active, {"session_id": session})
+        self.assertEqual(
+            (
+                migrated["writer_version"],
+                migrated["execution_profile_version"],
+                migrated["executor_state"],
+                migrated["executor_model"],
+            ),
+            ("1.0.71", "14", "spawn_required", None),
+        )
+        old_request = self.executor_spawn_payload(
+            migrated,
+            session=session,
+            hook_run_id="old-executor",
+            model="gpt-5.6-sol",
+            effort="medium",
+        )
+        self.assertEqual(
+            HOOK.confirmed_executor_request(old_request, migrated),
+            (False, "executor requires gpt-6-sol at medium"),
+        )
+
+        sealed_data = Path(self.temporary.name) / "profile-v13-sealed"
+        sealed_session = "profile-v13-sealed"
+        sealed = self.create_completed_execution_baseline(sealed_session, sealed_data)
+        historical_baseline = json.loads(json.dumps(sealed["last_execution_baseline"]))
+        sealed["writer_version"] = "1.0.70"
+        sealed["execution_profile_version"] = "13"
+        preserved = HOOK.normalize_state(sealed, {"session_id": sealed_session})
+        self.assertEqual(
+            (
+                preserved["writer_version"],
+                preserved["execution_profile_version"],
+                preserved["executor_state"],
+            ),
+            ("1.0.71", "13", "succeeded"),
+        )
+        self.assertEqual(preserved["last_execution_baseline"], historical_baseline)
 
     def test_writer_upgrade_preserves_sealed_historical_success_without_reexecution(self) -> None:
         data = Path(self.temporary.name) / "sealed-upgrade-data"
@@ -1278,7 +1399,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.70", "13"),
+                    (34, "1.0.71", "14"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1324,7 +1445,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.70", "5", "verification_required", 1),
+            (34, "1.0.71", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -4052,7 +4173,7 @@ class OrchestratorHookTests(unittest.TestCase):
         confirmed_state = self.load_only_state()
         self.assertEqual((confirmed_state["executor_state"], confirmed_state["parent_writer_lease"]["status"]),
                          ("running", "live"))
-        self.assertEqual(confirmed_state["model_profile"], "work_executor_low_latest")
+        self.assertEqual(confirmed_state["model_profile"], "work_executor_sol_medium")
 
     def test_pending_plan_constraint_change_invalidates_and_never_confirms(self) -> None:
         session = "hard-plan-change"
@@ -4087,18 +4208,18 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def create_confirmed_executor_state(
         self, session: str, data: Path | None = None, *, highest: bool = False,
-        assessor_effort: str = "max", slice_count: int = 1,
+        assessor_effort: str = "ultra", slice_count: int = 1,
         cwd: str | None = None,
     ) -> dict:
         # Retained keyword arguments exercise migration callers; current Hard
-        # assessment is always gpt-5.6-sol/max and executors are always lower-tier/medium.
-        assessor_effort = "max"
+        # assessment is always gpt-6-sol/ultra and executors are always gpt-6-sol/medium.
+        assessor_effort = "ultra"
         self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": f"{session}-objective",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "cwd": cwd,
                 "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
             },
@@ -4110,9 +4231,9 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": f"{session}-assessor-request",
                 "tool_name": "collaboration.spawn_agent",
-                "tool_input": {"task_name": HOOK.bound_assessor_task_name(self.load_only_state(data)), "model": "gpt-5.6-sol", "reasoning_effort": assessor_effort, "fork_turns": "1", "message": f"assessor_binding_id={self.load_only_state(data)['assessor_binding_id']} objective_fingerprint={self.load_only_state(data)['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"},
+                "tool_input": {"task_name": HOOK.bound_assessor_task_name(self.load_only_state(data)), "model": "gpt-6-sol", "reasoning_effort": assessor_effort, "fork_turns": "1", "message": f"assessor_binding_id={self.load_only_state(data)['assessor_binding_id']} objective_fingerprint={self.load_only_state(data)['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"},
             }, data=data)
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-assessor-start", "agent_id": f"{session}-assessor", "model": "gpt-5.6-sol", "reasoning_effort": assessor_effort}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-assessor-start", "agent_id": f"{session}-assessor", "model": "gpt-6-sol", "reasoning_effort": assessor_effort}, data=data)
         binding = self.load_only_state(data)["assessor_binding_id"]
         self.run_hook(
             {
@@ -4179,8 +4300,8 @@ class OrchestratorHookTests(unittest.TestCase):
         state = self.load_only_state(data)
         binding = state["assessor_binding_id"]
         request = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": f"{run_id}-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": request, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}, data=data)
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{run_id}-start", "agent_id": f"{run_id}-assessor", "model": "gpt-5.6-sol"}, data=data)
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": f"{run_id}-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": request, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{run_id}-start", "agent_id": f"{run_id}-assessor", "model": "gpt-6-sol"}, data=data)
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": f"{run_id}-stop", "agent_id": f"{run_id}-assessor", "status": "completed", "last_assistant_message": f"{self.with_execution_slices(message)}\nWORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n计划已就绪，等待确认后执行"}, data=data)
         self.run_hook(
             {
@@ -4197,8 +4318,8 @@ class OrchestratorHookTests(unittest.TestCase):
         state = self.load_only_state(data)
         binding = state["assessor_binding_id"]
         request = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": f"{run_id}-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": request, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}, data=data)
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{run_id}-start", "agent_id": f"{run_id}-assessor", "model": "gpt-5.6-sol"}, data=data)
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": f"{run_id}-request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": request, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}, data=data)
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{run_id}-start", "agent_id": f"{run_id}-assessor", "model": "gpt-6-sol"}, data=data)
         running = self.load_only_state(data)
         self.assertEqual(running["assessor_state"], "running")
         return running
@@ -4209,7 +4330,7 @@ class OrchestratorHookTests(unittest.TestCase):
         *,
         session: str,
         hook_run_id: str,
-        model: str = "gpt-5.6-terra",
+        model: str = "gpt-6-sol",
         effort: str = "medium",
         fork_turns: str | None = "1",
         contract_id: str | None = None,
@@ -4385,7 +4506,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": f"{session}-executor-start",
                 "agent_id": agent,
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             },
             data=data,
@@ -4462,7 +4583,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": f"{run_id}-start",
                 "agent_id": agent,
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             },
             data=data,
@@ -4514,7 +4635,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def create_explicit_stall_state(self, session: str, data: Path | None = None, *, highest: bool = False) -> dict:
         state = self.create_confirmed_executor_state(session, data, highest=highest)
-        model, effort = (("gpt-5.6-sol", "ultra") if highest else ("gpt-5.6-terra", "medium"))
+        model, effort = ("gpt-6-sol", "medium")
         self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id=f"{session}-request", model=model, effort=effort), data=data)
         agent = f"{session}-executor"
         self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": f"{session}-start", "agent_id": agent, "model": model, "reasoning_effort": effort}, data=data)
@@ -4629,7 +4750,7 @@ class OrchestratorHookTests(unittest.TestCase):
     def test_confirmed_executor_requires_explicit_profile_but_not_contract_prose(self) -> None:
         session = "executor-contract"
         state = self.create_confirmed_executor_state(session)
-        self.assertEqual(state["model_profile"], "work_executor_low_latest")
+        self.assertEqual(state["model_profile"], "work_executor_sol_medium")
         self.assertEqual(state["executor_state"], "spawn_required")
         self.assertRegex(state["execution_contract_id"], r"^[0-9a-f]{32}$")
 
@@ -4639,7 +4760,7 @@ class OrchestratorHookTests(unittest.TestCase):
             "missing-fork": {"fork_turns": None},
             "all-fork": {"fork_turns": "all"},
             "wrong-effort": {"effort": "high"},
-            "same-model": {"model": "gpt-5.6-sol"},
+            "old-model": {"model": "gpt-5.6-sol"},
         }.items():
             with self.subTest(label=label):
                 payload = self.executor_spawn_payload(
@@ -4666,7 +4787,7 @@ class OrchestratorHookTests(unittest.TestCase):
         pending = self.load_only_state()
         self.assertEqual(pending["executor_state"], "spawn_pending")
         self.assertEqual(pending["executor_attempt"], 1)
-        self.assertEqual(pending["executor_model"], "gpt-5.6-terra")
+        self.assertEqual(pending["executor_model"], "gpt-6-sol")
         self.assertEqual(pending["executor_reasoning_effort"], "medium")
         self.assertEqual(pending["executor_fork_turns"], "1")
 
@@ -5043,6 +5164,10 @@ class OrchestratorHookTests(unittest.TestCase):
         running = self.load_only_state()
         self.assertEqual(running["executor_state"], "running")
         self.assertEqual(running["executor_agent_id"], "agent-executor")
+        self.assertEqual(
+            (running["executor_model"], running["executor_reasoning_effort"]),
+            ("gpt-6-sol", "medium"),
+        )
 
         allowed = self.run_hook(
             {
@@ -5094,7 +5219,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "executor-start",
                 "agent_id": "executor-runtime-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -5140,7 +5265,7 @@ class OrchestratorHookTests(unittest.TestCase):
         context = json.loads(stopped.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("host_accepted=true", context)
         self.assertIn("Start=full", context)
-        self.assertIn("observed model=gpt-5.6-terra, effort=medium", context)
+        self.assertIn("observed model=gpt-6-sol, effort=medium", context)
         self.assertIn("Executor self-report is only a candidate", context)
 
         collected = self.run_hook(
@@ -5156,7 +5281,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn("parent-visible", parent_context)
         self.assertIn("host_accepted=true", parent_context)
         self.assertIn("Start=full", parent_context)
-        self.assertIn("observed model=gpt-5.6-terra, effort=medium", parent_context)
+        self.assertIn("observed model=gpt-6-sol, effort=medium", parent_context)
         self.assertIn("do not describe the runtime echo as absent", parent_context)
         duplicate = self.run_hook(
             {
@@ -5292,7 +5417,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(after_unchanged["executor_attempt"], 1)
         self.assertEqual(
             after_unchanged["model_profile"],
-            "work_executor_low_latest",
+            "work_executor_sol_medium",
         )
 
         second_payload = self.executor_spawn_payload(after_unchanged, session=session,
@@ -5371,7 +5496,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(
             (lifecycle["model"], lifecycle["reasoning_effort"], lifecycle["fork_turns"]),
-            ("gpt-5.6-sol", "max", "1"),
+            ("gpt-6-sol", "ultra", "1"),
         )
 
         def records(state: dict) -> tuple[dict, dict]:
@@ -6015,7 +6140,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIsNone(start_record["plan_handoff_delivery_digest"])
         self.assertNotIn("BEGIN_WORKFLOW_MANAGER_EXECUTION_SLICE", started.stdout)
 
-    def test_default_executor_full_start_before_post_keeps_lower_tier_profile(self) -> None:
+    def test_default_executor_full_start_before_post_keeps_sol_medium_profile(self) -> None:
         session = "default-executor-start-before-post"
         state = self.create_confirmed_executor_state(session)
         self.legacy_start_fixtures = False
@@ -6032,7 +6157,7 @@ class OrchestratorHookTests(unittest.TestCase):
             if item.get("event") == "request"
             and item.get("role") == "confirmed_executor"
         )
-        transcript = self.start_transcript(turn_id, "gpt-5.6-terra", "medium")
+        transcript = self.start_transcript(turn_id, "gpt-6-sol", "medium")
         locked = self.run_hook(
             {
                 "hook_event_name": "SubagentStart",
@@ -6040,7 +6165,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_run_id": "start-before-post",
                 "turn_id": turn_id,
                 "agent_id": "default-late-post-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "transcript_path": str(transcript),
             }
         )
@@ -6052,7 +6177,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 waiting["executor_model"],
                 waiting["executor_reasoning_effort"],
             ),
-            ("recovery_required", "model_unavailable", "gpt-5.6-terra", "medium"),
+            ("recovery_required", "model_unavailable", "gpt-6-sol", "medium"),
         )
         self.assertIn("delivered under a locked Start", locked.stdout)
         self.run_hook(
@@ -6080,7 +6205,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "running",
                 "default-late-post-agent",
                 None,
-                "gpt-5.6-terra",
+                "gpt-6-sol",
                 "medium",
                 "1",
                 True,
@@ -7410,7 +7535,7 @@ class OrchestratorHookTests(unittest.TestCase):
             pending["evidence_digest"],
             evidence_digest,
         )
-        self.assertEqual(reserved["model_profile"], "work_executor_low_latest")
+        self.assertEqual(reserved["model_profile"], "work_executor_sol_medium")
         self.assertEqual(reserved["authorization_envelope"], envelope)
         self.assertEqual(reserved["authorization_envelope"]["confirmation_count"], 1)
         task_name = HOOK.bound_executor_task_name(reserved)
@@ -9907,7 +10032,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.70 active", context)
+        self.assertIn("Workflow Manager 1.0.71 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10725,7 +10850,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.70"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.71"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11080,7 +11205,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.70", "recovery_required", None),
+                    (34, "1.0.71", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -11156,8 +11281,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertIn("collaboration.spawn_agent(", context)
         self.assertIn(f'task_name="{task_name}"', context)
         self.assertIn('fork_turns="1"', context)
-        self.assertIn('model="gpt-5.6-sol"', context)
-        self.assertIn('reasoning_effort="max"', context)
+        self.assertIn('model="gpt-6-sol"', context)
+        self.assertIn('reasoning_effort="ultra"', context)
         self.assertIn("Omit agent_type", context)
         self.assertIn("do not construct fork_context", context)
 
@@ -11170,8 +11295,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": "Read-only Hard assessment",
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                     "agent_type": "default",
                     "fork_context": True,
@@ -11197,8 +11322,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": "Read-only Hard assessment",
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                     "fork_context": True,
                 },
@@ -11221,8 +11346,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": "Read-only Hard assessment",
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }
@@ -11670,10 +11795,19 @@ class OrchestratorHookTests(unittest.TestCase):
         pending_session = "parent-pending-child"
         pending = self.create_confirmed_executor_state(pending_session)
         self.run_hook(self.executor_spawn_payload(pending, session=pending_session, hook_run_id="reserve"))
+        self.run_hook({
+            "hook_event_name": "SubagentStart",
+            "session_id": pending_session,
+            "hook_run_id": "child-start",
+            "agent_id": "live-device-writer",
+            "model": "gpt-6-sol",
+            "reasoning_effort": "medium",
+        })
         denied = self.run_hook({"hook_event_name": "PreToolUse", "session_id": pending_session,
-                                "hook_run_id": "parent", "tool_name": "apply_patch",
-                                "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
+                                "hook_run_id": "parent", "tool_name": "Bash",
+                                "tool_input": {"command": "adb reboot"}})
         self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.load_only_state()["parent_writer_lease"]["status"], "none")
 
         session = "parent-blocks-child"
         lease_data = Path(self.temporary.name) / "parent-blocks-child-data"
@@ -11685,7 +11819,7 @@ class OrchestratorHookTests(unittest.TestCase):
         blocked = self.run_hook(self.executor_spawn_payload(leased, session=session, hook_run_id="child"), data=lease_data)
         self.assertEqual(json.loads(blocked.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_parent_writer_takes_over_old_candidate_monotonically_and_keeps_fixed_guards(self) -> None:
+    def test_parent_writer_takes_over_old_candidate_and_confirmed_device_operation_takes_lease(self) -> None:
         session = "parent-candidate-takeover"
         candidate = self.create_executor_candidate(session)
         old_attempt = candidate["executor_attempt"]
@@ -11697,14 +11831,41 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(taken["executor_attempt"], old_attempt + 1)
         self.assertEqual(taken["executor_review"]["status"], "none")
 
-        guarded_session = "parent-fixed-boundary"
-        guard_data = Path(self.temporary.name) / "parent-fixed-boundary-data"
-        self.create_confirmed_executor_state(guarded_session, data=guard_data)
-        guarded = self.run_hook({"hook_event_name": "PreToolUse", "session_id": guarded_session,
+        device_session = "parent-confirmed-device-operation"
+        device_data = Path(self.temporary.name) / "parent-confirmed-device-operation-data"
+        self.create_confirmed_executor_state(device_session, data=device_data)
+        allowed_device = self.run_hook({"hook_event_name": "PreToolUse", "session_id": device_session,
                                  "hook_run_id": "adb", "tool_name": "Bash",
-                                 "tool_input": {"command": "adb reboot"}}, data=guard_data)
-        self.assertEqual(json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertEqual(self.load_only_state(guard_data)["parent_writer_lease"]["status"], "none")
+                                 "tool_input": {"command": "adb reboot"}}, data=device_data)
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(allowed_device.stdout or "{}").get("hookSpecificOutput", {}),
+        )
+        leased = self.load_only_state(device_data)
+        self.assertEqual(
+            (leased["parent_writer_lease"]["status"], leased["executor_state"], leased["executor_attempt"]),
+            ("live", "running", 1),
+        )
+
+    def test_unconfirmed_hard_parent_cannot_reboot_device(self) -> None:
+        session = "unconfirmed-device-operation"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": session,
+            "hook_run_id": "objective",
+            "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
+        })
+        denied = self.run_hook({
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "hook_run_id": "adb-before-confirmation",
+            "tool_name": "Bash",
+            "tool_input": {"command": "adb reboot"},
+        })
+        output = json.loads(denied.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("not strictly confirmed", output["permissionDecisionReason"])
+        self.assertEqual(self.load_only_state()["parent_writer_lease"]["status"], "none")
 
 
 class ConfirmationSemanticsV1070Tests(unittest.TestCase):

@@ -63,6 +63,8 @@ class SkillIdentityTests(unittest.TestCase):
             "fixed result markers have no protocol authority",
             "strong acceptance evidence is never optional",
             "only summary, review, recovery, and final-acceptance entry",
+            'model="gpt-6-sol", reasoning_effort="ultra"',
+            "Hard parent remains `gpt-6-sol` at `ultra`",
             "Start=0",
             "labels alone do not upgrade a bounded known single-function bug",
         ):
@@ -117,7 +119,7 @@ class SkillIdentityTests(unittest.TestCase):
     def test_recovery_and_liveness_are_evidence_budget_driven(self) -> None:
         contract = "\n".join((self.skill_text, self.confirmed_execution, self.assessment_liveness))
         for phrase in (
-            "current lower-tier model at `medium`",
+            "`gpt-6-sol` at `medium`",
             "positive, monotonic",
             "bounded state byte/node budget",
             "Three or more distinct failure fingerprints",
@@ -127,12 +129,12 @@ class SkillIdentityTests(unittest.TestCase):
             "reserve a second assessor",
         ):
             self.assertIn(phrase, contract)
-        self.assertIn("current lower-tier model, `medium`", self.stall_recovery)
+        self.assertIn("uses `gpt-6-sol`, `medium`", self.stall_recovery)
         self.assertIn("inherits the existing strict confirmation", self.regression_continuity)
 
     def test_protocol_continuity_and_privacy_are_preserved(self) -> None:
-        self.assertIn("Schema 34/writer 1.0.70", self.confirmed_execution)
-        self.assertIn("execution profile v13", self.confirmed_execution)
+        self.assertIn("Schema 34/writer 1.0.71", self.confirmed_execution)
+        self.assertIn("execution profile v14", self.confirmed_execution)
         self.assertIn("canonical journal v3", self.confirmed_execution)
         self.assertIn("preserves its real profile/contract", self.confirmed_execution)
         self.assertIn("Persist only digests", self.confirmed_execution)
@@ -155,9 +157,9 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.70")
-        self.assertIn("/1.0.70/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.70\n")
+        self.assertEqual(self.manifest["version"], "1.0.71")
+        self.assertIn("/1.0.71/", readme)
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.71\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
     def test_ci_runs_python_without_bytecode_on_linux_and_windows(self) -> None:

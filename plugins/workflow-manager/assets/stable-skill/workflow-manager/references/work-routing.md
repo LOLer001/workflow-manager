@@ -25,7 +25,7 @@ Examples:
 
 ## Hard assessment
 
-Request one read-only `gpt-5.6-sol` assessor at `reasoning_effort=max`, `fork_turns=1`. Any concise safe ASCII task name is acceptable and carries no semantics. The current Hard authorization envelope has one assessor slot; a failed lifecycle remains fail-closed rather than starting a same-envelope replacement.
+Request one read-only `gpt-6-sol` assessor at `reasoning_effort=ultra`, `fork_turns=1`. Any concise safe ASCII task name is acceptable and carries no semantics. The current Hard authorization envelope has one assessor slot; a failed lifecycle remains fail-closed rather than starting a same-envelope replacement.
 
 The assessor may return ordinary prose. Do not require a binding line, exact keywords, JSON, numbered table, fixed ending, or plugin marker. Its unique request + accepted Post + full Start establish provenance; the parent model judges the substance and writes the only plan.
 

@@ -1,6 +1,6 @@
 # Confirmed Hard execution
 
-This reference applies only after a Hard plan is confirmed. Schema 34/writer 1.0.70 uses execution profile v13 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
+This reference applies only after a Hard plan is confirmed. Schema 34/writer 1.0.71 uses execution profile v14 and an append-only canonical journal v3. A new objective owns an independent task epoch and journal; a worktree-only migration never clears its contract.
 
 ## Minimal authority model
 
@@ -63,13 +63,13 @@ Desktop may omit Hook delivery for parent Stop or a programmatic delegated confi
 
 ## Executor and parent review
 
-Confirmation authorizes one writer, not necessarily one child executor. With a current canonical contract and no pending/live/unknown child writer or unfinished causal/stall diagnosis, the parent atomically acquires the current slice lease. While that lease is live, child spawn is denied; while a child is reserved or live, parent mutation is denied. The fixed mounted-tree Git, device, scope, risk, and irreversible-action gates remain unchanged.
+Confirmation authorizes one writer, not necessarily one child executor. With a current canonical contract and no pending/live/unknown child writer or unfinished causal/stall diagnosis, the parent atomically acquires the current slice lease. While that lease is live, child spawn is denied; while a child is reserved or live, parent mutation is denied. Authorized device operations, including `adb reboot`, use that lease. Mounted-tree Git safety and the scope, risk, and irreversible-action boundaries remain in force.
 
 If the parent takes over a `verification_required` child candidate, it increments the attempt monotonically, clears the old review candidate, and binds later operations to the current epoch/contract/slice/attempt. A failed parent test does not change writers: the parent may correct and verify again in the same lease. The latest bound verification after the last change is authoritative: a later success may correct an earlier failure, while a later failure or unknown result cannot inherit an older success. Final-result negatives must be explicit; verified fail-closed behavior and failure-case coverage are not themselves failed acceptance. Successful bound change and verification operations plus parent Stop may seal without a child Stop.
 
-When a child is chosen, every executor—including a recovery executor—uses a current lower-tier model at `medium`, `fork_turns=1`. A request is reserved from trusted state; copied contract text in its message is neither required nor authoritative.
+When a child is chosen, every executor—including a recovery executor—uses `gpt-6-sol` at `medium`, `fork_turns=1`. A request is reserved from trusted state; copied contract text in its message is neither required nor authoritative.
 
-The Hard parent remains `gpt-5.6-sol` at `max` and is the sole summary, independent review, recovery, and final-acceptance entry. Execution-child progress is event-driven and limited to location complete, mutation start, verification end, or a blocker.
+The Hard parent remains `gpt-6-sol` at `ultra` and is the sole summary, independent review, recovery, and final-acceptance entry. Execution-child progress is event-driven and limited to location complete, mutation start, verification end, or a blocker.
 
 Executor Stop is ordinary nonempty bounded native prose. Its wording and formatting never grant or deny authority. A successful host-bound terminal result becomes only `verification_required`; the parent must still supply current, bounded host verification. Child claims cannot substitute for that evidence.
 
@@ -79,7 +79,7 @@ For shell verification, preserve the complete structured host result, including 
 
 ## Typed recovery
 
-All failure, stall, incomplete, and verification recovery enters through the high-reasoning parent. After the unique original assessor lifecycle is proven, any newly chosen execution child still uses a current lower-tier model at `medium`, `fork_turns=1`.
+All failure, stall, incomplete, and verification recovery enters through the high-reasoning parent. After the unique original assessor lifecycle is proven, any newly chosen execution child uses `gpt-6-sol` at `medium`, `fork_turns=1`.
 
 At each boundary the Hook derives one host-generated evidence digest and failure fingerprint from lifecycle, terminal, operation-ledger, and review facts. Never search state files or infer them from child prose. Recovery state does not force another turn or child: the parent may diagnose, independently verify, replan, or finish natively. Only if the model chooses an encrypted or plaintext recovery spawn, the parent supplies those Hook-issued facts plus the diagnosed root cause and material correction. The Hook persists only digests and atomically reserves that fresh child inside the existing authorization envelope; this is not another confirmation.
 

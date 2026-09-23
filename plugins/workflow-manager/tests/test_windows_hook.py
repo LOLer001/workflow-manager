@@ -154,12 +154,12 @@ class WindowsHookTests(unittest.TestCase):
     def test_windows_transcript_turn_context_is_exactly_correlated(self) -> None:
         transcript = self.root / "start-context.jsonl"
         transcript.write_text(
-            json.dumps({"type": "turn_context", "payload": {"turn_id": "windows-turn", "model": "gpt-5.6-sol", "effort": "max"}}) + "\n",
+            json.dumps({"type": "turn_context", "payload": {"turn_id": "windows-turn", "model": "gpt-6-sol", "effort": "max"}}) + "\n",
             encoding="utf-8",
         )
-        observed = HOOK.start_turn_observation({"turn_id": "windows-turn", "model": "gpt-5.6-sol", "transcript_path": str(transcript)})
-        self.assertEqual(observed, ("gpt-5.6-sol", "max", "transcript_turn_context_effort"))
-        self.assertEqual(HOOK.start_turn_observation({"turn_id": "other-turn", "model": "gpt-5.6-sol", "transcript_path": str(transcript)}), (None, None, None))
+        observed = HOOK.start_turn_observation({"turn_id": "windows-turn", "model": "gpt-6-sol", "transcript_path": str(transcript)})
+        self.assertEqual(observed, ("gpt-6-sol", "max", "transcript_turn_context_effort"))
+        self.assertEqual(HOOK.start_turn_observation({"turn_id": "other-turn", "model": "gpt-6-sol", "transcript_path": str(transcript)}), (None, None, None))
 
     def test_windows_identity_preflight_is_direct_and_denies_child_spawn(self) -> None:
         session = "windows-identity-preflight"
@@ -577,7 +577,7 @@ class WindowsHookTests(unittest.TestCase):
             "hook_event_name": "UserPromptSubmit",
             "session_id": session,
             "hook_run_id": "executor-objective",
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-sol",
             "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
         }]
         for payload in events:
@@ -591,7 +591,7 @@ class WindowsHookTests(unittest.TestCase):
         assessor_request = self.run_command_windows({
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "executor-assessor-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
+            "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
                 "profile_resolution=highest_available Hard read-only plan then confirmation"
             )},
@@ -605,7 +605,7 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(requested_state["assessor_state"], "spawn_pending")
         self.assertEqual(requested_state["subagents"][-1]["role"], "high_assessor")
         for payload in (
-            {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-assessor-start", "agent_id": "windows-executor-assessor", "model": "gpt-5.6-sol"},
+            {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-assessor-start", "agent_id": "windows-executor-assessor", "model": "gpt-6-sol"},
             {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "executor-assessor-stop", "agent_id": "windows-executor-assessor", "status": "completed", "last_assistant_message": (
                 "根因定位需要跨模块只读分析，并保留当前验收、回滚与风险边界。"
                 "建议由父会话形成最终计划，再交给单一执行者完成修改和独立验证。"
@@ -631,7 +631,7 @@ class WindowsHookTests(unittest.TestCase):
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
                     "task_name": HOOK.bound_executor_task_name(state),
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
                     "message": "Execute the confirmed native plan as the one writer and report the verification evidence.",
@@ -645,7 +645,7 @@ class WindowsHookTests(unittest.TestCase):
         state_path = next((self.data / "sessions").glob("*.json"))
         final_state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(final_state["executor_state"], "spawn_pending")
-        self.assertEqual(final_state["executor_model"], "gpt-5.6-terra")
+        self.assertEqual(final_state["executor_model"], "gpt-6-sol")
 
         for payload in (
             {
@@ -653,7 +653,7 @@ class WindowsHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "executor-start",
                 "agent_id": "windows-confirmed-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             },
             {
@@ -733,7 +733,7 @@ class WindowsHookTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "causal-objective",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
             },
         ]
@@ -750,7 +750,7 @@ class WindowsHookTests(unittest.TestCase):
         assessor = self.run_command_windows({
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "causal-assessor-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1", "message": (
+            "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1", "message": (
                 f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} "
                 "profile_resolution=highest_available Hard read-only plan then confirmation"
             )},
@@ -764,7 +764,7 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(requested_state["assessor_state"], "spawn_pending")
         self.assertEqual(requested_state["subagents"][-1]["role"], "high_assessor")
         for payload in (
-            {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "causal-assessor-start", "agent_id": "windows-causal-assessor", "model": "gpt-5.6-sol"},
+            {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "causal-assessor-start", "agent_id": "windows-causal-assessor", "model": "gpt-6-sol"},
             {"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "causal-assessor-stop", "agent_id": "windows-causal-assessor", "status": "completed", "last_assistant_message": (
                 "根因定位需要跨模块只读分析，并保留当前验收、回滚与风险边界。"
                 "建议由父会话形成最终计划，再交给单一执行者完成修改和独立验证。"
@@ -790,7 +790,7 @@ class WindowsHookTests(unittest.TestCase):
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
                     "task_name": HOOK.bound_executor_task_name(state),
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
                     "message": "Execute the confirmed native plan as the one writer and report the verification evidence.",
@@ -801,7 +801,7 @@ class WindowsHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "causal-executor-start",
                 "agent_id": "windows-causal-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
             },
             {
                 "hook_event_name": "PostToolUse",

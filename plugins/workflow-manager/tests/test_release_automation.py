@@ -36,8 +36,8 @@ class ReleaseAutomationTests(unittest.TestCase):
             constants,
             {
                 "SCHEMA_VERSION": "34",
-                "WRITER_VERSION": "1.0.70",
-                "EXECUTION_PROFILE_VERSION": "13",
+                "WRITER_VERSION": "1.0.71",
+                "EXECUTION_PROFILE_VERSION": "14",
                 "STABLE_SKILL_SCHEMA": "10",
             },
         )

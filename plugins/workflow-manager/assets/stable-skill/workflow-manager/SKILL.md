@@ -9,7 +9,7 @@ Workflow Manager is a narrow authorization and evidence layer, not a second task
 
 ## Route narrowly
 
-- Daily and Simple work run natively with `Start=0`: no assessor, executor, or confirmation.
+- Daily and Simple work run natively with the user's selected model and `Start=0`: no assessor, executor, or confirmation.
 - Hard needs explicit evidence: production release/deployment, irreversible action, security/data loss, system-wide outage, host-continuity risk; or two strong groups including unknown-cause, cross-scope, or continuity. `production`, `core`, `customer-visible`, or `business-critical` labels alone do not upgrade a bounded known single-function bug with clear acceptance.
 - Explicit exclusions or no-risk bounds—such as “do not modify, test, publish, or write Git”—are not positive Hard evidence. They do not erase genuine production-release, irreversible, or cross-scope evidence elsewhere in the same request.
 - If uncertain, begin with bounded native read-only diagnosis and promote only when evidence crosses that threshold. See [work routing](references/work-routing.md).
@@ -25,17 +25,17 @@ Everything else is advisory. Let the model decide whether a plan needs one step 
 
 ## Hard flow
 
-- Spawn one read-only assessor exactly as `collaboration.spawn_agent(task_name=<safe ASCII>, fork_turns="1", model="gpt-5.6-sol", reasoning_effort="max", message=<read-only assessment>)`. Omit `agent_type` and `fork_context`; the task name is opaque. Each Hard envelope has one assessor slot and a failed lifecycle stays fail-closed.
+- Spawn one read-only assessor exactly as `collaboration.spawn_agent(task_name=<safe ASCII>, fork_turns="1", model="gpt-6-sol", reasoning_effort="ultra", message=<read-only assessment>)`. Omit `agent_type` and `fork_context`; the task name is opaque. Each Hard envelope has one assessor slot and a failed lifecycle stays fail-closed.
 - The assessor may answer with any nonempty bounded native result. No `WORK_ASSESSMENT`, JSON fence, fixed keywords, closing sentence, or minimum prose length is required. The host-bound lifecycle proves provenance; the parent model judges the content and writes one nonempty bounded native plan.
 - Store the bounded parent plan in the private append-only journal. Tail seals never grant authority. A slice manifest is optional; missing or malformed data becomes one native slice. A valid manifest may expand within the 196608-byte / 1024-node budget with no item cap.
 - Before confirmation, permit read-only diagnosis but deny mutation. An awaiting canonical plan accepts bounded contextual or explicit assent; early assent requires explicit execution intent. Reject negation, conditions, questions, quotation, and scope changes—never demand a fixed phrase. Early confirmation stores only a digest receipt and auto-binds after the matching revision commits; never ask the user to repeat it.
-- After confirmation, exactly one writer owns the current slice. If no child writer is pending, live, or unknown and no causal/stall diagnosis is unfinished, the parent may atomically take the slice lease and implement, repair, verify, or publish directly. Otherwise it may start one bound child using a current lower-tier model at `medium`, `fork_turns=1`.
-- The Hard parent remains `gpt-5.6-sol` at `max` and is the only summary, review, recovery, and final-acceptance entry. An execution child reports only four material events: location complete, mutation start, verification end, or a blocker.
+- After confirmation, exactly one writer owns the current slice. If no child writer is pending, live, or unknown and no causal/stall diagnosis is unfinished, the parent may atomically take the slice lease and implement, repair, verify, or publish directly, including authorized device operations. Otherwise it may start one bound child using `gpt-6-sol` at `medium`, `fork_turns=1`.
+- The Hard parent remains `gpt-6-sol` at `ultra` and is the only summary, review, recovery, and final-acceptance entry. An execution child reports only four material events: location complete, mutation start, verification end, or a blocker.
 - A child executor output is a candidate; any nonempty bounded native prose is valid and fixed result markers have no protocol authority. A parent-held lease instead binds its PostTool operations directly to the current contract/slice/attempt; a failed parent operation retains the same lease for correction. Taking over an old child candidate monotonically increments attempt and clears the old review candidate. Advance only with host-recorded bounded verification and parent review/Stop evidence; strong acceptance evidence is never optional.
 
 ## Recovery and liveness
 
-- Failure, stall, incomplete, and verification recovery all enter through the high-reasoning parent. If the parent chooses a fresh execution child, it still uses a current lower-tier model at `medium`, `fork_turns=1`, and the original assessor lifecycle must remain valid.
+- Failure, stall, incomplete, and verification recovery all enter through the high-reasoning parent. If the parent chooses a fresh execution child, it uses `gpt-6-sol` at `medium`, `fork_turns=1`, and the original assessor lifecycle must remain valid.
 - Recovery state is advisory: the parent may diagnose, verify, replan, or finish. A chosen child binds digest-only failure evidence to the root cause and correction. Reject only unchanged replay without new evidence or correction; otherwise monotonic sequences continue within byte/node budgets, with no attempt ceiling.
 - Assessor progress is event-driven. Elapsed time, polling, or repeated status observations never create a workflow action, replacement assessor, timeout, or failure. See [assessment liveness](references/assessment-liveness.md).
 

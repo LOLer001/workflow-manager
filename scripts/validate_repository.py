@@ -110,7 +110,7 @@ def main() -> int:
     assert f"Schema {release_metadata['schema']}/writer {release_version}" in confirmed_execution
     assert f"execution profile v{release_metadata['execution_profile']}" in confirmed_execution
     assert "marker-like text has no protocol authority" in confirmed_execution
-    assert "every executor—including a recovery executor—uses a current lower-tier model" in confirmed_execution
+    assert "every executor—including a recovery executor—uses `gpt-6-sol` at `medium`" in confirmed_execution
     assert "workflow-manager-execution-slices` JSON block is optional" in confirmed_execution
     assert "Any concise safe ASCII `task_name` is valid" in confirmed_execution
     assert not (PLUGIN / "skills").exists()
