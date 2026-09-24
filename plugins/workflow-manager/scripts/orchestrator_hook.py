@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.71", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.72", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -13857,6 +13857,13 @@ def git_tag_disposition(command: str) -> str:
 
 
 def git_command_mutates(command: str) -> bool:
+    windows_bridge = static_windows_git_bridge(command)
+    if windows_bridge is not None:
+        # The absolute Windows git.exe is still a Git operation for Hard
+        # authorization. Only these Git verbs are unconditionally read-only.
+        return windows_bridge["subcommand"] not in {
+            "diff", "log", "ls-files", "rev-parse", "show", "status",
+        }
     aggregated = static_git_invocations(command, None)
     if aggregated is not None and len(aggregated) > 1:
         return not all(item["disposition"] == "read_only" for item in aggregated)
@@ -14367,6 +14374,99 @@ GIT_INVOCATION_RE = re.compile(
     r"(?i)(?:^|[;&|]\s*|\$\(|\(\s*)(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
     r"git(?:\.exe)?\s+(?:(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+)\s+)*([a-z][a-z0-9-]*)"
 )
+WINDOWS_GIT_BRIDGE_ROOTS = frozenset({
+    r"D:\A2343R\RkAiExpertBox-A12".casefold(),
+    r"D:\A2343R\RealtimeTranslation".casefold(),
+    r"D:\A2343R\RkAiMeetingNotes-A12-ASR".casefold(),
+    r"D:\A2343R\AndroidNativeDemo".casefold(),
+})
+WINDOWS_GIT_BRIDGE_EXE = r"D:\Git\Git\cmd\git.exe"
+_WINDOWS_GIT_BRIDGE_OUTER_RE = re.compile(
+    r'^\s*powershell\.exe[ \t]+-NoProfile[ \t]+-Command[ \t]+"(?P<body>[^"$`\r\n\x00]*)"[ \t]*$',
+    re.I,
+)
+_WINDOWS_GIT_BRIDGE_BODY_RE = re.compile(
+    r"^Set-Location[ \t]+-LiteralPath[ \t]+"
+    r"(?P<cwd>'[^']+'|[^\s;'\"&|<>]+)[ \t]+-ErrorAction[ \t]+Stop[ \t]*;[ \t]*"
+    r"&[ \t]+'(?P<exe>[^']+)'[ \t]+(?P<args>.+)$",
+    re.I,
+)
+
+
+def _static_windows_git_arguments(value: str) -> list[str] | None:
+    """Read one literal PowerShell argv, with no control or expansion syntax."""
+    args: list[str] = []
+    offset = 0
+    while offset < len(value):
+        whitespace = re.match(r"[ \t]+", value[offset:])
+        if whitespace:
+            offset += whitespace.end()
+            continue
+        if value[offset] == "'":
+            end = value.find("'", offset + 1)
+            if end < 0:
+                return None
+            token = value[offset + 1:end]
+            if not token or any(char in token for char in ';|&<>$`"(){}[]\x00'):
+                return None
+            offset = end + 1
+        else:
+            token_match = re.match(r"[A-Za-z0-9_./\\:+,=%-]+", value[offset:])
+            if token_match is None:
+                return None
+            token = token_match.group()
+            offset += token_match.end()
+        if offset < len(value) and value[offset] not in " \t":
+            return None
+        args.append(token)
+    return args if args else None
+
+
+def static_windows_git_bridge(command: str) -> dict[str, str] | None:
+    """Accept one fixed Windows Git process in one of the four native D: repos.
+
+    The outer double quotes are required by the WSL shell; PowerShell receives
+    a literal Set-Location that terminates on failure, then one trusted Git call.
+    """
+    if not isinstance(command, str):
+        return None
+    outer = _WINDOWS_GIT_BRIDGE_OUTER_RE.fullmatch(command)
+    if outer is None:
+        return None
+    body = _WINDOWS_GIT_BRIDGE_BODY_RE.fullmatch(outer.group("body").strip())
+    if body is None:
+        return None
+    raw_cwd = body.group("cwd")
+    cwd = raw_cwd[1:-1] if raw_cwd.startswith("'") else raw_cwd
+    if cwd.casefold() not in WINDOWS_GIT_BRIDGE_ROOTS:
+        return None
+    if body.group("exe").casefold() != WINDOWS_GIT_BRIDGE_EXE.casefold():
+        return None
+    args = _static_windows_git_arguments(body.group("args"))
+    if args is None or not re.fullmatch(r"[a-z][a-z0-9-]*", args[0], re.I):
+        return None
+    # An option that moves Git's repository or delegates argument construction
+    # would invalidate the literal Set-Location binding.
+    if any(
+        arg.lower() in {"-c", "-C", "--git-dir", "--work-tree", "--config-env", "--exec-path"}
+        or arg.lower().startswith(("--git-dir=", "--work-tree=", "--config-env=", "--exec-path="))
+        for arg in args[1:]
+    ):
+        return None
+    return {"cwd": cwd, "subcommand": args[0].lower()}
+
+
+def windows_git_bridge_attempt(command: str) -> bool:
+    """Fail closed for Git or script attempts through a PowerShell wrapper."""
+    return any(
+        re.match(
+            r"(?i)^\s*(?:(?:env|sudo)\s+)?(?:[^\s'\"]*[/\\])?"
+            r"(?:powershell|pwsh)(?:\.exe)?\s+",
+            view,
+        )
+        and re.search(r"(?i)(?:\bgit(?:\.exe)?\b|\s-File\b)", view)
+        for view in command_views(command)
+    )
 _COMMAND_BOUNDARY_RE = (
     r"(?:^|[;&|]\s*|\$\(|[({}]\s*|\)\s*|[\r\n]\s*|"
     r"\b(?:if|then|elif|else|while|until|do|coproc)\s+)"
@@ -14521,6 +14621,9 @@ def explicit_git_cwd(command: str, payload_cwd: Any) -> tuple[str | None, str | 
 
 
 def git_subcommand(command: str) -> str | None:
+    windows_bridge = static_windows_git_bridge(command)
+    if windows_bridge is not None:
+        return windows_bridge["subcommand"]
     invocation = _git_invocation(command)
     return invocation[1].group(1).lower() if invocation else None
 
@@ -14675,6 +14778,17 @@ def command_guard(payload: dict[str, Any]) -> tuple[str, str] | None:
     resolution = command_request_resolution(payload)
     command = str(resolution.get("command") or "")
     if not command:
+        return None
+    if windows_git_bridge_attempt(command):
+        if resolution.get("error") or static_windows_git_bridge(command) is None:
+            return (
+                "ambiguous_git_input",
+                "Workflow Manager guard blocked a non-static Windows Git bridge. Use one literal "
+                "powershell.exe -NoProfile -Command invocation with Set-Location -LiteralPath "
+                "and -ErrorAction Stop "
+                "in an approved native D: repository and D:\\Git\\Git\\cmd\\git.exe; "
+                "scripts, expansion, composites, and alternate executables are not accepted.",
+            )
         return None
     subcommand = git_subcommand(command)
     aggregate = static_git_invocations(command, resolution.get("cwd"))

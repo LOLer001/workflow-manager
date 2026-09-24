@@ -443,7 +443,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.71")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.72")
         self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "14")
@@ -559,7 +559,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.71"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.72"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -586,7 +586,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.71 active", context)
+        self.assertIn("Workflow Manager 1.0.72 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1252,7 +1252,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.71"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.72"))
         self.assertEqual(migrated["execution_profile_version"], "14")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1279,7 +1279,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_model"],
             ),
-            ("1.0.71", "14", "spawn_required", None),
+            ("1.0.72", "14", "spawn_required", None),
         )
         old_request = self.executor_spawn_payload(
             migrated,
@@ -1306,7 +1306,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 preserved["execution_profile_version"],
                 preserved["executor_state"],
             ),
-            ("1.0.71", "13", "succeeded"),
+            ("1.0.72", "13", "succeeded"),
         )
         self.assertEqual(preserved["last_execution_baseline"], historical_baseline)
 
@@ -1399,7 +1399,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.71", "14"),
+                    (34, "1.0.72", "14"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1445,7 +1445,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.71", "5", "verification_required", 1),
+            (34, "1.0.72", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -9376,6 +9376,134 @@ class OrchestratorHookTests(unittest.TestCase):
         )
         self.assertEqual(bounded.stdout, "")
 
+    def test_windows_git_bridge_allows_one_literal_command_in_approved_d_repos(self) -> None:
+        cases = (
+            ("RkAiExpertBox-A12", "add -A", True),
+            ("RealtimeTranslation", "commit -m 'Sync validated app source'", True),
+            ("RkAiMeetingNotes-A12-ASR", "push origin main", True),
+            ("AndroidNativeDemo", "status --short", False),
+            ("AndroidNativeDemo", "add '@literal.txt'", True),
+        )
+        for index, (repo, git_args, mutates) in enumerate(cases):
+            with self.subTest(repo=repo, git_args=git_args):
+                command = (
+                    'powershell.exe -NoProfile -Command "'
+                    f"Set-Location -LiteralPath 'D:\\A2343R\\{repo}' -ErrorAction Stop; "
+                    f"& 'D:\\Git\\Git\\cmd\\git.exe' {git_args}"
+                    '"'
+                )
+                self.assertEqual(HOOK.git_command_mutates(command), mutates)
+                decision = self.run_hook({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": f"windows-git-bridge-{index}",
+                    "hook_run_id": "git",
+                    "cwd": "/mnt/c/work/repo",
+                    "tool_name": "exec_command",
+                    "tool_input": {"cmd": command},
+                })
+                self.assertEqual(decision.stdout, "", decision.stdout)
+
+    def test_windows_git_bridge_rejects_dynamic_or_ambiguous_invocations(self) -> None:
+        repo = r"D:\A2343R\RkAiExpertBox-A12"
+        git_exe = r"D:\Git\Git\cmd\git.exe"
+        body = f"Set-Location -LiteralPath '{repo}' -ErrorAction Stop; & '{git_exe}' add -A"
+        cases = {
+            "fake_git_exe": body.replace(git_exe, r"D:\Tools\Git\cmd\git.exe"),
+            "unc_cwd": body.replace(repo, r"\\server\share\repo"),
+            "unapproved_d_repo": body.replace(repo, r"D:\A2343R\OtherApp"),
+            "dynamic_cwd": body.replace(f"'{repo}'", "$repo"),
+            "powershell_splatting": body.replace("add -A", "add @args"),
+            "set_location_without_stop": body.replace(" -ErrorAction Stop", ""),
+            "git_dash_c": body + " -C /mnt/c/work/repo",
+            "multiple_git_commands": body + f"; & '{git_exe}' commit -m 'second'",
+            "pipeline": body + " | Out-Null",
+            "redirection": body + " > result.txt",
+            "extra_outer_command": body + '"; git status',
+        }
+        for index, (label, source) in enumerate(cases.items()):
+            with self.subTest(label=label):
+                command = f'powershell.exe -NoProfile -Command "{source}'
+                if not command.endswith('"'):
+                    command += '"'
+                result = self.run_hook({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": f"windows-git-bridge-deny-{index}",
+                    "hook_run_id": "git",
+                    "cwd": "/mnt/c/work/repo",
+                    "tool_name": "exec_command",
+                    "tool_input": {"cmd": command},
+                })
+                reason = json.loads(result.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+                self.assertIn("non-static Windows Git bridge", reason)
+
+        script = self.run_hook({
+            "hook_event_name": "PreToolUse",
+            "session_id": "windows-git-bridge-script",
+            "hook_run_id": "script",
+            "cwd": "/mnt/c/work/repo",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": r"powershell.exe -NoProfile -File D:\A2343R\git.ps1"},
+        })
+        self.assertIn("non-static Windows Git bridge", script.stdout)
+
+        for index, executable in enumerate((
+            "./powershell.exe", "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            "env powershell.exe",
+        )):
+            with self.subTest(executable=executable):
+                wrapped = self.run_hook({
+                    "hook_event_name": "PreToolUse",
+                    "session_id": f"windows-git-bridge-wrapper-{index}",
+                    "hook_run_id": "wrapped",
+                    "cwd": "/mnt/c/work/repo",
+                    "tool_name": "exec_command",
+                    "tool_input": {"cmd": f'{executable} -NoProfile -Command "{body}"'},
+                })
+                self.assertIn("non-static Windows Git bridge", wrapped.stdout)
+
+    def test_windows_git_bridge_write_requires_hard_confirmation(self) -> None:
+        session = "windows-git-bridge-hard"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": session,
+            "hook_run_id": "objective",
+            "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
+        })
+        self.assertEqual(self.load_only_state()["work_difficulty"], "hard")
+        command = (
+            'powershell.exe -NoProfile -Command "'
+            "Set-Location -LiteralPath 'D:\\A2343R\\RkAiExpertBox-A12' -ErrorAction Stop; "
+            "& 'D:\\Git\\Git\\cmd\\git.exe' add -A"
+            '"'
+        )
+        denied = self.run_hook({
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "hook_run_id": "write-before-confirmation",
+            "cwd": "/mnt/c/work/repo",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": command},
+        })
+        reason = json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("Git mutation", reason)
+
+        confirmed_data = Path(self.temporary.name) / "windows-git-bridge-confirmed"
+        confirmed_session = "windows-git-bridge-confirmed"
+        self.create_confirmed_executor_state(confirmed_session, data=confirmed_data)
+        allowed = self.run_hook({
+            "hook_event_name": "PreToolUse",
+            "session_id": confirmed_session,
+            "hook_run_id": "confirmed-write",
+            "cwd": "/mnt/c/work/repo",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": command},
+        }, data=confirmed_data)
+        self.assertNotIn(
+            "permissionDecision",
+            json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}),
+        )
+        self.assertEqual(self.load_only_state(confirmed_data)["parent_writer_lease"]["status"], "live")
+
     def test_exec_command_uses_same_leaf_workdir_for_git_mount_safety(self) -> None:
         native_workdir = Path(self.temporary.name) / "native-git-workdir"
         native_workdir.mkdir()
@@ -10032,7 +10160,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.71 active", context)
+        self.assertIn("Workflow Manager 1.0.72 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10850,7 +10978,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.71"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.72"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11205,7 +11333,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.71", "recovery_required", None),
+                    (34, "1.0.72", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")

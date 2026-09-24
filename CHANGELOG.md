@@ -1,5 +1,10 @@
 # 更新记录
 
+## 1.0.72
+
+- 修复原生 Windows Git 从 WSL Codex 会话调用时被误认作挂载树 Git 的问题：只接受可静态核查的单条 PowerShell 命令，先以字面路径进入 `D:\A2343R` 下的原生仓库，再通过可信绝对路径调用 Windows `git.exe`。Linux Git 在 CIFS/DrvFS、UNC、动态路径和多命令脚本仍被拒绝。
+- 将绝对路径 `git.exe` 纳入 Git 写入与 Hard 授权分类，避免安全路径修复同时漏过未确认的高风险写入。补充允许及拒绝的定向回归；Schema 34、execution profile v14 和 stable-skill schema 10 保持不变。
+
 ## 1.0.71
 
 - 移除已确认 Hard 计划中父执行者对所有设备写操作的额外固定拒绝；`adb reboot` 等获授权操作现在通过现有单写者租约执行，未确认计划、其他写入者占用及挂载树 Git 安全门保持原约束。
