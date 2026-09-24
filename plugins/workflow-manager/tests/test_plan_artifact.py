@@ -226,8 +226,8 @@ class PlanArtifactTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": request,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             },
@@ -245,14 +245,14 @@ class PlanArtifactTests(unittest.TestCase):
                 "tool_name": "collaboration.spawn_agent",
                 "tool_input": {
                     "task_name": task_name, "message": request,
-                    "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1",
+                    "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1",
                 },
                 "tool_response": {"status": "ok"},
             },
             data=selected,
         )
         transcript = selected.parent / f"{suffix}-start.jsonl"
-        transcript.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": f"{suffix}-turn", "model": "gpt-5.6-sol", "effort": "max"}}) + "\n", encoding="utf-8")
+        transcript.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": f"{suffix}-turn", "model": "gpt-6-sol", "effort": "ultra"}}) + "\n", encoding="utf-8")
         agent_id = f"{suffix}-assessor"
         self.run_hook(
             {
@@ -261,7 +261,7 @@ class PlanArtifactTests(unittest.TestCase):
                 "hook_run_id": f"{suffix}-start",
                 "turn_id": f"{suffix}-turn",
                 "agent_id": agent_id,
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "transcript_path": str(transcript),
             },
             data=selected,
@@ -911,8 +911,8 @@ class PlanArtifactTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": "readonly_check",
                     "message": "read-only assessor",
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }

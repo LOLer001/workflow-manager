@@ -316,8 +316,8 @@ class OrchestratorHookTests(unittest.TestCase):
         assessor_binding = "b" * 32
         assessor_request_fingerprint = "c" * 32
         state["subagents"].extend((
-            {"at": "2000-01-01T00:00:00+00:00", "event": "request", "role": "high_assessor", "contract_id": assessor_binding, "objective_fingerprint": state["objective"]["fingerprint"], "requested": True, "host_accepted": True, "host_acceptance_status": "ok", "host_acceptance_source": "PostToolUse", "request_fingerprint": assessor_request_fingerprint, "host_acceptance_fingerprint": assessor_request_fingerprint, "host_acceptance_receipt_digest": "d" * 32, "attempt": 1, "fork_turns": "1", "model": "gpt-5.6-sol", "reasoning_effort": "max"},
-            {"at": "2000-01-01T00:00:01+00:00", "event": "start", "role": "high_assessor", "contract_id": assessor_binding, "objective_fingerprint": state["objective"]["fingerprint"], "requested": True, "host_accepted": True, "request_fingerprint": assessor_request_fingerprint, "agent_id": "historical-assessor", "attempt": 1, "fork_turns": "1", "start_observed": "full", "model": "gpt-5.6-sol", "reasoning_effort": "max", "observation_source": "host_transcript_turn_context"},
+            {"at": "2000-01-01T00:00:00+00:00", "event": "request", "role": "high_assessor", "contract_id": assessor_binding, "objective_fingerprint": state["objective"]["fingerprint"], "requested": True, "host_accepted": True, "host_acceptance_status": "ok", "host_acceptance_source": "PostToolUse", "request_fingerprint": assessor_request_fingerprint, "host_acceptance_fingerprint": assessor_request_fingerprint, "host_acceptance_receipt_digest": "d" * 32, "attempt": 1, "fork_turns": "1", "model": "gpt-6-sol", "reasoning_effort": "ultra"},
+            {"at": "2000-01-01T00:00:01+00:00", "event": "start", "role": "high_assessor", "contract_id": assessor_binding, "objective_fingerprint": state["objective"]["fingerprint"], "requested": True, "host_accepted": True, "request_fingerprint": assessor_request_fingerprint, "agent_id": "historical-assessor", "attempt": 1, "fork_turns": "1", "start_observed": "full", "model": "gpt-6-sol", "reasoning_effort": "ultra", "observation_source": "host_transcript_turn_context"},
         ))
         state.update({"plan_state": "analyzing", "plan_digest": None, "confirmed_plan_digest": None, "execution_contract_id": None, "executor_state": "none"})
         transcript = Path(self.temporary.name) / "gate-rollout.jsonl"
@@ -451,7 +451,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
         self.assertFalse(hasattr(HOOK, "session_execution_preference_directive"))
         prompt = "本会话全程使用最高可用模型和最高推理强度"
-        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "fixed-profile", "hook_run_id": "prose", "model": "gpt-5.6-sol", "prompt": prompt})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": "fixed-profile", "hook_run_id": "prose", "model": "gpt-6-sol", "prompt": prompt})
         state = self.load_only_state()
         self.assertEqual(state["session_execution_preference"], "default")
         self.assertEqual((state["task_domain"], state["model_profile"]), ("daily", "current"))
@@ -669,8 +669,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": HOOK.bound_assessor_task_name(stale),
                     "message": message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             },
@@ -747,7 +747,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(state["model_profile"], "work_executor_sol_medium")
         for index, payload in enumerate((
             self.executor_spawn_payload(state, session=session, hook_run_id="old-model", model="gpt-5.6-sol", effort="medium"),
-            self.executor_spawn_payload(state, session=session, hook_run_id="wrong-effort", model="gpt-6-sol", effort="max"),
+            self.executor_spawn_payload(state, session=session, hook_run_id="wrong-effort", model="gpt-6-sol", effort="ultra"),
         )):
             denied = self.run_hook(payload)
             self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny", index)
@@ -803,7 +803,7 @@ class OrchestratorHookTests(unittest.TestCase):
     def test_retired_highest_preference_migrates_to_default(self) -> None:
         session = "fixed-profile-resume"
         prompt = "For this entire session, always use the highest available model and maximum reasoning effort"
-        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "enable", "model": "gpt-5.6-sol", "prompt": prompt})
+        self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "enable", "model": "gpt-6-sol", "prompt": prompt})
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "target", "prompt": "修复 Android 跨模块反复崩溃，根因未知并验证"})
         self.assertEqual(self.load_only_state()["session_execution_preference"], "default")
         self.run_hook({"hook_event_name": "PreCompact", "session_id": session, "hook_run_id": "compact", "trigger": "auto"})
@@ -1067,7 +1067,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "start",
                 "agent_id": "bounded-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -1103,8 +1103,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 跨模块反复崩溃，根因未知并验证"})
         state = self.load_only_state(); binding = state["assessor_binding_id"]
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}})
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "model-only", "model": "gpt-5.6-sol"})
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "model-only", "model": "gpt-6-sol"})
         running = self.load_only_state()
         self.assertEqual((running["assessor_state"], running["assessor_observed_model"], running["assessor_observed_reasoning_effort"]), ("recovery_required", None, None))
         self.assertFalse(running["assessor_observed_effective"])
@@ -1116,15 +1116,15 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 跨模块反复崩溃，根因未知并验证"})
         state = self.load_only_state(); binding = state["assessor_binding_id"]
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        request = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "turn_id": "turn-full", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+        request = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "turn_id": "turn-full", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}
         self.run_hook(request)
         pending = self.load_only_state()["subagents"][-1]
         self.assertTrue(pending["requested"]); self.assertIsNone(pending["host_accepted"])
         failed = {**request, "hook_event_name": "PostToolUse", "hook_run_id": "request-failed", "tool_response": {"status": "error"}}
         self.run_hook(failed)
         self.assertFalse(self.load_only_state()["subagents"][-1]["host_accepted"])
-        transcript = self.start_transcript("turn-full", "gpt-5.6-sol", "max")
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-denied", "turn_id": "turn-full", "agent_id": "not-accepted", "model": "gpt-5.6-sol", "transcript_path": str(transcript)})
+        transcript = self.start_transcript("turn-full", "gpt-6-sol", "ultra")
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-denied", "turn_id": "turn-full", "agent_id": "not-accepted", "model": "gpt-6-sol", "transcript_path": str(transcript)})
         denied_state = self.load_only_state()
         self.assertEqual(
             (denied_state["assessor_state"], denied_state["assessor_failure_kind"]),
@@ -1147,10 +1147,10 @@ class OrchestratorHookTests(unittest.TestCase):
         request["hook_run_id"] = "request-ok"; request["turn_id"] = "turn-full"
         self.run_hook(request, data=ok_data)
         self.run_hook({**request, "hook_event_name": "PostToolUse", "hook_run_id": "request-ok-post", "tool_response": {"status": "ok"}}, data=ok_data)
-        transcript = self.start_transcript("turn-full", "gpt-5.6-sol", "max")
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-full", "turn_id": "turn-full", "agent_id": "full", "model": "gpt-5.6-sol", "reasoning_effort": "child-lie", "transcript_path": str(transcript)}, data=ok_data)
+        transcript = self.start_transcript("turn-full", "gpt-6-sol", "ultra")
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-full", "turn_id": "turn-full", "agent_id": "full", "model": "gpt-6-sol", "reasoning_effort": "child-lie", "transcript_path": str(transcript)}, data=ok_data)
         running = self.load_only_state(ok_data)
-        self.assertEqual((running["assessor_state"], running["assessor_start_observed"], running["assessor_observed_reasoning_effort"]), ("running", "full", "max"))
+        self.assertEqual((running["assessor_state"], running["assessor_start_observed"], running["assessor_observed_reasoning_effort"]), ("running", "full", "ultra"))
         self.assertEqual(running["assessor_observation_source"], "transcript_turn_context_effort")
 
     def test_bound_start_rejects_flat_state_or_forged_request_substitutes(self) -> None:
@@ -1160,35 +1160,35 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 跨模块反复崩溃，根因未知并验证"})
         state = self.load_only_state(); binding = state["assessor_binding_id"]
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        request = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "turn_id": "bound-turn", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+        request = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "turn_id": "bound-turn", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}
         self.run_hook(request)
         # Mutating only flat fields cannot replace the missing PostToolUse
         # acceptance fact.
         stored = self.load_only_state()
-        stored["assessor_model"] = "gpt-5.6-sol"
-        stored["assessor_reasoning_effort"] = "max"
+        stored["assessor_model"] = "gpt-6-sol"
+        stored["assessor_reasoning_effort"] = "ultra"
         self.state_files()[0].write_text(json.dumps(stored), encoding="utf-8")
-        transcript = self.start_transcript("bound-turn", "gpt-5.6-sol", "max")
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "missing-post", "turn_id": "bound-turn", "agent_id": "flat-forgery", "model": "gpt-5.6-sol", "transcript_path": str(transcript)})
+        transcript = self.start_transcript("bound-turn", "gpt-6-sol", "ultra")
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "missing-post", "turn_id": "bound-turn", "agent_id": "flat-forgery", "model": "gpt-6-sol", "transcript_path": str(transcript)})
         rejected = self.load_only_state()
         self.assertEqual((rejected["assessor_state"], rejected["assessor_failure_kind"]), ("recovery_required", "model_unavailable"))
 
     def test_start_observation_rejects_missing_model_effort_wrong_turn_and_conflicts(self) -> None:
         self.assertEqual(HOOK.start_observation_status(*HOOK.start_turn_observation({"turn_id": "x"})), "absent")
-        transcript = self.start_transcript("right", "gpt-5.6-sol", "max")
-        self.assertEqual(HOOK.start_turn_observation({"turn_id": "wrong", "model": "gpt-5.6-sol", "transcript_path": str(transcript)}), (None, None, None))
+        transcript = self.start_transcript("right", "gpt-6-sol", "ultra")
+        self.assertEqual(HOOK.start_turn_observation({"turn_id": "wrong", "model": "gpt-6-sol", "transcript_path": str(transcript)}), (None, None, None))
         self.assertEqual(HOOK.start_turn_observation({"turn_id": "right", "model": "gpt-5.6-terra", "transcript_path": str(transcript)})[2], "transcript_turn_context_model_mismatch")
-        missing_effort = self.start_transcript("partial", "gpt-5.6-sol", None)
-        observed = HOOK.start_turn_observation({"turn_id": "partial", "model": "gpt-5.6-sol", "transcript_path": str(missing_effort)})
+        missing_effort = self.start_transcript("partial", "gpt-6-sol", None)
+        observed = HOOK.start_turn_observation({"turn_id": "partial", "model": "gpt-6-sol", "transcript_path": str(missing_effort)})
         self.assertEqual(HOOK.start_observation_status(*observed), "partial")
 
     def test_rollout_0148_turn_context_fixture_and_legacy_event_message_are_distinct(self) -> None:
         fixture = Path(self.temporary.name) / "sanitized-rollout-0148.jsonl"
-        fixture.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": "rollout-0148", "model": "gpt-5.6-sol", "effort": "max"}}) + "\n", encoding="utf-8")
-        self.assertEqual(HOOK.start_turn_observation({"turn_id": "rollout-0148", "model": "gpt-5.6-sol", "transcript_path": str(fixture)}), ("gpt-5.6-sol", "max", "transcript_turn_context_effort"))
+        fixture.write_text(json.dumps({"type": "turn_context", "payload": {"turn_id": "rollout-0148", "model": "gpt-6-sol", "effort": "ultra"}}) + "\n", encoding="utf-8")
+        self.assertEqual(HOOK.start_turn_observation({"turn_id": "rollout-0148", "model": "gpt-6-sol", "transcript_path": str(fixture)}), ("gpt-6-sol", "ultra", "transcript_turn_context_effort"))
         legacy = Path(self.temporary.name) / "legacy-event-msg.jsonl"
-        legacy.write_text(json.dumps({"type": "event_msg", "payload": {"type": "turn_context", "turn_id": "legacy", "model": "gpt-5.6-sol", "reasoning_effort": "max"}}) + "\n", encoding="utf-8")
-        self.assertEqual(HOOK.start_turn_observation({"turn_id": "legacy", "model": "gpt-5.6-sol", "transcript_path": str(legacy)}), ("gpt-5.6-sol", "max", "transcript_event_msg_reasoning_effort"))
+        legacy.write_text(json.dumps({"type": "event_msg", "payload": {"type": "turn_context", "turn_id": "legacy", "model": "gpt-6-sol", "reasoning_effort": "ultra"}}) + "\n", encoding="utf-8")
+        self.assertEqual(HOOK.start_turn_observation({"turn_id": "legacy", "model": "gpt-6-sol", "transcript_path": str(legacy)}), ("gpt-6-sol", "ultra", "transcript_event_msg_reasoning_effort"))
 
     def test_partial_start_capability_boundary_is_recorded_once_per_session(self) -> None:
         self.legacy_start_fixtures = False
@@ -1196,10 +1196,10 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 跨模块反复崩溃，根因未知并验证"})
         state = self.load_only_state(); binding = state["assessor_binding_id"]
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        request = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "turn_id": "partial", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+        request = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "turn_id": "partial", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}
         self.run_hook(request); self.run_hook({**request, "hook_event_name": "PostToolUse", "hook_run_id": "post", "tool_response": {"status": "ok"}})
-        partial = self.start_transcript("partial", "gpt-5.6-sol", None)
-        start = {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-1", "turn_id": "partial", "agent_id": "partial-1", "model": "gpt-5.6-sol", "transcript_path": str(partial)}
+        partial = self.start_transcript("partial", "gpt-6-sol", None)
+        start = {"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start-1", "turn_id": "partial", "agent_id": "partial-1", "model": "gpt-6-sol", "transcript_path": str(partial)}
         self.run_hook(start)
         first = self.load_only_state()
         self.assertEqual(first["assessor_state"], "recovery_required")
@@ -1506,8 +1506,8 @@ class OrchestratorHookTests(unittest.TestCase):
         state = self.load_only_state()
         binding = state["assessor_binding_id"]
         request = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": request, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}})
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "missing-status", "model": "gpt-5.6-sol", "reasoning_effort": "max"})
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": request, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "missing-status", "model": "gpt-6-sol", "reasoning_effort": "ultra"})
         plan = f"1. 定位根因\n2. 修改并验证\n验收：回归通过。\n{self.execution_slices_block()}\nWORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32}\n计划已就绪，等待确认后执行"
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "missing-status", "last_assistant_message": plan})
         planned = self.load_only_state()
@@ -1527,7 +1527,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": invalid_session, "hook_run_id": "work", "prompt": "排查 Android 反复崩溃且根因未知，并跨模块编译验证"}, data=invalid_data)
         invalid = self.load_only_state(invalid_data)
         invalid_request = f"assessor_binding_id={invalid['assessor_binding_id']} objective_fingerprint={invalid['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        invalid_spawn = {"hook_event_name": "PreToolUse", "session_id": invalid_session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(invalid), "message": invalid_request, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+        invalid_spawn = {"hook_event_name": "PreToolUse", "session_id": invalid_session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(invalid), "message": invalid_request, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}
         self.run_hook(invalid_spawn, data=invalid_data)
         self.run_hook({**invalid_spawn, "hook_event_name": "PostToolUse", "hook_run_id": "post", "tool_response": {"status": "ok"}}, data=invalid_data)
         self.legacy_start_fixtures = False
@@ -1548,7 +1548,7 @@ class OrchestratorHookTests(unittest.TestCase):
             case = self.load_only_state(case_data)
             case_binding = case["assessor_binding_id"]
             case_request = f"assessor_binding_id={case_binding} objective_fingerprint={case['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-            self.run_hook({"hook_event_name": "PreToolUse", "session_id": case_session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(case), "message": case_request, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}, data=case_data)
+            self.run_hook({"hook_event_name": "PreToolUse", "session_id": case_session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(case), "message": case_request, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}, data=case_data)
             self.run_hook({"hook_event_name": "SubagentStart", "session_id": case_session, "hook_run_id": "start", "agent_id": f"{label}-agent"}, data=case_data)
             stop = {"hook_event_name": "SubagentStop", "session_id": case_session, "hook_run_id": "stop", "agent_id": f"{label}-agent"}
             if explicit_status:
@@ -1576,7 +1576,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "start",
                 "agent_id": "mailbox-reject-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -1701,7 +1701,7 @@ class OrchestratorHookTests(unittest.TestCase):
         session = "executor-status-missing"
         state = self.create_confirmed_executor_state(session, slice_count=1)
         self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="request", fork_turns="1"))
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "missing-status-executor", "model": "gpt-5.6-terra", "reasoning_effort": "medium"})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "missing-status-executor", "model": "gpt-6-sol", "reasoning_effort": "medium"})
         self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "change", "agent_id": "missing-status-executor", "tool_name": "apply_patch", "tool_input": {"patch": "x"}, "tool_response": {"status": "ok"}})
         self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "verify", "agent_id": "missing-status-executor", "tool_name": "Bash", "tool_input": {"command": "python3 -m unittest acceptance"}, "tool_response": {"status": "ok", "exit_code": 0}})
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "missing-status-executor", "last_assistant_message": f"EXECUTION_RESULT execution_contract_id={state['execution_contract_id']} slice_id=s01 outcome=succeeded"})
@@ -1754,7 +1754,7 @@ class OrchestratorHookTests(unittest.TestCase):
             case_session = f"executor-status-{label}"
             case_state = self.create_confirmed_executor_state(case_session, data=case_data)
             self.run_hook(self.executor_spawn_payload(case_state, session=case_session, hook_run_id="request", fork_turns="1"), data=case_data)
-            self.run_hook({"hook_event_name": "SubagentStart", "session_id": case_session, "hook_run_id": "start", "agent_id": f"{label}-executor", "model": "gpt-5.6-terra", "reasoning_effort": "medium"}, data=case_data)
+            self.run_hook({"hook_event_name": "SubagentStart", "session_id": case_session, "hook_run_id": "start", "agent_id": f"{label}-executor", "model": "gpt-6-sol", "reasoning_effort": "medium"}, data=case_data)
             stop = {"hook_event_name": "SubagentStop", "session_id": case_session, "hook_run_id": "stop", "agent_id": f"{label}-executor"}
             if explicit_status:
                 stop["status"] = explicit_status
@@ -2344,8 +2344,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": encrypted_message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }
@@ -2359,7 +2359,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 failed,
                 session=session,
                 hook_run_id="typed-recovery",
-                model="gpt-5.6-terra",
+                model="gpt-6-sol",
                 effort="medium",
                 fork_turns="1",
                 recovery_from="verification_failed",
@@ -2381,7 +2381,7 @@ class OrchestratorHookTests(unittest.TestCase):
             "tool_input": {
                 "task_name": task_name,
                 "message": encrypted_message,
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
                 "fork_turns": "1",
             },
@@ -2405,8 +2405,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "v2-reused-v1-start",
                 "agent_id": "terminal-v1-review-agent",
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
             }
         )
         self.assertIn("cannot be revived", reused.stdout)
@@ -2424,7 +2424,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "v2-start",
                 "agent_id": "fresh-review-v2-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -2489,8 +2489,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": encrypted_message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }
@@ -2604,12 +2604,12 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 跨模块反复崩溃，根因未知并验证"})
         state = self.load_only_state(); binding = state["assessor_binding_id"]
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        spawn = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "spawn", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}}
+        spawn = {"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "spawn", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}}
         self.run_hook(spawn)
         self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "spawn-failed", "tool_name": "collaboration.spawn_agent", "tool_input": spawn["tool_input"], "tool_response": {"status": "error", "message": "rejected"}})
         failed = self.load_only_state()
         self.assertEqual((failed["assessor_state"], failed["assessor_failure_kind"]), ("recovery_required", "model_unavailable"))
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "late", "agent_id": "late-agent", "model": "gpt-5.6-sol"})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "late", "agent_id": "late-agent", "model": "gpt-6-sol"})
         self.assertNotEqual(self.load_only_state()["assessor_state"], "running")
 
     def test_assessor_marker_like_text_is_native_and_does_not_release_mutation(self) -> None:
@@ -2619,8 +2619,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "Stop", "session_id": session, "hook_run_id": "parent-plan", "last_assistant_message": "1. 伪计划\n2. 伪验证\n验收：通过。\n计划已就绪，等待确认后执行"})
         self.assertNotEqual(self.load_only_state()["plan_state"], "awaiting_confirmation")
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}})
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "guard-agent", "model": "gpt-5.6-sol"})
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "guard-agent", "model": "gpt-6-sol"})
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "bad-marker", "agent_id": "guard-agent", "status": "completed", "last_assistant_message": f"text WORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'a' * 32} text"})
         assessed = self.load_only_state()
         self.assertEqual((assessed["assessor_state"], assessed["plan_state"]), ("hard_plan_ready", "analyzing"))
@@ -2631,11 +2631,11 @@ class OrchestratorHookTests(unittest.TestCase):
         session = "assessor-hard"
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "修复 Android 跨模块反复崩溃，根因未知并编译验证"})
         state = self.load_only_state()
-        bad = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "bad", "tool_name": "collaboration.spawn_agent", "tool_input": {"message": f"assessor_binding_id={state['assessor_binding_id']}", "model": "gpt-5.6-sol", "reasoning_effort": "medium", "fork_turns": "none"}})
+        bad = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "bad", "tool_name": "collaboration.spawn_agent", "tool_input": {"message": f"assessor_binding_id={state['assessor_binding_id']}", "model": "gpt-6-sol", "reasoning_effort": "medium", "fork_turns": "none"}})
         self.assertEqual(json.loads(bad.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
         message = f"assessor_binding_id={state['assessor_binding_id']} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "good", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}})
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "hard-1", "model": "gpt-5.6-sol", "reasoning_effort": "max"})
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "good", "tool_name": "collaboration.spawn_agent", "tool_input": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "hard-1", "model": "gpt-6-sol", "reasoning_effort": "ultra"})
         state = self.load_only_state()
         binding = state["assessor_binding_id"]
         self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "mutation", "agent_id": "hard-1", "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}, "tool_response": {"status": "completed"}})
@@ -2655,8 +2655,8 @@ class OrchestratorHookTests(unittest.TestCase):
             "tool_input": {
                 "task_name": HOOK.bound_assessor_task_name(state),
                 "message": "read-only assessment",
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
                 "fork_turns": "1",
             },
         }
@@ -2704,8 +2704,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 leaf = {
                     "task_name": HOOK.bound_assessor_task_name(state),
                     "message": message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 }
                 shapes = (
@@ -2759,8 +2759,8 @@ class OrchestratorHookTests(unittest.TestCase):
         content_leaf = {
             "taskName": HOOK.bound_assessor_task_name(state),
             "message": [{"type": "input_text", "text": message}],
-            "model": "gpt-5.6-sol",
-            "reasoningEffort": "max",
+            "model": "gpt-6-sol",
+            "reasoningEffort": "ultra",
             "forkTurns": "1",
         }
         accepted = self.run_hook(
@@ -2797,8 +2797,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": encrypted_message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }
@@ -2837,8 +2837,8 @@ class OrchestratorHookTests(unittest.TestCase):
                         "tool_input": {
                             "task_name": task_name,
                             "message": encrypted_message,
-                            "model": "gpt-5.6-sol",
-                            "reasoning_effort": "max",
+                            "model": "gpt-6-sol",
+                            "reasoning_effort": "ultra",
                             "fork_turns": "1",
                         },
                     }
@@ -2890,8 +2890,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "profile_resolution=highest_available assess Simple directly solve and verify; "
                 "Hard read-only plan then confirmation"
             ),
-            "model": "gpt-5.6-sol",
-            "reasoning_effort": "max",
+            "model": "gpt-6-sol",
+            "reasoning_effort": "ultra",
             "fork_turns": "1",
         }
         result = self.run_hook(
@@ -2937,7 +2937,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": "high_assessor",
                     "message": message,
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "ultra",
                     "fork_turns": "none",
                 },
@@ -2969,7 +2969,7 @@ class OrchestratorHookTests(unittest.TestCase):
         conflicting = {
             "message": message,
             "args": {
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "ultra",
                 "fork_turns": "none",
             },
@@ -3012,7 +3012,7 @@ class OrchestratorHookTests(unittest.TestCase):
                     "task_name": "high_assessor",
                     "message": message,
                     "prompt": "different assessor prompt",
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "ultra",
                     "fork_turns": "none",
                 },
@@ -3062,8 +3062,8 @@ class OrchestratorHookTests(unittest.TestCase):
             "tool_input": {
                 "task_name": HOOK.bound_assessor_task_name(state),
                 "message": message,
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
                 "fork_turns": "1",
             },
         }
@@ -3111,8 +3111,8 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "UserPromptSubmit", "session_id": session, "hook_run_id": "work", "prompt": "AndroidNativeDemo 对齐 Unity 主题0"})
         state = self.load_only_state(); binding = state["assessor_binding_id"]
         message = f"assessor_binding_id={binding} objective_fingerprint={state['objective']['fingerprint']} profile_resolution=highest_available Hard read-only plan then confirmation"
-        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": json.dumps({"arguments": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"}})})
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "resume-1", "model": "gpt-5.6-sol", "reasoning_effort": "max"})
+        self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "request", "tool_name": "collaboration.spawn_agent", "tool_input": json.dumps({"arguments": {"task_name": HOOK.bound_assessor_task_name(state), "message": message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"}})})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "resume-1", "model": "gpt-6-sol", "reasoning_effort": "ultra"})
         self.run_hook({"hook_event_name": "SubagentStop", "session_id": session, "hook_run_id": "stop", "agent_id": "resume-1", "status": "completed", "last_assistant_message": f"1. 对齐\n2. 验证\n验收：一致。\n{self.execution_slices_block()}\nWORK_ASSESSMENT binding_id={binding} outcome=hard evidence_digest={'d' * 32}\n计划已就绪，等待确认后执行"})
         hard = self.load_only_state()
         self.assertEqual((hard["assessor_state"], hard["plan_state"]), ("hard_plan_ready", "analyzing"))
@@ -3967,14 +3967,14 @@ class OrchestratorHookTests(unittest.TestCase):
             "不要创建或修改文件，只回复 OK": ("daily", "current"),
             "帮我清理电脑垃圾文件": ("daily", "current"),
             "修复 Android 设备反复重启的 bug": ("work", "work_assessment"),
-            "实现客户的设备定制需求": ("work", "work_assessment"),
-            "编写一个 Android App 并完成测试": ("work", "work_assessment"),
-            "编写一个生成日报的 App": ("work", "work_assessment"),
-            "修改 Parser.java 的 parse 方法": ("work", "work_assessment"),
-            "编译 Settings 模块并部署到实机验证": ("work", "work_assessment"),
-            "先问一下天气，然后修改应用代码并发布": ("work", "work_assessment"),
-            "Work / Hard engineering acceptance: create slice1-note.md and verify the file": ("work", "work_assessment"),
-            "创建验收文件 acceptance-note.md 并验证精确内容": ("work", "work_assessment"),
+            "实现客户的设备定制需求": ("work", "current"),
+            "编写一个 Android App 并完成测试": ("work", "current"),
+            "编写一个生成日报的 App": ("work", "current"),
+            "修改 Parser.java 的 parse 方法": ("work", "current"),
+            "编译 Settings 模块并部署到实机验证": ("work", "current"),
+            "先问一下天气，然后修改应用代码并发布": ("work", "current"),
+            "Work / Hard engineering acceptance: create slice1-note.md and verify the file": ("work", "current"),
+            "创建验收文件 acceptance-note.md 并验证精确内容": ("work", "current"),
             "继续修复 Workflow Manager 的计划容量与确认恢复缺陷，并发布 1.0.48": ("work", "work_assessment"),
         }
         for prompt, expected in cases.items():
@@ -4805,7 +4805,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": encrypted_message,
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
                 },
@@ -4832,7 +4832,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": "plain_writer",
                     "message": encrypted_message,
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "none",
                 },
@@ -4852,7 +4852,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": "unencoded_writer_name",
                     "message": encrypted_message,
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
                 },
@@ -4889,7 +4889,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_run_id": "handoff-start",
                 "cwd": str(workspace),
                 "agent_id": "private-handoff-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -4943,7 +4943,7 @@ class OrchestratorHookTests(unittest.TestCase):
                         "session_id": session,
                         "hook_run_id": f"{mode}-start",
                         "agent_id": f"{mode}-executor",
-                        "model": "gpt-5.6-terra",
+                        "model": "gpt-6-sol",
                         "reasoning_effort": "medium",
                     },
                     data=data,
@@ -4981,7 +4981,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "v1-start",
                 "agent_id": "terminal-v1-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -5047,8 +5047,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": recovery_task,
                     "message": encrypted_message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }
@@ -5069,7 +5069,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": session,
                 "hook_run_id": "objective",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "prompt": "排查 Android 设备反复重启并修复、编译部署实机验证",
             }
         )
@@ -5084,11 +5084,11 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "assessor-request",
                 "tool_name": "collaborationspawn_agent",
-                "tool_input": {"task_name": assessor_task, "message": encrypted_message, "model": "gpt-5.6-sol", "reasoning_effort": "max", "fork_turns": "1"},
+                "tool_input": {"task_name": assessor_task, "message": encrypted_message, "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1"},
             }
         )
         assessor = f"/root/{assessor_task}"
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "assessor-start", "agent_id": assessor, "model": "gpt-5.6-sol", "reasoning_effort": "max"})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "assessor-start", "agent_id": assessor, "model": "gpt-6-sol", "reasoning_effort": "ultra"})
         early_write = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "early-write", "agent_id": assessor, "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
         self.assertEqual(json.loads(early_write.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
         plan = (
@@ -5118,11 +5118,11 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "executor-request",
                 "tool_name": "collaborationspawn_agent",
-                "tool_input": {"task_name": executor_task, "message": encrypted_message, "model": "gpt-5.6-terra", "reasoning_effort": "medium", "fork_turns": "1"},
+                "tool_input": {"task_name": executor_task, "message": encrypted_message, "model": "gpt-6-sol", "reasoning_effort": "medium", "fork_turns": "1"},
             }
         )
         executor = f"/root/{executor_task}"
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-start", "agent_id": executor, "model": "gpt-5.6-terra", "reasoning_effort": "medium"})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "executor-start", "agent_id": executor, "model": "gpt-6-sol", "reasoning_effort": "medium"})
         allowed = self.run_hook({"hook_event_name": "PreToolUse", "session_id": session, "hook_run_id": "executor-write", "agent_id": executor, "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}})
         self.assertNotIn("permissionDecision", json.loads(allowed.stdout or "{}").get("hookSpecificOutput", {}))
         self.run_hook({"hook_event_name": "PostToolUse", "session_id": session, "hook_run_id": "change", "agent_id": executor, "tool_name": "apply_patch", "tool_input": {"patch": "*** Begin Patch\n*** End Patch"}, "tool_response": {"status": "ok"}})
@@ -5342,7 +5342,7 @@ class OrchestratorHookTests(unittest.TestCase):
         session = "native-failure-prose"
         state = self.create_confirmed_executor_state(session)
         self.run_hook(self.executor_spawn_payload(state, session=session, hook_run_id="request"))
-        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "native-failure-agent", "model": "gpt-5.6-terra", "reasoning_effort": "medium"})
+        self.run_hook({"hook_event_name": "SubagentStart", "session_id": session, "hook_run_id": "start", "agent_id": "native-failure-agent", "model": "gpt-6-sol", "reasoning_effort": "medium"})
         self.run_hook({
             "hook_event_name": "SubagentStop",
             "session_id": session,
@@ -5439,7 +5439,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "start-2",
                 "agent_id": "executor-2",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -5536,10 +5536,10 @@ class OrchestratorHookTests(unittest.TestCase):
             "objective": lambda state, request, started: request.update(objective_fingerprint="0" * 16),
             "attempt": lambda state, request, started: request.update(attempt=request["attempt"] + 1),
             "model": lambda state, request, started: started.update(model="gpt-5.6-terra"),
-            "effort": lambda state, request, started: started.update(reasoning_effort="ultra"),
+            "effort": lambda state, request, started: started.update(reasoning_effort="max"),
             "fork": lambda state, request, started: started.update(fork_turns="2"),
             "flat_model": lambda state, request, started: state.update(assessor_model="gpt-5.6-terra"),
-            "flat_effort": lambda state, request, started: state.update(assessor_reasoning_effort="ultra"),
+            "flat_effort": lambda state, request, started: state.update(assessor_reasoning_effort="max"),
             "flat_fork": lambda state, request, started: state.update(assessor_fork_turns="2"),
         }
         for label, mutate in mismatch_cases.items():
@@ -5582,13 +5582,13 @@ class OrchestratorHookTests(unittest.TestCase):
                     f"objective_fingerprint={state['objective']['fingerprint']} "
                     "profile_resolution=highest_available Hard read-only plan then confirmation"
                 ),
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
                 "fork_turns": "1",
             },
         }
         self.run_hook(request)
-        transcript = self.start_transcript(turn_id, "gpt-5.6-sol", "max")
+        transcript = self.start_transcript(turn_id, "gpt-6-sol", "ultra")
         self.run_hook(
             {
                 "hook_event_name": "SubagentStart",
@@ -5596,7 +5596,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_run_id": "start-before-post",
                 "turn_id": turn_id,
                 "agent_id": "late-assessor-agent",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "transcript_path": str(transcript),
             }
         )
@@ -5621,14 +5621,14 @@ class OrchestratorHookTests(unittest.TestCase):
                 "host_acceptance_fingerprint": conflict_request["request_fingerprint"],
             }
         )
-        flat_conflict["assessor_observed_model"] = "gpt-5.6-terra"
+        flat_conflict["assessor_observed_model"] = "gpt-6-sol"
         self.assertFalse(
             HOOK.reconcile_post_accepted_bound_start(
                 flat_conflict, conflict_request, {}
             )
         )
         self.assertEqual(
-            flat_conflict["assessor_observed_model"], "gpt-5.6-terra"
+            flat_conflict["assessor_observed_model"], "gpt-6-sol"
         )
         self.assertIsNone(flat_conflict["assessor_agent_id"])
 
@@ -5702,13 +5702,13 @@ class OrchestratorHookTests(unittest.TestCase):
                     f"objective_fingerprint={state['objective']['fingerprint']} "
                     "profile_resolution=highest_available Hard read-only plan then confirmation"
                 ),
-                "model": "gpt-5.6-sol",
-                "reasoning_effort": "max",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "ultra",
                 "fork_turns": "1",
             },
         }
         self.run_hook(request)
-        transcript = self.start_transcript(turn_id, "gpt-5.6-sol", "max")
+        transcript = self.start_transcript(turn_id, "gpt-6-sol", "ultra")
         self.run_hook(
             {
                 "hook_event_name": "SubagentStart",
@@ -5716,7 +5716,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_run_id": "start-before-post",
                 "turn_id": turn_id,
                 "agent_id": "late-assessor-wrong-agent",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "transcript_path": str(transcript),
             }
         )
@@ -5774,8 +5774,8 @@ class OrchestratorHookTests(unittest.TestCase):
                             f"objective_fingerprint={state['objective']['fingerprint']} "
                             "profile_resolution=highest_available Hard read-only plan then confirmation"
                         ),
-                        "model": "gpt-5.6-sol",
-                        "reasoning_effort": "max",
+                        "model": "gpt-6-sol",
+                        "reasoning_effort": "ultra",
                         "fork_turns": "1",
                     },
                 }
@@ -5943,7 +5943,7 @@ class OrchestratorHookTests(unittest.TestCase):
             state,
             session=session,
             hook_run_id="recovery-request",
-            model="gpt-5.6-terra",
+            model="gpt-6-sol",
             effort="medium",
             recovery_from="build_failed",
             material_correction="changed the bounded build setup after root cause review",
@@ -5959,7 +5959,7 @@ class OrchestratorHookTests(unittest.TestCase):
             if item.get("event") == "request"
             and item.get("role") == "confirmed_executor"
         )
-        transcript = self.start_transcript(turn_id, "gpt-5.6-terra", "medium")
+        transcript = self.start_transcript(turn_id, "gpt-6-sol", "medium")
         locked_start = self.run_hook(
             {
                 "hook_event_name": "SubagentStart",
@@ -5967,7 +5967,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_run_id": "recovery-start-before-post",
                 "turn_id": turn_id,
                 "agent_id": "late-recovery-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "transcript_path": str(transcript),
             }
         )
@@ -6079,7 +6079,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "running",
                 "late-recovery-agent",
                 None,
-                "gpt-5.6-terra",
+                "gpt-6-sol",
                 "medium",
                 "1",
                 True,
@@ -6108,7 +6108,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_response": {},
             }
         )
-        transcript = self.start_transcript(turn_id, "gpt-5.6-terra", "medium")
+        transcript = self.start_transcript(turn_id, "gpt-6-sol", "medium")
         started = self.run_hook(
             {
                 "hook_event_name": "SubagentStart",
@@ -6116,7 +6116,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "hook_run_id": "start-after-unknown-post",
                 "turn_id": turn_id,
                 "agent_id": "unknown-post-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "transcript_path": str(transcript),
             }
         )
@@ -6472,7 +6472,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": "plain_writer",
                     "message": "gAAAAA" + "A" * 80,
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
                 },
@@ -7030,7 +7030,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "executor-start",
                 "agent_id": "native-hotfix-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -7121,7 +7121,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "legacy-executor-start",
                 "agent_id": "legacy-incomplete-executor",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -7252,7 +7252,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current,
                 session=session,
                 hook_run_id=f"{label}-request",
-                model="gpt-5.6-terra",
+                model="gpt-6-sol",
                 effort="medium",
                 recovery_from=recovery,
                 material_correction=correction,
@@ -7271,7 +7271,7 @@ class OrchestratorHookTests(unittest.TestCase):
                     "session_id": session,
                     "hook_run_id": f"{label}-start",
                     "agent_id": f"{label}-agent",
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                 }
             )
@@ -7314,7 +7314,7 @@ class OrchestratorHookTests(unittest.TestCase):
             state,
             session=session,
             hook_run_id="unchanged-replay",
-            model="gpt-5.6-terra",
+            model="gpt-6-sol",
             effort="medium",
             recovery_from="build_failed",
             material_correction="corrected the bounded build configuration",
@@ -7362,7 +7362,7 @@ class OrchestratorHookTests(unittest.TestCase):
         }
         self.assertGreaterEqual(len(fingerprints), 3)
         self.assertEqual(state["executor_attempt"], 5)
-        self.assertEqual(state["executor_model"], "gpt-5.6-terra")
+        self.assertEqual(state["executor_model"], "gpt-6-sol")
         self.assertEqual(state["executor_reasoning_effort"], "medium")
         persisted = self.state_files()[0].read_text(encoding="utf-8")
         for private_text in (
@@ -7387,7 +7387,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "normal-start",
                 "agent_id": "normal-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -7459,8 +7459,8 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": HOOK.bound_executor_task_name(failed),
                     "message": opaque_message,
-                    "model": "gpt-5.6-sol",
-                    "reasoning_effort": "max",
+                    "model": "gpt-6-sol",
+                    "reasoning_effort": "ultra",
                     "fork_turns": "1",
                 },
             }
@@ -7586,7 +7586,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "tool_input": {
                     "task_name": task_name,
                     "message": opaque_message,
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                     "fork_turns": "1",
                 },
@@ -7610,7 +7610,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "opaque-start-one",
                 "agent_id": "opaque-agent-one",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -7671,7 +7671,7 @@ class OrchestratorHookTests(unittest.TestCase):
                     "tool_input": {
                         "task_name": recovery_task,
                         "message": opaque_message,
-                        "model": "gpt-5.6-terra",
+                        "model": "gpt-6-sol",
                         "reasoning_effort": "medium",
                         "fork_turns": "1",
                     },
@@ -7689,7 +7689,7 @@ class OrchestratorHookTests(unittest.TestCase):
                     "session_id": session,
                     "hook_run_id": f"opaque-start-{index}",
                     "agent_id": f"opaque-agent-{index}",
-                    "model": "gpt-5.6-terra",
+                    "model": "gpt-6-sol",
                     "reasoning_effort": "medium",
                 }
             )
@@ -7732,7 +7732,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "normal-start",
                 "agent_id": "normal-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -7774,7 +7774,7 @@ class OrchestratorHookTests(unittest.TestCase):
             reserved,
             session=session,
             hook_run_id="recovery-valid",
-            model="gpt-5.6-terra",
+            model="gpt-6-sol",
             effort="medium",
             recovery_from="executor_failed",
             material_correction="completed the missing bound acceptance evidence",
@@ -7787,18 +7787,18 @@ class OrchestratorHookTests(unittest.TestCase):
             reserved,
             session=session,
             hook_run_id="wrong-model",
-            model="gpt-5.6-sol",
+            model="gpt-5.6-terra",
             effort="medium",
             recovery_from="executor_failed",
             material_correction="completed the missing bound acceptance evidence",
         )
-        self.assertIn("lower-tier", HOOK.confirmed_executor_request(wrong_model, reserved)[1] or "")
+        self.assertIn("executor requires gpt-6-sol at medium", HOOK.confirmed_executor_request(wrong_model, reserved)[1] or "")
         wrong_effort = self.executor_spawn_payload(
             reserved,
             session=session,
             hook_run_id="wrong-effort",
-            model="gpt-5.6-terra",
-            effort="max",
+            model="gpt-6-sol",
+            effort="ultra",
             recovery_from="executor_failed",
             material_correction="completed the missing bound acceptance evidence",
         )
@@ -7807,7 +7807,7 @@ class OrchestratorHookTests(unittest.TestCase):
             reserved,
             session=session,
             hook_run_id="wrong-fork",
-            model="gpt-5.6-terra",
+            model="gpt-6-sol",
             effort="medium",
             fork_turns="2",
             recovery_from="executor_failed",
@@ -8762,7 +8762,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 "session_id": session,
                 "hook_run_id": "direct-patch-start",
                 "agent_id": "direct-patch-agent",
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "medium",
             }
         )
@@ -11156,7 +11156,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({
             "hook_event_name": "SubagentStart", "session_id": sigkill_session,
             "hook_run_id": "sigkill-start", "agent_id": "sigkill-writer",
-            "model": "gpt-5.6-terra", "reasoning_effort": "medium",
+            "model": "gpt-6-sol", "reasoning_effort": "medium",
         }, data=sigkill_data)
         self.run_hook({
             "hook_event_name": "PostToolUse", "session_id": sigkill_session,
@@ -11178,7 +11178,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({
             "hook_event_name": "SubagentStart", "session_id": unknown_session,
             "hook_run_id": "unknown-start", "agent_id": "unknown-writer",
-            "model": "gpt-5.6-terra", "reasoning_effort": "medium",
+            "model": "gpt-6-sol", "reasoning_effort": "medium",
         }, data=unknown_data)
         running = self.load_only_state(unknown_data)
         task_name = next(
@@ -11226,8 +11226,8 @@ class OrchestratorHookTests(unittest.TestCase):
         request_payload = {
             "hook_event_name": "PreToolUse", "session_id": session,
             "hook_run_id": "q1-request", "tool_name": "collaboration.spawn_agent",
-            "tool_input": {"task_name": "assessor_q1", "model": "gpt-5.6-sol",
-                           "reasoning_effort": "max", "fork_turns": "1", "message": "opaque"},
+            "tool_input": {"task_name": "assessor_q1", "model": "gpt-6-sol",
+                           "reasoning_effort": "ultra", "fork_turns": "1", "message": "opaque"},
         }
         self.run_hook(request_payload)
         q1 = self.load_only_state()
@@ -11318,7 +11318,7 @@ class OrchestratorHookTests(unittest.TestCase):
         self.run_hook({
             "hook_event_name": "SubagentStart", "session_id": session,
             "hook_run_id": "legacy-start", "agent_id": "legacy-writer",
-            "model": "gpt-5.6-terra", "reasoning_effort": "medium",
+            "model": "gpt-6-sol", "reasoning_effort": "medium",
         })
         running = self.load_only_state()
         for schema, writer, cwd in (
