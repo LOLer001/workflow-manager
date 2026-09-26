@@ -10,6 +10,7 @@ Use this reference only to decide whether the narrow Hard authorization layer ap
 4. If evidence is ambiguous, start with bounded native read-only diagnosis. Promote only after evidence crosses the Hard threshold.
 
 Build/deploy/device work, many steps, length, shared resources, or vague wording alone do not make work Hard. Workflow Manager does not assign ordinary phases, agent counts, retry policy, progress format, or output shape.
+Historical conversation titles used only to locate prior context are not reference-fidelity requests. A direct instruction to match a reference remains Hard.
 `production`, `core`, `customer-visible`, and `business-critical` labels alone are not critical-production evidence. A known, bounded, reversible single-function bug with clear acceptance stays Simple/native: do not call an assessor or ask for plan confirmation.
 Explicit exclusions or no-risk bounds—such as “do not modify, test, publish, or write Git”—are not positive Hard evidence. They do not cancel genuine production-release, irreversible, or cross-scope evidence elsewhere in the same request.
 
@@ -48,3 +49,7 @@ Confirmation binds only objective plus explicit acceptance, risk category, and i
 If pure confirmation arrives after the assessor completes but before parent Stop lands, preserve the pending plan, repair, Hard route, and assessor lifecycle. Persist a host-bound confirmation-receipt digest only and automatically bind it after the matching trusted revision commits. Do not reset to Daily and do not ask the user to repeat confirmation.
 
 A material change to objective, explicit acceptance, risk category, or irreversible external action needs a new confirmation. Ordinary plan refinement within the same envelope does not.
+
+## Safe downgrade review
+
+An explicit single-line `降级复核：<完整当前目标>` may reclassify a restated objective only when the current Hard plan is canonical, awaiting confirmation, never executed, and no assessor, executor, or parent writer is pending, live, or unknown. The independent classifier must return Work/Simple and no direct reference-fidelity request. The Hook rechecks the journal and liveness under the state lock, retires the old authority without deleting journal bytes, clears prior confirmation and reference state, and opens a fresh task epoch. A vague request, still-Hard objective, confirmed plan, invalid journal, or uncertain writer is denied.

@@ -3939,6 +3939,7 @@ def isolate_legacy_writer(
 def rotate_task_epoch(
     state: dict[str, Any], payload: dict[str, Any], objective: dict[str, Any],
     *, retirement_reason: str = "task_epoch_rotated",
+    reset_prior_scope: bool = False,
 ) -> bool:
     """Archive a terminal epoch and create an isolated successor.
 
@@ -3965,10 +3966,11 @@ def rotate_task_epoch(
             "execution_contract_id": safe_fingerprint(state.get("execution_contract_id")) or None,
         })
     retire_current_plan_authority(state, reason=retirement_reason)
-    state["reference_acceptance"] = _safe_reference_acceptance(None)
-    state["authorization_scope"] = _safe_authorization_scope(None)
-    state["authorization_envelope"] = _safe_authorization_envelope(None)
-    state["pending_confirmation_receipt"] = None
+    if reset_prior_scope:
+        state["reference_acceptance"] = _safe_reference_acceptance(None)
+        state["authorization_scope"] = _safe_authorization_scope(None)
+        state["authorization_envelope"] = _safe_authorization_envelope(None)
+        state["pending_confirmation_receipt"] = None
     sequence = max(current.get("sequence", 0), 0) + 1
     state["task_epoch"] = {
         "id": task_epoch_id(payload, sequence, objective.get("fingerprint")),
@@ -16706,6 +16708,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 retirement_reason=(
                     "safe_downgrade" if downgrade_candidate else "task_epoch_rotated"
                 ),
+                reset_prior_scope=new_objective,
             ):
                 record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
                 if downgrade_candidate:
