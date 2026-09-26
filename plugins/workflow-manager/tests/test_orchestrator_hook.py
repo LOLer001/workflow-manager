@@ -443,7 +443,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.72")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.73")
         self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "14")
@@ -559,7 +559,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.72"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.73"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -586,7 +586,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.72 active", context)
+        self.assertIn("Workflow Manager 1.0.73 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1252,7 +1252,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.72"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.73"))
         self.assertEqual(migrated["execution_profile_version"], "14")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1279,7 +1279,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_model"],
             ),
-            ("1.0.72", "14", "spawn_required", None),
+            ("1.0.73", "14", "spawn_required", None),
         )
         old_request = self.executor_spawn_payload(
             migrated,
@@ -1306,7 +1306,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 preserved["execution_profile_version"],
                 preserved["executor_state"],
             ),
-            ("1.0.72", "13", "succeeded"),
+            ("1.0.73", "13", "succeeded"),
         )
         self.assertEqual(preserved["last_execution_baseline"], historical_baseline)
 
@@ -1399,7 +1399,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.72", "14"),
+                    (34, "1.0.73", "14"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1445,7 +1445,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.72", "5", "verification_required", 1),
+            (34, "1.0.73", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -3180,6 +3180,31 @@ class OrchestratorHookTests(unittest.TestCase):
         changed = json.loads(next((self.data / "sessions").glob("reference-replan-*.json")).read_text(encoding="utf-8"))
         self.assertNotEqual(changed["reference_acceptance"]["contract_digest"], old_digest)
         self.assertEqual(changed["plan_state"], "analyzing")
+
+    def test_historical_conversation_title_does_not_request_reference_acceptance(self) -> None:
+        lookup = (
+            "遇到不清楚的地方就去会话 优化 AndroidNativeDemo 对齐 Unity 效果 "
+            "中查找相关对话记录"
+        )
+        self.assertFalse(HOOK.reference_requested(lookup))
+        self.assertFalse(HOOK.reference_requested(
+            "读取会话《优化 AndroidNativeDemo 对齐 Unity 效果》的上下文"
+        ))
+        self.assertFalse(HOOK.reference_requested(
+            "在会话 优化 AndroidNativeDemo 对齐 Unity 效果 中有记载"
+        ))
+        self.assertTrue(HOOK.reference_requested(
+            lookup + "，然后按 Unity 效果为准修改当前画面"
+        ))
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "historical-conversation-title",
+            "hook_run_id": "lookup",
+            "prompt": "只修改 AndroidNativeDemo 横屏 UI；" + lookup,
+        })
+        state = self.load_only_state()
+        self.assertNotEqual(state["work_difficulty"], "hard")
+        self.assertFalse(state["reference_acceptance"]["enabled"])
 
     def test_historical_reference_material_summary_stays_native(self) -> None:
         result = self.run_hook({
@@ -8617,6 +8642,110 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(state["plan_state"], "none")
         self.assertIsNone(state["plan_digest"])
 
+    def create_pending_plan_for_downgrade(self, session: str, prompt: str) -> None:
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "objective", "prompt": prompt,
+        })
+        state = self.load_only_state()
+        request = {
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "assessor-request", "tool_name": "collaboration.spawn_agent",
+            "tool_input": {
+                "task_name": HOOK.bound_assessor_task_name(state),
+                "message": "Read-only assessment of this Hard objective",
+                "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1",
+            },
+        }
+        self.run_hook(request)
+        self.run_hook({
+            **request, "hook_event_name": "PostToolUse",
+            "hook_run_id": "assessor-post", "tool_response": {"status": "ok"},
+        })
+        agent = f"assessor-{session}"
+        self.run_hook({
+            "hook_event_name": "SubagentStart", "session_id": session,
+            "hook_run_id": "assessor-start", "agent_id": agent,
+            "model": "gpt-6-sol", "reasoning_effort": "ultra",
+        })
+        self.run_hook({
+            "hook_event_name": "SubagentStop", "session_id": session,
+            "hook_run_id": "assessor-stop", "agent_id": agent,
+            "status": "completed", "last_assistant_message": "Scope, acceptance, risk, and rollback assessed.",
+        })
+        self.run_hook({
+            "hook_event_name": "Stop", "session_id": session,
+            "hook_run_id": "plan",
+            "last_assistant_message": "按参考实现并验证；失败时恢复上一版本。等待确认。",
+        })
+
+    def test_safe_downgrade_retires_unconfirmed_plan_without_erasing_journal(self) -> None:
+        session = "safe-downgrade-pending"
+        self.create_pending_plan_for_downgrade(
+            session, "AndroidNativeDemo 对齐 Unity 效果，按 Unity 效果为准"
+        )
+        before = self.load_only_state()
+        self.assertEqual(before["plan_state"], "awaiting_confirmation")
+        self.assertTrue(before["reference_acceptance"]["enabled"])
+        journal = self.data / before["plan_artifact"]["relative_path"]
+        journal_bytes = journal.read_bytes()
+        old_epoch = before["task_epoch"]["id"]
+
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "downgrade",
+            "prompt": "降级复核：仅修改 AndroidNativeDemo App 源码中的横屏界面布局，设置页保持左右两半",
+        })
+        after = self.load_only_state()
+        self.assertEqual((after["work_difficulty"], after["plan_state"]), ("simple", "none"))
+        self.assertNotEqual(after["task_epoch"]["id"], old_epoch)
+        self.assertFalse(after["reference_acceptance"]["enabled"])
+        self.assertIsNone(after["authorization_envelope"]["digest"])
+        self.assertTrue(any(
+            item["retired_reason"] == "safe_downgrade"
+            and item["objective_fingerprint"] == before["objective"]["fingerprint"]
+            for item in after["retired_plan_authorities"]
+        ))
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def test_safe_downgrade_rejects_incomplete_scope_and_unknown_writer(self) -> None:
+        self.assertIsNone(HOOK.scoped_downgrade_objective("降级复核：不是 Hard 任务"))
+        session = "safe-downgrade-unknown-writer"
+        self.create_pending_plan_for_downgrade(
+            session, "实现跨 Settings/framework/SystemUI 的客户定制"
+        )
+        before = self.load_only_state()
+        self.assertEqual(before["plan_state"], "awaiting_confirmation")
+        self.assertFalse(HOOK.pending_hard_plan_reclassifiable(
+            {**before, "child_liveness": {"status": "unknown"}},
+            {"session_id": session},
+        ))
+        self.assertFalse(HOOK.pending_hard_plan_reclassifiable(
+            {**before, "assessor_observed_effective": False},
+            {"session_id": session},
+        ))
+        journal = self.data / before["plan_artifact"]["relative_path"]
+        journal_bytes = journal.read_bytes()
+        journal.write_bytes(journal_bytes + b"tampered")
+        self.assertFalse(HOOK.pending_hard_plan_reclassifiable(
+            json.loads(json.dumps(before)), {"session_id": session},
+        ))
+        journal.write_bytes(journal_bytes)
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "confirm", "prompt": "确认",
+        })
+        confirmed = self.load_only_state()
+        self.assertEqual(confirmed["plan_state"], "confirmed")
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "late-downgrade",
+            "prompt": "降级复核：仅修改 AndroidNativeDemo App 源码中的横屏界面布局，设置页保持左右两半",
+        })
+        after = self.load_only_state()
+        self.assertEqual(after["task_epoch"]["id"], confirmed["task_epoch"]["id"])
+        self.assertEqual(after["plan_state"], "confirmed")
+
     def test_pending_plan_guard_blocks_mutation_but_allows_read_only_evidence(self) -> None:
         state = HOOK.new_state({"session_id": "guard-unit"})
         state.update(
@@ -10160,7 +10289,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.72 active", context)
+        self.assertIn("Workflow Manager 1.0.73 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -10978,7 +11107,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.72"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.73"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11333,7 +11462,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.72", "recovery_required", None),
+                    (34, "1.0.73", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")

@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.72", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.73", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -961,8 +961,23 @@ def assessor_binding_id(state: dict[str, Any]) -> str | None:
     ) if objective and generation else None
 
 
+def _without_historical_conversation_titles(prompt: str) -> str:
+    """Exclude lookup titles while retaining instructions after the title."""
+    owner = r"(?:会话|对话|聊天|conversation|thread)"
+    quoted = r'(?:《[^》\n]{1,120}》|“[^”\n]{1,120}”|"[^"\n]{1,120}")'
+    text = re.sub(rf"{owner}\s*{quoted}", "历史会话", prompt, flags=re.I)
+    return re.sub(
+        rf"{owner}\s*[^，。；;\n]{{1,120}}?"
+        r"(?:(?:中|里)\s*(?:查找|检索|搜索|查看|读取|有记载|记载)|的\s*(?:上下文|记录))",
+        "历史会话",
+        text,
+        flags=re.I,
+    )
+
+
 def reference_requested(prompt: str) -> bool:
     """Opt in only for an explicit request to match a supplied reference."""
+    prompt = _without_historical_conversation_titles(prompt)
     lower = prompt.lower()
     return bool(
         re.search(r"\b(?:reference[- ]driven|match (?:the )?reference|visual fidelity|faithful(?:ly)? reproduce)\b", lower)
@@ -3499,13 +3514,46 @@ def _writer_blocks_authority_retirement(state: dict[str, Any]) -> bool:
     )
 
 
+def pending_hard_plan_reclassifiable(
+    state: dict[str, Any], payload: dict[str, Any]
+) -> bool:
+    """Permit review only before confirmation or any possible writer activity."""
+    if (
+        state.get("task_domain") != "work"
+        or state.get("work_difficulty") != "hard"
+        or state.get("plan_state") != "awaiting_confirmation"
+        or state.get("assessor_state") != "hard_plan_ready"
+        or not state.get("assessor_observed_effective")
+        or state.get("assessor_start_observed") != "full"
+        or state.get("assessor_failure_kind")
+        or state.get("executor_state") not in {None, "none"}
+        or state.get("execution_contract_id")
+        or state.get("confirmed_plan_digest")
+        or state.get("confirmed_at")
+        or state.get("pending_confirmation_receipt")
+        or _safe_authorization_envelope(state.get("authorization_envelope")).get("digest")
+        or _safe_parent_writer_lease(state.get("parent_writer_lease")).get("status") != "none"
+        or _writer_blocks_authority_retirement(state)
+        or _epoch_has_live_writer(state)
+        or any(
+            group.get("state") in {"unknown", "pending", "result_pending", "live"}
+            for group in subagent_lifecycle_groups(state)
+        )
+    ):
+        return False
+    return trusted_plan_binding_valid(state, payload)
+
+
 def retire_current_plan_authority(
     state: dict[str, Any], *, reason: str
 ) -> bool:
     """Revoke current authority while leaving every journal byte untouched."""
     artifact = _safe_plan_artifact(state.get("plan_artifact"))
     epoch = current_task_epoch_id(state)
-    objective = safe_fingerprint(state.get("objective", {}).get("fingerprint"))
+    objective = safe_fingerprint(
+        state.get("plan_objective_fingerprint")
+        or state.get("objective", {}).get("fingerprint")
+    )
     if not (
         artifact.get("format_version") == 2
         and artifact.get("relative_path")
@@ -3888,7 +3936,10 @@ def isolate_legacy_writer(
     return True
 
 
-def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective: dict[str, Any]) -> bool:
+def rotate_task_epoch(
+    state: dict[str, Any], payload: dict[str, Any], objective: dict[str, Any],
+    *, retirement_reason: str = "task_epoch_rotated",
+) -> bool:
     """Archive a terminal epoch and create an isolated successor.
 
     This function is deliberately called only after the prompt classifier has
@@ -3913,7 +3964,11 @@ def rotate_task_epoch(state: dict[str, Any], payload: dict[str, Any], objective:
             "plan_digest": safe_fingerprint(state.get("plan_digest")) or None,
             "execution_contract_id": safe_fingerprint(state.get("execution_contract_id")) or None,
         })
-    retire_current_plan_authority(state, reason="task_epoch_rotated")
+    retire_current_plan_authority(state, reason=retirement_reason)
+    state["reference_acceptance"] = _safe_reference_acceptance(None)
+    state["authorization_scope"] = _safe_authorization_scope(None)
+    state["authorization_envelope"] = _safe_authorization_envelope(None)
+    state["pending_confirmation_receipt"] = None
     sequence = max(current.get("sequence", 0), 0) + 1
     state["task_epoch"] = {
         "id": task_epoch_id(payload, sequence, objective.get("fingerprint")),
@@ -16024,6 +16079,28 @@ def explicit_new_objective(prompt: str) -> bool:
     )
 
 
+def scoped_downgrade_objective(prompt: str) -> str | None:
+    """Return a bounded restated objective for an explicit downgrade review."""
+    candidate = _normalized_control_candidate(prompt)
+    match = re.fullmatch(
+        r"(?:降级复核|安全降级|重新分类|safe downgrade|reclassify)\s*[:：]\s*(.{12,})",
+        candidate,
+        re.I,
+    )
+    if not match or re.search(r"[?？]|(?:如果|若|\bif\b|\bunless\b)", candidate, re.I):
+        return None
+    objective = match.group(1).strip()
+    if not re.search(
+        r"(?:修改|修复|适配|实现|开发|添加|移除|优化|处理|生成|"
+        r"modify|fix|adapt|implement|develop|add|remove|improve|build)\s*"
+        r"[\w\u3400-\u9fff]{2,}",
+        objective,
+        re.I,
+    ):
+        return None
+    return objective
+
+
 def successful_acceptance_feedback(prompt: str) -> bool:
     normalized = re.sub(r"\s+", " ", prompt.strip().lower())
     regression_signal = any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
@@ -16225,6 +16302,9 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     continuation_ack_delivery: dict[str, bool] = {"consumed": False}
     delegated_prompt = codex_delegation_input(raw_prompt)
     prompt = delegated_prompt if delegated_prompt is not None else raw_prompt
+    downgrade_objective = scoped_downgrade_objective(prompt)
+    route_prompt = downgrade_objective or prompt
+    downgrade_result: dict[str, str] = {}
     identity_preflight = bool(
         delegated_prompt is None and identity_preflight_prompt(prompt)
     )
@@ -16233,7 +16313,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or plan_replan_request(prompt)
         or prompt_changes_pending_plan(prompt)
     )
-    prospective_route = classify_prompt(prompt)
+    prospective_route = classify_prompt(route_prompt)
     if (
         explicit_new_objective(prompt)
         and prospective_route.get("task_domain") in {"daily", "work"}
@@ -16250,6 +16330,14 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         snapshot_payload["_read_canonical_plan_body"] = True
     previous = snapshot_state(snapshot_payload)
     canonical_current_body = previous.pop("_canonical_current_body", None)
+    downgrade_candidate = bool(
+        downgrade_objective
+        and not previous.get("_snapshot_failure")
+        and prospective_route.get("task_domain") == "work"
+        and prospective_route.get("work_difficulty") == "simple"
+        and not reference_requested(route_prompt)
+        and pending_hard_plan_reclassifiable(previous, payload)
+    )
     recovery_marker_present = bool(
         re.search(
             r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]",
@@ -16283,7 +16371,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and previous.get("assessor_state")
         in {"spawn_required", "spawn_pending", "running", "recovery_required", "failed"}
     )
-    requested_reference = reference_requested(prompt) and not historical_material_summary_only(prompt)
+    requested_reference = reference_requested(route_prompt) and not historical_material_summary_only(route_prompt)
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     confirmable_pending = previous.get("plan_state") == "awaiting_confirmation"
     repair_pending = previous.get("plan_state") == "repair_required"
@@ -16314,7 +16402,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     pending_plan = confirmable_pending
     active_plan = confirmable_pending or repair_pending or previous.get("plan_state") == "confirmed"
     status_query = bool(active_plan and pure_read_only_status_query(prompt))
-    explicit_new = explicit_new_objective(prompt)
+    explicit_new = explicit_new_objective(prompt) or downgrade_candidate
     failed_assessor_replan = bool(
         previous.get("assessor_state") in {"recovery_required", "failed"}
         and plan_replan_request(prompt)
@@ -16475,7 +16563,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or contextual_early_assent
         or recovery_followup
     ))
-    classification = classify_prompt(prompt)
+    classification = classify_prompt(route_prompt)
     if requested_reference:
         classification.update(
             {
@@ -16532,6 +16620,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
+        if downgrade_objective:
+            if not downgrade_candidate or not pending_hard_plan_reclassifiable(state, payload):
+                downgrade_result["status"] = "denied"
+                return
         if root_continuation_key:
             continuation_ack_delivery["consumed"] = consume_continuation_lease(
                 state, root_continuation_key, source="root_visible",
@@ -16609,8 +16701,16 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
                 != state.get("objective", {}).get("fingerprint")
             )
         ):
-            if not rotate_task_epoch(state, payload, state.get("objective", {})):
+            if not rotate_task_epoch(
+                state, payload, state.get("objective", {}),
+                retirement_reason=(
+                    "safe_downgrade" if downgrade_candidate else "task_epoch_rotated"
+                ),
+            ):
                 record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
+                if downgrade_candidate:
+                    downgrade_result["status"] = "denied"
+                    return
         if not continuation or not state.get("authorization_scope"):
             state["authorization_scope"] = authorization_scope_from_prompt(prompt)
         elif plan_changed or acceptance_miss or scope_changed:
@@ -16843,8 +16943,24 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         )
         if telemetry:
             state["telemetry"] = telemetry
+        if downgrade_candidate:
+            downgrade_result["status"] = "accepted"
 
-    mutate_state(payload, update)
+    _, state_written = mutate_state(payload, update)
+    if downgrade_objective:
+        if not state_written:
+            return
+        if downgrade_result.get("status") == "accepted":
+            emit_context(
+                "UserPromptSubmit",
+                "Workflow Manager safely retired the unconfirmed Hard plan and independently classified the restated objective as Simple. The old journal remains intact; no prior confirmation or writer authority transfers.",
+            )
+        else:
+            emit_context(
+                "UserPromptSubmit",
+                "Workflow Manager denied the downgrade review. A complete independently Simple objective, a valid unconfirmed Hard plan, and no pending, live, or unknown writer are required; old authority remains unavailable.",
+            )
+        return
     if continuation_ack_delivery["consumed"]:
         emit_context(
             "UserPromptSubmit",
