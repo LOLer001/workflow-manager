@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.74", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.75", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -3931,7 +3931,7 @@ def retire_writer_lifecycles_for_simple_override(state: dict[str, Any]) -> None:
         )
         if group.get("state") == "pending" and request:
             # Keep the reservation as an inert identifier for a delayed Start.
-            request["status"] = "isolated_incomplete"
+            request["status"] = "user_simple_override"
         else:
             remove_indices.update(index for index, _ in group.get("records", []))
     if remove_indices:
@@ -5413,7 +5413,7 @@ def subagent_lifecycle_groups(value: Any) -> list[dict[str, Any]]:
             group = new_group(
                 index,
                 item,
-                "isolated" if item.get("status") == "isolated_incomplete"
+                "isolated" if item.get("status") in {"isolated_incomplete", "user_simple_override"}
                 else "result_pending" if item.get("agent_id") else "pending",
             )
             if group["state"] == "result_pending":
@@ -5514,7 +5514,8 @@ def retained_subagent_records(state: dict[str, Any], records: Any = None) -> lis
     isolated = [
         group for group in groups
         if group.get("state") == "isolated"
-        and (group.get("request") or {}).get("status") == "isolated_incomplete"
+        and (group.get("request") or {}).get("status")
+        in {"isolated_incomplete", "user_simple_override"}
         and (group.get("request") or {}).get("role")
         in {"high_assessor", "confirmed_executor"}
     ]
@@ -19912,7 +19913,7 @@ def subagent_start(payload: dict[str, Any]) -> None:
             item for item in as_list(previous.get("subagents"))
             if isinstance(item, dict)
             and item.get("event") == "request"
-            and item.get("status") == "isolated_incomplete"
+            and item.get("status") == "user_simple_override"
             and item.get("role") in {"high_assessor", "confirmed_executor"}
             and (
                 (payload_request and item.get("request_fingerprint") == payload_request)

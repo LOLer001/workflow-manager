@@ -55,8 +55,8 @@ class SkillIdentityTests(unittest.TestCase):
     def test_skill_is_lean_and_leaves_native_judgment_to_codex(self) -> None:
         self.assertLessEqual(len(self.skill_text.encode("utf-8")), 7000)
         for phrase in (
-            "narrow authorization and evidence layer",
-            "Current Codex owns planning",
+            "gates Hard authorization and runtime evidence",
+            "Codex owns normal execution",
             "Everything else is advisory",
             "task name is opaque",
             "No `WORK_ASSESSMENT`, JSON fence, fixed keywords, closing sentence, or minimum prose length",
@@ -133,7 +133,7 @@ class SkillIdentityTests(unittest.TestCase):
         self.assertIn("inherits the existing strict confirmation", self.regression_continuity)
 
     def test_protocol_continuity_and_privacy_are_preserved(self) -> None:
-        self.assertIn("Schema 34/writer 1.0.74", self.confirmed_execution)
+        self.assertIn("Schema 34/writer 1.0.75", self.confirmed_execution)
         self.assertIn("execution profile v14", self.confirmed_execution)
         self.assertIn("canonical journal v3", self.confirmed_execution)
         self.assertIn("preserves its real profile/contract", self.confirmed_execution)
@@ -157,9 +157,9 @@ class SkillIdentityTests(unittest.TestCase):
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         contributing = (REPOSITORY_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-        self.assertEqual(self.manifest["version"], "1.0.74")
-        self.assertIn("/1.0.74/", readme)
-        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.74\n")
+        self.assertEqual(self.manifest["version"], "1.0.75")
+        self.assertIn("/1.0.75/", readme)
+        self.assertRegex(changelog, r"\A# 更新记录\n\n## 1\.0\.75\n")
         self.assertNotRegex(readme + contributing, r"\b30\s*项计划")
 
     def test_ci_runs_python_without_bytecode_on_linux_and_windows(self) -> None:
