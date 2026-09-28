@@ -4,10 +4,11 @@ Use this reference only to decide whether the narrow Hard authorization layer ap
 
 ## Decision order
 
-1. Daily requests run natively.
-2. High-confidence Simple engineering work runs natively with `Start=0`.
-3. Hard requires explicit production release/deployment, irreversible, security/data-loss, system-wide outage, or host-continuity evidence; or at least two independent strong groups where one is unknown-cause, cross-scope, or continuity.
-4. If evidence is ambiguous, start with bounded native read-only diagnosis. Promote only after evidence crosses the Hard threshold.
+1. The user's direct Simple route instruction takes effect immediately for the current task; do not run the difficulty classifier again.
+2. Daily requests run natively.
+3. High-confidence Simple engineering work runs natively with `Start=0`.
+4. Hard requires explicit production release/deployment, irreversible, security/data-loss, system-wide outage, or host-continuity evidence; or at least two independent strong groups where one is unknown-cause, cross-scope, or continuity.
+5. If evidence is ambiguous, start with bounded native read-only diagnosis. Promote only after evidence crosses the Hard threshold.
 
 Build/deploy/device work, many steps, length, shared resources, or vague wording alone do not make work Hard. Workflow Manager does not assign ordinary phases, agent counts, retry policy, progress format, or output shape.
 Historical conversation titles used only to locate prior context are not reference-fidelity requests. A direct instruction to match a reference remains Hard.
@@ -50,6 +51,6 @@ If pure confirmation arrives after the assessor completes but before parent Stop
 
 A material change to objective, explicit acceptance, risk category, or irreversible external action needs a new confirmation. Ordinary plan refinement within the same envelope does not.
 
-## Safe downgrade review
+## User-selected Simple route
 
-An explicit single-line `降级复核：<完整当前目标>` may reclassify a restated objective only when the current Hard plan is canonical, awaiting confirmation, never executed, and no assessor, executor, or parent writer is pending, live, or unknown. The independent classifier must return Work/Simple and no direct reference-fidelity request. The Hook rechecks the journal and liveness under the state lock, retires the old authority without deleting journal bytes, clears prior confirmation and reference state, and opens a fresh task epoch. A vague request, still-Hard objective, confirmed plan, invalid journal, or uncertain writer is denied.
+An explicit single-line instruction such as `按普通任务执行`, `降级判断为普通任务`, or `降级复核：<当前目标>` is a user route choice. The Hook marks the current objective Work/Simple immediately, without classifying the objective again or demanding another Hard confirmation. It atomically retires the prior Hard plan and contract, preserves the journal bytes for audit, clears prior confirmation and reference state, and opens a fresh task epoch. A confirmed plan or old writer lease does not prevent the route change. Old Hard children are isolated and their later tool actions are denied. The user's choice changes only Workflow Manager's route; mounted-tree Git restrictions and external safety boundaries still apply. Questions, quotations, conditionals, and vague discussion are not route commands.

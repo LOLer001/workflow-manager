@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.73", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.74", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -224,7 +224,7 @@ CHILD_LIVENESS_STATES = frozenset(
 )
 PARENT_WRITER_LEASE_STATES = frozenset({"none", "live", "sealed"})
 ISOLATED_LIFECYCLE_STATES = frozenset(
-    {"isolated_incomplete", "late_start", "late_terminal", "late_post"}
+    {"isolated_incomplete", "user_simple_override", "late_start", "late_terminal", "late_post"}
 )
 MAX_ISOLATED_LIFECYCLES = 8
 MAX_RETIRED_PLAN_AUTHORITIES = 8
@@ -3514,38 +3514,8 @@ def _writer_blocks_authority_retirement(state: dict[str, Any]) -> bool:
     )
 
 
-def pending_hard_plan_reclassifiable(
-    state: dict[str, Any], payload: dict[str, Any]
-) -> bool:
-    """Permit review only before confirmation or any possible writer activity."""
-    if (
-        state.get("task_domain") != "work"
-        or state.get("work_difficulty") != "hard"
-        or state.get("plan_state") != "awaiting_confirmation"
-        or state.get("assessor_state") != "hard_plan_ready"
-        or not state.get("assessor_observed_effective")
-        or state.get("assessor_start_observed") != "full"
-        or state.get("assessor_failure_kind")
-        or state.get("executor_state") not in {None, "none"}
-        or state.get("execution_contract_id")
-        or state.get("confirmed_plan_digest")
-        or state.get("confirmed_at")
-        or state.get("pending_confirmation_receipt")
-        or _safe_authorization_envelope(state.get("authorization_envelope")).get("digest")
-        or _safe_parent_writer_lease(state.get("parent_writer_lease")).get("status") != "none"
-        or _writer_blocks_authority_retirement(state)
-        or _epoch_has_live_writer(state)
-        or any(
-            group.get("state") in {"unknown", "pending", "result_pending", "live"}
-            for group in subagent_lifecycle_groups(state)
-        )
-    ):
-        return False
-    return trusted_plan_binding_valid(state, payload)
-
-
 def retire_current_plan_authority(
-    state: dict[str, Any], *, reason: str
+    state: dict[str, Any], *, reason: str, allow_missing_artifact: bool = False
 ) -> bool:
     """Revoke current authority while leaving every journal byte untouched."""
     artifact = _safe_plan_artifact(state.get("plan_artifact"))
@@ -3554,13 +3524,14 @@ def retire_current_plan_authority(
         state.get("plan_objective_fingerprint")
         or state.get("objective", {}).get("fingerprint")
     )
-    if not (
+    complete_artifact = bool(
         artifact.get("format_version") == 2
         and artifact.get("relative_path")
         and artifact.get("journal_digest")
         and epoch
         and objective
-    ):
+    )
+    if not complete_artifact and not allow_missing_artifact:
         return False
     retired = [
         item
@@ -3578,7 +3549,7 @@ def retire_current_plan_authority(
             "retired_reason": reason,
             "retired_at": utc_now(),
         }
-    )
+    ) if complete_artifact else None
     if candidate and not any(
         item.get("authority_identity") == candidate.get("authority_identity")
         and item.get("journal_digest") == candidate.get("journal_digest")
@@ -3936,20 +3907,83 @@ def isolate_legacy_writer(
     return True
 
 
+def retire_writer_lifecycles_for_simple_override(state: dict[str, Any]) -> None:
+    """Revoke old Hard children before the user's ordinary route takes effect."""
+    epoch = current_task_epoch_id(state)
+    remove_indices: set[int] = set()
+    for group in subagent_lifecycle_groups(state):
+        if group.get("state") not in {"pending", "result_pending", "live"}:
+            continue
+        request = group.get("request") or {}
+        started = group.get("start") or {}
+        role = request.get("role") or started.get("role")
+        if role not in {"high_assessor", "confirmed_executor"}:
+            continue
+        _append_isolated_lifecycle(
+            state, status="user_simple_override", role=role,
+            agent_id=group.get("agent_id"),
+            request_fingerprint=request.get("request_fingerprint")
+            or started.get("request_fingerprint"),
+            contract_id=request.get("contract_id") or started.get("contract_id"),
+            attempt=request.get("attempt") or started.get("attempt"),
+            event_material={"reason": "user_simple_override", "epoch": epoch},
+            epoch_id=epoch,
+        )
+        if group.get("state") == "pending" and request:
+            # Keep the reservation as an inert identifier for a delayed Start.
+            request["status"] = "isolated_incomplete"
+        else:
+            remove_indices.update(index for index, _ in group.get("records", []))
+    if remove_indices:
+        state["subagents"] = [
+            item for index, item in enumerate(as_list(state.get("subagents")))
+            if index not in remove_indices
+        ]
+    liveness = _safe_child_liveness(state.get("child_liveness"))
+    if (
+        liveness.get("status") in {"live", "unknown"}
+        and liveness.get("role") in {"high_assessor", "confirmed_executor"}
+        and liveness.get("agent_fingerprint")
+    ):
+        candidate = _safe_isolated_lifecycle({
+            "status": "user_simple_override",
+            "role": liveness["role"],
+            "epoch_id": epoch,
+            "agent_fingerprint": liveness["agent_fingerprint"],
+            "request_fingerprint": liveness.get("request_fingerprint"),
+            "contract_id": state.get("execution_contract_id")
+            if liveness["role"] == "confirmed_executor"
+            else state.get("assessor_binding_id"),
+            "attempt": state.get("executor_attempt")
+            if liveness["role"] == "confirmed_executor"
+            else state.get("assessor_attempt"),
+            "event_digest": stable_hash(
+                f"user-simple-override\0{epoch}\0{liveness['agent_fingerprint']}", 32
+            ),
+            "at": utc_now(),
+        })
+        if candidate:
+            state.setdefault("isolated_lifecycles", []).append(candidate)
+            state["isolated_lifecycles"] = state["isolated_lifecycles"][-MAX_ISOLATED_LIFECYCLES:]
+
+
 def rotate_task_epoch(
     state: dict[str, Any], payload: dict[str, Any], objective: dict[str, Any],
     *, retirement_reason: str = "task_epoch_rotated",
     reset_prior_scope: bool = False,
+    user_simple_override: bool = False,
 ) -> bool:
     """Archive a terminal epoch and create an isolated successor.
 
-    This function is deliberately called only after the prompt classifier has
-    ruled out a same-objective worktree migration.  It never revokes an active
-    writer: callers must retain the old epoch and surface a diagnostic instead.
+    Normal callers retain an active writer and surface a diagnostic. The
+    explicit user Simple override revokes the old Hard writer under the same
+    state lock before the successor epoch becomes active.
     """
-    if _epoch_has_live_writer(state):
+    if _epoch_has_live_writer(state) and not user_simple_override:
         record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
         return False
+    if user_simple_override:
+        retire_writer_lifecycles_for_simple_override(state)
     current = _safe_task_epoch(state.get("task_epoch"))
     archive = list(state.get("archived_epochs", []))[-7:]
     if current.get("id"):
@@ -3965,7 +3999,10 @@ def rotate_task_epoch(
             "plan_digest": safe_fingerprint(state.get("plan_digest")) or None,
             "execution_contract_id": safe_fingerprint(state.get("execution_contract_id")) or None,
         })
-    retire_current_plan_authority(state, reason=retirement_reason)
+    retire_current_plan_authority(
+        state, reason=retirement_reason,
+        allow_missing_artifact=user_simple_override,
+    )
     if reset_prior_scope:
         state["reference_acceptance"] = _safe_reference_acceptance(None)
         state["authorization_scope"] = _safe_authorization_scope(None)
@@ -5474,8 +5511,18 @@ def retained_subagent_records(state: dict[str, Any], records: Any = None) -> lis
         for group in groups
         if group.get("state") in {"pending", "result_pending", "live"} or subagent_lifecycle_is_bound(state, group)
     ]
+    isolated = [
+        group for group in groups
+        if group.get("state") == "isolated"
+        and (group.get("request") or {}).get("status") == "isolated_incomplete"
+        and (group.get("request") or {}).get("role")
+        in {"high_assessor", "confirmed_executor"}
+    ]
     terminal = [group for group in groups if group.get("state") == "terminal" and group not in protected]
-    kept_ids = {id(group) for group in protected + terminal[-MAX_TERMINAL_SUBAGENT_LIFECYCLES:]}
+    kept_ids = {
+        id(group) for group in
+        protected + isolated[-MAX_ISOLATED_LIFECYCLES:] + terminal[-MAX_TERMINAL_SUBAGENT_LIFECYCLES:]
+    }
     kept = [pair for group in groups if id(group) in kept_ids for pair in group.get("records", [])]
     return [item for _, item in sorted(kept, key=lambda pair: pair[0])]
 
@@ -16081,8 +16128,8 @@ def explicit_new_objective(prompt: str) -> bool:
     )
 
 
-def scoped_downgrade_objective(prompt: str) -> str | None:
-    """Return a bounded restated objective for an explicit downgrade review."""
+def restated_simple_override_objective(prompt: str) -> str | None:
+    """Return a bounded restated objective for an explicit user override."""
     candidate = _normalized_control_candidate(prompt)
     match = re.fullmatch(
         r"(?:降级复核|安全降级|重新分类|safe downgrade|reclassify)\s*[:：]\s*(.{12,})",
@@ -16091,16 +16138,29 @@ def scoped_downgrade_objective(prompt: str) -> str | None:
     )
     if not match or re.search(r"[?？]|(?:如果|若|\bif\b|\bunless\b)", candidate, re.I):
         return None
-    objective = match.group(1).strip()
-    if not re.search(
-        r"(?:修改|修复|适配|实现|开发|添加|移除|优化|处理|生成|"
-        r"modify|fix|adapt|implement|develop|add|remove|improve|build)\s*"
-        r"[\w\u3400-\u9fff]{2,}",
-        objective,
-        re.I,
-    ):
-        return None
-    return objective
+    return match.group(1).strip()
+
+
+def explicit_simple_override(prompt: str) -> tuple[bool, str | None]:
+    """Recognize a direct user route choice without classifying its difficulty."""
+    candidate = _normalized_control_candidate(prompt)
+    if not candidate or re.search(r"[?？\"'“”‘’]|(?:如果|若|\bif\b|\bunless\b)", candidate, re.I):
+        return False, None
+    objective = restated_simple_override_objective(prompt)
+    if objective:
+        return True, objective
+    direct = (
+        r"(?:请)?(?:直接)?(?:把|将)?(?:当前|这个|本)?(?:任务|工作)?"
+        r"(?:直接)?(?:降级(?:判断)?为|改为|改成|标记为|判定为)普通任务"
+        r"(?:并(?:立即|直接)?(?:开始)?执行)?[。.!！]?"
+    )
+    native = r"(?:请)?(?:直接)?按普通任务(?:开始)?(?:执行|处理)(?:当前任务)?[。.!！]?"
+    english = r"(?:please )?(?:directly )?(?:treat|run|handle) (?:the |this |current )?task as (?:a )?(?:simple|ordinary) task[.!]?"
+    return bool(
+        re.fullmatch(direct, candidate)
+        or re.fullmatch(native, candidate)
+        or re.fullmatch(english, candidate, re.I)
+    ), None
 
 
 def successful_acceptance_feedback(prompt: str) -> bool:
@@ -16297,6 +16357,93 @@ def authorization_context(classification: dict[str, Any]) -> str:
     )
 
 
+def user_simple_override_route(objective_fingerprint: str, epoch_id: str) -> dict[str, Any]:
+    """The user's explicit choice is the route; no difficulty classifier runs."""
+    return decorate_route({
+        "task_domain": "work",
+        "domain_confidence": "high",
+        "domain_rule_codes": ["user_simple_override"],
+        "domain_classifier_version": DOMAIN_CLASSIFIER_VERSION,
+        "domain_decision_id": stable_hash(
+            f"user-simple-domain\0{objective_fingerprint}\0{epoch_id}", 24
+        ),
+        "work_difficulty": "simple",
+        "difficulty_confidence": "high",
+        "difficulty_rule_codes": ["user_simple_override"],
+        "difficulty_classifier_version": DIFFICULTY_CLASSIFIER_VERSION,
+        "difficulty_decision_id": stable_hash(
+            f"user-simple-difficulty\0{objective_fingerprint}\0{epoch_id}", 24
+        ),
+        "model_profile": "current",
+        "route_source": "user_override",
+    })
+
+
+def apply_explicit_simple_override(
+    payload: dict[str, Any], prompt: str, restated_objective: str | None
+) -> None:
+    """Retire this task's Hard authority and immediately open native Simple work."""
+    if payload_claims_child_identity(payload):
+        emit_context("UserPromptSubmit", "Only the user or root task may change the execution route.")
+        return
+    outcome: dict[str, str] = {}
+
+    def update(state: dict[str, Any]) -> None:
+        objective = (
+            text_metadata(restated_objective)
+            if restated_objective
+            else safe_metadata(state.get("objective"))
+        )
+        fingerprint = safe_fingerprint(objective.get("fingerprint"))
+        if not fingerprint:
+            outcome["status"] = "missing_objective"
+            return
+        if not rotate_task_epoch(
+            state, payload, objective,
+            retirement_reason="user_simple_override",
+            reset_prior_scope=True,
+            user_simple_override=True,
+        ):
+            outcome["status"] = "state_unavailable"
+            return
+        state["objective"] = {**objective, "updated_at": utc_now()}
+        state["assessment_liveness"] = _empty_assessment_liveness()
+        state["last_execution_baseline"] = {}
+        state["causal_lineage"] = _safe_causal_lineage(None)
+        state["continuation_lease"] = _safe_continuation_lease(None)
+        route = user_simple_override_route(fingerprint, current_task_epoch_id(state) or "")
+        state["last_route"] = {**route, "at": utc_now()}
+        for key in (
+            "task_domain", "domain_confidence", "domain_rule_codes",
+            "domain_classifier_version", "domain_decision_id", "work_difficulty",
+            "difficulty_confidence", "difficulty_rule_codes",
+            "difficulty_classifier_version", "difficulty_decision_id", "model_profile",
+        ):
+            state[key] = route.get(key)
+        state.setdefault("prompts", []).append({
+            "at": utc_now(),
+            "turn_id": safe_label(payload.get("turn_id"), 120) if payload.get("turn_id") else None,
+            "prompt_meta": text_metadata(prompt),
+            **route,
+        })
+        outcome["status"] = "accepted"
+
+    _, written = mutate_state(payload, update)
+    if not written:
+        return
+    if outcome.get("status") == "accepted":
+        emit_context(
+            "UserPromptSubmit",
+            "Workflow Manager accepted the user's direct Simple route. The previous Hard "
+            "contract is retired, its journal is preserved for audit, and ordinary execution "
+            "continues now without a new difficulty assessment or Hard confirmation.",
+        )
+    elif outcome.get("status") == "missing_objective":
+        emit_context(
+            "UserPromptSubmit", "No current objective exists; state the task to run as Simple."
+        )
+
+
 
 def user_prompt_submit(payload: dict[str, Any]) -> None:
     raw_prompt = str(payload.get("prompt") or "")
@@ -16304,9 +16451,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     continuation_ack_delivery: dict[str, bool] = {"consumed": False}
     delegated_prompt = codex_delegation_input(raw_prompt)
     prompt = delegated_prompt if delegated_prompt is not None else raw_prompt
-    downgrade_objective = scoped_downgrade_objective(prompt)
-    route_prompt = downgrade_objective or prompt
-    downgrade_result: dict[str, str] = {}
+    simple_override, restated_objective = explicit_simple_override(prompt)
+    if simple_override:
+        apply_explicit_simple_override(payload, prompt, restated_objective)
+        return
     identity_preflight = bool(
         delegated_prompt is None and identity_preflight_prompt(prompt)
     )
@@ -16315,7 +16463,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or plan_replan_request(prompt)
         or prompt_changes_pending_plan(prompt)
     )
-    prospective_route = classify_prompt(route_prompt)
+    prospective_route = classify_prompt(prompt)
     if (
         explicit_new_objective(prompt)
         and prospective_route.get("task_domain") in {"daily", "work"}
@@ -16332,14 +16480,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         snapshot_payload["_read_canonical_plan_body"] = True
     previous = snapshot_state(snapshot_payload)
     canonical_current_body = previous.pop("_canonical_current_body", None)
-    downgrade_candidate = bool(
-        downgrade_objective
-        and not previous.get("_snapshot_failure")
-        and prospective_route.get("task_domain") == "work"
-        and prospective_route.get("work_difficulty") == "simple"
-        and not reference_requested(route_prompt)
-        and pending_hard_plan_reclassifiable(previous, payload)
-    )
     recovery_marker_present = bool(
         re.search(
             r"(?:recovery_from|recovery-from|恢复自)\s*[:=：]",
@@ -16373,7 +16513,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         and previous.get("assessor_state")
         in {"spawn_required", "spawn_pending", "running", "recovery_required", "failed"}
     )
-    requested_reference = reference_requested(route_prompt) and not historical_material_summary_only(route_prompt)
+    requested_reference = reference_requested(prompt) and not historical_material_summary_only(prompt)
     reference_changed = bool(_safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"] and not requested_reference and not fidelity_negative_feedback(prompt) and reference_contract_changed(prompt))
     confirmable_pending = previous.get("plan_state") == "awaiting_confirmation"
     repair_pending = previous.get("plan_state") == "repair_required"
@@ -16404,7 +16544,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     pending_plan = confirmable_pending
     active_plan = confirmable_pending or repair_pending or previous.get("plan_state") == "confirmed"
     status_query = bool(active_plan and pure_read_only_status_query(prompt))
-    explicit_new = explicit_new_objective(prompt) or downgrade_candidate
+    explicit_new = explicit_new_objective(prompt)
     failed_assessor_replan = bool(
         previous.get("assessor_state") in {"recovery_required", "failed"}
         and plan_replan_request(prompt)
@@ -16565,7 +16705,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         or contextual_early_assent
         or recovery_followup
     ))
-    classification = classify_prompt(route_prompt)
+    classification = classify_prompt(prompt)
     if requested_reference:
         classification.update(
             {
@@ -16622,10 +16762,6 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     telemetry = latest_token_telemetry(payload)
 
     def update(state: dict[str, Any]) -> None:
-        if downgrade_objective:
-            if not downgrade_candidate or not pending_hard_plan_reclassifiable(state, payload):
-                downgrade_result["status"] = "denied"
-                return
         if root_continuation_key:
             continuation_ack_delivery["consumed"] = consume_continuation_lease(
                 state, root_continuation_key, source="root_visible",
@@ -16705,15 +16841,10 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         ):
             if not rotate_task_epoch(
                 state, payload, state.get("objective", {}),
-                retirement_reason=(
-                    "safe_downgrade" if downgrade_candidate else "task_epoch_rotated"
-                ),
+                retirement_reason="task_epoch_rotated",
                 reset_prior_scope=new_objective,
             ):
                 record_lifecycle_diagnostic(state, "epoch_switch_live_writer", level="error")
-                if downgrade_candidate:
-                    downgrade_result["status"] = "denied"
-                    return
         if not continuation or not state.get("authorization_scope"):
             state["authorization_scope"] = authorization_scope_from_prompt(prompt)
         elif plan_changed or acceptance_miss or scope_changed:
@@ -16946,24 +17077,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
         )
         if telemetry:
             state["telemetry"] = telemetry
-        if downgrade_candidate:
-            downgrade_result["status"] = "accepted"
 
     _, state_written = mutate_state(payload, update)
-    if downgrade_objective:
-        if not state_written:
-            return
-        if downgrade_result.get("status") == "accepted":
-            emit_context(
-                "UserPromptSubmit",
-                "Workflow Manager safely retired the unconfirmed Hard plan and independently classified the restated objective as Simple. The old journal remains intact; no prior confirmation or writer authority transfers.",
-            )
-        else:
-            emit_context(
-                "UserPromptSubmit",
-                "Workflow Manager denied the downgrade review. A complete independently Simple objective, a valid unconfirmed Hard plan, and no pending, live, or unknown writer are required; old authority remains unavailable.",
-            )
-        return
     if continuation_ack_delivery["consumed"]:
         emit_context(
             "UserPromptSubmit",
@@ -17517,6 +17632,17 @@ def pre_tool_use(payload: dict[str, Any]) -> None:
         ),
         None,
     )
+    if nested_caller and any(
+        item.get("status") == "user_simple_override"
+        and item.get("agent_fingerprint")
+        == _lifecycle_agent_fingerprint(nested_caller, None)
+        for raw in as_list(state.get("isolated_lifecycles"))
+        if (item := _safe_isolated_lifecycle(raw)) is not None
+    ):
+        emit_pretool_deny(
+            "Workflow Manager blocked a retired Hard child after the user's Simple override."
+        )
+        return
     if (
         nested_caller
         and _safe_child_liveness(state.get("child_liveness")).get("status") == "unknown"
@@ -19779,6 +19905,37 @@ def subagent_start_conflict_reason(
 def subagent_start(payload: dict[str, Any]) -> None:
     previous = snapshot_state(payload)
     request = pending_subagent_request(previous, payload) or {}
+    if not request:
+        payload_request = safe_fingerprint(payload.get("request_fingerprint"))
+        payload_task = task_name_from_payload(payload)
+        retired = [
+            item for item in as_list(previous.get("subagents"))
+            if isinstance(item, dict)
+            and item.get("event") == "request"
+            and item.get("status") == "isolated_incomplete"
+            and item.get("role") in {"high_assessor", "confirmed_executor"}
+            and (
+                (payload_request and item.get("request_fingerprint") == payload_request)
+                or (payload_task and item.get("task_name") == payload_task)
+            )
+        ]
+        if len(retired) == 1:
+            old_request = retired[0]
+
+            def isolate_delayed_start(state: dict[str, Any]) -> None:
+                _append_isolated_lifecycle(
+                    state, status="user_simple_override",
+                    role=old_request["role"], agent_id=payload.get("agent_id"),
+                    request_fingerprint=old_request.get("request_fingerprint"),
+                    contract_id=old_request.get("contract_id"),
+                    attempt=old_request.get("attempt"),
+                    event_material={"reason": "delayed_start_after_user_override"},
+                    epoch_id=old_request.get("epoch_id"),
+                )
+
+            mutate_state(payload, isolate_delayed_start)
+            emit_continue()
+            return
     payload_epoch = safe_fingerprint(
         payload.get("task_epoch_id") or payload.get("epoch_id")
     )

@@ -443,7 +443,7 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.73")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.74")
         self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
         self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "14")
@@ -559,7 +559,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.73"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.74"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -586,7 +586,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.73 active", context)
+        self.assertIn("Workflow Manager 1.0.74 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1252,7 +1252,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.73"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.74"))
         self.assertEqual(migrated["execution_profile_version"], "14")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1279,7 +1279,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_model"],
             ),
-            ("1.0.73", "14", "spawn_required", None),
+            ("1.0.74", "14", "spawn_required", None),
         )
         old_request = self.executor_spawn_payload(
             migrated,
@@ -1306,7 +1306,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 preserved["execution_profile_version"],
                 preserved["executor_state"],
             ),
-            ("1.0.73", "13", "succeeded"),
+            ("1.0.74", "13", "succeeded"),
         )
         self.assertEqual(preserved["last_execution_baseline"], historical_baseline)
 
@@ -1399,7 +1399,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.73", "14"),
+                    (34, "1.0.74", "14"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1445,7 +1445,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.73", "5", "verification_required", 1),
+            (34, "1.0.74", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -8679,8 +8679,8 @@ class OrchestratorHookTests(unittest.TestCase):
             "last_assistant_message": "按参考实现并验证；失败时恢复上一版本。等待确认。",
         })
 
-    def test_safe_downgrade_retires_unconfirmed_plan_without_erasing_journal(self) -> None:
-        session = "safe-downgrade-pending"
+    def test_user_simple_override_retires_unconfirmed_plan_without_reclassification(self) -> None:
+        session = "user-simple-pending"
         self.create_pending_plan_for_downgrade(
             session, "AndroidNativeDemo 对齐 Unity 效果，按 Unity 效果为准"
         )
@@ -8693,58 +8693,149 @@ class OrchestratorHookTests(unittest.TestCase):
 
         self.run_hook({
             "hook_event_name": "UserPromptSubmit", "session_id": session,
-            "hook_run_id": "downgrade",
-            "prompt": "降级复核：仅修改 AndroidNativeDemo App 源码中的横屏界面布局，设置页保持左右两半",
+            "hook_run_id": "override",
+            "prompt": "降级复核：修复跨 Framework 和 SystemUI 的生产崩溃并发布固件",
         })
         after = self.load_only_state()
         self.assertEqual((after["work_difficulty"], after["plan_state"]), ("simple", "none"))
+        self.assertEqual(after["difficulty_rule_codes"], ["user_simple_override"])
+        self.assertEqual(after["last_route"]["route_source"], "user_override")
         self.assertNotEqual(after["task_epoch"]["id"], old_epoch)
         self.assertFalse(after["reference_acceptance"]["enabled"])
         self.assertIsNone(after["authorization_envelope"]["digest"])
         self.assertTrue(any(
-            item["retired_reason"] == "safe_downgrade"
+            item["retired_reason"] == "user_simple_override"
             and item["objective_fingerprint"] == before["objective"]["fingerprint"]
             for item in after["retired_plan_authorities"]
         ))
         self.assertEqual(journal.read_bytes(), journal_bytes)
 
-    def test_safe_downgrade_rejects_incomplete_scope_and_unknown_writer(self) -> None:
-        self.assertIsNone(HOOK.scoped_downgrade_objective("降级复核：不是 Hard 任务"))
-        session = "safe-downgrade-unknown-writer"
+    def test_user_simple_override_retires_confirmed_parent_writer_and_survives_resume(self) -> None:
+        self.assertIsNone(HOOK.restated_simple_override_objective("降级复核：不是 Hard 任务"))
+        session = "user-simple-confirmed"
         self.create_pending_plan_for_downgrade(
             session, "实现跨 Settings/framework/SystemUI 的客户定制"
         )
-        before = self.load_only_state()
-        self.assertEqual(before["plan_state"], "awaiting_confirmation")
-        self.assertFalse(HOOK.pending_hard_plan_reclassifiable(
-            {**before, "child_liveness": {"status": "unknown"}},
-            {"session_id": session},
-        ))
-        self.assertFalse(HOOK.pending_hard_plan_reclassifiable(
-            {**before, "assessor_observed_effective": False},
-            {"session_id": session},
-        ))
-        journal = self.data / before["plan_artifact"]["relative_path"]
-        journal_bytes = journal.read_bytes()
-        journal.write_bytes(journal_bytes + b"tampered")
-        self.assertFalse(HOOK.pending_hard_plan_reclassifiable(
-            json.loads(json.dumps(before)), {"session_id": session},
-        ))
-        journal.write_bytes(journal_bytes)
         self.run_hook({
             "hook_event_name": "UserPromptSubmit", "session_id": session,
             "hook_run_id": "confirm", "prompt": "确认",
         })
         confirmed = self.load_only_state()
         self.assertEqual(confirmed["plan_state"], "confirmed")
+        old_contract = confirmed["execution_contract_id"]
+        old_epoch = confirmed["task_epoch"]["id"]
+        journal = self.data / confirmed["plan_artifact"]["relative_path"]
+        journal_bytes = journal.read_bytes()
+        self.assertTrue(HOOK.acquire_parent_writer_lease(confirmed))
+        self.state_files()[0].write_text(json.dumps(confirmed), encoding="utf-8")
         self.run_hook({
             "hook_event_name": "UserPromptSubmit", "session_id": session,
-            "hook_run_id": "late-downgrade",
-            "prompt": "降级复核：仅修改 AndroidNativeDemo App 源码中的横屏界面布局，设置页保持左右两半",
+            "hook_run_id": "override", "prompt": "按普通任务执行",
         })
         after = self.load_only_state()
-        self.assertEqual(after["task_epoch"]["id"], confirmed["task_epoch"]["id"])
-        self.assertEqual(after["plan_state"], "confirmed")
+        self.assertEqual((after["work_difficulty"], after["plan_state"]), ("simple", "none"))
+        self.assertNotEqual(after["task_epoch"]["id"], old_epoch)
+        self.assertEqual(after["objective"]["fingerprint"], confirmed["objective"]["fingerprint"])
+        self.assertIsNone(after["execution_contract_id"])
+        self.assertEqual(after["parent_writer_lease"]["status"], "none")
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertTrue(any(item["execution_contract_id"] == old_contract
+                            for item in after["archived_epochs"]))
+        self.run_hook({
+            "hook_event_name": "SessionStart", "session_id": session,
+            "hook_run_id": "resume", "source": "resume",
+        })
+        resumed = self.load_only_state()
+        self.assertEqual((resumed["work_difficulty"], resumed["plan_state"]), ("simple", "none"))
+        self.assertIsNone(resumed["execution_contract_id"])
+
+    def test_user_simple_override_requires_an_explicit_command(self) -> None:
+        self.assertEqual(HOOK.explicit_simple_override("降级判断为普通任务"), (True, None))
+        self.assertEqual(HOOK.explicit_simple_override("按普通任务执行"), (True, None))
+        self.assertEqual(HOOK.explicit_simple_override("为什么按普通任务执行？"), (False, None))
+        self.assertEqual(HOOK.explicit_simple_override("当我说按普通任务执行时是什么意思"), (False, None))
+        session = "no-user-override"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "hard", "prompt": "排查跨模块未知原因的生产系统重启",
+        })
+        unchanged = self.load_only_state()
+        self.assertEqual((unchanged["work_difficulty"], unchanged["assessor_state"]),
+                         ("hard", "spawn_required"))
+
+    def test_user_simple_override_revokes_unknown_old_child(self) -> None:
+        session = "user-simple-unknown-child"
+        self.create_pending_plan_for_downgrade(
+            session, "实现跨 Settings/framework/SystemUI 的客户定制"
+        )
+        state = self.load_only_state()
+        old_epoch = state["task_epoch"]["id"]
+        state["child_liveness"] = HOOK._safe_child_liveness({
+            "status": "unknown", "role": "high_assessor",
+            "epoch_id": old_epoch,
+            "agent_fingerprint": HOOK._lifecycle_agent_fingerprint("old-assessor", None),
+            "request_fingerprint": "a" * 16,
+            "source": "host_inventory", "observation_digest": "b" * 32,
+        })
+        self.state_files()[0].write_text(json.dumps(state), encoding="utf-8")
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "override", "prompt": "降级判断为普通任务",
+        })
+        after = self.load_only_state()
+        self.assertEqual((after["work_difficulty"], after["plan_state"]), ("simple", "none"))
+        self.assertNotEqual(after["task_epoch"]["id"], old_epoch)
+        self.assertTrue(any(item["status"] == "user_simple_override"
+                            for item in after["isolated_lifecycles"]))
+        denied = self.run_hook({
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "old-child-tool", "agent_id": "old-assessor",
+            "tool_name": "apply_patch", "tool_input": "*** Begin Patch\n*** End Patch",
+        })
+        self.assertEqual(
+            json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+    def test_user_simple_override_isolates_delayed_old_start(self) -> None:
+        session = "user-simple-delayed-start"
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "hard", "prompt": "排查跨模块未知原因的生产系统重启",
+        })
+        state = self.load_only_state()
+        task_name = HOOK.bound_assessor_task_name(state)
+        request = {
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "request", "tool_name": "collaboration.spawn_agent",
+            "tool_input": {
+                "task_name": task_name, "message": "Read-only assessment",
+                "model": "gpt-6-sol", "reasoning_effort": "ultra", "fork_turns": "1",
+            },
+        }
+        self.run_hook(request)
+        pending = self.load_only_state()
+        self.assertEqual(pending["assessor_state"], "spawn_pending")
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": session,
+            "hook_run_id": "override", "prompt": "按普通任务执行",
+        })
+        after = self.load_only_state()
+        self.assertEqual((after["work_difficulty"], after["assessor_state"]), ("simple", "none"))
+        self.run_hook({
+            "hook_event_name": "SubagentStart", "session_id": session,
+            "hook_run_id": "late-start", "agent_id": "old-delayed-assessor",
+            "task_name": task_name, "model": "gpt-6-sol", "reasoning_effort": "ultra",
+        })
+        denied = self.run_hook({
+            "hook_event_name": "PreToolUse", "session_id": session,
+            "hook_run_id": "late-tool", "agent_id": "old-delayed-assessor",
+            "tool_name": "apply_patch", "tool_input": "*** Begin Patch\n*** End Patch",
+        })
+        self.assertEqual(
+            json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
 
     def test_pending_plan_guard_blocks_mutation_but_allows_read_only_evidence(self) -> None:
         state = HOOK.new_state({"session_id": "guard-unit"})
@@ -10289,7 +10380,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.73 active", context)
+        self.assertIn("Workflow Manager 1.0.74 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11107,7 +11198,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.73"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.74"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11462,7 +11553,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.73", "recovery_required", None),
+                    (34, "1.0.74", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
