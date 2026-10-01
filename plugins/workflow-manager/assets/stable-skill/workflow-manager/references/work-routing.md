@@ -11,6 +11,7 @@ Use this reference only to decide whether the narrow Hard authorization layer ap
 5. If evidence is ambiguous, start with bounded native read-only diagnosis. Promote only after evidence crosses the Hard threshold.
 
 Build/deploy/device work, many steps, length, shared resources, or vague wording alone do not make work Hard. Workflow Manager does not assign ordinary phases, agent counts, retry policy, progress format, or output shape.
+Text explicitly pointed back to as a passage to delete is an editorial target, not a request to perform its described engineering work. Keep independent instructions before or after that target in the risk assessment; report or draft labels alone never exempt a mixed request.
 Historical conversation titles used only to locate prior context are not reference-fidelity requests. A direct instruction to match a reference remains Hard.
 `production`, `core`, `customer-visible`, and `business-critical` labels alone are not critical-production evidence. A known, bounded, reversible single-function bug with clear acceptance stays Simple/native: do not call an assessor or ask for plan confirmation.
 Explicit exclusions or no-risk bounds—such as “do not modify, test, publish, or write Git”—are not positive Hard evidence. They do not cancel genuine production-release, irreversible, or cross-scope evidence elsewhere in the same request.
@@ -20,6 +21,7 @@ Examples:
 | Request | Route |
 |---|---|
 | Generate today's report | Daily/native |
+| Remove a draft passage describing reboot diagnosis, repair, and regression | Daily/native |
 | Fix one known function and run its tests | Simple/native, `Start=0` |
 | Compile, deploy, and run a bounded regression | Simple/native unless another Hard signal exists |
 | Diagnose unknown repeated production reboot across modules | Hard |

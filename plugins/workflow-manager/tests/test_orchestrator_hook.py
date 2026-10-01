@@ -443,9 +443,9 @@ class OrchestratorHookTests(unittest.TestCase):
 
     def test_session_model_prose_cannot_change_fixed_child_profiles(self) -> None:
         self.assertEqual(HOOK.SCHEMA_VERSION, 34)
-        self.assertEqual(HOOK.WRITER_VERSION, "1.0.75")
-        self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "3")
-        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "5")
+        self.assertEqual(HOOK.WRITER_VERSION, "1.0.76")
+        self.assertEqual(HOOK.DOMAIN_CLASSIFIER_VERSION, "4")
+        self.assertEqual(HOOK.DIFFICULTY_CLASSIFIER_VERSION, "6")
         self.assertEqual(HOOK.EXECUTION_PROFILE_VERSION, "14")
         self.assertEqual(HOOK.STABLE_SKILL_SCHEMA, 10)
         self.assertEqual(HOOK.new_state({})["session_execution_preference"], "default")
@@ -559,7 +559,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema26-lean"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.75"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.76"))
         for obsolete in (
             "coordination_activity",
             "coordination_notices",
@@ -586,7 +586,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.75 active", context)
+        self.assertIn("Workflow Manager 1.0.76 active", context)
         for obsolete in ("Pressure:", "crossed 70%", "Route:", "Agents:", "Contract > Evidence"):
             self.assertNotIn(obsolete, context)
 
@@ -1252,7 +1252,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         migrated = HOOK.normalize_state(legacy, {"session_id": "writer-upgrade"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.75"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.76"))
         self.assertEqual(migrated["execution_profile_version"], "14")
         self.assertEqual(migrated["assessor_state"], "none")
         self.assertIsNone(migrated["assessor_binding_id"])
@@ -1279,7 +1279,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated["executor_state"],
                 migrated["executor_model"],
             ),
-            ("1.0.75", "14", "spawn_required", None),
+            ("1.0.76", "14", "spawn_required", None),
         )
         old_request = self.executor_spawn_payload(
             migrated,
@@ -1306,7 +1306,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 preserved["execution_profile_version"],
                 preserved["executor_state"],
             ),
-            ("1.0.75", "13", "succeeded"),
+            ("1.0.76", "13", "succeeded"),
         )
         self.assertEqual(preserved["last_execution_baseline"], historical_baseline)
 
@@ -1399,7 +1399,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 current = self.load_only_state(data)
                 self.assertEqual(
                     (current["schema_version"], current["writer_version"], current["execution_profile_version"]),
-                    (34, "1.0.75", "14"),
+                    (34, "1.0.76", "14"),
                 )
                 self.assertIsNone(current["execution_contract_id"])
                 self.assertEqual(current["plan_state"], "invalidated")
@@ -1445,7 +1445,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 pending["executor_state"],
                 pending["executor_attempt"],
             ),
-            (34, "1.0.75", "5", "verification_required", 1),
+            (34, "1.0.76", "5", "verification_required", 1),
         )
         self.assertEqual(pending["execution_contract_id"], old_contract)
         self.assertIsNone(pending["executor_failure_kind"])
@@ -10380,7 +10380,7 @@ class OrchestratorHookTests(unittest.TestCase):
             }
         )
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Workflow Manager 1.0.75 active", context)
+        self.assertIn("Workflow Manager 1.0.76 active", context)
         self.assertIn("Codex owns ordinary execution", context)
         self.assertIn("Hard authorization", context)
         self.assertLess(len(context), 500)
@@ -11198,7 +11198,7 @@ class OrchestratorHookTests(unittest.TestCase):
                        "objective": {"fingerprint": "e" * 16}})
         legacy["assessor_binding_id"] = HOOK.assessor_binding_id(legacy)
         migrated = HOOK.normalize_state(legacy, {"session_id": "schema27-liveness"})
-        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.75"))
+        self.assertEqual((migrated["schema_version"], migrated["writer_version"]), (34, "1.0.76"))
         self.assertEqual(migrated["assessor_state"], "running")
         self.assertIsNone(migrated["assessment_liveness"]["last_progress_at"])
         self.assertIsNone(HOOK.assessment_liveness_tick(migrated, now=99_999))
@@ -11553,7 +11553,7 @@ class OrchestratorHookTests(unittest.TestCase):
                 migrated = HOOK.normalize_state(legacy, {"session_id": session, "cwd": cwd})
                 self.assertEqual(
                     (migrated["schema_version"], migrated["writer_version"], migrated["executor_state"], migrated["executor_agent_id"]),
-                    (34, "1.0.75", "recovery_required", None),
+                    (34, "1.0.76", "recovery_required", None),
                 )
                 self.assertEqual(migrated["subagents"], [])
                 self.assertEqual(migrated["child_liveness"]["status"], "isolated_incomplete")
@@ -12214,6 +12214,104 @@ class OrchestratorHookTests(unittest.TestCase):
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("not strictly confirmed", output["permissionDecisionReason"])
         self.assertEqual(self.load_only_state()["parent_writer_lease"]["status"], "none")
+
+    def test_editorial_removal_targets_do_not_request_engineering_work(self) -> None:
+        cases = (
+            "复现并定位服务间歇性重启，完成根因修复与稳定性回归 "
+            "这个相关的部分都去掉 示例 App 方案讨论 这个去掉",
+            "排查多个模块中的异常重启并完成修复和回归 这段删掉",
+            "复现 App 异常并修复，完成回归 这一条内容删除",
+            "把“生产发布数据库迁移并提供回滚”这段去掉",
+            "“发布 Workflow Manager 插件 2.0.0”这句移除",
+            "按 Unity 效果为准修改当前画面 这句去掉",
+        )
+        for prompt in cases:
+            with self.subTest(prompt=prompt):
+                route = HOOK.classify_prompt(prompt)
+                self.assertEqual(
+                    (route["task_domain"], route["work_difficulty"], route["model_profile"]),
+                    ("daily", "not_applicable", "current"),
+                )
+                self.assertEqual(route["phase_hints"], [])
+                self.assertFalse(HOOK.reference_requested(prompt))
+                # The scan is only a view; decision identity still binds raw input.
+                self.assertNotEqual(
+                    route["domain_decision_id"],
+                    HOOK.classify_prompt(HOOK.classification_action_scan(prompt))["domain_decision_id"],
+                )
+
+    def test_editorial_removal_preserves_independent_hard_instructions(self) -> None:
+        edit = "排查多个模块中的异常重启并完成修复和回归 这段删掉"
+        engineering = "排查 Android 设备反复重启并修复、编译部署实机验证"
+        cases = (
+            edit + "；然后" + engineering,
+            engineering + "。" + edit,
+            "先生产发布数据库迁移，然后“修复 App 反复重启”这句去掉",
+            "先生产发布数据库迁移，然后这段删掉",
+            edit + "；然后发布 Workflow Manager 插件 2.0.0",
+            "请修复多个模块中根因未知的生产故障，这段去掉",
+            "生成周报，然后排查 Android 设备反复重启并修复、编译部署实机验证",
+        )
+        for prompt in cases:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(HOOK.classify_prompt(prompt)["work_difficulty"], "hard")
+        # A bare backward object pointer does not establish a text-edit target.
+        direct = "修复多个模块中根因未知的生产故障，这个去掉"
+        self.assertEqual(HOOK.classify_prompt(direct)["work_difficulty"], "hard")
+        quoted_object = "把“生产发布数据库迁移并提供回滚”这个去掉"
+        self.assertEqual(HOOK.classify_prompt(quoted_object)["work_difficulty"], "hard")
+        for pointer in ("这个模块", "这部分功能", "这段代码", "这段脚本"):
+            self.assertEqual(
+                HOOK.classify_prompt("生产发布数据库迁移并提供回滚，" + pointer + "去掉")["work_difficulty"],
+                "hard",
+            )
+        self.assertTrue(HOOK.reference_requested(edit + "；然后按 Unity 效果为准修改当前画面"))
+
+    def test_draft_removal_hook_stays_native_without_assessor_or_reference(self) -> None:
+        prompt = (
+            "复现并定位服务间歇性重启，完成根因修复与稳定性回归 "
+            "这个相关的部分都去掉 示例 App 方案讨论 这个去掉"
+        )
+        result = self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": "draft-removal",
+            "hook_run_id": "edit", "prompt": prompt,
+        })
+        self.assertIn("difficulty=not_applicable, profile=current", result.stdout)
+        state = self.load_only_state()
+        self.assertEqual(
+            (state["task_domain"], state["work_difficulty"], state["assessor_state"], state["plan_state"]),
+            ("daily", "not_applicable", "none", "none"),
+        )
+        self.assertEqual(state["objective"]["fingerprint"], HOOK.stable_hash(prompt))
+        self.assertFalse(state["reference_acceptance"]["enabled"])
+        self.assertIsNone(state["assessor_binding_id"])
+
+    def test_deleted_reference_text_does_not_hide_new_reference_instruction(self) -> None:
+        self.run_hook({
+            "hook_event_name": "UserPromptSubmit", "session_id": "draft-reference-mixed",
+            "hook_run_id": "edit", "prompt": (
+                "对齐 Example 主题0并完成构建、安装和录屏验证 这段去掉；"
+                "然后按 Unity 效果为准修改当前画面"
+            ),
+        })
+        state = self.load_only_state()
+        self.assertEqual((state["work_difficulty"], state["assessor_state"]), ("hard", "spawn_required"))
+        self.assertTrue(state["reference_acceptance"]["enabled"])
+
+    def test_editorial_targets_keep_line_boundaries_and_real_delivery_dependency(self) -> None:
+        prompt = (
+            "先生产发布数据库迁移并提供回滚\n"
+            "复现 App 重启并修复回归 这段删掉\n"
+            "然后编译 Settings 模块并部署到唯一设备验证"
+        )
+        route = HOOK.classify_prompt(prompt)
+        self.assertEqual(route["work_difficulty"], "hard")
+        self.assertIn("critical_irreversible_or_production", route["difficulty_rule_codes"])
+        self.assertIn("build_package", route["phase_hints"])
+        self.assertIn("delivery_device", route["phase_hints"])
+        self.assertIn("verification", route["phase_hints"])
+        self.assertEqual(HOOK.prompt_dependency_signal(prompt), "ordered_shared")
+
 
 
 class ConfirmationSemanticsV1070Tests(unittest.TestCase):

@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.75", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.76", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -59,8 +59,8 @@ def _release_metadata() -> dict[str, Any]:
 RELEASE_METADATA = _release_metadata()
 SCHEMA_VERSION = RELEASE_METADATA["schema"]
 WRITER_VERSION = RELEASE_METADATA["version"]
-DOMAIN_CLASSIFIER_VERSION = "3"
-DIFFICULTY_CLASSIFIER_VERSION = "5"
+DOMAIN_CLASSIFIER_VERSION = "4"
+DIFFICULTY_CLASSIFIER_VERSION = "6"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the one read-only high-tier boundary for Hard work.
 DEFAULT_PLAN_REASONING_EFFORT = "ultra"
@@ -977,7 +977,7 @@ def _without_historical_conversation_titles(prompt: str) -> str:
 
 def reference_requested(prompt: str) -> bool:
     """Opt in only for an explicit request to match a supplied reference."""
-    prompt = _without_historical_conversation_titles(prompt)
+    prompt = _without_historical_conversation_titles(classification_action_scan(prompt))
     lower = prompt.lower()
     return bool(
         re.search(r"\b(?:reference[- ]driven|match (?:the )?reference|visual fidelity|faithful(?:ly)? reproduce)\b", lower)
@@ -12658,16 +12658,57 @@ def _english_hits(text: str, terms: tuple[str, ...]) -> int:
     return sum(1 for term in terms if re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", text))
 
 
+def _without_editorial_removal_targets(prompt: str) -> str:
+    """Exclude text explicitly pointed back to as a passage to delete.
+
+    A report line can contain engineering imperatives without requesting those
+    operations. Only a backward text pointer binds an unquoted passage here;
+    bare object deletion and independent instructions retain their signals.
+    The returned view is transient, never objective or authorization material.
+    """
+    removal = re.compile(
+        r"(?P<pointer>这(?:一句|一段|一条|一项|句|段|条|项)"
+        r"(?:话|文案|内容|描述|文字)?|这(?:一)?部分(?:内容)?|"
+        r"这个(?:相关的)?(?:部分|内容|条目|描述|文案|话题)?)"
+        r"\s*(?:相关的部分|的内容)?\s*(?:都|全部|也)?\s*"
+        r"(?:去掉|删掉|删除|移除)"
+    )
+    quote = re.compile(
+        r'''(?:“[^”\n]+”|「[^」\n]+」|"[^"\n]+"|'[^'\n]+'|`[^`\n]+`)\s*[，,:：]?\s*$'''
+    )
+    parts: list[str] = []
+    cursor = 0
+    for match in removal.finditer(prompt):
+        # Quotation alone does not make a module or external object a passage.
+        if match.group("pointer") == "这个":
+            continue
+        prefix = prompt[cursor:match.start()]
+        quoted = quote.search(prefix)
+        if quoted:
+            target_start = cursor + quoted.start()
+        else:
+            boundaries = list(re.finditer(r"[\n。！？!?；;]|然后|接着|同时|并且|此外|还要", prefix))
+            target_start = cursor + (boundaries[-1].end() if boundaries else 0)
+            target = prompt[target_start:match.start()].strip(" ，,:：")
+            if not target or re.match(r"(?:请|帮我|给我|先|现在|继续|开始|执行|运行)", target):
+                continue
+        parts.append(prompt[cursor:target_start])
+        parts.append(" 文案编辑 ")
+        cursor = match.end()
+    parts.append(prompt[cursor:])
+    return "".join(parts)
+
+
 def classification_action_scan(prompt: str) -> str:
     """Return a transient classifier view with prohibited actions neutralized.
 
     This is deliberately not a prompt normalizer: callers must retain the
     original prompt for objective fingerprints, authorization, and journals.
-    It only prevents a bounded prohibition such as ``不得发布`` or ``do not
-    run tests`` from being counted as a requested phase or critical action.
+    It prevents editorial removal targets and a bounded prohibition such as
+    ``不得发布`` or ``do not run tests`` from counting as requested operations.
     Separators and later affirmative clauses remain intact.
     """
-    text = re.sub(r"\s+", " ", str(prompt or "").strip())
+    text = re.sub(r"\s+", " ", _without_editorial_removal_targets(str(prompt or "").strip()))
     english_actions = (
         r"(?:create|write|modify|edit|change|fix|implement|build|compile|package|"
         r"test|verify|validate|install|reboot|flash|"
@@ -12722,11 +12763,10 @@ def classify_task_domain(prompt: str) -> dict[str, Any]:
     destructive-action confirmation, evidence, or verification requirements.
     """
     normalized = re.sub(r"\s+", " ", prompt.strip())
-    lower = normalized.lower()
     # A prohibition is a boundary, not an engineering deliverable.  This view
     # is transient and must never replace the raw prompt's fingerprint.
-    work_scan = classification_action_scan(normalized)
-    daily_codes = [code for code, pattern in DAILY_EXACT_PATTERNS if re.search(pattern, lower, re.I)]
+    work_scan = classification_action_scan(prompt)
+    daily_codes = [code for code, pattern in DAILY_EXACT_PATTERNS if re.search(pattern, work_scan, re.I)]
     work_codes = [code for code, pattern in WORK_STRONG_PATTERNS if re.search(pattern, work_scan, re.I)]
     context_codes = [code for code, pattern in WORK_CONTEXT_PATTERNS if re.search(pattern, work_scan, re.I)]
     report_with_separate_work = bool(
@@ -12841,7 +12881,7 @@ def classify_work_difficulty(
     """Classify work difficulty independently from execution shape and agent count."""
     normalized = re.sub(r"\s+", " ", prompt.strip())
     lower = normalized.lower()
-    action_scan = classification_action_scan(normalized)
+    action_scan = classification_action_scan(prompt)
     if domain.get("task_domain") != "work":
         difficulty = "not_applicable"
         confidence = "high"
