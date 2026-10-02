@@ -68,6 +68,31 @@ class IntentRoutingTests(unittest.TestCase):
                     route = self.assert_native(prompt)
                     self.assertEqual(route["phase_hints"], [])
 
+    def test_chinese_adjacent_document_format_aliases_are_native(self) -> None:
+        for kind in ("md", "MD", "PDF", "Word", "docx", "LaTeX", "PPT", "pptx"):
+            for request in ("生成" + kind + "文件", "给我生成一个" + kind):
+                prompt = DIMENSION_TABLE + "\n" + request
+                with self.subTest(request=request):
+                    route = self.assert_native(prompt)
+                    self.assertEqual(route["phase_hints"], [])
+                    self.assertFalse(HOOK.reference_requested(prompt))
+            action = DIMENSION_TABLE + "\n生成" + kind + "文件；删除生产数据库"
+            self.assertEqual(HOOK.classify_prompt(action)["work_difficulty"], "hard")
+        self.assertEqual(
+            HOOK.classify_prompt("修改 markdownit.cpp，排查跨模块未知根因导致的安全漏洞")["work_difficulty"],
+            "hard",
+        )
+
+    def test_quoted_document_output_names_are_artifact_arguments(self) -> None:
+        for name in ("`score.md`", "“report.pdf”", "'review.docx'", '"summary.xlsx"', "‘export.csv’"):
+            with self.subTest(name=name):
+                self.assert_native(DIMENSION_TABLE + "\n生成" + name)
+                self.assertEqual(
+                    HOOK.classify_prompt("生成" + name + "；删除生产数据库")["work_difficulty"], "hard",
+                )
+        source = HOOK.classify_prompt("Write a Python script that outputs `score.md`.")
+        self.assertEqual((source["task_domain"], source["work_difficulty"]), ("work", "simple"))
+
     def test_document_topics_and_plain_reference_style_are_native(self) -> None:
         cases = (
             "给我生成一个部署文档，介绍源码编译、APK 安装及生产部署的检查点。",

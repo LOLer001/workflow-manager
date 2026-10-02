@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.77", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.78", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -59,8 +59,8 @@ def _release_metadata() -> dict[str, Any]:
 RELEASE_METADATA = _release_metadata()
 SCHEMA_VERSION = RELEASE_METADATA["schema"]
 WRITER_VERSION = RELEASE_METADATA["version"]
-DOMAIN_CLASSIFIER_VERSION = "5"
-DIFFICULTY_CLASSIFIER_VERSION = "7"
+DOMAIN_CLASSIFIER_VERSION = "6"
+DIFFICULTY_CLASSIFIER_VERSION = "8"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the one read-only high-tier boundary for Hard work.
 DEFAULT_PLAN_REASONING_EFFORT = "ultra"
@@ -12662,7 +12662,7 @@ def _english_hits(text: str, terms: tuple[str, ...]) -> int:
 CONTENT_REQUEST_PATTERN = re.compile(
     r"(?:生成|整理(?:成)?|汇总|撰写|写(?:成)?|编写|制作|创建|输出|起草|编辑|修改|更新|补充|"
     r"删减|删除|润色|完善|总结(?:为)?).{0,48}?"
-    r"(?:markdown|\bmd\b|\bpdf\b|\bword\b|\bdocx\b|\blatex\b|\bpptx?\b|"
+    r"(?:(?<![A-Za-z0-9_])(?:markdown|md|pdf|word|docx|latex|pptx?)(?![A-Za-z0-9_])|"
     r"文档|报告|日报|周报|月报|工作总结|成果说明|汇报材料|草稿|教程|手册|清单|表格|说明书)"
     r"|(?:翻译|润色).{0,32}(?:内容|资料|材料|完成情况)"
     r"|翻译(?:成|为)?.{0,16}(?:英文|中文|英语|汉语|日语|韩语)"
@@ -12700,6 +12700,13 @@ def _content_request_view(prompt: str) -> tuple[str, bool]:
     token_prefix = "__wm_material_" + stable_hash(prompt, 12) + "_"
 
     def protect(match: re.Match[str]) -> str:
+        # A quoted output filename is an artifact argument, not a quoted
+        # instruction/example. Keep its document type visible to the request.
+        if re.fullmatch(
+            r'''[“‘「"'`][^\n;；|“”‘’「」"'`]{1,180}\.(?:md|markdown|pdf|docx?|txt|rtf|tex|latex|pptx?|xlsx?|csv|odt|ods)[”’」"'`]''',
+            match.group(0), re.I,
+        ):
+            return "文档路径 " + match.group(0)
         token = token_prefix + str(len(literals)) + "__"
         literals[token] = match.group(0)
         return token
@@ -12740,7 +12747,7 @@ def _content_request_view(prompt: str) -> tuple[str, bool]:
             else:
                 modifier = protected[source_name.end():document_name.start()]
                 document_primary = len(modifier) <= 16 and not re.search(
-                    r"并|然后|生成|导出|实现|写入|\b(?:and|then|generat\w*|writ\w*|export\w*)\b",
+                    r"并|然后|生成|导出|输出|实现|写入|\b(?:and|then|generat\w*|writ\w*|export\w*|output\w*)\b",
                     modifier, re.I,
                 )
         if not document_primary:
