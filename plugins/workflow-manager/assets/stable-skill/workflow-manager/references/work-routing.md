@@ -7,12 +7,13 @@ Use this reference only to decide whether the narrow Hard authorization layer ap
 1. The user's direct Simple route instruction takes effect immediately for the current task; do not run the difficulty classifier again.
 2. Daily requests run natively.
 3. High-confidence Simple engineering work runs natively with `Start=0`.
-4. Hard requires explicit production release/deployment, irreversible, security/data-loss, system-wide outage, or host-continuity evidence; or at least two independent strong groups where one is unknown-cause, cross-scope, or continuity.
+4. Hard requires that the current requested execution carries production release/deployment, irreversible, security/data-loss, system-wide outage, or host-continuity evidence; or at least two independent strong groups where one is unknown-cause, cross-scope, or continuity. Described topics, examples and completed work are input material.
 5. If evidence is ambiguous, start with bounded native read-only diagnosis. Promote only after evidence crosses the Hard threshold.
 
 Build/deploy/device work, many steps, length, shared resources, or vague wording alone do not make work Hard. Workflow Manager does not assign ordinary phases, agent counts, retry policy, progress format, or output shape.
+Generating or editing documents, reports, drafts, translations and explanations stays native. Tables, quoted commands and historical material do not request their described operations. Preserve separately requested execution before or after the writing task, including explicit instructions to run supplied commands. A complete new writing objective does not inherit a prior Hard route; active writers and canonical plan controls keep their existing safety boundaries.
 Text explicitly pointed back to as a passage to delete is an editorial target, not a request to perform its described engineering work. Keep independent instructions before or after that target in the risk assessment; report or draft labels alone never exempt a mixed request.
-Historical conversation titles used only to locate prior context are not reference-fidelity requests. A direct instruction to match a reference remains Hard.
+Historical conversation titles used only to locate prior context are not reference-fidelity requests. Direct engineering reference-fidelity requests keep their acceptance contract; ordinary document style and template references stay native.
 `production`, `core`, `customer-visible`, and `business-critical` labels alone are not critical-production evidence. A known, bounded, reversible single-function bug with clear acceptance stays Simple/native: do not call an assessor or ask for plan confirmation.
 Explicit exclusions or no-risk bounds—such as “do not modify, test, publish, or write Git”—are not positive Hard evidence. They do not cancel genuine production-release, irreversible, or cross-scope evidence elsewhere in the same request.
 

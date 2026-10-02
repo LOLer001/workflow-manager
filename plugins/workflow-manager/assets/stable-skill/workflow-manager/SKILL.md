@@ -5,11 +5,12 @@ description: Minimal Hard-work authorization, host-runtime evidence, and mounted
 
 # Workflow Manager
 
-Workflow Manager gates Hard authorization and runtime evidence. Codex owns normal execution, recovery, compaction, model choice, and agents; prose, task names, counts, and elapsed time are not workflow gates.
+Workflow Manager gates Hard authorization and runtime evidence. Codex owns normal execution.
 
 ## Route narrowly
 
 - Daily and Simple work run natively with the user's selected model and `Start=0`: no assessor, executor, or confirmation.
+- Writing and explanations stay native. Tables, quotes and history are inputs; assess independent execution. Reference document styles are native.
 - A direct user instruction to run the current task as Simple takes effect immediately; retire its Hard authority without reclassification or reconfirmation.
 - Hard needs explicit evidence: production release/deployment, irreversible action, security/data loss, system-wide outage, host-continuity risk; or two strong groups including unknown-cause, cross-scope, or continuity. `production`, `core`, `customer-visible`, or `business-critical` labels alone do not upgrade a bounded known single-function bug with clear acceptance.
 - Explicit exclusions or no-risk bounds—such as “do not modify, test, publish, or write Git”—are not positive Hard evidence. They do not erase genuine production-release, irreversible, or cross-scope evidence elsewhere in the same request.

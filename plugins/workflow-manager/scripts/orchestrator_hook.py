@@ -42,7 +42,7 @@ def _release_metadata() -> dict[str, Any]:
         # has no authority to upgrade state; retain the last compatible
         # release identity so the lifecycle hook can fail open and the next
         # normal runner refresh restores the structured source of truth.
-        value = {"version": "1.0.76", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
+        value = {"version": "1.0.77", "schema": 34, "execution_profile": "14", "stable_skill_schema": 10}
     if not (
         isinstance(value, dict)
         and isinstance(value.get("version"), str)
@@ -59,8 +59,8 @@ def _release_metadata() -> dict[str, Any]:
 RELEASE_METADATA = _release_metadata()
 SCHEMA_VERSION = RELEASE_METADATA["schema"]
 WRITER_VERSION = RELEASE_METADATA["version"]
-DOMAIN_CLASSIFIER_VERSION = "4"
-DIFFICULTY_CLASSIFIER_VERSION = "6"
+DOMAIN_CLASSIFIER_VERSION = "5"
+DIFFICULTY_CLASSIFIER_VERSION = "7"
 EXECUTION_PROFILE_VERSION = RELEASE_METADATA["execution_profile"]
 # The assessor is the one read-only high-tier boundary for Hard work.
 DEFAULT_PLAN_REASONING_EFFORT = "ultra"
@@ -1018,6 +1018,7 @@ def historical_material_summary_only(prompt: str) -> bool:
 def reference_contract_changed(prompt: str) -> bool:
     # A bare "version" occurs in ordinary product questions.  Only an
     # explicit request to alter a reference/fidelity contract is material.
+    prompt = classification_action_scan(prompt)
     return bool(re.search(
         r"(?:参考|reference|视觉|fidelity).{0,48}(?:版本|version|方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态)"
         r"|(?:版本|version|方向|orientation|视口|viewport|场景|scene|时相|phase|稳定态|过渡态).{0,48}(?:参考|reference|视觉|fidelity)"
@@ -12588,8 +12589,8 @@ PHASE_TERMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("编译", "构建", "合包", "打包"),
     ),
     "delivery_device": (
-        ("adb", "deploy", "device", "flash", "install", "reboot"),
-        ("部署", "设备", "实机", "上机", "安装", "刷机", "重启"),
+        ("adb", "deploy", "flash", "install", "reboot"),
+        ("部署", "实机", "上机", "安装", "刷机", "重启设备", "重启手机"),
     ),
     "verification": (
         ("acceptance", "regression", "test", "validate", "verification", "verify"),
@@ -12617,8 +12618,8 @@ WORK_STRONG_PATTERNS = (
     ("work_device_bug", r"(?:设备|产品|系统|固件|framework|android).{0,24}(?:bug|问题|异常|故障|崩溃|重启|修复|排查|诊断)"),
     (
         "work_app_code",
-        r"(?:写|编写|开发|实现|修改|修复|重构|调试|\b(?:review|write|create|implement|develop|debug|fix|refactor)\b)"
-        r".{0,24}(?:应用|代码|源码|模块|脚本|函数|方法|接口|服务|插件|\b(?:app|java|kotlin|python|javascript|typescript|skill|hook|function|class|service|plugin|script|code)\b)",
+        r"(?:写|编写|创建|开发|实现|修改|修复|重构|调试|\b(?:review|write|create|implement|develop|debug|fix|refactor)\b)"
+        r".{0,24}(?:应用|代码|源码|模块|脚本|函数|方法|接口|服务|插件|生成器|导出器|渲染器|\b(?:app|java|kotlin|python|javascript|typescript|skill|hook|function|class|service|plugin|script|code|report generator)\b)",
     ),
     (
         "work_build_delivery",
@@ -12627,7 +12628,7 @@ WORK_STRONG_PATTERNS = (
         r"\bflash\b.{0,24}\b(?:device|firmware|image|rom)\b)",
     ),
     ("work_engineering_artifact", r"(?:仓库|代码库|项目|工程|模块|source tree|repository).{0,24}(?:修改|修复|实现|诊断|排查|测试|验证|发布|迁移)"),
-    ("work_engineering_diagnosis", r"(?:排查|诊断|修复|调试|分析|审查|investigate|diagnose|debug|fix|analy[sz]e|review).{0,24}(?:日志|测试|bug|崩溃|重启|异常|故障|失败|log|test|crash|failure|error)"),
+    ("work_engineering_diagnosis", r"(?:排查|诊断|修复|调试|分析|审查|investigate|diagnose|debug|fix|analy[sz]e|review).{0,24}(?:日志|测试|bug|崩溃|重启|异常|故障|失败|log|test|crash|failure|error|root cause)"),
     ("work_engineering_operation", r"(?:测试|验证|优化|迁移|安装|test|verify|optimize|migrate|install).{0,24}(?:ci|api|数据库|服务器|服务|插件|skill|workflow|模块|代码|系统|设备|database|server|service|plugin|module|code|system|device)"),
     (
         "work_file_artifact_contract",
@@ -12656,6 +12657,178 @@ WORK_CONTEXT_PATTERNS = (
 
 def _english_hits(text: str, terms: tuple[str, ...]) -> int:
     return sum(1 for term in terms if re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", text))
+
+
+CONTENT_REQUEST_PATTERN = re.compile(
+    r"(?:生成|整理(?:成)?|汇总|撰写|写(?:成)?|编写|制作|创建|输出|起草|编辑|修改|更新|补充|"
+    r"删减|删除|润色|完善|总结(?:为)?).{0,48}?"
+    r"(?:markdown|\bmd\b|\bpdf\b|\bword\b|\bdocx\b|\blatex\b|\bpptx?\b|"
+    r"文档|报告|日报|周报|月报|工作总结|成果说明|汇报材料|草稿|教程|手册|清单|表格|说明书)"
+    r"|(?:翻译|润色).{0,32}(?:内容|资料|材料|完成情况)"
+    r"|翻译(?:成|为)?.{0,16}(?:英文|中文|英语|汉语|日语|韩语)"
+    r"|(?:从|在).{0,12}(?:草稿|报告|文档|周报).{0,12}(?:删除|去掉|移除)"
+    r"|\b(?:write|draft|generate|create|prepare|edit|revise|polish|summarize|translate|explain)\b"
+    r"[^;\n]{0,100}?\b(?:document|report|markdown|pdf|word|docx|latex|draft|manual|guide|source material)\b",
+    re.I,
+)
+INFORMATION_REQUEST_PATTERN = re.compile(
+    r"^(?:请)?(?:解释|说明|介绍|如何理解|怎么理解|什么是|为什么|比较|对比|分析一下)"
+    r"|^(?:what|why|how\s+(?:does|do|is|are)|explain|describe|compare)\b",
+    re.I,
+)
+EXECUTION_CLAUSE_PATTERN = re.compile(
+    r"^[\s，,:：]*(?:(?:请|帮我|给我|先|现在|继续|开始|直接|please|first|now)\s*)*"
+    r"(?:修改|修复|实现|开发|编写|编译|构建|打包|部署|安装|烧录|刷机|重启|排查|诊断|复现|"
+    r"发布|生产发布|生产部署|执行|运行|完成|进行|对齐|复刻|还原|"
+    r"(?:按|以).{0,48}(?:效果|界面|主题|视觉|行为|参考).{0,16}(?:为准|为参考)|"
+    r"删除|销毁|擦除|清空|强推|强制推送|重写|轮换|"
+    r"fix\b|implement\b|develop\b|write\b|build\b|compile\b|deploy\b|install\b|"
+    r"publish\b|release\b|execute\b|run\b|diagnose\b|investigate\b|reproduce\b|"
+    r"perform\b|complete\b|delete\b|drop\b|remove\b|rm\b|wipe\b|erase\b|force[- ]push\b|rewrite\b|git\s+(?:push|reset|clean)\b)",
+    re.I,
+)
+
+
+def _content_request_view(prompt: str) -> tuple[str, bool]:
+    """Separate non-executing deliverables from independent requested actions.
+
+    Tables, quoted examples, completed work and document topics are inputs,
+    not operations. Keep separately requested execution, including commands
+    supplied by reference. This view never replaces the original objective.
+    """
+    literals: dict[str, str] = {}
+    token_prefix = "__wm_material_" + stable_hash(prompt, 12) + "_"
+
+    def protect(match: re.Match[str]) -> str:
+        token = token_prefix + str(len(literals)) + "__"
+        literals[token] = match.group(0)
+        return token
+
+    protected = re.sub(
+        r"```[\s\S]*?```|~~~[\s\S]*?~~~|“[^”\n]*”|‘[^’\n]*’|「[^」\n]*」|"
+        r'''"[^"\n]*"|'[^'\n]*'|`[^`\n]*`''', protect, prompt,
+    )
+    document = CONTENT_REQUEST_PATTERN.search(protected)
+    informational = INFORMATION_REQUEST_PATTERN.search(protected.strip())
+    if not document and not informational:
+        return prompt, False
+
+    def restore(text: str) -> str:
+        for token, literal in literals.items():
+            text = text.replace(token, literal)
+        return text
+
+    # A report generator or a script that writes documents is a source-code
+    # deliverable. Its output format does not convert implementation to prose.
+    source_request = re.compile(
+        r"^(?:(?:请|帮我|先|现在|继续)\s*)*(?:编写|写一个|创建|实现|开发|修复|修改).{0,60}"
+        r"(?:\bapp\b|源码|源代码|脚本|函数|方法|生成器|生成服务|生成工具|导出器|渲染器|\.(?:py|java|kt|js|ts)\b)"
+        r"|^(?:please\s+)?(?:write|create|implement|develop|fix|debug)\s+(?:a\s+|the\s+)?"
+        r"(?:[a-z]+\s+){0,3}(?:script|app|application|function|generator|renderer|exporter)\b",
+        re.I,
+    )
+    if source_request.search(protected.strip()):
+        source_name = re.search(r"\b(?:app|script|function|generator|renderer|exporter)\b|源码|脚本|函数|方法|生成器|生成服务|生成工具", protected, re.I)
+        document_name = re.search(r"文档|报告|日报|周报|月报|草稿|说明|手册|\b(?:document|report|markdown|pdf|word|draft)\b", protected, re.I)
+        document_primary = False
+        if source_name and document_name:
+            if document_name.start() < source_name.start():
+                document_primary = bool(re.search(
+                    r"[：:]|中的|里面|内容|关于|包含|包括|涉及|\babout\b|\bcover",
+                    protected[document_name.end():source_name.start()], re.I,
+                ))
+            else:
+                modifier = protected[source_name.end():document_name.start()]
+                document_primary = len(modifier) <= 16 and not re.search(
+                    r"并|然后|生成|导出|实现|写入|\b(?:and|then|generat\w*|writ\w*|export\w*)\b",
+                    modifier, re.I,
+                )
+        if not document_primary:
+            return prompt, False
+
+    historical = bool(re.search(
+        r"(?:资料|材料|历史记录|工作内容|工作记录|完成情况|已完成|已经完成|已经修复|昨天|本周已|上月|上个月|"
+        r"completed|yesterday|source material|以下内容|以上内容|用这\d*个维度|根据.{0,16}(?:内容|资料|材料))",
+        protected, re.I,
+    ))
+    chunks = re.split(
+        r"([\n。；;]|然后|随后|接着|此外|另外|还要|同时|\bthen\b|\balso\b|\bafterwards?\b)",
+        protected, flags=re.I,
+    )
+    actions: list[str] = []
+    seen_document = False
+    material_scope = historical
+    boundary = ""
+    requested_materials: set[str] = set()
+    offset = 0
+
+    def bind_material_reference(text: str, position: int) -> None:
+        for reference in re.finditer(
+            r"(?:执行|运行|execute|run).{0,24}(?P<direction>下方|以下|上面|上述|following|below|above|commands?|steps?)",
+            text, re.I,
+        ):
+            at = position + reference.end()
+            tokens = [(protected.find(token), token) for token in literals]
+            if reference.group("direction").lower() in {"上面", "上述", "above"}:
+                candidates = [(where, token) for where, token in tokens if where < at]
+                if candidates:
+                    requested_materials.add(max(candidates)[1])
+            else:
+                candidates = [(where, token) for where, token in tokens if where >= at]
+                if candidates:
+                    requested_materials.add(min(candidates)[1])
+
+    for index, chunk in enumerate(chunks):
+        chunk_position = offset
+        offset += len(chunk)
+        if index % 2:
+            boundary = chunk
+            continue
+        request = CONTENT_REQUEST_PATTERN.search(chunk)
+        if request:
+            prefix = chunk[:request.start()].strip(" ，,:：")
+            explicit_prefix = bool(re.match(r"(?:请|帮我|先|现在|继续|开始|直接|执行|运行|please|first|now|execute|run)", prefix, re.I))
+            document_alignment = bool(re.match(r"(?:对齐|复刻|还原|按|以)", prefix) and re.search(r"文档|报告|排版|字体|\b(?:document|report|typography)\b", prefix, re.I))
+            if EXECUTION_CLAUSE_PATTERN.match(prefix) and not document_alignment and (not historical or explicit_prefix):
+                actions.append(restore(prefix))
+                bind_material_reference(prefix, chunk_position)
+            # An independent implementation following the document object is
+            # execution; text introduced as its contents remains material.
+            tail = chunk[request.end():]
+            material_scope = bool(re.search(r"[：:]|关于|内容|包含|包括|介绍|说明|\babout\b|\bcover", tail, re.I))
+            joined = re.search(r"(?:并且|并|and|，|,)\s*(?=(?:执行|运行|发布|部署|修复|实现|编译|install|deploy|execute|run|publish|release|fix|implement|compile))", tail, re.I)
+            if joined and not re.search(r"[：:]|关于|内容|包含|包括|介绍|说明|\babout\b|\bcover", tail[:joined.start()], re.I):
+                actions.append(restore(tail[joined.end():]))
+            seen_document = True
+            continue
+        text = chunk.strip(" ，,:：")
+        strong_boundary = bool(re.search(r"然后|随后|接着|此外|另外|还要|同时|then|also|after", boundary, re.I))
+        explicit = bool(re.match(r"(?:请|帮我|先|现在|继续|开始|直接|please|first|now)", text, re.I))
+        execution = bool(EXECUTION_CLAUSE_PATTERN.match(text))
+        if informational and re.match(r"^(?:请)?(?:解释|说明|介绍|比较|对比)|^(?:explain|describe|compare)\b", text, re.I):
+            joined = re.search(r"(?:并且|并|and)\s*(?=(?:执行|运行|发布|部署|修复|实现|deploy|execute|run|publish|fix|implement))", text, re.I)
+            if joined and not re.search(r"文档中|代码中|例子|示例|中的|是什么意思|含义|\bexample\b|\bmeans\b", text[:joined.start()], re.I):
+                actions.append(restore(text[joined.end():]))
+        # Content examples may begin with verbs. Outside a request connector,
+        # a material/history introducer keeps them inside the document scope.
+        independent_boundary = bool(re.search(r"[\n。；;]", boundary)) and not material_scope
+        if execution and (strong_boundary or explicit or independent_boundary or (not seen_document and not historical)):
+            actions.append(restore(text))
+            bind_material_reference(text, chunk_position + chunk.find(text))
+        elif not seen_document and not historical and not informational and document and document.start() > 0:
+            if not re.search(r"[|>]|" + re.escape(token_prefix), text) and re.search(r"^(?:生产发布|生产部署|production\s+deployment)", text, re.I):
+                actions.append(restore(text))
+    actions.extend(literals[token] for token in literals if token in requested_materials)
+    if actions:
+        return "；".join(actions), False
+    # Keep source symbols for informational domain suggestions, without
+    # treating the question's engineering vocabulary as execution evidence.
+    symbols = re.findall(r"[\w./-]+\.(?:java|kt|py|js|ts|cpp|c|h)\b", prompt, re.I) if informational else []
+    return "解释当前实现 " + " ".join(symbols) if symbols else "撰写文档", True
+
+
+def native_content_request(prompt: str) -> bool:
+    return _content_request_view(prompt)[1]
 
 
 def _without_editorial_removal_targets(prompt: str) -> str:
@@ -12708,7 +12881,8 @@ def classification_action_scan(prompt: str) -> str:
     ``不得发布`` or ``do not run tests`` from counting as requested operations.
     Separators and later affirmative clauses remain intact.
     """
-    text = re.sub(r"\s+", " ", _without_editorial_removal_targets(str(prompt or "").strip()))
+    content_view, _ = _content_request_view(str(prompt or "").strip())
+    text = re.sub(r"\s+", " ", _without_editorial_removal_targets(content_view))
     english_actions = (
         r"(?:create|write|modify|edit|change|fix|implement|build|compile|package|"
         r"test|verify|validate|install|reboot|flash|"
@@ -12780,7 +12954,12 @@ def classify_task_domain(prompt: str) -> dict[str, Any]:
     )
 
     # An explicit engineering deliverable outranks an incidental daily phrase in a mixed request.
-    if "daily_report" in daily_codes and not report_with_separate_work and not work_codes:
+    critical_codes = [code for code, pattern in CRITICAL_HARD_PATTERNS if re.search(pattern, work_scan, re.I)]
+    if critical_codes:
+        domain = "work"
+        confidence = "high"
+        rule_codes = ["work_explicit_risk_action", *critical_codes]
+    elif "daily_report" in daily_codes and not report_with_separate_work and not work_codes:
         domain = "daily"
         confidence = "high"
         rule_codes = ["daily_report"]
@@ -12829,7 +13008,14 @@ CRITICAL_HARD_PATTERNS = (
         "critical_irreversible_or_production",
         r"(?:生产发布|production\s+(?:release|deployment)|不可逆|irreversible|"
         r"数据丢失|data\s+loss|安全漏洞|security\s+(?:incident|vulnerability)|"
-        r"销毁|wipe|erase|rotate\s+(?:production\s+)?credentials?)",
+        r"销毁|wipe|erase|rotate\s+(?:production\s+)?credentials?|"
+        r"强推|强制推送|重写\s*(?:git\s*)?历史|force[- ]push|rewrite\s+(?:git\s+)?history|"
+        r"deploy\s+--production|(?:deploy|publish|release)\b[^;。\n]{0,80}\b(?:to|into)\s+(?:the\s+)?production\b|"
+        r"(?:发布|部署).{0,32}(?:到|至|进入)生产|"
+        r"(?:删除|清空|擦除|销毁).{0,32}(?:生产|线上).{0,16}(?:数据库|数据)|"
+        r"(?:drop|delete|truncate|wipe|erase|clear)\b[^;。\n]{0,64}\bproduction\b.{0,16}\b(?:data|database|tables?)\b|"
+        r"rm\b[^;。\n]{0,48}\s-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\b[^;。\n]{0,64}(?:production|线上|生产)|"
+        r"git\b[^;。\n]{0,80}\b(?:push\b[^;。\n]{0,80}(?:--force(?:-with-lease)?\b|\s-f(?:\s|$))|reset\b[^;。\n]{0,80}--hard\b))",
     ),
     (
         "critical_architecture_delivery",
@@ -12849,7 +13035,7 @@ CRITICAL_HARD_PATTERNS = (
     ),
 )
 HARD_WORK_PATTERNS = (
-    ("hard_unknown_root_cause", r"(?:根因未知|未知根因|原因不明|反复|间歇|偶现|复现|root cause|intermittent|flaky|keeps|repeated)"),
+    ("hard_unknown_root_cause", r"(?:根因未知|未知根因|原因不明|反复|间歇|偶现|root cause|intermittent|flaky|keeps|repeated|(?:排查|诊断|定位).{0,36}(?:异常|故障|错误|失败|损坏|原因|崩溃))"),
     ("hard_cross_module", r"(?:跨模块|多个模块|多模块|跨组件|多个组件|framework.{0,28}systemui|settings.{0,28}framework|cross[- ]module|multiple modules?|several modules?)"),
     ("hard_architecture", r"(?:架构|离线同步|后台同步|认证系统|rollback|migration|迁移)"),
     ("hard_host_continuity", r"(?:host\s+compaction|真实(?:宿主)?压缩|压缩).{0,96}(?:same[- ]session|同一会话|同会话|resume|恢复)"),
@@ -12865,7 +13051,6 @@ HARD_SIGNAL_GROUPS = {
     "hard_device_change": "external_state",
     "hard_shared_resource": "coordination",
     "hard_shared_or_ordered": "coordination",
-    "hard_three_phase_chain": "workflow",
 }
 PRIMARY_HARD_SIGNAL_GROUPS = {"diagnosis", "scope", "continuity"}
 SIMPLE_WORK_PATTERNS = (
@@ -12919,8 +13104,6 @@ def classify_work_difficulty(
         phases = set(as_list(route.get("phase_hints")))
         if domain_codes & {"work_device_bug", "work_device_customization"}:
             hard_codes.append("hard_device_change")
-        if len(phases) >= 3:
-            hard_codes.append("hard_three_phase_chain")
         if route.get("dependency_signal") in {"shared_resource", "ordered_shared"}:
             hard_codes.append("hard_shared_or_ordered")
         signal_groups = {
@@ -12983,6 +13166,8 @@ def classify_work_difficulty(
 
 
 def phase_hints(prompt: str) -> list[str]:
+    if native_content_request(prompt):
+        return []
     scan = classification_action_scan(prompt)
     lower = scan.lower()
     result: list[str] = []
@@ -16160,6 +16345,12 @@ def prompt_changes_pending_plan(prompt: str) -> bool:
 
 def explicit_new_objective(prompt: str) -> bool:
     normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    if native_content_request(prompt) and not re.search(
+        r"(?:当前|本次|上述|原|这个|该)(?:的)?(?:hard\s*)?(?:计划|合同|验收|任务(?:状态|进度|结果))"
+        r"|\b(?:canonical|execution_contract_id|recovery_from|current plan|this plan|current contract)\b",
+        normalized, re.I,
+    ):
+        return True
     return bool(
         re.match(
             r"^(?:another task|new task|separately|换个问题|另一个任务|新任务|另外一个|顺便帮我|再帮我)",
@@ -16205,7 +16396,7 @@ def explicit_simple_override(prompt: str) -> tuple[bool, str | None]:
 
 
 def successful_acceptance_feedback(prompt: str) -> bool:
-    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    normalized = classification_action_scan(prompt).lower()
     regression_signal = any(marker in normalized for marker in REGRESSION_REPORT_MARKERS)
     contrast_signal = bool(
         re.search(r"(?:但是|但|不过|然而|却|同时|另外|可是|but|however|yet)", normalized)
@@ -16217,7 +16408,8 @@ def successful_acceptance_feedback(prompt: str) -> bool:
 
 
 def fidelity_negative_feedback(prompt: str) -> bool:
-    return any(marker in prompt.lower() for marker in ("不一致", "不对", "不像", "方向错误", "方向不对", "动画方向不对"))
+    scan = classification_action_scan(prompt).lower()
+    return any(marker in scan for marker in ("不一致", "不对", "不像", "方向错误", "方向不对", "动画方向不对"))
 
 
 def regression_feedback(
@@ -16225,7 +16417,7 @@ def regression_feedback(
 ) -> bool:
     baseline = _safe_execution_baseline(previous.get("last_execution_baseline"))
     review = _safe_causal_review(previous.get("causal_review"))
-    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    normalized = classification_action_scan(prompt).lower()
     return bool(
         baseline.get("change_set_digest")
         and previous.get("plan_state") == "confirmed"
@@ -16249,7 +16441,7 @@ def unmet_acceptance_without_recorded_change(
     """Replan a failed outcome without inventing a change-caused regression."""
     baseline = _safe_execution_baseline(previous.get("last_execution_baseline"))
     review = _safe_causal_review(previous.get("causal_review"))
-    normalized = re.sub(r"\s+", " ", prompt.strip().lower())
+    normalized = classification_action_scan(prompt).lower()
     return bool(
         baseline
         and not baseline.get("change_set_digest")
@@ -16670,7 +16862,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> None:
     reference_rejection = bool(
         _safe_reference_acceptance(previous.get("reference_acceptance"))["enabled"]
         and not acceptance_success
-        and (any(marker in prompt.lower() for marker in REGRESSION_REPORT_MARKERS) or fidelity_negative_feedback(prompt))
+        and (any(marker in classification_action_scan(prompt).lower() for marker in REGRESSION_REPORT_MARKERS) or fidelity_negative_feedback(prompt))
     )
     causal_report = regression_feedback(prompt, previous, new_objective=new_objective)
     acceptance_miss = unmet_acceptance_without_recorded_change(
