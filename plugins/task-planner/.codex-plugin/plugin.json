@@ -1,0 +1,23 @@
+{
+  "name": "task-planner",
+  "version": "1.0.0",
+  "description": "Creates a session plan artifact and waits for explicit approval before task execution.",
+  "author": {
+    "name": "Cong"
+  },
+  "skills": "./skills",
+  "interface": {
+    "displayName": "Task Planner",
+    "shortDescription": "Plan first, then execute after explicit approval.",
+    "longDescription": "Writes a concrete, reviewable Markdown plan in the current session and pauses execution until the user explicitly approves that displayed revision.",
+    "developerName": "Cong",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Use $task-planner to create a concrete session plan and wait for my explicit approval before executing it."
+    ],
+    "screenshots": []
+  }
+}

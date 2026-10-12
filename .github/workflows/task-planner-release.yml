@@ -1,0 +1,53 @@
+name: Publish Task Planner Releases
+
+on:
+  push:
+    tags:
+      - "task-planner-v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate and test package
+        run: |
+          python -B scripts/validate_repository.py
+          python -B -m unittest discover -s plugins/task-planner/tests -p "test_*.py" -v
+      - name: Publish Task Planner release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^task-planner-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#task-planner-v}"
+          manifest_version="$(python -c 'import json; print(json.load(open("plugins/task-planner/.codex-plugin/plugin.json", encoding="utf-8"))["version"])')"
+          [[ "$version" == "$manifest_version" ]]
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; skipping"
+            exit 0
+          fi
+          notes="$(mktemp)"
+          python -B scripts/extract_release_notes.py --version "Task Planner $version" >"$notes"
+          archive="task-planner-$version.zip"
+          python - "$archive" <<'PY'
+          import sys
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          root = Path("plugins/task-planner")
+          with ZipFile(sys.argv[1], "w", ZIP_DEFLATED) as archive:
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, str(Path("task-planner") / path.relative_to(root)))
+          PY
+          gh release create "$RELEASE_TAG" "$archive" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+            --title "Task Planner $version" --notes-file "$notes"

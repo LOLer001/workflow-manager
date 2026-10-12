@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Planner"
+  short_description: "显式调用后生成会话 Markdown 计划，等待用户确认再执行任务"
+  default_prompt: "Use $task-planner to write a concrete session plan and wait for my explicit approval before executing it."
+
+policy:
+  allow_implicit_invocation: false

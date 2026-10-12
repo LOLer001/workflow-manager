@@ -5,6 +5,13 @@
 - 补齐中文紧邻的文档格式别名识别，例如“生成md文件”“生成PDF文件”和“生成一个Word”：英文单词边界不再因相邻中文失效，保留 ASCII 词内边界以防把代码符号误识别成格式。
 - 新增 36 个格式、引用文件名及混合真实操作场景，安装端回放和双平台完整测试验证后前向发布；1.0.77 标签保持不变。Domain classifier v6、difficulty classifier v8；Schema 34、execution profile v14、stable-skill schema 10 保持不变。
 
+## Task Planner 1.0.0
+
+- 在现有 Workflow Manager 市场新增独立的 Task Planner 插件，显式调用 `$task-planner` 后先生成本会话的 Markdown 计划和可执行步骤表，保存并展示后等待用户确认。
+- 计划修改保留旧版并重新确认；批准后按范围执行，同范围修复和验证无需重复确认。恢复时结合计划与聊天批准记录，文档状态不能独立授予执行权限。
+- 采用纯 skill，不使用 hook、MCP 或全局配置，不更改 Workflow Manager 的运行代码、私有状态或授权规则；被独立审批阻止时明确报告，不绕过限制。
+- 扩展市场校验与 Linux/Windows 包装测试，采用独立 `task-planner-v1.0.0` 标签和 Release，Workflow Manager 保持 1.0.78。
+
 ## 1.0.77
 
 - 将 Hard 判定统一绑定到当前请求执行的动作：文档生成与编辑、报告、翻译、解释、历史完成内容、表格和引用示例不再因为素材中的工程或风险词升级；独立执行指令以及明确要求运行的引用命令仍保留风险信号。

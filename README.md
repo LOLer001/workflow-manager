@@ -2,6 +2,28 @@
 
 面向 Codex 的质量优先、上下文高效工作流管理插件：只减少冗余和噪声，不削弱解决问题所需的推理、证据、纠错与验收验证。
 
+本市场包含两个独立插件：Workflow Manager 提供 Hard 任务授权和宿主证据检查；[Task Planner](plugins/task-planner/README.md) 提供显式调用的“生成计划文件 → 用户确认 → 执行”流程。
+
+## Task Planner
+
+安装到同一市场：
+
+```bash
+codex plugin marketplace add LOLer001/workflow-manager --json
+codex plugin marketplace upgrade workflow-manager --json
+codex plugin add task-planner@workflow-manager --json
+```
+
+重启 Codex 并新建会话后，在任务消息中调用：
+
+```text
+$task-planner 帮我修复设置页返回后列表位置丢失的问题。
+```
+
+Codex 会先做必要的只读检查，把具体步骤、依赖、产出和验收标准写入本会话 Markdown 文件（有宿主指定的 `outputs` 时放在该目录），展示后等待你修改或确认。后续回复“按这个计划执行”才开始实际处理；修改计划会保存新版本并再次等待确认。
+
+Task Planner 1.0.0 不使用 hook，也不自动调用。它按 skill 指令约束执行，不替代 Workflow Manager 的独立授权；若已有 Hard 审批阻止计划文件写入，会明确报告，不声称已经保存或继续执行。Workflow Manager 的运行代码和版本保持不变。Task Planner 发布标签为 `task-planner-v1.0.0`。
+
 ## 核心能力
 
 Workflow Manager 1.0.78 是当前 Codex 的 Hard 任务安全层：普通开发保持原生体验，只在高风险、跨范围或未知根因任务中介入。
@@ -129,7 +151,7 @@ codex plugin add workflow-manager@workflow-manager --json
 .agents/plugins/marketplace.json       GitHub 插件市场
 plugins/workflow-manager/              插件源码
   .codex-plugin/plugin.json            插件清单
-  assets/stable-skill/workflow-manager/  唯一可调用 Skill 的安装源
+  assets/stable-skill/workflow-manager/  Workflow Manager Skill 的安装源
     references/work-routing.md          困难判断、计划确认与防误拦边界
     references/confirmed-execution.md   合同执行、模型证据、失败恢复与迁移
     references/regression-continuity.md 验收回归、因果复核、重规划与压缩续接
@@ -139,6 +161,10 @@ plugins/workflow-manager/              插件源码
   scripts/install_stable_skill.py      用户级稳定路径安装器
   scripts/                             其他跨平台运行脚本
   tests/                               策略与 Windows 原生测试
+plugins/task-planner/                  Task Planner 独立 skill 插件
+  .codex-plugin/plugin.json            插件清单，无 hook
+  skills/task-planner/                 显式调用的计划与确认流程
+  tests/                              包装与调用策略检查
 ```
 
 ## 开发与测试
@@ -154,6 +180,7 @@ Linux、WSL 或 macOS：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s plugins/workflow-manager/tests -p "test_*.py" -v
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s plugins/task-planner/tests -p "test_*.py" -v
 ```
 
 Windows 原生测试：
@@ -169,6 +196,6 @@ py -3 -B -m unittest discover -s tests -p "test_*.py" -v
 
 ## 贡献与发布
 
-行为修改请附最小复现和验证结果，避免上传原始会话、完整日志、密钥或设备隐私数据。发布时同步更新插件版本与 [CHANGELOG.md](CHANGELOG.md)，通过测试后创建同版本 `vX.Y.Z` 标签。
+行为修改请附最小复现和验证结果，避免上传原始会话、完整日志、密钥或设备隐私数据。发布时同步更新对应插件版本与 [CHANGELOG.md](CHANGELOG.md)。通过测试后，Workflow Manager 创建 `vX.Y.Z` 标签；Task Planner 创建 `task-planner-vX.Y.Z` 标签，由各自的发布流程生成 Release。
 
 安装命令依据 OpenAI 官方的 [插件打包与 GitHub 市场说明](https://developers.openai.com/plugins/build/plugins)。项目采用 [MIT License](LICENSE)。

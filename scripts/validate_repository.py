@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the GitHub marketplace and bundled Workflow Manager identity."""
+"""Validate the marketplace and its independent plugin packages."""
 
 from __future__ import annotations
 
@@ -49,16 +49,27 @@ def main() -> int:
     entries = marketplace.get("plugins")
 
     assert marketplace.get("name") == PLUGIN_NAME
-    assert isinstance(entries, list) and len(entries) == 1
-    assert entries[0].get("name") == PLUGIN_NAME
-    assert entries[0].get("source") == {
-        "source": "local",
-        "path": f"./plugins/{PLUGIN_NAME}",
-    }
-    assert entries[0].get("policy") == {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL",
-    }
+    assert isinstance(entries, list) and len(entries) == 2
+    assert {entry.get("name") for entry in entries} == {PLUGIN_NAME, "task-planner"}
+    for entry in entries:
+        assert entry.get("source") == {
+            "source": "local",
+            "path": f"./plugins/{entry['name']}",
+        }
+        assert entry.get("policy") == {
+            "installation": "AVAILABLE",
+            "authentication": "ON_INSTALL",
+        }
+        assert entry.get("category") == "Productivity"
+    planner = ROOT / "plugins" / "task-planner"
+    planner_manifest = read_json(planner / ".codex-plugin" / "plugin.json")
+    assert planner_manifest.get("name") == "task-planner"
+    assert planner_manifest.get("interface", {}).get("displayName") == "Task Planner"
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", planner_manifest.get("version", ""))
+    assert planner_manifest.get("skills") == "./skills"
+    assert not {"hooks", "mcpServers", "mcp", "apps", "settings"}.intersection(planner_manifest)
+    assert not (planner / "hooks").exists()
+    assert (planner / "skills" / "task-planner" / "SKILL.md").is_file()
     assert manifest.get("name") == PLUGIN_NAME
     assert manifest.get("interface", {}).get("displayName") == "Workflow Manager"
     assert "skills" not in manifest
@@ -236,7 +247,7 @@ def main() -> int:
     print(
         f"repository valid: marketplace={marketplace['name']} "
         f"plugin={manifest['name']} version={manifest['version']} "
-        "skills=stable-user-path"
+        f"skills=stable-user-path task-planner={planner_manifest['version']}"
     )
     return 0
 
